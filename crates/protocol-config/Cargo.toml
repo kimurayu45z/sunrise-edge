@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bonds.workspace = true
 canonical-encoding.workspace = true
 commitments.workspace = true
 fees.workspace = true

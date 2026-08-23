@@ -2,6 +2,10 @@
 
 //! Canonically encoded protocol configuration values.
 
+use bonds::{
+    BondAssetRegistry, BondError, ValidatorAdmissionPolicy, encode_bond_asset_registry,
+    encode_validator_admission_policy,
+};
 use canonical_encoding::{CanonicalEncodingError, CanonicalStruct};
 use commitments::{CommitmentSchemeError, CommitmentSchemeId, encode_commitment_scheme_id};
 use core::fmt;
@@ -23,6 +27,8 @@ pub enum ProtocolConfigError {
     ZeroHashSuiteId,
     /// Commitment scheme encoding failed.
     CommitmentScheme(CommitmentSchemeError),
+    /// Bond configuration is invalid.
+    Bond(BondError),
     /// Fee configuration is invalid.
     Fee(FeeError),
     /// Canonical encoding failed.
@@ -35,6 +41,7 @@ impl fmt::Display for ProtocolConfigError {
             Self::ZeroProtocolVersion => write!(f, "protocol version must be non-zero"),
             Self::ZeroHashSuiteId => write!(f, "hash-suite id must be non-zero"),
             Self::CommitmentScheme(error) => error.fmt(f),
+            Self::Bond(error) => error.fmt(f),
             Self::Fee(error) => error.fmt(f),
             Self::CanonicalEncoding(error) => error.fmt(f),
         }
@@ -61,6 +68,12 @@ impl From<FeeError> for ProtocolConfigError {
     }
 }
 
+impl From<BondError> for ProtocolConfigError {
+    fn from(value: BondError) -> Self {
+        Self::Bond(value)
+    }
+}
+
 /// Protocol configuration fields that affect cryptographic commitments today.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtocolConfig {
@@ -74,6 +87,10 @@ pub struct ProtocolConfig {
     pub gas_schedule: GasSchedule,
     /// Approved fee assets and conversion parameters.
     pub fee_assets: FeeAssetRegistry,
+    /// Approved bond assets and validator collateral rules.
+    pub bond_assets: BondAssetRegistry,
+    /// Current validator admission policy.
+    pub validator_admission_policy: ValidatorAdmissionPolicy,
 }
 
 impl ProtocolConfig {
@@ -86,6 +103,8 @@ impl ProtocolConfig {
             commitment_scheme_id: CommitmentSchemeId::SparseMerkleSha256V1,
             gas_schedule: GasSchedule::genesis(),
             fee_assets: FeeAssetRegistry::new(),
+            bond_assets: BondAssetRegistry::new(),
+            validator_admission_policy: ValidatorAdmissionPolicy::GenesisPermissioned,
         }
     }
 
@@ -98,6 +117,7 @@ impl ProtocolConfig {
             return Err(ProtocolConfigError::ZeroHashSuiteId);
         }
         self.fee_assets.validate()?;
+        self.bond_assets.validate()?;
         Ok(())
     }
 
@@ -117,13 +137,19 @@ pub fn encode_protocol_config(config: &ProtocolConfig) -> Result<Vec<u8>, Protoc
     canonical.field_bytes(3, encode_commitment_scheme_id(config.commitment_scheme_id)?)?;
     canonical.field_bytes(4, encode_gas_schedule(&config.gas_schedule)?)?;
     canonical.field_bytes(5, encode_fee_asset_registry(&config.fee_assets)?)?;
+    canonical.field_bytes(6, encode_bond_asset_registry(&config.bond_assets)?)?;
+    canonical.field_bytes(
+        7,
+        encode_validator_admission_policy(config.validator_admission_policy)?,
+    )?;
     Ok(canonical.finish()?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fees::{AssetId, FeeAsset};
+    use bonds::BondAssetConfig;
+    use fees::{Amount, AssetId, FeeAsset};
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -136,7 +162,7 @@ mod tests {
         assert_eq!(
             hex(&bytes),
             concat!(
-                "534e5245015001000500",
+                "534e5245015001000700",
                 "01000400000001000000",
                 "0200020000000100",
                 "03009f000000",
@@ -158,7 +184,13 @@ mod tests {
                 "0600080000000000000000000000",
                 "050014000000",
                 "534e5245047001000100",
-                "01000400000000000000"
+                "01000400000000000000",
+                "060014000000",
+                "534e5245038001000100",
+                "01000400000000000000",
+                "070012000000",
+                "534e5245018001000100",
+                "0100020000000100"
             )
         );
     }
@@ -183,6 +215,8 @@ mod tests {
             commitment_scheme_id: CommitmentSchemeId::SparseMerkleSha256V1,
             gas_schedule: GasSchedule::genesis(),
             fee_assets: FeeAssetRegistry::new(),
+            bond_assets: BondAssetRegistry::new(),
+            validator_admission_policy: ValidatorAdmissionPolicy::GenesisPermissioned,
         })
         .unwrap_err();
 
@@ -197,6 +231,8 @@ mod tests {
             commitment_scheme_id: CommitmentSchemeId::SparseMerkleSha256V1,
             gas_schedule: GasSchedule::genesis(),
             fee_assets: FeeAssetRegistry::new(),
+            bond_assets: BondAssetRegistry::new(),
+            validator_admission_policy: ValidatorAdmissionPolicy::GenesisPermissioned,
         })
         .unwrap_err();
 
@@ -219,5 +255,36 @@ mod tests {
         let without_asset = encode_protocol_config(&ProtocolConfig::genesis()).unwrap();
 
         assert_ne!(with_asset, without_asset);
+    }
+
+    #[test]
+    fn bond_asset_registry_is_included_in_encoding() {
+        let mut config = ProtocolConfig::genesis();
+        config
+            .bond_assets
+            .add_asset(BondAssetConfig {
+                asset_id: AssetId::new([0xBC; 32]),
+                min_bond: Amount::new(100),
+                enabled: true,
+                unbonding_epochs: 7,
+                max_validator_exposure: Some(Amount::new(500)),
+            })
+            .unwrap();
+
+        let with_asset = encode_protocol_config(&config).unwrap();
+        let without_asset = encode_protocol_config(&ProtocolConfig::genesis()).unwrap();
+
+        assert_ne!(with_asset, without_asset);
+    }
+
+    #[test]
+    fn validator_admission_policy_is_included_in_encoding() {
+        let genesis = encode_protocol_config(&ProtocolConfig::genesis()).unwrap();
+
+        let mut updated = ProtocolConfig::genesis();
+        updated.validator_admission_policy = ValidatorAdmissionPolicy::BondRequired;
+        let bond_required = encode_protocol_config(&updated).unwrap();
+
+        assert_ne!(genesis, bond_required);
     }
 }
