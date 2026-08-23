@@ -15,6 +15,7 @@
 //! | [`ExecutionStatus`]         | Whether execution succeeded or trapped.                  |
 //! | [`ExecutionEngine`]         | Trait implemented by execution back-ends.                |
 //! | [`NullExecutionEngine`]     | No-op back-end useful for wiring tests.                  |
+//! | [`WasmExecutionEngine`]     | Deterministic WASM back-end built on `wasmi`.            |
 //!
 //! # Canonical encoding
 //!
@@ -63,6 +64,10 @@ pub enum ExecutionError {
     EmptyEntrypoint,
     /// The transaction must carry a non-empty signature.
     EmptySignature,
+    /// The WASM engine raised an error (module parse, instantiation, or trap).
+    WasmEngine(String),
+    /// The requested entry-point function was not found in the WASM module.
+    MissingEntrypoint(String),
 }
 
 impl fmt::Display for ExecutionError {
@@ -75,6 +80,10 @@ impl fmt::Display for ExecutionError {
             Self::Fee(e) => write!(f, "fee error: {e}"),
             Self::EmptyEntrypoint => write!(f, "transaction entrypoint must not be empty"),
             Self::EmptySignature => write!(f, "transaction signature must not be empty"),
+            Self::WasmEngine(msg) => write!(f, "wasm engine error: {msg}"),
+            Self::MissingEntrypoint(name) => {
+                write!(f, "entry-point not found in wasm module: {name}")
+            }
         }
     }
 }
@@ -478,6 +487,11 @@ impl ExecutionEngine for NullExecutionEngine {
         })
     }
 }
+
+// ── WASM engine ───────────────────────────────────────────────────────────
+
+mod wasm_engine;
+pub use wasm_engine::WasmExecutionEngine;
 
 // ── tests ─────────────────────────────────────────────────────────────────
 
