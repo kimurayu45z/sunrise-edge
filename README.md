@@ -71,6 +71,8 @@ experimental ZK commitment and execution-proof interface milestone:
 - Self-describing digests and domain-separated hash/signature framing.
 - Versioned objects, object references, access manifests, and lazy migration.
 - Runtime traits and an in-memory runtime for deterministic tests.
+- A bounded, replay-context-aware node-core invocation boundary that persists
+  one pure transition with compare-and-swap before releasing output.
 - Transactions, execution effects, deterministic `wasmi` execution, and a
   Rust contract SDK.
 - Stablecoin fee assets, deterministic fee calculation, bond assets, validator
@@ -87,8 +89,9 @@ experimental ZK commitment and execution-proof interface milestone:
 - Canonical execution-proof statements and bounded, exact-ID verifier dispatch;
   concrete proof backends are not yet implemented.
 
-Important remaining work includes the owned-object fast path, complete node-core
-event orchestration, portable system-module execution, cryptographic slashing
+Important remaining work includes the owned-object fast path, concrete
+node-event dispatch and protocol handlers, crash-safe transactional persistence
+and outbox delivery, portable system-module execution, cryptographic slashing
 proof verification, fee-object debiting, production persistence, runtime
 adapters, networking/RPC surfaces, and independent security review.
 

@@ -1848,8 +1848,54 @@ Phase 15:
 Phase 15 prerequisites:
 
 - bounded canonical frame decoder (implemented)
-- deterministic node-core event boundary (pending)
+- deterministic node-core event boundary with one-key CAS persistence
+  (implemented As-Is)
 - adapter-neutral request/response contract (pending)
+
+Phase 15 As-Is scope:
+
+- NodeEventはchain_id、protocol_version、epoch、non-zero request_id、closed event kind、
+  bounded canonical payloadを持つ。
+- node-coreはcontextをstate read前に検証し、1 event / 1 explicit state valueをpureな
+  NodeStateMachineへ渡す。
+- transition outputはcompare-and-swap成功まで返さない。競合時は内部retryせず、
+  adapterへStateConflictを返す。
+- node-core自身はsign、send、schedule、spawn、background loopを行わない。
+- request_idはdeduplicationを実装するためのidentityであり、存在だけではidempotencyを
+  保証しない。
+- 現在のsingle-key CASはnative adapter統合用の実験的境界であり、production persistence
+  architectureの完成形ではない。
+
+Phase 15 To-Be production exit criteria:
+
+1. 全NodeEvent kindについてcanonical payload schema、type/version ID、最大サイズ、
+   authentication/authorization順序、state read/write set、response、outbound message、
+   stable/negative vectorsをprotocol specificationとして固定する。
+2. transaction、vote、certificate、consensus、governance、upgrade、validator-set、Tickの
+   concrete dispatchを実装し、unknown kind/type/version/fieldと未対応機能をfail closedにする。
+3. single-key state replacementをversioned atomic write-setへ置換し、複数object、index、
+   consensus metadata、dedup recordを同一commitで更新できるproduction StateStore transaction
+   contractと少なくとも1つのdurable実装を完成させる。
+4. request_idとevent digestをpersisted dedup recordへ統合し、duplicate、replay、reorder、
+   timeout後retry、concurrent delivery、process crash後retryで同一effectsを二重適用しない。
+5. state commitとoutbound publicationのcrash windowをtransactional outboxまたは同等の
+   recovery protocolで閉じる。commit済み未送信、送信済み未ack、duplicate sendを回復でき、
+   relayをtrust rootにしない。
+6. HTTP contractにmethod/path、content type、body/header limits、timeout、cancellation、
+   status/error mapping、request correlation、backpressure、streaming禁止/許可範囲、
+   secret-bearing response policyを明文化する。
+7. CAS conflict、storage outage、signing failure、outbox failure、overloadに対するbounded retry、
+   jitter、deadline、admission control、circuit breakingをadapter policyとして実装し、
+   protocol transitionをretry policyから独立させる。
+8. native HTTP adapterをTLS termination、authentication、rate limiting、request smuggling対策、
+   decompression bomb対策、graceful shutdown、health/readiness、structured audit log、metrics、
+   traces、secret/key isolationを含むproduction deploymentとして検証する。
+9. supported native/edge runtime間でevent decode、context rejection、state transition、CAS conflict、
+   error mapping、outbox recoveryのconformance suiteを通し、fuzz/property/adversarial/load/soak testと
+   worst-case capacity budgetを固定する。
+10. version upgrade、epoch rollover、schema compatibility、database migration、backup/restore、
+    disaster recovery、key rotation、rollback非依存のsafe disable、operator runbook、SLO/alertを
+    rehearsalし、independent security reviewを完了する。
 
 Phase 16:
 - Cloudflare Workers adapter
