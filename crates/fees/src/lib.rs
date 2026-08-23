@@ -395,7 +395,9 @@ pub fn encode_fee_asset_registry(registry: &FeeAssetRegistry) -> Result<Vec<u8>,
     let mut canonical = CanonicalStruct::new(FEE_ASSET_REGISTRY_TYPE_ID, ENCODING_VERSION);
     canonical.field_u32(1, registry.assets.len() as u32)?;
     for (index, asset) in registry.assets.iter().enumerate() {
-        canonical.field_bytes((index + 2) as u16, encode_fee_asset(asset)?)?;
+        let field_id = u16::try_from(index + 2)
+            .map_err(|_| FeeError::RegistryTooLarge(registry.assets.len()))?;
+        canonical.field_bytes(field_id, encode_fee_asset(asset)?)?;
     }
     Ok(canonical.finish()?)
 }
@@ -547,7 +549,7 @@ pub fn distribute_fee(
         .enumerate()
         .map(|(index, validator_id)| ValidatorFeeShare {
             validator_id,
-            amount: Amount::new(base_share + u64::from(index < remainder as usize)),
+            amount: Amount::new(base_share + u64::from((index as u64) < remainder)),
         })
         .collect();
 
@@ -559,6 +561,9 @@ pub fn distribute_fee(
 }
 
 fn ceil_div(numerator: u64, denominator: u64) -> Result<u64, FeeError> {
+    if denominator == 0 {
+        return Err(FeeError::ArithmeticOverflow);
+    }
     let adjusted = numerator
         .checked_add(denominator - 1)
         .ok_or(FeeError::ArithmeticOverflow)?;

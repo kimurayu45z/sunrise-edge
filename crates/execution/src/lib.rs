@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn fee_payment_affects_transaction_encoding() {
-        let mut with_fee = sample_transaction();
+        let with_fee = sample_transaction();
         let mut without_fee = sample_transaction();
         without_fee.fee_payment = None;
 
@@ -584,8 +584,11 @@ mod tests {
             encode_transaction(&with_fee).unwrap(),
             encode_transaction(&without_fee).unwrap()
         );
-        with_fee.fee_payment = None;
         assert_eq!(
+            encode_transaction_signable(&with_fee).unwrap(),
+            encode_transaction_signable(&sample_transaction()).unwrap()
+        );
+        assert_ne!(
             encode_transaction_signable(&with_fee).unwrap(),
             encode_transaction_signable(&without_fee).unwrap()
         );
