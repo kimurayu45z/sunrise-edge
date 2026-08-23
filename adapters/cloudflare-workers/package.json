@@ -1,0 +1,24 @@
+{
+  "name": "@sunrise-edge/cloudflare-workers-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "types": "wrangler types --include-runtime false",
+    "typecheck": "wrangler types --include-runtime false --check && tsc --noEmit",
+    "lint": "eslint src test vitest.config.ts",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run lint && npm test"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.0.0",
+    "@cloudflare/workers-types": "5.20260823.1",
+    "@eslint/js": "10.0.1",
+    "@types/node": "26.2.0",
+    "eslint": "10.9.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.67.0",
+    "vitest": "4.1.11",
+    "wrangler": "4.125.0"
+  }
+}

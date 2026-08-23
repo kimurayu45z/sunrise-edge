@@ -387,6 +387,32 @@ authentication, rate limiting, production storage, audit telemetry, and proxy
 hardening also remain deployment requirements rather than claims of this
 milestone.
 
+## 32. Cloudflare Workers ingress adapter
+
+Phase 16 adds an ES-module Worker in `adapters/cloudflare-workers`. It preserves
+the Phase 15 HTTP path, exact media types, content-encoding rejection, body
+limit, liveness behavior, and no-store responses. Incoming bodies are consumed
+with a bounded `ReadableStream` reader rather than an unbounded
+`arrayBuffer()`/`text()` call. The implementation has no mutable module-level
+request state, awaits every service-binding operation, sanitizes downstream
+headers, and converts an internal downstream 500 into a coarse 502 response.
+
+The ingress invokes a separately deployed node-core service through the
+generated `Env.NODE_CORE` Service Binding. It never calls a public Worker URL
+or the Cloudflare REST API. The binding capability removes embedded API
+credentials and public network routing, but it does not authenticate the
+protocol event and does not propagate Cloudflare Access context to the bound
+service. Protocol signatures and node-core authorization remain mandatory.
+
+Wrangler configuration is the source of truth. It pins the latest compatibility
+date supported by the tested workerd build, enables `nodejs_compat`, generates
+the binding type instead of hand-writing `Env`, and enables Workers
+observability. Integration tests execute inside workerd with a mock Service
+Binding. This As-Is Worker is only a bounded ingress/relay: it does not yet
+provide the production node-core service, durable state, deduplication,
+transactional outbox, authentication policy, WAF/rate-limit policy, or rollout
+runbook required by the Phase 16 To-Be criteria.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -414,3 +440,7 @@ milestone.
   status mapping outside node-core. Dispatch outbound events only after state
   commit while treating the remaining commit/send window as deferred production
   work requiring a transactional outbox.
+- DR-0017: Implement Cloudflare public ingress as a bounded ES-module Worker and
+  call the private node service through a generated, awaited Service Binding.
+  Treat the binding as routing/capability isolation rather than event
+  authentication, and keep the ingress independently testable in workerd.

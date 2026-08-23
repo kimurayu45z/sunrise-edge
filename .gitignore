@@ -1,1 +1,4 @@
 /target
+/adapters/cloudflare-workers/node_modules
+/adapters/cloudflare-workers/.wrangler
+/adapters/cloudflare-workers/.dev.vars

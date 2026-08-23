@@ -62,7 +62,7 @@ lifetime, or cloud provider.
 ## Current status
 
 The workspace currently contains the foundations implemented through the
-experimental native HTTP adapter milestone:
+experimental Cloudflare Workers ingress milestone:
 
 - Canonical framed encoding for protocol-critical values.
 - Bounded, zero-copy canonical frame decoding with strict order and length
@@ -75,6 +75,8 @@ experimental native HTTP adapter milestone:
   one pure transition with compare-and-swap before releasing output.
 - A native Axum/Tokio HTTP adapter with strict canonical binary media types,
   bounded bodies, deterministic status mapping, and graceful shutdown wiring.
+- A bounded Cloudflare Workers ingress that uses a generated private Service
+  Binding, strict TypeScript, and workerd integration tests.
 - Transactions, execution effects, deterministic `wasmi` execution, and a
   Rust contract SDK.
 - Stablecoin fee assets, deterministic fee calculation, bond assets, validator
@@ -97,8 +99,9 @@ and outbox delivery, portable system-module execution, cryptographic slashing
 proof verification, fee-object debiting, production persistence, runtime
 adapters, networking/RPC surfaces, and independent security review.
 
-The next planned technical milestone is the Phase 16 Cloudflare Workers adapter
-described in [`TODO.md`](TODO.md), stacked on the portable HTTP contract.
+The next planned technical milestone is the Phase 17 Vercel, Supabase, AWS, and
+Deno adapter family described in [`TODO.md`](TODO.md), stacked on the portable
+HTTP contract.
 
 ## Workspace map
 
@@ -109,7 +112,7 @@ described in [`TODO.md`](TODO.md), stacked on the portable HTTP contract.
 | Execution | `execution`, `contract-sdk`, `chain-ir`, `system-modules` | Transactions/effects, deterministic WASM, proof envelopes/verifier interfaces, contract host APIs, portable IR, and governed modules |
 | Economics and governance | `fees`, `bonds`, `governance`, `protocol-upgrades`, `protocol-config` | Stablecoin fees/bonds, admission, governance actions, upgrades, migrations, and committed configuration |
 | Runtime and consensus | `runtime`, `validator-set`, `consensus`, `node-core` | Persistence/runtime interfaces, epoch validator snapshots, event-driven shared-object ordering, and one-event conditional transitions |
-| Adapters | `native-http` | Bounded native HTTP routing and canonical request/response mapping around node-core |
+| Adapters | `native-http`, `adapters/cloudflare-workers` | Bounded native routing plus Cloudflare Service-Binding ingress around the canonical HTTP contract |
 
 The repository intentionally keeps vendor-specific dependencies out of the
 protocol core. Future Cloudflare, Vercel, Supabase, AWS, Deno, and native HTTP
@@ -146,6 +149,10 @@ To work on one crate while iterating:
 cargo test -p consensus
 cargo test -p execution
 cargo test -p native-http
+
+cd adapters/cloudflare-workers
+npm ci
+npm run check
 ```
 
 ## Protocol invariants
