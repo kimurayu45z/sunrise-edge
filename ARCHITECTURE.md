@@ -107,7 +107,50 @@ Hash migration is schedule-based, forward-only, and lazy. There is no global sta
 System modules are deferred. Their code hashes and governance actions will consume the same framing infrastructure once introduced.
 
 ## 24. WASM / Chain IR execution
-Execution is deferred. Deterministic execution outputs will eventually be fed into `ExecutionEffects` hashing using the same canonical framing guarantees.
+Phase 9 introduces the first concrete execution back-end: `WasmExecutionEngine`
+in the `execution` crate, backed by `wasmi` — a deterministic, pure-Rust WASM
+interpreter.
+
+**Execution lifecycle:**
+1. The validator resolves the objects declared in the transaction's
+   `AccessManifest` into a `&[ResolvedObject]` slice.
+2. `WasmExecutionEngine::execute` is called with the WASM module bytes, the
+   entry-point name, the resolved objects, and the transaction args and gas
+   limit.
+3. A fresh `wasmi::Engine` is created with `consume_fuel(true)` to enable
+   deterministic fuel-based gas metering.
+4. Host functions are registered via `wasmi::Linker` under the `"env"` import
+   module. The full ABI surface is documented in `execution::wasm_engine`.
+5. The module is compiled and instantiated fresh for every execution call so
+   there is no mutable shared state between invocations.
+6. `gas_limit` fuel units are loaded before calling the entry point.
+   `gas_used = gas_limit − remaining_fuel` is recorded in `ExecutionEffects`.
+7. On return the accumulated `ObjectEffect`s and `EventRecord`s are packaged
+   into the `ExecutionEffects` result. If execution trapped or `abort` was
+   called, the status is `Failure` and all effects / events are discarded.
+
+**Determinism invariants:**
+- `wasmi` interpreter semantics are fully deterministic; JIT / native
+  compilation is not used.
+- Object IDs for new objects are derived as
+  `SHA-256(tx_hash_bytes ‖ creation_index_le_u32)` so the same transaction
+  always produces the same IDs.
+- Fuel consumption is instruction-accurate and machine-independent.
+
+**Contract SDK (`contract-sdk` crate):**
+The `contract-sdk` crate provides a `no_std`-compatible Rust SDK for writing
+WASM contracts. It declares the host ABI in the `host` module (linking against
+`"env"`) and exposes safe, ergonomic wrappers: `object_data`, `write_object`,
+`consume_object`, `create_object`, `emit_event`, `args`, and the `abort!`
+macro. Panicking stubs replace the extern imports on native (non-wasm32)
+builds so the crate can be unit-tested without a WASM toolchain.
+
+**DR-009: `NullExecutionEngine` and `WasmExecutionEngine` coexist**
+The existing `NullExecutionEngine` remains the default for wiring tests that do
+not need real WASM execution. `WasmExecutionEngine` is the canonical
+deterministic back-end for production use. Future optional back-ends (native
+JIT/AOT) must produce output equivalent to `WasmExecutionEngine` for every
+input.
 
 ## 25. ZK execution architecture
 ZK execution is deferred. The architecture reserves separate commitment-scheme evolution so ZK-specific cryptography can change independently from consensus hashes.
