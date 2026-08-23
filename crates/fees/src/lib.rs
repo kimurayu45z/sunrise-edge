@@ -564,10 +564,8 @@ fn ceil_div(numerator: u64, denominator: u64) -> Result<u64, FeeError> {
     if denominator == 0 {
         return Err(FeeError::ArithmeticOverflow);
     }
-    let adjusted = numerator
-        .checked_add(denominator - 1)
-        .ok_or(FeeError::ArithmeticOverflow)?;
-    Ok(adjusted / denominator)
+    let quotient = numerator / denominator;
+    Ok(quotient + u64::from(numerator % denominator != 0))
 }
 
 #[cfg(test)]
@@ -586,6 +584,11 @@ mod tests {
             version: 1,
             digest: Digest32::new(HashAlgorithmId::Sha2_256, [byte; 32]),
         }
+    }
+
+    #[test]
+    fn large_fee_conversion_does_not_overflow() {
+        assert_eq!(ceil_div(u64::MAX, 2).unwrap(), 1u64 << 63);
     }
 
     fn sample_validator_id(byte: u8) -> ValidatorId {

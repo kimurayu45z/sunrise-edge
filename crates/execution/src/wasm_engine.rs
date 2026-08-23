@@ -100,15 +100,16 @@ impl HostState {
     }
 
     /// Derives the next deterministic `ObjectId` for a newly created object.
-    fn next_object_id(&mut self) -> ObjectId {
+    fn next_object_id(&mut self) -> Option<ObjectId> {
         let counter = self.creation_counter;
-        self.creation_counter += 1;
+        self.creation_counter = self.creation_counter.checked_add(1)?;
 
         let mut hasher = Sha256::new();
+        hasher.update(self.tx_hash.algorithm().as_u16().to_le_bytes());
         hasher.update(self.tx_hash.bytes());
         hasher.update(counter.to_le_bytes());
         let hash: [u8; 32] = hasher.finalize().into();
-        ObjectId::new(hash)
+        Some(ObjectId::new(hash))
     }
 }
 
@@ -117,6 +118,9 @@ impl HostState {
 /// Copy `len` bytes starting at `offset` from `src` into WASM linear memory
 /// at `buf_ptr`.  Returns the number of bytes written, or `-1` on error.
 fn write_to_wasm(caller: &mut Caller<HostState>, buf_ptr: i32, src: &[u8]) -> i32 {
+    if buf_ptr < 0 {
+        return -1;
+    }
     let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
         return -1;
     };
@@ -126,12 +130,15 @@ fn write_to_wasm(caller: &mut Caller<HostState>, buf_ptr: i32, src: &[u8]) -> i3
         return -1;
     }
     wasm_mem[ptr..ptr + src.len()].copy_from_slice(src);
-    src.len() as i32
+    i32::try_from(src.len()).unwrap_or(-1)
 }
 
 /// Read `len` bytes from WASM linear memory at `ptr`.  Returns `None` if the
 /// access would go out of bounds.
 fn read_from_wasm(caller: &Caller<HostState>, ptr: i32, len: i32) -> Option<Vec<u8>> {
+    if ptr < 0 || len < 0 {
+        return None;
+    }
     let mem = caller.get_export("memory")?.into_memory()?;
     let ptr = ptr as usize;
     let len = len as usize;
@@ -181,6 +188,9 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
          buf_ptr: i32,
          buf_len: i32|
          -> i32 {
+            if index < 0 || offset < 0 || buf_ptr < 0 || buf_len < 0 {
+                return -1;
+            }
             let idx = index as usize;
             let off = offset as usize;
             let len = buf_len as usize;
@@ -199,7 +209,10 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
                 if off > src.len() {
                     return -1;
                 }
-                let end = (off + len).min(src.len());
+                let Some(requested_end) = off.checked_add(len) else {
+                    return -1;
+                };
+                let end = requested_end.min(src.len());
                 src[off..end].to_vec()
             };
 
@@ -212,6 +225,9 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
         "env",
         "write_object_data",
         |mut caller: Caller<HostState>, index: i32, data_ptr: i32, data_len: i32| -> i32 {
+            if index < 0 {
+                return -1;
+            }
             let idx = index as usize;
             {
                 let state = caller.data();
@@ -235,6 +251,9 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
         "env",
         "consume_object",
         |mut caller: Caller<HostState>, index: i32| -> i32 {
+            if index < 0 {
+                return -1;
+            }
             let idx = index as usize;
             {
                 let state = caller.data();
@@ -267,6 +286,9 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
          owner_tag: i32,
          owner_addr_ptr: i32|
          -> i32 {
+            if schema_version <= 0 {
+                return -1;
+            }
             let data = match read_from_wasm(&caller, data_ptr, data_len) {
                 Some(d) => d,
                 None => return -1,
@@ -302,7 +324,9 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
                 _ => return -1,
             };
 
-            let id = caller.data_mut().next_object_id();
+            let Some(id) = caller.data_mut().next_object_id() else {
+                return -1;
+            };
             let obj = Object {
                 id,
                 version: 1,
@@ -352,6 +376,9 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
         "env",
         "read_args",
         |mut caller: Caller<HostState>, offset: i32, buf_ptr: i32, buf_len: i32| -> i32 {
+            if offset < 0 || buf_ptr < 0 || buf_len < 0 {
+                return -1;
+            }
             let off = offset as usize;
             let len = buf_len as usize;
             let chunk: Vec<u8> = {
@@ -359,7 +386,10 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
                 if off > args.len() {
                     return -1;
                 }
-                let end = (off + len).min(args.len());
+                let Some(requested_end) = off.checked_add(len) else {
+                    return -1;
+                };
+                let end = requested_end.min(args.len());
                 args[off..end].to_vec()
             };
             write_to_wasm(&mut caller, buf_ptr, &chunk)
@@ -481,7 +511,10 @@ impl ExecutionEngine for WasmExecutionEngine {
                     });
                 } else if let Some(new_data) = &state.mutated_data[idx] {
                     let mut new_obj = resolved.object.clone();
-                    new_obj.version += 1;
+                    new_obj.version = new_obj
+                        .version
+                        .checked_add(1)
+                        .ok_or(ExecutionError::ObjectVersionOverflow(resolved.object.id))?;
                     new_obj.data = new_data.clone();
                     object_effects.push(ObjectEffect::Mutated {
                         previous_version: resolved.object.version,

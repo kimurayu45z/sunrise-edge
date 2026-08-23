@@ -68,6 +68,8 @@ pub enum ExecutionError {
     WasmEngine(String),
     /// The requested entry-point function was not found in the WASM module.
     MissingEntrypoint(String),
+    /// An object at the maximum version cannot be mutated again.
+    ObjectVersionOverflow(ObjectId),
 }
 
 impl fmt::Display for ExecutionError {
@@ -83,6 +85,9 @@ impl fmt::Display for ExecutionError {
             Self::WasmEngine(msg) => write!(f, "wasm engine error: {msg}"),
             Self::MissingEntrypoint(name) => {
                 write!(f, "entry-point not found in wasm module: {name}")
+            }
+            Self::ObjectVersionOverflow(id) => {
+                write!(f, "object version overflow while mutating {id}")
             }
         }
     }
