@@ -213,12 +213,11 @@ impl GovernanceAction {
         }
         if let Self::ActivateSystemModule { version, .. }
         | Self::DeactivateSystemModule { version, .. } = self
+            && *version == 0
         {
-            if *version == 0 {
-                return Err(GovernanceError::SystemModule(
-                    SystemModuleError::ZeroModuleVersion,
-                ));
-            }
+            return Err(GovernanceError::SystemModule(
+                SystemModuleError::ZeroModuleVersion,
+            ));
         }
         Ok(())
     }

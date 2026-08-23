@@ -237,13 +237,13 @@ impl BondAssetConfig {
         if self.unbonding_epochs == 0 {
             return Err(BondError::ZeroUnbondingEpochs);
         }
-        if let Some(max_validator_exposure) = self.max_validator_exposure {
-            if max_validator_exposure < self.min_bond {
-                return Err(BondError::ExposureBelowMinBond {
-                    min_bond: self.min_bond,
-                    max_validator_exposure,
-                });
-            }
+        if let Some(max_validator_exposure) = self.max_validator_exposure
+            && max_validator_exposure < self.min_bond
+        {
+            return Err(BondError::ExposureBelowMinBond {
+                min_bond: self.min_bond,
+                max_validator_exposure,
+            });
         }
         Ok(())
     }
@@ -370,13 +370,13 @@ impl BondObject {
                 min_bond: config.min_bond,
             });
         }
-        if let Some(max_validator_exposure) = config.max_validator_exposure {
-            if self.amount > max_validator_exposure {
-                return Err(BondError::BondAboveExposure {
-                    amount: self.amount,
-                    max_validator_exposure,
-                });
-            }
+        if let Some(max_validator_exposure) = config.max_validator_exposure
+            && self.amount > max_validator_exposure
+        {
+            return Err(BondError::BondAboveExposure {
+                amount: self.amount,
+                max_validator_exposure,
+            });
         }
         Ok(())
     }
