@@ -97,6 +97,33 @@ impl Epoch {
     }
 }
 
+/// Stable validator identity, independent of membership, voting power, and bond state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ValidatorId([u8; 32]);
+
+impl ValidatorId {
+    /// Creates a validator identifier from raw bytes.
+    #[must_use]
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the raw identifier bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for ValidatorId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// An identifier for a hash suite.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HashSuiteId(u16);
@@ -117,7 +144,7 @@ impl HashSuiteId {
 
 /// Consensus-supported hash algorithm identifiers.
 #[repr(u16)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HashAlgorithmId {
     /// SHA-256.
     Sha2_256 = 0x0001,
@@ -190,6 +217,8 @@ pub enum HashDomain {
     Migration = 0x000A,
     /// Persistent state nodes.
     StateNode = 0x000B,
+    /// Shared-object consensus messages.
+    ConsensusMessage = 0x000C,
 }
 
 impl HashDomain {
@@ -216,13 +245,14 @@ impl TryFrom<u16> for HashDomain {
             0x0009 => Ok(Self::SystemModule),
             0x000A => Ok(Self::Migration),
             0x000B => Ok(Self::StateNode),
+            0x000C => Ok(Self::ConsensusMessage),
             other => Err(TypeError::UnknownHashDomain(other)),
         }
     }
 }
 
 /// A self-describing 32-byte digest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Digest32 {
     algorithm: HashAlgorithmId,
     bytes: [u8; 32],
@@ -273,6 +303,10 @@ pub enum HashPurpose {
     ProtocolConfig,
     /// Certificate hashing.
     Certificate,
+    /// Validator-set snapshot hashing.
+    ValidatorSet,
+    /// Shared-object consensus proposal hashing.
+    ConsensusMessage,
 }
 
 impl HashPurpose {
@@ -286,6 +320,8 @@ impl HashPurpose {
             Self::ContractCode => HashDomain::ContractCode,
             Self::ProtocolConfig => HashDomain::ProtocolConfig,
             Self::Certificate => HashDomain::Certificate,
+            Self::ValidatorSet => HashDomain::ValidatorSet,
+            Self::ConsensusMessage => HashDomain::ConsensusMessage,
         }
     }
 }
@@ -340,6 +376,8 @@ impl HashSuite {
             HashPurpose::ContractCode => self.code_hash,
             HashPurpose::ProtocolConfig => self.config_hash,
             HashPurpose::Certificate => self.certificate_hash,
+            HashPurpose::ValidatorSet => self.certificate_hash,
+            HashPurpose::ConsensusMessage => self.certificate_hash,
         }
     }
 }

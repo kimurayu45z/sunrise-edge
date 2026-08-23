@@ -3,6 +3,7 @@
 //! Runtime abstraction and in-memory adapters for serverless-safe node execution.
 
 use core::fmt;
+pub use protocol_types::ValidatorId;
 use protocol_types::{ChainId, Digest32, Epoch, ProtocolVersion};
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
@@ -140,33 +141,6 @@ pub trait Runtime {
     fn clock(&self) -> &Self::Time;
     /// Returns scheduler.
     fn scheduler(&self) -> &Self::TaskScheduler;
-}
-
-/// Stable validator identifier.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ValidatorId([u8; 32]);
-
-impl ValidatorId {
-    /// Creates a validator identifier from raw bytes.
-    #[must_use]
-    pub const fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    /// Returns raw bytes.
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-impl fmt::Display for ValidatorId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
-    }
 }
 
 /// In-memory `StateStore` implementation for tests and local execution.
@@ -500,6 +474,12 @@ impl PersistenceLayout {
         self.prefixed("protocol/upgrades")
     }
 
+    /// Returns the persisted shared-object consensus state key for an epoch.
+    #[must_use]
+    pub fn consensus_state_key(&self, epoch: Epoch) -> Vec<u8> {
+        self.prefixed(&format!("consensus/{:020}/state", epoch.get()))
+    }
+
     /// Returns a deterministic migration implementation record key.
     #[must_use]
     pub fn migration_record_key(&self, migration_hash: &Digest32) -> Vec<u8> {
@@ -626,6 +606,10 @@ mod tests {
         let migration = Digest32::new(protocol_types::HashAlgorithmId::Sha2_256, [0xBB; 32]);
         let migration_key = layout.migration_record_key(&migration);
         assert_ne!(migration_key, layout.protocol_upgrade_schedule_key());
+        assert_ne!(
+            layout.consensus_state_key(Epoch::new(7)),
+            layout.consensus_state_key(Epoch::new(8))
+        );
         assert!(
             String::from_utf8(migration_key)
                 .unwrap()

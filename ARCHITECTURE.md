@@ -11,6 +11,10 @@ Sunrise Edge is designed as a deterministic state-transition system over authent
 - `hashing`: domain-separated hash framing, built-in hash implementations, and hash-suite resolution.
 - `crypto`: signature-domain framing and signer/verifier traits.
 - `chain-ir`: versioned deterministic instruction program format for execution back-end neutrality.
+- `validator-set`: immutable epoch membership, public keys, explicit voting
+  power, quorum calculation, and validator-set commitments.
+- `consensus`: canonical proposal/vote/certificate types and the event-driven
+  shared-object chained-HotStuff state machine.
 - `protocol-upgrades`: canonical feature flags, hash-suite schedules, protocol-version transitions, and lazy-migration descriptors.
 
 ## 3. Canonical serialization rules
@@ -41,13 +45,27 @@ Transactions are not implemented in Phase 1. They will be canonically serialized
 Fast Path is deferred. Its certificates will rely on the Phase 1 digest, suite-resolution, and signature-domain primitives.
 
 ## 12. Certificate lifecycle
-Certificates are deferred. Their hashes and signatures will use explicit certificate domains and future message-type identifiers.
+Phase 13 adds shared-consensus quorum certificates. Each certificate binds the
+chain, protocol version, epoch, view, height, and proposal digest to a
+canonically sorted set of domain-separated validator votes. A non-genesis
+certificate must carry voting power strictly greater than two thirds; replaying
+an already processed certificate is a no-op. Fast-path certificates remain a
+separate follow-up.
 
 ## 13. Persistent state layout
-Persistent storage is deferred, but stored references must preserve algorithm identifiers in digests and avoid any requirement for global rehashing.
+Runtime persistence uses deterministic chain/version namespaces for protocol
+configuration, objects, effects, modules, upgrades, migrations, and Phase 13
+epoch-scoped consensus state. Stored references preserve algorithm identifiers
+in digests and never require a global rehash.
 
 ## 14. Validator lifecycle
-Validator identity and lifecycle are deferred. Future validator records will bind to explicit chain, epoch, and protocol-version context.
+Phase 13 introduces immutable epoch-scoped `ValidatorSet` snapshots. Validator
+identity, membership, governance-assigned voting power, and bond amount remain
+separate concepts; a larger stablecoin bond does not implicitly grant more
+votes. Validator records commit the signature scheme and public verification
+key used for consensus messages. Sets are canonically sorted by validator ID,
+reject duplicates and zero power, and compute quorum as strictly greater than
+two thirds of total voting power.
 
 ## 15. Genesis bootstrap
 Genesis starts with a permissioned validator set and a conservative default hash suite. Phase 1 encodes this by exposing a `HashSuite::genesis()` helper that selects SHA-256 for all required purposes.
@@ -233,9 +251,37 @@ ZK execution is deferred. The architecture reserves separate commitment-scheme e
 - Unsupported algorithms fail explicitly instead of downgrading.
 - Invalid hash-suite schedules fail construction.
 - Empty chain or message identifiers fail validation before framing.
+- Wrong-chain, wrong-version, old-epoch, non-member, invalid-leader, and
+  under-quorum consensus messages are rejected before state transition.
+- Duplicate consensus delivery is idempotent; conflicting signed votes produce
+  explicit equivocation evidence instead of being silently overwritten.
 
 ## 28. Serverless runtime constraints
 The cryptographic core is pure, synchronous, and free of background workers, daemons, mutable globals, and runtime-vendor dependencies. This keeps the implementation portable to edge and serverless adapters.
+
+## 29. Shared-object consensus
+
+Phase 13 routes shared or conflicting-object transactions through an
+event-driven chained-HotStuff state machine. A `ConsensusEngine::on_event`
+invocation consumes exactly one proposal, vote, certificate, or external Tick
+plus explicit persisted `ConsensusState`, and returns the next state, outbound
+messages, and newly committed ordered blocks. The caller atomically persists
+the returned state; transports may drop, duplicate, reorder, delay, or replay
+messages without becoming a safety trust root.
+
+Leaders rotate deterministically by view. Proposals carry a quorum-certified
+parent, validators sign domain-separated proposal/vote frames, and certificates
+require voting power strictly greater than two thirds. The HotStuff lock rule
+prevents an honest validator from voting across unsafe forks, and the canonical
+three-certificate chain commits the grandparent. Votes and certificates are
+stored in canonical validator order so arrival order cannot change bytes or
+the resulting commit.
+
+Timeouts enter only as `Tick` events. A Tick cannot advance a view before the
+persisted deadline and advances at most one view per event; false time input can
+affect liveness but cannot create a certificate or commit state. Consensus
+parameters (protocol ID, block transaction bound, and timeout) are committed in
+`ProtocolConfig`, and consensus state uses an epoch-namespaced persistence key.
 
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
@@ -247,3 +293,6 @@ The cryptographic core is pure, synchronous, and free of background workers, dae
 - DR-0012: Store complete hash-suite and protocol-upgrade schedules in canonical
   configuration, enforce future activation at enactment, and use per-object
   hash-identified lazy migrations instead of global state rewrites.
+- DR-0013: Use event-driven three-chain HotStuff for shared-object ordering.
+  Keep the protocol state explicit and persistable, accept untrusted relay and
+  Tick delivery, and require authenticated quorum certificates for safety.
