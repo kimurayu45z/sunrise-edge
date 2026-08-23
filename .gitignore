@@ -2,3 +2,5 @@
 /adapters/cloudflare-workers/node_modules
 /adapters/cloudflare-workers/.wrangler
 /adapters/cloudflare-workers/.dev.vars
+/adapters/vercel/.vercel
+/adapters/vercel/.env*.local
