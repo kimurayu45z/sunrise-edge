@@ -8,6 +8,7 @@ use core::fmt;
 use fees::{Amount, AssetId, FeeError, encode_asset_id};
 use protocol_types::{Digest32, Epoch};
 use runtime::ValidatorId;
+use std::collections::BTreeSet;
 use std::error::Error;
 
 const VALIDATOR_ADMISSION_POLICY_TYPE_ID: u16 = 0x8001;
@@ -111,13 +112,19 @@ impl fmt::Display for BondError {
             Self::AlreadyUnbonding => write!(f, "bond is already unbonding"),
             Self::UnlockEpochOverflow => write!(f, "bond unlock epoch overflowed"),
             Self::IdenticalEvidenceDigests => {
-                write!(f, "slashing evidence must contain two distinct statement digests")
+                write!(
+                    f,
+                    "slashing evidence must contain two distinct statement digests"
+                )
             }
             Self::MissingGovernanceApproval => {
                 write!(f, "governance approval is required for validator admission")
             }
             Self::MissingBond => write!(f, "validator admission requires a valid bond"),
-            Self::BondNotActive { epoch, unlock_epoch } => write!(
+            Self::BondNotActive {
+                epoch,
+                unlock_epoch,
+            } => write!(
                 f,
                 "bond is no longer active at epoch {}; unlock epoch is {}",
                 epoch.get(),
@@ -253,13 +260,12 @@ impl BondAssetRegistry {
             return Err(BondError::RegistryTooLarge(self.assets.len()));
         }
 
-        let mut previous = None;
+        let mut seen = BTreeSet::new();
         for asset in &self.assets {
             asset.validate()?;
-            if previous == Some(asset.asset_id) {
+            if !seen.insert(asset.asset_id) {
                 return Err(BondError::DuplicateAsset(asset.asset_id));
             }
-            previous = Some(asset.asset_id);
         }
         Ok(())
     }
@@ -359,7 +365,11 @@ impl BondObject {
     }
 
     /// Starts unbonding using the configured delay for the bond asset.
-    pub fn request_unbond(&mut self, registry: &BondAssetRegistry, epoch: Epoch) -> Result<(), BondError> {
+    pub fn request_unbond(
+        &mut self,
+        registry: &BondAssetRegistry,
+        epoch: Epoch,
+    ) -> Result<(), BondError> {
         if self.unlock_epoch.is_some() {
             return Err(BondError::AlreadyUnbonding);
         }
@@ -502,7 +512,11 @@ pub fn encode_bond_asset_registry(registry: &BondAssetRegistry) -> Result<Vec<u8
     registry.validate()?;
 
     let mut canonical = CanonicalStruct::new(BOND_ASSET_REGISTRY_TYPE_ID, ENCODING_VERSION);
-    canonical.field_u32(1, registry.assets.len() as u32)?;
+    canonical.field_u32(
+        1,
+        u32::try_from(registry.assets.len())
+            .map_err(|_| BondError::RegistryTooLarge(registry.assets.len()))?,
+    )?;
     for (index, asset) in registry.assets.iter().enumerate() {
         let field_id = u16::try_from(index + 2)
             .map_err(|_| BondError::RegistryTooLarge(registry.assets.len()))?;
@@ -545,9 +559,7 @@ pub fn encode_slashing_evidence(evidence: &SlashingEvidence) -> Result<Vec<u8>, 
 }
 
 /// Encodes one validator admission record.
-pub fn encode_validator_admission(
-    admission: &ValidatorAdmission,
-) -> Result<Vec<u8>, BondError> {
+pub fn encode_validator_admission(admission: &ValidatorAdmission) -> Result<Vec<u8>, BondError> {
     let mut canonical = CanonicalStruct::new(VALIDATOR_ADMISSION_TYPE_ID, ENCODING_VERSION);
     canonical.field_bytes(1, admission.validator_id.as_bytes())?;
     canonical.field_bytes(2, encode_validator_admission_policy(admission.policy)?)?;
@@ -658,11 +670,14 @@ mod tests {
             right_statement: digest(0xAA),
         };
 
-        assert_eq!(evidence.validate(), Err(BondError::IdenticalEvidenceDigests));
+        assert_eq!(
+            evidence.validate(),
+            Err(BondError::IdenticalEvidenceDigests)
+        );
     }
 
     #[test]
-    fn bond_registry_encoding_changes_when_policy_changes() {
+    fn bond_registry_encoding_changes_when_asset_is_added() {
         let registry = BondAssetRegistry::new();
         let empty = encode_bond_asset_registry(&registry).unwrap();
 
