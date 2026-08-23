@@ -12,6 +12,7 @@ use sha3::Sha3_256;
 use std::{error::Error, fmt};
 
 const HASH_DOMAIN_VERSION: u16 = 1;
+const HASH_FRAME_ENCODING_VERSION: u16 = 1;
 const HASH_FRAME_TYPE_ID: u16 = 0x1001;
 
 /// Hashing errors.
@@ -99,6 +100,7 @@ impl HashFunction for BuiltinHashFunction {
         chain_id: &ChainId,
         canonical_payload: &[u8],
     ) -> Result<Digest32, HashingError> {
+        ensure_supported(self.algorithm)?;
         let frame = frame_hash_input(
             self.algorithm,
             purpose,
@@ -119,7 +121,7 @@ pub fn frame_hash_input(
     chain_id: &ChainId,
     canonical_payload: &[u8],
 ) -> Result<Vec<u8>, HashingError> {
-    let mut frame = CanonicalStruct::new(HASH_FRAME_TYPE_ID, HASH_DOMAIN_VERSION);
+    let mut frame = CanonicalStruct::new(HASH_FRAME_TYPE_ID, HASH_FRAME_ENCODING_VERSION);
     frame.field_u16(1, algorithm.as_u16())?;
     frame.field_u16(2, purpose.domain().as_u16())?;
     frame.field_u16(3, HASH_DOMAIN_VERSION)?;
@@ -213,6 +215,13 @@ fn hash_unframed_bytes(algorithm: HashAlgorithmId, input: &[u8]) -> Result<[u8; 
     match algorithm {
         HashAlgorithmId::Sha2_256 => Ok(Sha256::digest(input).into()),
         HashAlgorithmId::Sha3_256 => Ok(Sha3_256::digest(input).into()),
+        HashAlgorithmId::Blake3_256 => Err(HashingError::UnsupportedAlgorithm(algorithm)),
+    }
+}
+
+fn ensure_supported(algorithm: HashAlgorithmId) -> Result<(), HashingError> {
+    match algorithm {
+        HashAlgorithmId::Sha2_256 | HashAlgorithmId::Sha3_256 => Ok(()),
         HashAlgorithmId::Blake3_256 => Err(HashingError::UnsupportedAlgorithm(algorithm)),
     }
 }

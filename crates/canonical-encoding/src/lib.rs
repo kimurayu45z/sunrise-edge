@@ -87,9 +87,10 @@ impl CanonicalStruct {
     }
 
     fn insert(&mut self, field_id: u16, bytes: Vec<u8>) -> Result<(), CanonicalEncodingError> {
-        if self.fields.insert(field_id, bytes).is_some() {
+        if self.fields.contains_key(&field_id) {
             return Err(CanonicalEncodingError::DuplicateField(field_id));
         }
+        self.fields.insert(field_id, bytes);
 
         Ok(())
     }
