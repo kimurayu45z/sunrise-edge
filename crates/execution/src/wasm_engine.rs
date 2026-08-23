@@ -338,7 +338,10 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
          owner_tag: i32,
          owner_addr_ptr: i32|
          -> i32 {
-            if schema_version <= 0 {
+            let Ok(schema_version) = u32::try_from(schema_version) else {
+                return -1;
+            };
+            if schema_version == 0 {
                 return -1;
             }
             if usize::try_from(data_len).map_or(true, |len| len > MAX_OBJECT_DATA_BYTES)
@@ -392,7 +395,7 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
                 version: 1,
                 owner,
                 type_hash,
-                schema_version: schema_version as u32,
+                schema_version,
                 data,
             };
             caller.data_mut().created_objects.push(obj);

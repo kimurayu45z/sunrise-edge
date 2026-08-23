@@ -565,7 +565,9 @@ fn ceil_div(numerator: u64, denominator: u64) -> Result<u64, FeeError> {
         return Err(FeeError::ArithmeticOverflow);
     }
     let quotient = numerator / denominator;
-    Ok(quotient + u64::from(!numerator.is_multiple_of(denominator)))
+    quotient
+        .checked_add(u64::from(!numerator.is_multiple_of(denominator)))
+        .ok_or(FeeError::ArithmeticOverflow)
 }
 
 #[cfg(test)]

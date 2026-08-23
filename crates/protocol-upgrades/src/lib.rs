@@ -8,6 +8,7 @@ use canonical_encoding::{
 };
 use core::fmt;
 use protocol_types::{Digest32, Epoch, HashSuite, HashSuiteId, HashSuiteSchedule, ProtocolVersion};
+use std::collections::BTreeSet;
 use std::error::Error;
 
 const FEATURE_FLAGS_TYPE_ID: u16 = 0xC001;
@@ -313,15 +314,14 @@ impl HashSuiteScheduleConfig {
             return Err(ProtocolUpgradeError::MissingGenesisHashSuite);
         }
 
-        let mut seen_ids = Vec::with_capacity(self.entries.len());
+        let mut seen_ids = BTreeSet::new();
         for entry in &self.entries {
             if entry.suite.id.get() == 0 {
                 return Err(ProtocolUpgradeError::ZeroHashSuiteId);
             }
-            if seen_ids.contains(&entry.suite.id) {
+            if !seen_ids.insert(entry.suite.id) {
                 return Err(ProtocolUpgradeError::DuplicateHashSuiteId(entry.suite.id));
             }
-            seen_ids.push(entry.suite.id);
         }
         if self
             .entries
