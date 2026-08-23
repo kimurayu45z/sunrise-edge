@@ -83,9 +83,20 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "canonical-encoding",
+ "fees",
  "hashing",
  "objects",
  "protocol-types",
+]
+
+[[package]]
+name = "fees"
+version = "0.1.0"
+dependencies = [
+ "canonical-encoding",
+ "objects",
+ "protocol-types",
+ "runtime",
 ]
 
 [[package]]
@@ -137,6 +148,7 @@ version = "0.1.0"
 dependencies = [
  "canonical-encoding",
  "commitments",
+ "fees",
  "protocol-types",
 ]
 
