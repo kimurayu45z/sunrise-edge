@@ -447,8 +447,9 @@ variables. The wrapper does not decode canonical bytes or own protocol state.
 The As-Is node-core transport requires an exact HTTPS `/v1/events` URL and a
 bounded Bearer token stored as a Deno Deploy secret. It reconstructs an
 allow-listed upstream request, forbids redirects to prevent cross-origin
-credential forwarding, and applies a bounded deadline. Configuration errors
-fail at startup; network and timeout failures become the shared sanitized 503.
+credential forwarding, and applies a bounded deadline through the shared
+`authenticated-node-core.ts` capability. Configuration errors fail at startup;
+network and timeout failures become the shared sanitized 503.
 
 This authenticated public relay is an incremental conformance adapter, not the
 production trust boundary. Phase 17 still requires a fixed private transport,
@@ -498,3 +499,7 @@ tests, observability, incident response, and rollback rehearsal.
 - DR-0020: Allow provider adapters to narrow the shared request-body capacity
   when the hosting platform has a smaller hard limit, but reject zero,
   non-integer, or larger values and record the resulting conformance gap.
+- DR-0021: Share the interim exact-HTTPS, Bearer-authenticated node-core fetch
+  capability across Web providers without moving environment lookup or secret
+  lifecycle into the shared layer. Keep private or mutually authenticated
+  transport as a production exit requirement.
