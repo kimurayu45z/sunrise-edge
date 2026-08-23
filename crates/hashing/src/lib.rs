@@ -196,6 +196,18 @@ impl HashSuiteResolver {
             .ok_or(HashingError::NoActiveHashSuite(epoch))
     }
 
+    /// Returns the chain context bound to this resolver.
+    #[must_use]
+    pub fn chain_id(&self) -> &ChainId {
+        &self.chain_id
+    }
+
+    /// Returns the protocol version bound to this resolver.
+    #[must_use]
+    pub const fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_version
+    }
+
     /// Hashes a canonical payload for the given purpose and epoch.
     pub fn hash_for_purpose(
         &self,

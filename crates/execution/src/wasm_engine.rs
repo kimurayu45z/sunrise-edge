@@ -32,7 +32,12 @@
 //!
 //! IDs for objects created during execution are derived deterministically:
 //! ```text
-//! new_id = SHA-256( tx_hash_bytes || creation_index_le_u32 )
+//! new_id = SHA-256(
+//!     derivation_version_le_u16
+//!     || tx_hash_algorithm_le_u16
+//!     || tx_hash_bytes
+//!     || creation_index_le_u32
+//! )
 //! ```
 //!
 //! # Gas / fuel
@@ -58,6 +63,16 @@ use crate::{
 const TYPE_HASH_WIRE_LEN: usize = 34;
 /// Byte length of a raw address in the host ABI.
 const ADDRESS_WIRE_LEN: usize = 32;
+const MAX_MODULE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ARGS_BYTES: usize = 1024 * 1024;
+const MAX_INPUT_OBJECTS: usize = 4_096;
+const MAX_INPUT_DATA_BYTES: usize = 16 * 1024 * 1024;
+const MAX_OBJECT_DATA_BYTES: usize = 1024 * 1024;
+const MAX_EVENT_BYTES: usize = 64 * 1024;
+const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CREATED_OBJECTS: usize = 1_024;
+const MAX_EVENTS: usize = 4_096;
+const OBJECT_ID_DERIVATION_VERSION: u16 = 2;
 
 // ── host state ────────────────────────────────────────────────────────────
 
@@ -81,6 +96,8 @@ struct HostState {
     creation_counter: u32,
     /// Trap message set by the `abort` host function.
     trap: Option<String>,
+    /// Total bytes retained in created objects and events.
+    output_bytes: usize,
 }
 
 impl HostState {
@@ -96,19 +113,49 @@ impl HostState {
             tx_hash,
             creation_counter: 0,
             trap: None,
+            output_bytes: 0,
         }
     }
 
     /// Derives the next deterministic `ObjectId` for a newly created object.
-    fn next_object_id(&mut self) -> ObjectId {
+    fn next_object_id(&mut self) -> Option<ObjectId> {
         let counter = self.creation_counter;
-        self.creation_counter += 1;
+        self.creation_counter = self.creation_counter.checked_add(1)?;
 
         let mut hasher = Sha256::new();
+        hasher.update(OBJECT_ID_DERIVATION_VERSION.to_le_bytes());
+        hasher.update(self.tx_hash.algorithm().as_u16().to_le_bytes());
         hasher.update(self.tx_hash.bytes());
         hasher.update(counter.to_le_bytes());
         let hash: [u8; 32] = hasher.finalize().into();
-        ObjectId::new(hash)
+        Some(ObjectId::new(hash))
+    }
+
+    fn reserve_output(&mut self, bytes: usize) -> bool {
+        let Some(total) = self.output_bytes.checked_add(bytes) else {
+            return false;
+        };
+        if total > MAX_OUTPUT_BYTES {
+            return false;
+        }
+        self.output_bytes = total;
+        true
+    }
+
+    fn replace_mutated_data(&mut self, index: usize, data: Vec<u8>) -> bool {
+        let previous_len = self.mutated_data[index]
+            .as_ref()
+            .map_or(0, |previous| previous.len());
+        let base = self.output_bytes.saturating_sub(previous_len);
+        let Some(total) = base.checked_add(data.len()) else {
+            return false;
+        };
+        if total > MAX_OUTPUT_BYTES {
+            return false;
+        }
+        self.output_bytes = total;
+        self.mutated_data[index] = Some(data);
+        true
     }
 }
 
@@ -117,6 +164,9 @@ impl HostState {
 /// Copy `len` bytes starting at `offset` from `src` into WASM linear memory
 /// at `buf_ptr`.  Returns the number of bytes written, or `-1` on error.
 fn write_to_wasm(caller: &mut Caller<HostState>, buf_ptr: i32, src: &[u8]) -> i32 {
+    if buf_ptr < 0 {
+        return -1;
+    }
     let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
         return -1;
     };
@@ -126,12 +176,15 @@ fn write_to_wasm(caller: &mut Caller<HostState>, buf_ptr: i32, src: &[u8]) -> i3
         return -1;
     }
     wasm_mem[ptr..ptr + src.len()].copy_from_slice(src);
-    src.len() as i32
+    i32::try_from(src.len()).unwrap_or(-1)
 }
 
 /// Read `len` bytes from WASM linear memory at `ptr`.  Returns `None` if the
 /// access would go out of bounds.
 fn read_from_wasm(caller: &Caller<HostState>, ptr: i32, len: i32) -> Option<Vec<u8>> {
+    if ptr < 0 || len < 0 {
+        return None;
+    }
     let mem = caller.get_export("memory")?.into_memory()?;
     let ptr = ptr as usize;
     let len = len as usize;
@@ -181,6 +234,9 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
          buf_ptr: i32,
          buf_len: i32|
          -> i32 {
+            if index < 0 || offset < 0 || buf_ptr < 0 || buf_len < 0 {
+                return -1;
+            }
             let idx = index as usize;
             let off = offset as usize;
             let len = buf_len as usize;
@@ -199,7 +255,10 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
                 if off > src.len() {
                     return -1;
                 }
-                let end = (off + len).min(src.len());
+                let Some(requested_end) = off.checked_add(len) else {
+                    return -1;
+                };
+                let end = requested_end.min(src.len());
                 src[off..end].to_vec()
             };
 
@@ -212,6 +271,12 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
         "env",
         "write_object_data",
         |mut caller: Caller<HostState>, index: i32, data_ptr: i32, data_len: i32| -> i32 {
+            if index < 0 {
+                return -1;
+            }
+            if usize::try_from(data_len).map_or(true, |len| len > MAX_OBJECT_DATA_BYTES) {
+                return -1;
+            }
             let idx = index as usize;
             {
                 let state = caller.data();
@@ -225,8 +290,11 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
             let Some(new_data) = read_from_wasm(&caller, data_ptr, data_len) else {
                 return -1;
             };
-            caller.data_mut().mutated_data[idx] = Some(new_data);
-            0
+            if caller.data_mut().replace_mutated_data(idx, new_data) {
+                0
+            } else {
+                -1
+            }
         },
     )?;
 
@@ -235,6 +303,9 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
         "env",
         "consume_object",
         |mut caller: Caller<HostState>, index: i32| -> i32 {
+            if index < 0 {
+                return -1;
+            }
             let idx = index as usize;
             {
                 let state = caller.data();
@@ -267,6 +338,17 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
          owner_tag: i32,
          owner_addr_ptr: i32|
          -> i32 {
+            let Ok(schema_version) = u32::try_from(schema_version) else {
+                return -1;
+            };
+            if schema_version == 0 {
+                return -1;
+            }
+            if usize::try_from(data_len).map_or(true, |len| len > MAX_OBJECT_DATA_BYTES)
+                || caller.data().created_objects.len() >= MAX_CREATED_OBJECTS
+            {
+                return -1;
+            }
             let data = match read_from_wasm(&caller, data_ptr, data_len) {
                 Some(d) => d,
                 None => return -1,
@@ -302,13 +384,18 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
                 _ => return -1,
             };
 
-            let id = caller.data_mut().next_object_id();
+            if !caller.data_mut().reserve_output(data.len()) {
+                return -1;
+            }
+            let Some(id) = caller.data_mut().next_object_id() else {
+                return -1;
+            };
             let obj = Object {
                 id,
                 version: 1,
                 owner,
                 type_hash,
-                schema_version: schema_version as u32,
+                schema_version,
                 data,
             };
             caller.data_mut().created_objects.push(obj);
@@ -326,6 +413,18 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
          data_ptr: i32,
          data_len: i32|
          -> i32 {
+            let Ok(type_tag_size) = usize::try_from(type_tag_len) else {
+                return -1;
+            };
+            let Ok(data_size) = usize::try_from(data_len) else {
+                return -1;
+            };
+            let Some(event_size) = type_tag_size.checked_add(data_size) else {
+                return -1;
+            };
+            if event_size > MAX_EVENT_BYTES || caller.data().events.len() >= MAX_EVENTS {
+                return -1;
+            }
             let type_tag = match read_from_wasm(&caller, type_tag_ptr, type_tag_len) {
                 Some(t) => t,
                 None => return -1,
@@ -334,6 +433,9 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
                 Some(d) => d,
                 None => return -1,
             };
+            if !caller.data_mut().reserve_output(event_size) {
+                return -1;
+            }
             caller
                 .data_mut()
                 .events
@@ -352,6 +454,9 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
         "env",
         "read_args",
         |mut caller: Caller<HostState>, offset: i32, buf_ptr: i32, buf_len: i32| -> i32 {
+            if offset < 0 || buf_ptr < 0 || buf_len < 0 {
+                return -1;
+            }
             let off = offset as usize;
             let len = buf_len as usize;
             let chunk: Vec<u8> = {
@@ -359,7 +464,10 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
                 if off > args.len() {
                     return -1;
                 }
-                let end = (off + len).min(args.len());
+                let Some(requested_end) = off.checked_add(len) else {
+                    return -1;
+                };
+                let end = requested_end.min(args.len());
                 args[off..end].to_vec()
             };
             write_to_wasm(&mut caller, buf_ptr, &chunk)
@@ -407,6 +515,26 @@ impl ExecutionEngine for WasmExecutionEngine {
         args: &[u8],
         gas_limit: u64,
     ) -> Result<ExecutionEffects, ExecutionError> {
+        if module.len() > MAX_MODULE_BYTES {
+            return Err(ExecutionError::ResourceLimitExceeded("module bytes"));
+        }
+        if args.len() > MAX_ARGS_BYTES {
+            return Err(ExecutionError::ResourceLimitExceeded("argument bytes"));
+        }
+        if inputs.len() > MAX_INPUT_OBJECTS {
+            return Err(ExecutionError::ResourceLimitExceeded("input objects"));
+        }
+        let input_bytes = inputs.iter().try_fold(0usize, |total, input| {
+            total.checked_add(input.object.data.len())
+        });
+        if input_bytes.is_none_or(|total| total > MAX_INPUT_DATA_BYTES)
+            || inputs
+                .iter()
+                .any(|input| input.object.data.len() > MAX_OBJECT_DATA_BYTES)
+        {
+            return Err(ExecutionError::ResourceLimitExceeded("input data bytes"));
+        }
+
         // ── engine with fuel consumption ─────────────────────────────────
         let mut config = Config::default();
         config.consume_fuel(true);
@@ -481,7 +609,10 @@ impl ExecutionEngine for WasmExecutionEngine {
                     });
                 } else if let Some(new_data) = &state.mutated_data[idx] {
                     let mut new_obj = resolved.object.clone();
-                    new_obj.version += 1;
+                    new_obj.version = new_obj
+                        .version
+                        .checked_add(1)
+                        .ok_or(ExecutionError::ObjectVersionOverflow(resolved.object.id))?;
                     new_obj.data = new_data.clone();
                     object_effects.push(ObjectEffect::Mutated {
                         previous_version: resolved.object.version,

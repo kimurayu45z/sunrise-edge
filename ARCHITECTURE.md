@@ -11,6 +11,7 @@ Sunrise Edge is designed as a deterministic state-transition system over authent
 - `hashing`: domain-separated hash framing, built-in hash implementations, and hash-suite resolution.
 - `crypto`: signature-domain framing and signer/verifier traits.
 - `chain-ir`: versioned deterministic instruction program format for execution back-end neutrality.
+- `protocol-upgrades`: canonical feature flags, hash-suite schedules, protocol-version transitions, and lazy-migration descriptors.
 
 ## 3. Canonical serialization rules
 All protocol-critical payloads use a SCALE-based framed binary encoding with explicit protocol magic, type identifier, encoding version, field count, field identifiers, field lengths, and field bytes. Fields are emitted in sorted field-id order to avoid map and construction-order nondeterminism.
@@ -99,10 +100,40 @@ action-validation layer to prevent permanent lock-in of the genesis set.
 Epoch transition activates configuration schedules lazily. New writes after activation may use the new suite, while historical data remains valid under its original algorithm identifier.
 
 ## 21. Protocol upgrade lifecycle
-Protocol upgrades are versioned and explicit. The hash and signature framing always includes `ProtocolVersion`, so upgrades naturally fork cryptographic domains.
+Phase 12 makes protocol upgrades versioned, explicit, governance-scheduled, and
+future-activated. A `ProtocolUpgrade` commits to the source and target versions,
+activation epoch, complete target `ProtocolConfig` hash, optional deterministic
+migration hash, and compatibility policy. The hash and signature framing always
+includes `ProtocolVersion`, so upgrades naturally fork cryptographic domains.
+
+Pending transitions are stored in strictly increasing activation order and must
+form a continuous version chain. Future activation is checked against the
+enactment epoch, not only the proposal-submission epoch. When constructing the
+target configuration, already activated transitions are pruned before computing
+`new_config_hash`; later pending transitions remain committed.
+
+`FeatureFlags` is a closed, canonically ordered set in `ProtocolConfig`. Unknown
+features cannot silently fall back to disabled behavior.
 
 ## 22. Hash algorithm migration lifecycle
-Hash migration is schedule-based, forward-only, and lazy. There is no global state rehash; existing digests remain self-describing and verifiable with their recorded algorithm ID.
+Hash migration is schedule-based, forward-only, and lazy. `ProtocolConfig`
+commits the full per-purpose `HashSuite` definitions and activation epochs, and
+consensus hashing APIs resolve the algorithm from
+`(chain_id, protocol_version, epoch)` rather than accepting a caller-selected
+algorithm. There is no global state rehash; existing digests remain
+self-describing and verifiable with their recorded algorithm ID.
+
+Object migrations are also lazy. Configuration commits a `MigrationDescriptor`
+and implementation digest. Runtime wiring selects an implementation by that
+digest and migrates one matching object on access, preserving its identity,
+owner, and type while incrementing object and schema versions. Migration
+implementations are deliberately excluded from canonical configuration values.
+
+Phase 12 also versions new-object identifier derivation as version 2. The frame
+now includes the transaction digest algorithm identifier before digest bytes and
+the creation counter. This prevents identical raw digest bytes from colliding
+across hash-suite migrations; historical version-1 object identifiers remain
+unchanged.
 
 ## 23. System Module lifecycle
 Phase 11 introduces deterministic, governance-installed system modules.
@@ -210,3 +241,6 @@ The cryptographic core is pure, synchronous, and free of background workers, dae
 - DR-0011: Introduce a governance-managed `SystemModuleRegistry` with versioned
   module commitments (`code`, `semantics`, `manifest`) and optional native/ZK
   acceleration hints while preserving canonical execution equivalence.
+- DR-0012: Store complete hash-suite and protocol-upgrade schedules in canonical
+  configuration, enforce future activation at enactment, and use per-object
+  hash-identified lazy migrations instead of global state rewrites.

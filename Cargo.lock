@@ -165,6 +165,7 @@ dependencies = [
  "bonds",
  "canonical-encoding",
  "protocol-types",
+ "protocol-upgrades",
  "runtime",
  "system-modules",
 ]
@@ -243,6 +244,7 @@ version = "0.1.0"
 dependencies = [
  "canonical-encoding",
  "protocol-types",
+ "protocol-upgrades",
 ]
 
 [[package]]
@@ -264,12 +266,21 @@ dependencies = [
  "fees",
  "governance",
  "protocol-types",
+ "protocol-upgrades",
  "system-modules",
 ]
 
 [[package]]
 name = "protocol-types"
 version = "0.1.0"
+
+[[package]]
+name = "protocol-upgrades"
+version = "0.1.0"
+dependencies = [
+ "canonical-encoding",
+ "protocol-types",
+]
 
 [[package]]
 name = "quote"

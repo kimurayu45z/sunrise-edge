@@ -8,5 +8,6 @@ version.workspace = true
 bonds.workspace = true
 canonical-encoding.workspace = true
 protocol-types.workspace = true
+protocol-upgrades.workspace = true
 runtime.workspace = true
 system-modules.workspace = true

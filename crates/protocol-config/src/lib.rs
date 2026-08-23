@@ -14,6 +14,10 @@ use fees::{
 };
 use governance::{GovernanceConfig, GovernanceError, encode_governance_config};
 use protocol_types::{HashSuiteId, ProtocolVersion};
+use protocol_upgrades::{
+    FeatureFlags, HashSuiteScheduleConfig, ProtocolUpgradeError, ProtocolUpgradeSchedule,
+    encode_feature_flags, encode_hash_suite_schedule, encode_protocol_upgrade_schedule,
+};
 use std::error::Error;
 use system_modules::{SystemModuleError, SystemModuleRegistry, encode_system_module_registry};
 
@@ -27,6 +31,8 @@ pub enum ProtocolConfigError {
     ZeroProtocolVersion,
     /// Hash-suite identifiers must be explicitly non-zero.
     ZeroHashSuiteId,
+    /// The active hash-suite id must have a committed schedule definition.
+    ActiveHashSuiteNotScheduled(HashSuiteId),
     /// Commitment scheme encoding failed.
     CommitmentScheme(CommitmentSchemeError),
     /// Bond configuration is invalid.
@@ -39,6 +45,8 @@ pub enum ProtocolConfigError {
     CanonicalEncoding(CanonicalEncodingError),
     /// System-module registry configuration is invalid.
     SystemModules(SystemModuleError),
+    /// Protocol-upgrade configuration is invalid.
+    ProtocolUpgrade(ProtocolUpgradeError),
 }
 
 impl fmt::Display for ProtocolConfigError {
@@ -46,11 +54,15 @@ impl fmt::Display for ProtocolConfigError {
         match self {
             Self::ZeroProtocolVersion => write!(f, "protocol version must be non-zero"),
             Self::ZeroHashSuiteId => write!(f, "hash-suite id must be non-zero"),
+            Self::ActiveHashSuiteNotScheduled(id) => {
+                write!(f, "active hash-suite id {} is not scheduled", id.get())
+            }
             Self::CommitmentScheme(error) => error.fmt(f),
             Self::Bond(error) => error.fmt(f),
             Self::Governance(error) => error.fmt(f),
             Self::Fee(error) => error.fmt(f),
             Self::SystemModules(error) => error.fmt(f),
+            Self::ProtocolUpgrade(error) => error.fmt(f),
             Self::CanonicalEncoding(error) => error.fmt(f),
         }
     }
@@ -94,6 +106,12 @@ impl From<SystemModuleError> for ProtocolConfigError {
     }
 }
 
+impl From<ProtocolUpgradeError> for ProtocolConfigError {
+    fn from(value: ProtocolUpgradeError) -> Self {
+        Self::ProtocolUpgrade(value)
+    }
+}
+
 /// Protocol configuration fields that affect cryptographic commitments today.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtocolConfig {
@@ -115,12 +133,18 @@ pub struct ProtocolConfig {
     pub governance_config: GovernanceConfig,
     /// Governance-installed system module registry.
     pub system_modules: SystemModuleRegistry,
+    /// Explicit protocol feature gates.
+    pub feature_flags: FeatureFlags,
+    /// Canonical epoch-activated hash-suite schedule.
+    pub hash_suite_schedule: HashSuiteScheduleConfig,
+    /// Pending protocol-version transitions.
+    pub protocol_upgrades: ProtocolUpgradeSchedule,
 }
 
 impl ProtocolConfig {
     /// Returns the genesis protocol configuration.
     #[must_use]
-    pub const fn genesis() -> Self {
+    pub fn genesis() -> Self {
         Self {
             protocol_version: ProtocolVersion::new(1),
             hash_suite_id: HashSuiteId::new(1),
@@ -131,6 +155,9 @@ impl ProtocolConfig {
             validator_admission_policy: ValidatorAdmissionPolicy::GenesisPermissioned,
             governance_config: GovernanceConfig::genesis(),
             system_modules: SystemModuleRegistry::new(),
+            feature_flags: FeatureFlags::genesis(),
+            hash_suite_schedule: HashSuiteScheduleConfig::genesis(),
+            protocol_upgrades: ProtocolUpgradeSchedule::new(),
         }
     }
 
@@ -146,6 +173,19 @@ impl ProtocolConfig {
         self.bond_assets.validate()?;
         self.governance_config.validate()?;
         self.system_modules.validate()?;
+        self.feature_flags.validate()?;
+        self.hash_suite_schedule.validate()?;
+        if !self
+            .hash_suite_schedule
+            .entries()
+            .iter()
+            .any(|entry| entry.suite.id == self.hash_suite_id)
+        {
+            return Err(ProtocolConfigError::ActiveHashSuiteNotScheduled(
+                self.hash_suite_id,
+            ));
+        }
+        self.protocol_upgrades.validate()?;
         Ok(())
     }
 
@@ -172,6 +212,12 @@ pub fn encode_protocol_config(config: &ProtocolConfig) -> Result<Vec<u8>, Protoc
     )?;
     canonical.field_bytes(8, encode_governance_config(&config.governance_config)?)?;
     canonical.field_bytes(9, encode_system_module_registry(&config.system_modules)?)?;
+    canonical.field_bytes(10, encode_feature_flags(&config.feature_flags)?)?;
+    canonical.field_bytes(11, encode_hash_suite_schedule(&config.hash_suite_schedule)?)?;
+    canonical.field_bytes(
+        12,
+        encode_protocol_upgrade_schedule(&config.protocol_upgrades)?,
+    )?;
     Ok(canonical.finish()?)
 }
 
@@ -181,6 +227,10 @@ mod tests {
     use bonds::BondAssetConfig;
     use fees::{Amount, AssetId, FeeAsset};
     use governance::GovernanceConfig;
+    use protocol_types::{Epoch, HashAlgorithmId, HashSuite};
+    use protocol_upgrades::{
+        CompatibilityPolicy, FeatureFlag, ProtocolUpgrade, ProtocolUpgradeSchedule,
+    };
     use system_modules::{ModuleId, ModuleStatus, SystemModule};
 
     fn hex(bytes: &[u8]) -> String {
@@ -194,8 +244,8 @@ mod tests {
         assert_eq!(
             hex(&bytes),
             concat!(
-                // outer ProtocolConfig frame (field count 8)
-                "534e5245015001000900",
+                // outer ProtocolConfig frame (field count 12)
+                "534e5245015001000c00",
                 "01000400000001000000",
                 "0200020000000100",
                 "03009f000000",
@@ -229,7 +279,29 @@ mod tests {
                 "534e524505900100030001000400000001000000020004000000020000000300080000000200000000000000",
                 // system_module_registry field (field 9)
                 "090012000000",
-                "534e524507b0010001000100020000000000"
+                "534e524507b0010001000100020000000000",
+                // feature_flags field (field 10)
+                "0a0012000000",
+                "534e524501c0010001000100020000000000",
+                // hash_suite_schedule field (field 11)
+                "0b0088000000",
+                "534e524503c001000200",
+                "0100020000000100",
+                "020070000000",
+                "534e524502c001000200",
+                "010018000000534e52450701010001000100080000000000000000000000",
+                "020042000000",
+                "534e5245040101000700",
+                "0100020000000100",
+                "0200020000000100",
+                "0300020000000100",
+                "0400020000000100",
+                "0500020000000100",
+                "0600020000000100",
+                "0700020000000100",
+                // protocol_upgrade_schedule field (field 12)
+                "0c0012000000",
+                "534e524506c0010001000100020000000000"
             )
         );
     }
@@ -258,6 +330,9 @@ mod tests {
             validator_admission_policy: ValidatorAdmissionPolicy::GenesisPermissioned,
             governance_config: GovernanceConfig::genesis(),
             system_modules: SystemModuleRegistry::new(),
+            feature_flags: FeatureFlags::genesis(),
+            hash_suite_schedule: HashSuiteScheduleConfig::genesis(),
+            protocol_upgrades: ProtocolUpgradeSchedule::new(),
         })
         .unwrap_err();
 
@@ -276,10 +351,25 @@ mod tests {
             validator_admission_policy: ValidatorAdmissionPolicy::GenesisPermissioned,
             governance_config: GovernanceConfig::genesis(),
             system_modules: SystemModuleRegistry::new(),
+            feature_flags: FeatureFlags::genesis(),
+            hash_suite_schedule: HashSuiteScheduleConfig::genesis(),
+            protocol_upgrades: ProtocolUpgradeSchedule::new(),
         })
         .unwrap_err();
 
         assert_eq!(err, ProtocolConfigError::ZeroHashSuiteId);
+    }
+
+    #[test]
+    fn active_hash_suite_must_have_a_committed_definition() {
+        let mut config = ProtocolConfig::genesis();
+        config.hash_suite_id = HashSuiteId::new(9);
+        assert_eq!(
+            config.validate(),
+            Err(ProtocolConfigError::ActiveHashSuiteNotScheduled(
+                HashSuiteId::new(9)
+            ))
+        );
     }
 
     #[test]
@@ -375,5 +465,49 @@ mod tests {
         let updated_bytes = encode_protocol_config(&updated).unwrap();
 
         assert_ne!(genesis, updated_bytes);
+    }
+
+    #[test]
+    fn feature_flags_and_hash_suite_schedule_are_committed() {
+        let genesis = encode_protocol_config(&ProtocolConfig::genesis()).unwrap();
+        let mut updated = ProtocolConfig::genesis();
+        updated
+            .feature_flags
+            .enable(FeatureFlag::LazyObjectMigration)
+            .unwrap();
+        updated
+            .hash_suite_schedule
+            .schedule(
+                HashSuite::uniform(HashSuiteId::new(2), HashAlgorithmId::Sha3_256),
+                Epoch::new(100),
+                Epoch::new(10),
+            )
+            .unwrap();
+        assert_ne!(genesis, encode_protocol_config(&updated).unwrap());
+    }
+
+    #[test]
+    fn protocol_upgrade_schedule_is_committed() {
+        let genesis = encode_protocol_config(&ProtocolConfig::genesis()).unwrap();
+        let mut updated = ProtocolConfig::genesis();
+        let mut upgrades = ProtocolUpgradeSchedule::new();
+        upgrades
+            .schedule(
+                ProtocolUpgrade {
+                    from_version: ProtocolVersion::new(1),
+                    to_version: ProtocolVersion::new(2),
+                    activation_epoch: Epoch::new(100),
+                    new_config_hash: protocol_types::Digest32::new(
+                        HashAlgorithmId::Sha2_256,
+                        [0x99; 32],
+                    ),
+                    migration_hash: None,
+                    compatibility_policy: CompatibilityPolicy::Strict,
+                },
+                Epoch::new(10),
+            )
+            .unwrap();
+        updated.protocol_upgrades = upgrades;
+        assert_ne!(genesis, encode_protocol_config(&updated).unwrap());
     }
 }

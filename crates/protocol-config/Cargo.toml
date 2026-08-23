@@ -11,4 +11,5 @@ canonical-encoding.workspace = true
 commitments.workspace = true
 fees.workspace = true
 protocol-types.workspace = true
+protocol-upgrades.workspace = true
 system-modules.workspace = true

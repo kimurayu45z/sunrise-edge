@@ -494,6 +494,22 @@ impl PersistenceLayout {
         ))
     }
 
+    /// Returns the pending protocol-upgrade schedule key.
+    #[must_use]
+    pub fn protocol_upgrade_schedule_key(&self) -> Vec<u8> {
+        self.prefixed("protocol/upgrades")
+    }
+
+    /// Returns a deterministic migration implementation record key.
+    #[must_use]
+    pub fn migration_record_key(&self, migration_hash: &Digest32) -> Vec<u8> {
+        self.prefixed(&format!(
+            "protocol/migrations/{}-{}",
+            migration_hash.algorithm().label(),
+            hex32(migration_hash.bytes())
+        ))
+    }
+
     fn prefixed(&self, suffix: &str) -> Vec<u8> {
         format!(
             "se/{}/v{}/{}",
@@ -606,6 +622,15 @@ mod tests {
         assert!(key1_text.starts_with("se/sunrise-devnet/v3/epoch/"));
         let key5_text = String::from_utf8(key5).unwrap();
         assert!(key5_text.contains("system-modules/"));
+
+        let migration = Digest32::new(protocol_types::HashAlgorithmId::Sha2_256, [0xBB; 32]);
+        let migration_key = layout.migration_record_key(&migration);
+        assert_ne!(migration_key, layout.protocol_upgrade_schedule_key());
+        assert!(
+            String::from_utf8(migration_key)
+                .unwrap()
+                .contains("protocol/migrations/sha2-256-")
+        );
     }
 
     #[test]
