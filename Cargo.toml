@@ -7,6 +7,7 @@ members = [
     "crates/commitments",
     "crates/objects",
     "crates/protocol-config",
+    "crates/abi",
 ]
 resolver = "3"
 
@@ -22,6 +23,7 @@ hashing = { path = "crates/hashing" }
 crypto = { path = "crates/crypto" }
 commitments = { path = "crates/commitments" }
 objects = { path = "crates/objects" }
+abi = { path = "crates/abi" }
 protocol-config = { path = "crates/protocol-config" }
 sha2 = "0.10.9"
 sha3 = "0.10.8"
