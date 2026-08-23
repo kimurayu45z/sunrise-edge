@@ -10,6 +10,7 @@ Sunrise Edge is designed as a deterministic state-transition system over authent
 - `canonical-encoding`: deterministic framed serialization for protocol-critical payloads.
 - `hashing`: domain-separated hash framing, built-in hash implementations, and hash-suite resolution.
 - `crypto`: signature-domain framing and signer/verifier traits.
+- `chain-ir`: versioned deterministic instruction program format for execution back-end neutrality.
 
 ## 3. Canonical serialization rules
 All protocol-critical payloads use a SCALE-based framed binary encoding with explicit protocol magic, type identifier, encoding version, field count, field identifiers, field lengths, and field bytes. Fields are emitted in sorted field-id order to avoid map and construction-order nondeterminism.
@@ -151,6 +152,13 @@ not need real WASM execution. `WasmExecutionEngine` is the canonical
 deterministic back-end for production use. Future optional back-ends (native
 JIT/AOT) must produce output equivalent to `WasmExecutionEngine` for every
 input.
+
+**DR-010: introduce versioned deterministic `chain-ir` program format**
+Phase 10 introduces the `chain-ir` crate as a stable, bounded and statically
+inspectable execution IR with explicit instruction opcodes and operand framing.
+Current contracts still execute through canonical WASM interpretation, but this
+IR becomes the protocol-level seam for future native/JIT and ZK proving
+back-ends that must preserve identical execution effects.
 
 ## 25. ZK execution architecture
 ZK execution is deferred. The architecture reserves separate commitment-scheme evolution so ZK-specific cryptography can change independently from consensus hashes.
