@@ -15,6 +15,7 @@ use fees::{
 use governance::{GovernanceConfig, GovernanceError, encode_governance_config};
 use protocol_types::{HashSuiteId, ProtocolVersion};
 use std::error::Error;
+use system_modules::{SystemModuleError, SystemModuleRegistry, encode_system_module_registry};
 
 const PROTOCOL_CONFIG_TYPE_ID: u16 = 0x5001;
 const ENCODING_VERSION: u16 = 1;
@@ -36,6 +37,8 @@ pub enum ProtocolConfigError {
     Fee(FeeError),
     /// Canonical encoding failed.
     CanonicalEncoding(CanonicalEncodingError),
+    /// System-module registry configuration is invalid.
+    SystemModules(SystemModuleError),
 }
 
 impl fmt::Display for ProtocolConfigError {
@@ -47,6 +50,7 @@ impl fmt::Display for ProtocolConfigError {
             Self::Bond(error) => error.fmt(f),
             Self::Governance(error) => error.fmt(f),
             Self::Fee(error) => error.fmt(f),
+            Self::SystemModules(error) => error.fmt(f),
             Self::CanonicalEncoding(error) => error.fmt(f),
         }
     }
@@ -84,6 +88,12 @@ impl From<GovernanceError> for ProtocolConfigError {
     }
 }
 
+impl From<SystemModuleError> for ProtocolConfigError {
+    fn from(value: SystemModuleError) -> Self {
+        Self::SystemModules(value)
+    }
+}
+
 /// Protocol configuration fields that affect cryptographic commitments today.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtocolConfig {
@@ -103,6 +113,8 @@ pub struct ProtocolConfig {
     pub validator_admission_policy: ValidatorAdmissionPolicy,
     /// On-chain governance parameters.
     pub governance_config: GovernanceConfig,
+    /// Governance-installed system module registry.
+    pub system_modules: SystemModuleRegistry,
 }
 
 impl ProtocolConfig {
@@ -118,6 +130,7 @@ impl ProtocolConfig {
             bond_assets: BondAssetRegistry::new(),
             validator_admission_policy: ValidatorAdmissionPolicy::GenesisPermissioned,
             governance_config: GovernanceConfig::genesis(),
+            system_modules: SystemModuleRegistry::new(),
         }
     }
 
@@ -132,6 +145,7 @@ impl ProtocolConfig {
         self.fee_assets.validate()?;
         self.bond_assets.validate()?;
         self.governance_config.validate()?;
+        self.system_modules.validate()?;
         Ok(())
     }
 
@@ -157,6 +171,7 @@ pub fn encode_protocol_config(config: &ProtocolConfig) -> Result<Vec<u8>, Protoc
         encode_validator_admission_policy(config.validator_admission_policy)?,
     )?;
     canonical.field_bytes(8, encode_governance_config(&config.governance_config)?)?;
+    canonical.field_bytes(9, encode_system_module_registry(&config.system_modules)?)?;
     Ok(canonical.finish()?)
 }
 
@@ -166,6 +181,7 @@ mod tests {
     use bonds::BondAssetConfig;
     use fees::{Amount, AssetId, FeeAsset};
     use governance::GovernanceConfig;
+    use system_modules::{ModuleId, ModuleStatus, SystemModule};
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -179,7 +195,7 @@ mod tests {
             hex(&bytes),
             concat!(
                 // outer ProtocolConfig frame (field count 8)
-                "534e5245015001000800",
+                "534e5245015001000900",
                 "01000400000001000000",
                 "0200020000000100",
                 "03009f000000",
@@ -210,7 +226,10 @@ mod tests {
                 "0100020000000100",
                 // governance_config field (field 8)
                 "08002c000000",
-                "534e524505900100030001000400000001000000020004000000020000000300080000000200000000000000"
+                "534e524505900100030001000400000001000000020004000000020000000300080000000200000000000000",
+                // system_module_registry field (field 9)
+                "090012000000",
+                "534e524507b0010001000100020000000000"
             )
         );
     }
@@ -238,6 +257,7 @@ mod tests {
             bond_assets: BondAssetRegistry::new(),
             validator_admission_policy: ValidatorAdmissionPolicy::GenesisPermissioned,
             governance_config: GovernanceConfig::genesis(),
+            system_modules: SystemModuleRegistry::new(),
         })
         .unwrap_err();
 
@@ -255,6 +275,7 @@ mod tests {
             bond_assets: BondAssetRegistry::new(),
             validator_admission_policy: ValidatorAdmissionPolicy::GenesisPermissioned,
             governance_config: GovernanceConfig::genesis(),
+            system_modules: SystemModuleRegistry::new(),
         })
         .unwrap_err();
 
@@ -320,6 +341,37 @@ mod tests {
             quorum_denominator: 3,
             voting_epochs: 4,
         };
+        let updated_bytes = encode_protocol_config(&updated).unwrap();
+
+        assert_ne!(genesis, updated_bytes);
+    }
+
+    #[test]
+    fn system_module_registry_is_included_in_encoding() {
+        let genesis = encode_protocol_config(&ProtocolConfig::genesis()).unwrap();
+
+        let mut updated = ProtocolConfig::genesis();
+        updated
+            .system_modules
+            .add_module(SystemModule {
+                module_id: ModuleId::new([0xCD; 32]),
+                version: 1,
+                canonical_code_hash: protocol_types::Digest32::new(
+                    protocol_types::HashAlgorithmId::Sha2_256,
+                    [0x11; 32],
+                ),
+                semantics_hash: protocol_types::Digest32::new(
+                    protocol_types::HashAlgorithmId::Sha2_256,
+                    [0x22; 32],
+                ),
+                manifest_hash: protocol_types::Digest32::new(
+                    protocol_types::HashAlgorithmId::Sha2_256,
+                    [0x33; 32],
+                ),
+                activation_epoch: protocol_types::Epoch::new(3),
+                status: ModuleStatus::Pending,
+            })
+            .unwrap();
         let updated_bytes = encode_protocol_config(&updated).unwrap();
 
         assert_ne!(genesis, updated_bytes);

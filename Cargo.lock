@@ -166,6 +166,7 @@ dependencies = [
  "canonical-encoding",
  "protocol-types",
  "runtime",
+ "system-modules",
 ]
 
 [[package]]
@@ -263,6 +264,7 @@ dependencies = [
  "fees",
  "governance",
  "protocol-types",
+ "system-modules",
 ]
 
 [[package]]
@@ -366,6 +368,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "system-modules"
+version = "0.1.0"
+dependencies = [
+ "canonical-encoding",
+ "protocol-types",
 ]
 
 [[package]]

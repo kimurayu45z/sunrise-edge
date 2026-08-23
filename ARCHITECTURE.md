@@ -105,7 +105,30 @@ Protocol upgrades are versioned and explicit. The hash and signature framing alw
 Hash migration is schedule-based, forward-only, and lazy. There is no global state rehash; existing digests remain self-describing and verifiable with their recorded algorithm ID.
 
 ## 23. System Module lifecycle
-System modules are deferred. Their code hashes and governance actions will consume the same framing infrastructure once introduced.
+Phase 11 introduces deterministic, governance-installed system modules.
+
+**Registry lifecycle:**
+1. Governance submits an `InstallSystemModule` action carrying a full
+   versioned module record.
+2. The action is canonically encoded and included in the proposal commitment.
+3. On approval, the module record is inserted into `SystemModuleRegistry` in
+   canonical `(module_id, version)` order.
+4. Activation is controlled by `activation_epoch` and `status`
+   (`Pending`/`Active`/`Disabled`).
+
+**Manifest lifecycle:**
+- `SystemModuleManifest` commits to input/output schemas, max input size, gas
+  model, and optional `zk_hint`.
+- The module record stores `manifest_hash`, `canonical_code_hash`, and
+  `semantics_hash` as explicit commitments.
+- Consensus-critical hashing/signing remains unchanged; system modules are an
+  execution-layer extension and do not replace protocol-root hash primitives.
+
+**Native acceleration model:**
+- Native implementations are optional and must be semantics-equivalent to the
+  canonical portable implementation for identical inputs.
+- Validators without native acceleration continue participating by executing
+  the canonical path.
 
 ## 24. WASM / Chain IR execution
 Phase 9 introduces the first concrete execution back-end: `WasmExecutionEngine`
@@ -184,3 +207,6 @@ The cryptographic core is pure, synchronous, and free of background workers, dae
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
 - DR-0003: Treat hash-suite scheduling as configuration resolution, not as a bulk migration job.
+- DR-0011: Introduce a governance-managed `SystemModuleRegistry` with versioned
+  module commitments (`code`, `semantics`, `manifest`) and optional native/ZK
+  acceleration hints while preserving canonical execution equivalence.
