@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 canonical-encoding.workspace = true
+sha2.workspace = true

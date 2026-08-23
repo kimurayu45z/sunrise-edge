@@ -68,6 +68,7 @@ name = "commitments"
 version = "0.1.0"
 dependencies = [
  "canonical-encoding",
+ "sha2",
 ]
 
 [[package]]
@@ -135,6 +136,7 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "canonical-encoding",
+ "commitments",
  "fees",
  "hashing",
  "objects",

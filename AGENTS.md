@@ -184,13 +184,12 @@ environmental limitation precisely.
 
 ## Current roadmap context
 
-The merged implementation covers the major foundations through shared-object
-consensus. The next planned technical phase in `TODO.md` is Phase 14:
+The implementation covers the major foundations through the Phase 14
+commitment and execution-proof interfaces. Poseidon2/BN254 is experimental and
+inactive; BLS12-381 and concrete proof backends remain unsupported and must
+fail closed.
 
-- CommitmentScheme abstraction evolution.
-- Experimental Poseidon2-based ZK commitment suite.
-- Execution-proof interfaces.
-
-The documentation work that introduced this file is intentionally separate from
-that implementation phase. Re-check `main`, open PRs, and `TODO.md` before
-starting the next phase; repository state may have advanced.
+The next planned technical phase in `TODO.md` is Phase 15, the native HTTP
+adapter. Keep adapter concerns outside protocol crates, and re-check `main`,
+open PRs, and `TODO.md` before starting it because repository state may have
+advanced.
