@@ -33,6 +33,13 @@ pub enum ProtocolConfigError {
     ZeroHashSuiteId,
     /// The active hash-suite id must have a committed schedule definition.
     ActiveHashSuiteNotScheduled(HashSuiteId),
+    /// The first pending upgrade must start from the active protocol version.
+    UnanchoredProtocolUpgrade {
+        /// Active protocol version.
+        active: ProtocolVersion,
+        /// Source version declared by the first pending upgrade.
+        scheduled_from: ProtocolVersion,
+    },
     /// Commitment scheme encoding failed.
     CommitmentScheme(CommitmentSchemeError),
     /// Bond configuration is invalid.
@@ -57,6 +64,15 @@ impl fmt::Display for ProtocolConfigError {
             Self::ActiveHashSuiteNotScheduled(id) => {
                 write!(f, "active hash-suite id {} is not scheduled", id.get())
             }
+            Self::UnanchoredProtocolUpgrade {
+                active,
+                scheduled_from,
+            } => write!(
+                f,
+                "first pending upgrade starts from protocol version {}, active version is {}",
+                scheduled_from.get(),
+                active.get()
+            ),
             Self::CommitmentScheme(error) => error.fmt(f),
             Self::Bond(error) => error.fmt(f),
             Self::Governance(error) => error.fmt(f),
@@ -186,6 +202,14 @@ impl ProtocolConfig {
             ));
         }
         self.protocol_upgrades.validate()?;
+        if let Some(first) = self.protocol_upgrades.upgrades().first()
+            && first.from_version != self.protocol_version
+        {
+            return Err(ProtocolConfigError::UnanchoredProtocolUpgrade {
+                active: self.protocol_version,
+                scheduled_from: first.from_version,
+            });
+        }
         Ok(())
     }
 
@@ -509,5 +533,35 @@ mod tests {
             .unwrap();
         updated.protocol_upgrades = upgrades;
         assert_ne!(genesis, encode_protocol_config(&updated).unwrap());
+    }
+
+    #[test]
+    fn protocol_upgrade_schedule_must_start_from_active_version() {
+        let mut config = ProtocolConfig::genesis();
+        config
+            .protocol_upgrades
+            .schedule(
+                ProtocolUpgrade {
+                    from_version: ProtocolVersion::new(2),
+                    to_version: ProtocolVersion::new(3),
+                    activation_epoch: Epoch::new(100),
+                    new_config_hash: protocol_types::Digest32::new(
+                        HashAlgorithmId::Sha2_256,
+                        [0x99; 32],
+                    ),
+                    migration_hash: None,
+                    compatibility_policy: CompatibilityPolicy::Strict,
+                },
+                Epoch::new(10),
+            )
+            .unwrap();
+
+        assert_eq!(
+            config.validate(),
+            Err(ProtocolConfigError::UnanchoredProtocolUpgrade {
+                active: ProtocolVersion::new(1),
+                scheduled_from: ProtocolVersion::new(2),
+            })
+        );
     }
 }
