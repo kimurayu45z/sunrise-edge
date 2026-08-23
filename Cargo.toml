@@ -12,6 +12,7 @@ members = [
     "crates/execution",
     "crates/fees",
     "crates/bonds",
+    "crates/governance",
 ]
 resolver = "3"
 
@@ -33,5 +34,6 @@ runtime = { path = "crates/runtime" }
 execution = { path = "crates/execution" }
 fees = { path = "crates/fees" }
 bonds = { path = "crates/bonds" }
+governance = { path = "crates/governance" }
 sha2 = "0.10.9"
 sha3 = "0.10.8"

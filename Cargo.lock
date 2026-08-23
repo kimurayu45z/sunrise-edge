@@ -121,6 +121,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "governance"
+version = "0.1.0"
+dependencies = [
+ "bonds",
+ "canonical-encoding",
+ "protocol-types",
+ "runtime",
+]
+
+[[package]]
 name = "hashing"
 version = "0.1.0"
 dependencies = [
@@ -161,6 +171,7 @@ dependencies = [
  "canonical-encoding",
  "commitments",
  "fees",
+ "governance",
  "protocol-types",
 ]
 
