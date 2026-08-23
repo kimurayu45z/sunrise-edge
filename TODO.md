@@ -1953,7 +1953,7 @@ Phase 17 prerequisites:
 
 - provider-neutral Web Fetch API ingress core (implemented As-Is)
 - Cloudflare conformance consumer over the shared implementation (implemented)
-- Deno adapter wrapper (pending)
+- Deno adapter wrapper (implemented As-Is)
 - Vercel adapter wrapper (pending)
 - Supabase Edge adapter wrapper (pending)
 - AWS adapter wrapper and API Gateway mapping (pending)
@@ -1966,8 +1966,20 @@ Phase 17 shared ingress As-Is scope:
   mutable global request stateを持たない。
 - provider wrapperは認証/private transportを追加できるが、shared boundやfail-closed mappingを
   緩めたりprovider独自wire contractへforkしてはならない。
-- 現在のconformance consumerはCloudflare workerdのみであり、他provider runtimeの実装・検証は
-  まだ完了していない。
+- 現在のconformance consumerはCloudflare workerdとlocal Deno runtimeであり、他provider runtimeの
+  実装・検証とreal provider deploymentはまだ完了していない。
+
+Phase 17 Deno As-Is scope:
+
+- current Deno 2 / Deno Deploy向けdefault fetch exportがshared ingress handlerをそのまま使用する。
+- node-core endpointはexact HTTPS /v1/eventsに限定し、userinfo、query、fragment、redirectを拒否する。
+- Deno Deploy secretからbounded Bearer capabilityを注入し、source、response、structured errorへ
+  secretを出さない。downstream timeoutは1..30000msの固定上限でfail closedにする。
+- provider wrapperはcanonical bodyをdecodeせず、path、media type、body bound、status、response headerを
+  forkしない。testはpermission-free mock fetchでshared rejectionとauthenticated forwardingを検証する。
+- 現実装はpublic HTTPS endpointへのBearer-authenticated relayであり、private connectivity、mTLSまたは
+  signed service request、rotation/revocation、durable deduplication/outbox、real Deno Deploy rehearsalを
+  production完成とみなさずTo-Beに残す。
 
 Phase 17 To-Be production exit criteria:
 
