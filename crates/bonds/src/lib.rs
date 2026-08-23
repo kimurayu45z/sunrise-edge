@@ -608,7 +608,9 @@ pub fn encode_validator_admission(admission: &ValidatorAdmission) -> Result<Vec<
     let mut canonical = CanonicalStruct::new(VALIDATOR_ADMISSION_TYPE_ID, ENCODING_VERSION);
     canonical.field_bytes(1, admission.validator_id.as_bytes())?;
     if let Some(bond) = &admission.bond {
-        canonical.field_bytes(2, encode_bond_object(bond)?)?;
+        // Fields 2 and 3 belonged to the removed caller-asserted policy and
+        // approval boolean. Keep field 4 stable for persisted admission blobs.
+        canonical.field_bytes(4, encode_bond_object(bond)?)?;
     }
     Ok(canonical.finish()?)
 }

@@ -129,6 +129,12 @@ digest and migrates one matching object on access, preserving its identity,
 owner, and type while incrementing object and schema versions. Migration
 implementations are deliberately excluded from canonical configuration values.
 
+Phase 12 also versions new-object identifier derivation as version 2. The frame
+now includes the transaction digest algorithm identifier before digest bytes and
+the creation counter. This prevents identical raw digest bytes from colliding
+across hash-suite migrations; historical version-1 object identifiers remain
+unchanged.
+
 ## 23. System Module lifecycle
 Phase 11 introduces deterministic, governance-installed system modules.
 

@@ -32,7 +32,12 @@
 //!
 //! IDs for objects created during execution are derived deterministically:
 //! ```text
-//! new_id = SHA-256( tx_hash_bytes || creation_index_le_u32 )
+//! new_id = SHA-256(
+//!     derivation_version_le_u16
+//!     || tx_hash_algorithm_le_u16
+//!     || tx_hash_bytes
+//!     || creation_index_le_u32
+//! )
 //! ```
 //!
 //! # Gas / fuel
@@ -67,6 +72,7 @@ const MAX_EVENT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CREATED_OBJECTS: usize = 1_024;
 const MAX_EVENTS: usize = 4_096;
+const OBJECT_ID_DERIVATION_VERSION: u16 = 2;
 
 // ── host state ────────────────────────────────────────────────────────────
 
@@ -117,6 +123,7 @@ impl HostState {
         self.creation_counter = self.creation_counter.checked_add(1)?;
 
         let mut hasher = Sha256::new();
+        hasher.update(OBJECT_ID_DERIVATION_VERSION.to_le_bytes());
         hasher.update(self.tx_hash.algorithm().as_u16().to_le_bytes());
         hasher.update(self.tx_hash.bytes());
         hasher.update(counter.to_le_bytes());

@@ -62,8 +62,12 @@ pub enum ProtocolUpgradeError {
         /// Actual source version.
         actual_from: ProtocolVersion,
     },
-    /// Migration versions and schema versions must be non-zero.
+    /// Migration implementation versions must be non-zero.
     ZeroMigrationVersion,
+    /// Source schema versions must be non-zero.
+    ZeroSourceSchemaVersion,
+    /// Target schema versions must be non-zero.
+    ZeroTargetSchemaVersion,
     /// A migration must increase the object schema version.
     NonIncreasingSchemaVersion {
         /// Existing schema version.
@@ -119,8 +123,12 @@ impl fmt::Display for ProtocolUpgradeError {
                 expected_from.get(),
                 actual_from.get()
             ),
-            Self::ZeroMigrationVersion => {
-                write!(f, "migration and schema versions must be non-zero")
+            Self::ZeroMigrationVersion => write!(f, "migration version must be non-zero"),
+            Self::ZeroSourceSchemaVersion => {
+                write!(f, "source schema version must be non-zero")
+            }
+            Self::ZeroTargetSchemaVersion => {
+                write!(f, "target schema version must be non-zero")
             }
             Self::NonIncreasingSchemaVersion { from, to } => {
                 write!(f, "migration must increase schema version ({from} -> {to})")
@@ -498,11 +506,14 @@ pub struct MigrationDescriptor {
 impl MigrationDescriptor {
     /// Validates migration version progression.
     pub fn validate(&self) -> Result<(), ProtocolUpgradeError> {
-        if self.migration_version == 0
-            || self.from_schema_version == 0
-            || self.to_schema_version == 0
-        {
+        if self.migration_version == 0 {
             return Err(ProtocolUpgradeError::ZeroMigrationVersion);
+        }
+        if self.from_schema_version == 0 {
+            return Err(ProtocolUpgradeError::ZeroSourceSchemaVersion);
+        }
+        if self.to_schema_version == 0 {
+            return Err(ProtocolUpgradeError::ZeroTargetSchemaVersion);
         }
         if self.to_schema_version <= self.from_schema_version {
             return Err(ProtocolUpgradeError::NonIncreasingSchemaVersion {

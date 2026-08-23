@@ -31,6 +31,8 @@ pub enum ProtocolConfigError {
     ZeroProtocolVersion,
     /// Hash-suite identifiers must be explicitly non-zero.
     ZeroHashSuiteId,
+    /// The active hash-suite id must have a committed schedule definition.
+    ActiveHashSuiteNotScheduled(HashSuiteId),
     /// Commitment scheme encoding failed.
     CommitmentScheme(CommitmentSchemeError),
     /// Bond configuration is invalid.
@@ -52,6 +54,9 @@ impl fmt::Display for ProtocolConfigError {
         match self {
             Self::ZeroProtocolVersion => write!(f, "protocol version must be non-zero"),
             Self::ZeroHashSuiteId => write!(f, "hash-suite id must be non-zero"),
+            Self::ActiveHashSuiteNotScheduled(id) => {
+                write!(f, "active hash-suite id {} is not scheduled", id.get())
+            }
             Self::CommitmentScheme(error) => error.fmt(f),
             Self::Bond(error) => error.fmt(f),
             Self::Governance(error) => error.fmt(f),
@@ -170,6 +175,16 @@ impl ProtocolConfig {
         self.system_modules.validate()?;
         self.feature_flags.validate()?;
         self.hash_suite_schedule.validate()?;
+        if !self
+            .hash_suite_schedule
+            .entries()
+            .iter()
+            .any(|entry| entry.suite.id == self.hash_suite_id)
+        {
+            return Err(ProtocolConfigError::ActiveHashSuiteNotScheduled(
+                self.hash_suite_id,
+            ));
+        }
         self.protocol_upgrades.validate()?;
         Ok(())
     }
@@ -343,6 +358,18 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err, ProtocolConfigError::ZeroHashSuiteId);
+    }
+
+    #[test]
+    fn active_hash_suite_must_have_a_committed_definition() {
+        let mut config = ProtocolConfig::genesis();
+        config.hash_suite_id = HashSuiteId::new(9);
+        assert_eq!(
+            config.validate(),
+            Err(ProtocolConfigError::ActiveHashSuiteNotScheduled(
+                HashSuiteId::new(9)
+            ))
+        );
     }
 
     #[test]
