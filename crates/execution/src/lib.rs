@@ -79,6 +79,8 @@ pub enum ExecutionError {
         /// Version bound to the resolver.
         resolver: ProtocolVersion,
     },
+    /// A deterministic execution resource limit was exceeded.
+    ResourceLimitExceeded(&'static str),
 }
 
 impl fmt::Display for ExecutionError {
@@ -110,6 +112,9 @@ impl fmt::Display for ExecutionError {
                 transaction.get(),
                 resolver.get()
             ),
+            Self::ResourceLimitExceeded(resource) => {
+                write!(f, "execution resource limit exceeded: {resource}")
+            }
         }
     }
 }

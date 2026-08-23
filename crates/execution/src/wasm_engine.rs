@@ -58,6 +58,15 @@ use crate::{
 const TYPE_HASH_WIRE_LEN: usize = 34;
 /// Byte length of a raw address in the host ABI.
 const ADDRESS_WIRE_LEN: usize = 32;
+const MAX_MODULE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ARGS_BYTES: usize = 1024 * 1024;
+const MAX_INPUT_OBJECTS: usize = 4_096;
+const MAX_INPUT_DATA_BYTES: usize = 16 * 1024 * 1024;
+const MAX_OBJECT_DATA_BYTES: usize = 1024 * 1024;
+const MAX_EVENT_BYTES: usize = 64 * 1024;
+const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CREATED_OBJECTS: usize = 1_024;
+const MAX_EVENTS: usize = 4_096;
 
 // ── host state ────────────────────────────────────────────────────────────
 
@@ -81,6 +90,8 @@ struct HostState {
     creation_counter: u32,
     /// Trap message set by the `abort` host function.
     trap: Option<String>,
+    /// Total bytes retained in created objects and events.
+    output_bytes: usize,
 }
 
 impl HostState {
@@ -96,6 +107,7 @@ impl HostState {
             tx_hash,
             creation_counter: 0,
             trap: None,
+            output_bytes: 0,
         }
     }
 
@@ -110,6 +122,33 @@ impl HostState {
         hasher.update(counter.to_le_bytes());
         let hash: [u8; 32] = hasher.finalize().into();
         Some(ObjectId::new(hash))
+    }
+
+    fn reserve_output(&mut self, bytes: usize) -> bool {
+        let Some(total) = self.output_bytes.checked_add(bytes) else {
+            return false;
+        };
+        if total > MAX_OUTPUT_BYTES {
+            return false;
+        }
+        self.output_bytes = total;
+        true
+    }
+
+    fn replace_mutated_data(&mut self, index: usize, data: Vec<u8>) -> bool {
+        let previous_len = self.mutated_data[index]
+            .as_ref()
+            .map_or(0, |previous| previous.len());
+        let base = self.output_bytes.saturating_sub(previous_len);
+        let Some(total) = base.checked_add(data.len()) else {
+            return false;
+        };
+        if total > MAX_OUTPUT_BYTES {
+            return false;
+        }
+        self.output_bytes = total;
+        self.mutated_data[index] = Some(data);
+        true
     }
 }
 
@@ -228,6 +267,9 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
             if index < 0 {
                 return -1;
             }
+            if usize::try_from(data_len).map_or(true, |len| len > MAX_OBJECT_DATA_BYTES) {
+                return -1;
+            }
             let idx = index as usize;
             {
                 let state = caller.data();
@@ -241,8 +283,11 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
             let Some(new_data) = read_from_wasm(&caller, data_ptr, data_len) else {
                 return -1;
             };
-            caller.data_mut().mutated_data[idx] = Some(new_data);
-            0
+            if caller.data_mut().replace_mutated_data(idx, new_data) {
+                0
+            } else {
+                -1
+            }
         },
     )?;
 
@@ -289,6 +334,11 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
             if schema_version <= 0 {
                 return -1;
             }
+            if usize::try_from(data_len).map_or(true, |len| len > MAX_OBJECT_DATA_BYTES)
+                || caller.data().created_objects.len() >= MAX_CREATED_OBJECTS
+            {
+                return -1;
+            }
             let data = match read_from_wasm(&caller, data_ptr, data_len) {
                 Some(d) => d,
                 None => return -1,
@@ -324,6 +374,9 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
                 _ => return -1,
             };
 
+            if !caller.data_mut().reserve_output(data.len()) {
+                return -1;
+            }
             let Some(id) = caller.data_mut().next_object_id() else {
                 return -1;
             };
@@ -350,6 +403,18 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
          data_ptr: i32,
          data_len: i32|
          -> i32 {
+            let Ok(type_tag_size) = usize::try_from(type_tag_len) else {
+                return -1;
+            };
+            let Ok(data_size) = usize::try_from(data_len) else {
+                return -1;
+            };
+            let Some(event_size) = type_tag_size.checked_add(data_size) else {
+                return -1;
+            };
+            if event_size > MAX_EVENT_BYTES || caller.data().events.len() >= MAX_EVENTS {
+                return -1;
+            }
             let type_tag = match read_from_wasm(&caller, type_tag_ptr, type_tag_len) {
                 Some(t) => t,
                 None => return -1,
@@ -358,6 +423,9 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
                 Some(d) => d,
                 None => return -1,
             };
+            if !caller.data_mut().reserve_output(event_size) {
+                return -1;
+            }
             caller
                 .data_mut()
                 .events
@@ -437,6 +505,26 @@ impl ExecutionEngine for WasmExecutionEngine {
         args: &[u8],
         gas_limit: u64,
     ) -> Result<ExecutionEffects, ExecutionError> {
+        if module.len() > MAX_MODULE_BYTES {
+            return Err(ExecutionError::ResourceLimitExceeded("module bytes"));
+        }
+        if args.len() > MAX_ARGS_BYTES {
+            return Err(ExecutionError::ResourceLimitExceeded("argument bytes"));
+        }
+        if inputs.len() > MAX_INPUT_OBJECTS {
+            return Err(ExecutionError::ResourceLimitExceeded("input objects"));
+        }
+        let input_bytes = inputs.iter().try_fold(0usize, |total, input| {
+            total.checked_add(input.object.data.len())
+        });
+        if input_bytes.is_none_or(|total| total > MAX_INPUT_DATA_BYTES)
+            || inputs
+                .iter()
+                .any(|input| input.object.data.len() > MAX_OBJECT_DATA_BYTES)
+        {
+            return Err(ExecutionError::ResourceLimitExceeded("input data bytes"));
+        }
+
         // ── engine with fuel consumption ─────────────────────────────────
         let mut config = Config::default();
         config.consume_fuel(true);

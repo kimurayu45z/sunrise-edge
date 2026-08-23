@@ -436,7 +436,10 @@ pub fn encode_governance_config(config: &GovernanceConfig) -> Result<Vec<u8>, Go
 mod tests {
     use super::*;
     use protocol_types::Epoch;
-    use protocol_types::{Digest32, HashAlgorithmId};
+    use protocol_types::{
+        Digest32, HashAlgorithmId, HashSuite, HashSuiteId, HashSuiteSchedule, ProtocolVersion,
+    };
+    use protocol_upgrades::{CompatibilityPolicy, ProtocolUpgrade, ProtocolUpgradeError};
     use system_modules::{ModuleId, ModuleStatus, SystemModule};
 
     fn proposal_id(byte: u8) -> ProposalId {
@@ -579,6 +582,38 @@ mod tests {
             err,
             GovernanceError::SystemModule(SystemModuleError::ZeroModuleVersion)
         );
+    }
+
+    #[test]
+    fn hash_suite_schedule_action_requires_future_enactment() {
+        let action = GovernanceAction::ScheduleHashSuite(HashSuiteSchedule {
+            activation_epoch: Epoch::new(20),
+            suite: HashSuite::uniform(HashSuiteId::new(2), HashAlgorithmId::Sha3_256),
+        });
+        assert!(!encode_governance_action(&action).unwrap().is_empty());
+        assert_eq!(
+            action.validate_for_enactment(Epoch::new(20)),
+            Err(GovernanceError::ProtocolUpgrade(
+                ProtocolUpgradeError::ActivationNotInFuture {
+                    activation_epoch: Epoch::new(20),
+                    current_epoch: Epoch::new(20)
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn protocol_upgrade_action_encodes_and_validates_at_enactment() {
+        let action = GovernanceAction::ScheduleProtocolUpgrade(ProtocolUpgrade {
+            from_version: ProtocolVersion::new(1),
+            to_version: ProtocolVersion::new(2),
+            activation_epoch: Epoch::new(30),
+            new_config_hash: digest(0x91),
+            migration_hash: Some(digest(0x92)),
+            compatibility_policy: CompatibilityPolicy::ReadOldWriteNew,
+        });
+        assert!(!encode_governance_action(&action).unwrap().is_empty());
+        action.validate_for_enactment(Epoch::new(29)).unwrap();
     }
 
     #[test]

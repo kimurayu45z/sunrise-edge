@@ -212,6 +212,10 @@ mod tests {
     use bonds::BondAssetConfig;
     use fees::{Amount, AssetId, FeeAsset};
     use governance::GovernanceConfig;
+    use protocol_types::{Epoch, HashAlgorithmId, HashSuite};
+    use protocol_upgrades::{
+        CompatibilityPolicy, FeatureFlag, ProtocolUpgrade, ProtocolUpgradeSchedule,
+    };
     use system_modules::{ModuleId, ModuleStatus, SystemModule};
 
     fn hex(bytes: &[u8]) -> String {
@@ -434,5 +438,49 @@ mod tests {
         let updated_bytes = encode_protocol_config(&updated).unwrap();
 
         assert_ne!(genesis, updated_bytes);
+    }
+
+    #[test]
+    fn feature_flags_and_hash_suite_schedule_are_committed() {
+        let genesis = encode_protocol_config(&ProtocolConfig::genesis()).unwrap();
+        let mut updated = ProtocolConfig::genesis();
+        updated
+            .feature_flags
+            .enable(FeatureFlag::LazyObjectMigration)
+            .unwrap();
+        updated
+            .hash_suite_schedule
+            .schedule(
+                HashSuite::uniform(HashSuiteId::new(2), HashAlgorithmId::Sha3_256),
+                Epoch::new(100),
+                Epoch::new(10),
+            )
+            .unwrap();
+        assert_ne!(genesis, encode_protocol_config(&updated).unwrap());
+    }
+
+    #[test]
+    fn protocol_upgrade_schedule_is_committed() {
+        let genesis = encode_protocol_config(&ProtocolConfig::genesis()).unwrap();
+        let mut updated = ProtocolConfig::genesis();
+        let mut upgrades = ProtocolUpgradeSchedule::new();
+        upgrades
+            .schedule(
+                ProtocolUpgrade {
+                    from_version: ProtocolVersion::new(1),
+                    to_version: ProtocolVersion::new(2),
+                    activation_epoch: Epoch::new(100),
+                    new_config_hash: protocol_types::Digest32::new(
+                        HashAlgorithmId::Sha2_256,
+                        [0x99; 32],
+                    ),
+                    migration_hash: None,
+                    compatibility_policy: CompatibilityPolicy::Strict,
+                },
+                Epoch::new(10),
+            )
+            .unwrap();
+        updated.protocol_upgrades = upgrades;
+        assert_ne!(genesis, encode_protocol_config(&updated).unwrap());
     }
 }

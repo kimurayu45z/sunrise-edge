@@ -446,6 +446,17 @@ impl ProtocolUpgradeSchedule {
             .find(|upgrade| upgrade.activation_epoch <= epoch)
     }
 
+    /// Removes transitions already activated at or before an epoch.
+    ///
+    /// Target configuration hashes are computed after this pruning step so an
+    /// enacted transition does not recursively commit to itself.
+    pub fn prune_activated(&mut self, epoch: Epoch) {
+        let first_pending = self
+            .upgrades
+            .partition_point(|upgrade| upgrade.activation_epoch <= epoch);
+        self.upgrades.drain(..first_pending);
+    }
+
     /// Validates schedule bounds, ordering, and version continuity.
     pub fn validate(&self) -> Result<(), ProtocolUpgradeError> {
         if self.upgrades.len() > MAX_SCHEDULE_ENTRIES {
@@ -721,6 +732,19 @@ mod tests {
                 actual_from: ProtocolVersion::new(3)
             }
         );
+    }
+
+    #[test]
+    fn activated_upgrades_are_pruned_from_target_config() {
+        let mut schedule = ProtocolUpgradeSchedule::new();
+        schedule
+            .schedule(upgrade(1, 2, 100), Epoch::new(10))
+            .unwrap();
+        schedule
+            .schedule(upgrade(2, 3, 200), Epoch::new(20))
+            .unwrap();
+        schedule.prune_activated(Epoch::new(100));
+        assert_eq!(schedule.upgrades(), &[upgrade(2, 3, 200)]);
     }
 
     #[test]
