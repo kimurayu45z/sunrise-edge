@@ -100,7 +100,10 @@ impl HashFunction for BuiltinHashFunction {
         chain_id: &ChainId,
         canonical_payload: &[u8],
     ) -> Result<Digest32, HashingError> {
-        ensure_supported(self.algorithm)?;
+        if matches!(self.algorithm, HashAlgorithmId::Blake3_256) {
+            return Err(HashingError::UnsupportedAlgorithm(self.algorithm));
+        }
+
         let frame = frame_hash_input(
             self.algorithm,
             purpose,
@@ -127,7 +130,7 @@ pub fn frame_hash_input(
     frame.field_u16(3, HASH_DOMAIN_VERSION)?;
     frame.field_str(4, chain_id.as_str())?;
     frame.field_u32(5, protocol_version.get())?;
-    frame.field_bytes(6, canonical_payload.to_vec())?;
+    frame.field_bytes(6, canonical_payload)?;
     Ok(frame.finish()?)
 }
 
@@ -215,14 +218,9 @@ fn hash_unframed_bytes(algorithm: HashAlgorithmId, input: &[u8]) -> Result<[u8; 
     match algorithm {
         HashAlgorithmId::Sha2_256 => Ok(Sha256::digest(input).into()),
         HashAlgorithmId::Sha3_256 => Ok(Sha3_256::digest(input).into()),
-        HashAlgorithmId::Blake3_256 => Err(HashingError::UnsupportedAlgorithm(algorithm)),
-    }
-}
-
-fn ensure_supported(algorithm: HashAlgorithmId) -> Result<(), HashingError> {
-    match algorithm {
-        HashAlgorithmId::Sha2_256 | HashAlgorithmId::Sha3_256 => Ok(()),
-        HashAlgorithmId::Blake3_256 => Err(HashingError::UnsupportedAlgorithm(algorithm)),
+        HashAlgorithmId::Blake3_256 => {
+            unreachable!("unsupported algorithms are rejected before framing")
+        }
     }
 }
 

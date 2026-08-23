@@ -122,7 +122,7 @@ pub fn frame_signature_message(
     frame.field_u64(3, domain.epoch.get())?;
     frame.field_str(4, domain.message_type.as_str())?;
     frame.field_u16(5, domain.signature_scheme_id.as_u16())?;
-    frame.field_bytes(6, canonical_payload.to_vec())?;
+    frame.field_bytes(6, canonical_payload)?;
     Ok(frame.finish()?)
 }
 
