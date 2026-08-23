@@ -584,10 +584,6 @@ mod tests {
             encode_transaction(&with_fee).unwrap(),
             encode_transaction(&without_fee).unwrap()
         );
-        assert_eq!(
-            encode_transaction_signable(&with_fee).unwrap(),
-            encode_transaction_signable(&with_fee).unwrap()
-        );
         assert_ne!(
             encode_transaction_signable(&with_fee).unwrap(),
             encode_transaction_signable(&without_fee).unwrap()
