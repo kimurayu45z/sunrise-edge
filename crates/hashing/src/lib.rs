@@ -218,9 +218,7 @@ fn hash_unframed_bytes(algorithm: HashAlgorithmId, input: &[u8]) -> Result<[u8; 
     match algorithm {
         HashAlgorithmId::Sha2_256 => Ok(Sha256::digest(input).into()),
         HashAlgorithmId::Sha3_256 => Ok(Sha3_256::digest(input).into()),
-        HashAlgorithmId::Blake3_256 => {
-            unreachable!("unsupported algorithms are rejected before framing")
-        }
+        HashAlgorithmId::Blake3_256 => Err(HashingError::UnsupportedAlgorithm(algorithm)),
     }
 }
 
