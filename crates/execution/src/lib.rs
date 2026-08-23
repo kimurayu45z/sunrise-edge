@@ -436,6 +436,7 @@ pub fn hash_execution_effects(
 /// effects must match the hash of the submitted transaction.
 pub trait ExecutionEngine {
     /// Executes a module entry-point with the provided resolved inputs.
+    #[allow(clippy::too_many_arguments)]
     fn execute(
         &self,
         protocol_version: ProtocolVersion,
@@ -457,6 +458,7 @@ pub trait ExecutionEngine {
 pub struct NullExecutionEngine;
 
 impl ExecutionEngine for NullExecutionEngine {
+    #[allow(clippy::too_many_arguments)]
     fn execute(
         &self,
         _protocol_version: ProtocolVersion,
