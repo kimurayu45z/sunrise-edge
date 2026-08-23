@@ -20,7 +20,7 @@ const FEE_DISTRIBUTION_TYPE_ID: u16 = 0x7008;
 const ENCODING_VERSION: u16 = 1;
 const IDENTIFIER_LEN: usize = 32;
 const MAX_REGISTRY_ASSETS: usize = u16::MAX as usize - 1;
-const MAX_SIGNERS: usize = u16::MAX as usize - 1;
+const MAX_SIGNERS: usize = u16::MAX as usize - 3;
 
 /// Errors returned by fee helpers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,7 +442,9 @@ pub fn encode_fee_distribution(distribution: &FeeDistribution) -> Result<Vec<u8>
     canonical.field_u64(2, distribution.total_amount.get())?;
     canonical.field_u32(3, distribution.shares.len() as u32)?;
     for (index, share) in distribution.shares.iter().enumerate() {
-        canonical.field_bytes((index + 4) as u16, encode_validator_fee_share(share)?)?;
+        let field_id = u16::try_from(index + 4)
+            .map_err(|_| FeeError::TooManySigners(distribution.shares.len()))?;
+        canonical.field_bytes(field_id, encode_validator_fee_share(share)?)?;
     }
     Ok(canonical.finish()?)
 }
