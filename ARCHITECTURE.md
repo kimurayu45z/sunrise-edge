@@ -548,6 +548,19 @@ and toolchain provenance, SBOMs, reproducible artifacts, protected required
 checks, real-provider test credentials and isolation, security scanning, and
 release-signing policy.
 
+## 40. Reviewed dependency update proposals
+
+Dependabot checks the Rust workspace, Cloudflare npm lockfile, and GitHub
+Actions weekly on a staggered schedule. It opens a bounded number of PRs with
+ecosystem-specific commit prefixes and never auto-merges them. Every update is
+expected to retain immutable action revisions and pass the repository-wide
+gate after a human reviews changelogs and compatibility impact.
+
+This As-Is automation discovers routine updates; it does not prove artifact or
+upstream integrity. Production still requires ownership and response SLAs,
+provenance and signature verification, emergency security-update procedures,
+license/SBOM policy, and protected review/merge controls.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -615,3 +628,6 @@ release-signing policy.
 - DR-0027: Resolve CI actions from verified upstream tags and commit their full
   immutable revisions. Keep the human-readable release tag as a comment and
   require reviewed updates rather than following a mutable major tag.
+- DR-0028: Ask Dependabot for bounded weekly Cargo, npm, and GitHub Actions
+  update PRs, but never auto-merge them. Require human compatibility review and
+  the complete repository gate for every proposed supply-chain change.
