@@ -4,6 +4,9 @@ members = [
     "crates/canonical-encoding",
     "crates/hashing",
     "crates/crypto",
+    "crates/commitments",
+    "crates/objects",
+    "crates/protocol-config",
 ]
 resolver = "3"
 
@@ -17,5 +20,8 @@ protocol-types = { path = "crates/protocol-types" }
 canonical-encoding = { path = "crates/canonical-encoding" }
 hashing = { path = "crates/hashing" }
 crypto = { path = "crates/crypto" }
+commitments = { path = "crates/commitments" }
+objects = { path = "crates/objects" }
+protocol-config = { path = "crates/protocol-config" }
 sha2 = "0.10.9"
 sha3 = "0.10.8"
