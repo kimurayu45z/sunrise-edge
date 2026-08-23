@@ -30,7 +30,12 @@
 //!
 //! # Object ID derivation
 //!
-//! IDs for objects created during execution are derived deterministically:
+//! IDs for objects created during execution are derived deterministically.
+//! Protocol version 1 retains its original framing:
+//! ```text
+//! new_id = SHA-256(tx_hash_bytes || creation_index_le_u32)
+//! ```
+//! Protocol version 2 and later use:
 //! ```text
 //! new_id = SHA-256(
 //!     derivation_version_le_u16
@@ -92,6 +97,8 @@ struct HostState {
     args: Vec<u8>,
     /// Transaction hash used to derive new object IDs.
     tx_hash: Digest32,
+    /// Protocol version selecting the object-ID derivation frame.
+    protocol_version: ProtocolVersion,
     /// Monotonic counter for new object ID derivation.
     creation_counter: u32,
     /// Trap message set by the `abort` host function.
@@ -101,7 +108,12 @@ struct HostState {
 }
 
 impl HostState {
-    fn new(inputs: Vec<ResolvedObject>, args: Vec<u8>, tx_hash: Digest32) -> Self {
+    fn new(
+        inputs: Vec<ResolvedObject>,
+        args: Vec<u8>,
+        tx_hash: Digest32,
+        protocol_version: ProtocolVersion,
+    ) -> Self {
         let n = inputs.len();
         Self {
             inputs,
@@ -111,6 +123,7 @@ impl HostState {
             events: Vec::new(),
             args,
             tx_hash,
+            protocol_version,
             creation_counter: 0,
             trap: None,
             output_bytes: 0,
@@ -123,8 +136,10 @@ impl HostState {
         self.creation_counter = self.creation_counter.checked_add(1)?;
 
         let mut hasher = Sha256::new();
-        hasher.update(OBJECT_ID_DERIVATION_VERSION.to_le_bytes());
-        hasher.update(self.tx_hash.algorithm().as_u16().to_le_bytes());
+        if self.protocol_version >= ProtocolVersion::new(2) {
+            hasher.update(OBJECT_ID_DERIVATION_VERSION.to_le_bytes());
+            hasher.update(self.tx_hash.algorithm().as_u16().to_le_bytes());
+        }
         hasher.update(self.tx_hash.bytes());
         hasher.update(counter.to_le_bytes());
         let hash: [u8; 32] = hasher.finalize().into();
@@ -507,7 +522,7 @@ pub struct WasmExecutionEngine;
 impl ExecutionEngine for WasmExecutionEngine {
     fn execute(
         &self,
-        _protocol_version: ProtocolVersion,
+        protocol_version: ProtocolVersion,
         tx_hash: Digest32,
         module: &[u8],
         entrypoint: &str,
@@ -541,7 +556,7 @@ impl ExecutionEngine for WasmExecutionEngine {
         let engine = Engine::new(&config);
 
         // ── host state ────────────────────────────────────────────────────
-        let host = HostState::new(inputs.to_vec(), args.to_vec(), tx_hash);
+        let host = HostState::new(inputs.to_vec(), args.to_vec(), tx_hash, protocol_version);
         let mut store = Store::new(&engine, host);
         store
             .set_fuel(gas_limit)
@@ -656,6 +671,32 @@ mod tests {
 
     fn sample_protocol_version() -> ProtocolVersion {
         ProtocolVersion::new(1)
+    }
+
+    #[test]
+    fn object_id_derivation_preserves_version_one_and_separates_version_two() {
+        let tx_hash = sample_digest(0x07);
+        let mut version_one =
+            HostState::new(Vec::new(), Vec::new(), tx_hash, ProtocolVersion::new(1));
+        let mut version_two =
+            HostState::new(Vec::new(), Vec::new(), tx_hash, ProtocolVersion::new(2));
+
+        assert_eq!(
+            version_one.next_object_id().unwrap().as_bytes(),
+            &[
+                0xD9, 0xE3, 0x8B, 0x47, 0x35, 0x02, 0x70, 0x0D, 0x57, 0x14, 0x76, 0xB3, 0x69, 0xF9,
+                0xBF, 0xE8, 0xD2, 0x87, 0xC2, 0x4C, 0xF1, 0xA0, 0x9A, 0x55, 0x78, 0x11, 0x72, 0xB1,
+                0xFC, 0xD0, 0x61, 0x3A,
+            ]
+        );
+        assert_eq!(
+            version_two.next_object_id().unwrap().as_bytes(),
+            &[
+                0x47, 0x29, 0x26, 0x0F, 0x83, 0xCC, 0x26, 0x4A, 0xD3, 0xEC, 0xA8, 0x88, 0x01, 0x3B,
+                0x40, 0x18, 0x16, 0x55, 0x70, 0x2B, 0x17, 0x99, 0xB3, 0x23, 0xFE, 0xA1, 0xCC, 0x09,
+                0x09, 0xAB, 0x62, 0x70,
+            ]
+        );
     }
 
     fn sample_object(id_byte: u8, version: u64) -> Object {
