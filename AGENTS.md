@@ -160,11 +160,15 @@ making protocol primitives depend on execution engines, runtimes, or adapters.
 7. Run the full required validation before handoff:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets
-git diff --check
+npm ci --prefix adapters/cloudflare-workers
+./scripts/check-all.sh
 ```
+
+The repository check includes Rust formatting, all-feature clippy and tests,
+Cloudflare type/lint/workerd tests, Deno/Vercel/Supabase/AWS adapter checks, and
+`git diff --check`. Run the targeted command while iterating, then the complete
+script before handoff. Do not omit provider checks because a change appears to
+touch only the shared Web layer.
 
 Do not claim success if any required command was skipped or failed. Explain any
 environmental limitation precisely.
@@ -184,15 +188,17 @@ environmental limitation precisely.
 
 ## Current roadmap context
 
-The implementation covers the major foundations through the Phase 14
-commitment and execution-proof interfaces. Poseidon2/BN254 is experimental and
+The implementation covers the major foundations through Phase 14 and local
+As-Is adapter milestones through Phase 17. Poseidon2/BN254 is experimental and
 inactive; BLS12-381 and concrete proof backends remain unsupported and must
-fail closed. In `TODO.md`, an implemented Phase is only an As-Is milestone, not
-a production-readiness claim. Preserve and work backward from its To-Be
-production exit criteria; do not normalize temporary or experimental code into
-the final architecture after context compaction.
+fail closed. Phase 15 node-core/native HTTP, Phase 16 Cloudflare, and Phase 17
+Deno/Vercel/Supabase/AWS implementations are bounded local seams, not completed
+production trust, persistence, deployment, or operations architectures.
 
-The next planned technical phase in `TODO.md` is Phase 15, the native HTTP
-adapter. Keep adapter concerns outside protocol crates, and re-check `main`,
-open PRs, and `TODO.md` before starting it because repository state may have
-advanced.
+In `TODO.md`, an implemented Phase is only an As-Is milestone, never a
+production-readiness claim. Preserve and work backward from each To-Be exit
+criterion after context compaction. Re-check `main`, the open stacked PR chain,
+and `TODO.md` before starting because repository state may have advanced. The
+next work is closing Phase 15-17 production gaps, especially atomic durable
+state/outbox behavior, provider trust boundaries, real runtime conformance,
+capacity/fault tests, observability, and rollout/rollback rehearsal.
