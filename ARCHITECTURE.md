@@ -106,11 +106,12 @@ activation epoch, complete target `ProtocolConfig` hash, optional deterministic
 migration hash, and compatibility policy. The hash and signature framing always
 includes `ProtocolVersion`, so upgrades naturally fork cryptographic domains.
 
-Pending transitions are stored in strictly increasing activation order and must
-form a continuous version chain. Future activation is checked against the
-enactment epoch, not only the proposal-submission epoch. When constructing the
-target configuration, already activated transitions are pruned before computing
-`new_config_hash`; later pending transitions remain committed.
+Pending transitions are stored in strictly increasing activation order, must
+start from the active protocol version, and must form a continuous version
+chain. Future activation is checked against the enactment epoch, not only the
+proposal-submission epoch. When constructing the target configuration, already
+activated transitions are pruned before computing `new_config_hash`; later
+pending transitions remain committed.
 
 `FeatureFlags` is a closed, canonically ordered set in `ProtocolConfig`. Unknown
 features cannot silently fall back to disabled behavior.
@@ -187,9 +188,11 @@ interpreter.
 **Determinism invariants:**
 - `wasmi` interpreter semantics are fully deterministic; JIT / native
   compilation is not used.
-- Object IDs for new objects are derived as
-  `SHA-256(tx_hash_bytes ‖ creation_index_le_u32)` so the same transaction
-  always produces the same IDs.
+- Protocol version 1 object IDs remain
+  `SHA-256(tx_hash_bytes ‖ creation_index_le_u32)`. Protocol version 2 and later
+  prepend the derivation version and transaction hash algorithm identifier so
+  the same transaction context always produces the same IDs without changing
+  historical IDs.
 - Fuel consumption is instruction-accurate and machine-independent.
 
 **Contract SDK (`contract-sdk` crate):**
