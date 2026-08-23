@@ -1,11 +1,11 @@
 [package]
-name = "protocol-config"
-version.workspace = true
+name = "fees"
 edition.workspace = true
 license.workspace = true
+version.workspace = true
 
 [dependencies]
 canonical-encoding.workspace = true
-commitments.workspace = true
-fees.workspace = true
+objects.workspace = true
+runtime.workspace = true
 protocol-types.workspace = true

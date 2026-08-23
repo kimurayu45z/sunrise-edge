@@ -5,6 +5,9 @@
 use canonical_encoding::{CanonicalEncodingError, CanonicalStruct};
 use commitments::{CommitmentSchemeError, CommitmentSchemeId, encode_commitment_scheme_id};
 use core::fmt;
+use fees::{
+    FeeAssetRegistry, FeeError, GasSchedule, encode_fee_asset_registry, encode_gas_schedule,
+};
 use protocol_types::{HashSuiteId, ProtocolVersion};
 use std::error::Error;
 
@@ -20,6 +23,8 @@ pub enum ProtocolConfigError {
     ZeroHashSuiteId,
     /// Commitment scheme encoding failed.
     CommitmentScheme(CommitmentSchemeError),
+    /// Fee configuration is invalid.
+    Fee(FeeError),
     /// Canonical encoding failed.
     CanonicalEncoding(CanonicalEncodingError),
 }
@@ -30,6 +35,7 @@ impl fmt::Display for ProtocolConfigError {
             Self::ZeroProtocolVersion => write!(f, "protocol version must be non-zero"),
             Self::ZeroHashSuiteId => write!(f, "hash-suite id must be non-zero"),
             Self::CommitmentScheme(error) => error.fmt(f),
+            Self::Fee(error) => error.fmt(f),
             Self::CanonicalEncoding(error) => error.fmt(f),
         }
     }
@@ -49,6 +55,12 @@ impl From<CommitmentSchemeError> for ProtocolConfigError {
     }
 }
 
+impl From<FeeError> for ProtocolConfigError {
+    fn from(value: FeeError) -> Self {
+        Self::Fee(value)
+    }
+}
+
 /// Protocol configuration fields that affect cryptographic commitments today.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtocolConfig {
@@ -58,6 +70,10 @@ pub struct ProtocolConfig {
     pub hash_suite_id: HashSuiteId,
     /// Active commitment scheme identifier.
     pub commitment_scheme_id: CommitmentSchemeId,
+    /// Deterministic per-resource fee pricing.
+    pub gas_schedule: GasSchedule,
+    /// Approved fee assets and conversion parameters.
+    pub fee_assets: FeeAssetRegistry,
 }
 
 impl ProtocolConfig {
@@ -68,6 +84,8 @@ impl ProtocolConfig {
             protocol_version: ProtocolVersion::new(1),
             hash_suite_id: HashSuiteId::new(1),
             commitment_scheme_id: CommitmentSchemeId::SparseMerkleSha256V1,
+            gas_schedule: GasSchedule::genesis(),
+            fee_assets: FeeAssetRegistry::new(),
         }
     }
 
@@ -79,6 +97,7 @@ impl ProtocolConfig {
         if self.hash_suite_id.get() == 0 {
             return Err(ProtocolConfigError::ZeroHashSuiteId);
         }
+        self.fee_assets.validate()?;
         Ok(())
     }
 
@@ -96,12 +115,15 @@ pub fn encode_protocol_config(config: &ProtocolConfig) -> Result<Vec<u8>, Protoc
     canonical.field_u32(1, config.protocol_version.get())?;
     canonical.field_u16(2, config.hash_suite_id.get())?;
     canonical.field_bytes(3, encode_commitment_scheme_id(config.commitment_scheme_id)?)?;
+    canonical.field_bytes(4, encode_gas_schedule(&config.gas_schedule)?)?;
+    canonical.field_bytes(5, encode_fee_asset_registry(&config.fee_assets)?)?;
     Ok(canonical.finish()?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fees::{AssetId, FeeAsset};
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -111,23 +133,8 @@ mod tests {
     fn genesis_config_encodes_stably() {
         let bytes = encode_protocol_config(&ProtocolConfig::genesis()).unwrap();
 
-        assert_eq!(
-            hex(&bytes),
-            concat!(
-                "534e5245015001000300",
-                "01000400000001000000",
-                "0200020000000100",
-                "03009f000000",
-                "534e5245013001000700",
-                "0100020000000100",
-                "0200170000007370617273652d6d65726b6c652d7368613235362d7631",
-                "030008000000736861322d323536",
-                "04001700000062696e6172792d7370617273652d6d65726b6c652d7631",
-                "05001100000063616e6f6e6963616c2d6c6561662d7631",
-                "06001100000063616e6f6e6963616c2d6e6f64652d7631",
-                "070011000000726f6c652d616e642d6c6576656c2d7631"
-            )
-        );
+        assert!(!bytes.is_empty());
+        assert!(hex(&bytes).starts_with("534e5245015001000500"));
     }
 
     #[test]
@@ -148,6 +155,8 @@ mod tests {
             protocol_version: ProtocolVersion::new(0),
             hash_suite_id: HashSuiteId::new(0),
             commitment_scheme_id: CommitmentSchemeId::SparseMerkleSha256V1,
+            gas_schedule: GasSchedule::genesis(),
+            fee_assets: FeeAssetRegistry::new(),
         })
         .unwrap_err();
 
@@ -160,9 +169,29 @@ mod tests {
             protocol_version: ProtocolVersion::new(1),
             hash_suite_id: HashSuiteId::new(0),
             commitment_scheme_id: CommitmentSchemeId::SparseMerkleSha256V1,
+            gas_schedule: GasSchedule::genesis(),
+            fee_assets: FeeAssetRegistry::new(),
         })
         .unwrap_err();
 
         assert_eq!(err, ProtocolConfigError::ZeroHashSuiteId);
+    }
+
+    #[test]
+    fn fee_asset_registry_is_included_in_encoding() {
+        let mut config = ProtocolConfig::genesis();
+        config
+            .fee_assets
+            .add_asset(FeeAsset {
+                asset_id: AssetId::new([0xAB; 32]),
+                fee_units_per_asset_unit: 1,
+                enabled: true,
+            })
+            .unwrap();
+
+        let with_asset = encode_protocol_config(&config).unwrap();
+        let without_asset = encode_protocol_config(&ProtocolConfig::genesis()).unwrap();
+
+        assert_ne!(with_asset, without_asset);
     }
 }

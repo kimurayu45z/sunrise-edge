@@ -10,3 +10,4 @@ canonical-encoding = { workspace = true }
 hashing = { workspace = true }
 objects = { workspace = true }
 abi = { workspace = true }
+fees = { workspace = true }

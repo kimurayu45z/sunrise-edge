@@ -336,8 +336,8 @@ impl Scheduler for MemoryScheduler {
         guard.insert(
             index,
             ScheduledPayload {
-            at_unix_millis,
-            payload,
+                at_unix_millis,
+                payload,
             },
         );
         Ok(())
@@ -573,8 +573,14 @@ mod tests {
         let key4 = layout.object_version_key([0x11; 32], 6);
         assert_ne!(key3, key4);
 
-        let other_layout = PersistenceLayout::new(ChainId::new("other-chain").unwrap(), ProtocolVersion::new(3));
-        assert_ne!(layout.protocol_config_key(), other_layout.protocol_config_key());
+        let other_layout = PersistenceLayout::new(
+            ChainId::new("other-chain").unwrap(),
+            ProtocolVersion::new(3),
+        );
+        assert_ne!(
+            layout.protocol_config_key(),
+            other_layout.protocol_config_key()
+        );
 
         let key1_text = String::from_utf8(key1).unwrap();
         assert!(key1_text.starts_with("se/sunrise-devnet/v3/epoch/"));
@@ -586,13 +592,22 @@ mod tests {
         runtime.set_time(123);
 
         assert_eq!(runtime.clock().now_unix_millis().unwrap(), 123);
-        assert_eq!(runtime.signer().validator_id(), ValidatorId::new([0xAA; 32]));
+        assert_eq!(
+            runtime.signer().validator_id(),
+            ValidatorId::new([0xAA; 32])
+        );
 
         let digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x01; 32]);
         runtime.blob_store().put_blob(digest, vec![7, 8]).unwrap();
-        assert_eq!(runtime.blob_store().get_blob(&digest).unwrap(), Some(vec![7, 8]));
+        assert_eq!(
+            runtime.blob_store().get_blob(&digest).unwrap(),
+            Some(vec![7, 8])
+        );
 
         runtime.transport().send(vec![1, 2, 3]).unwrap();
-        assert_eq!(runtime.transport().drain_outbound().unwrap(), vec![vec![1, 2, 3]]);
+        assert_eq!(
+            runtime.transport().drain_outbound().unwrap(),
+            vec![vec![1, 2, 3]]
+        );
     }
 }

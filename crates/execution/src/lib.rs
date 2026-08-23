@@ -25,8 +25,12 @@
 use abi::{AbiError, AccessManifest, encode_access_manifest};
 use canonical_encoding::{CanonicalEncodingError, CanonicalStruct, encode_digest32};
 use core::fmt;
-use hashing::{HashFunction, HashingError, BuiltinHashFunction};
-use objects::{Address, AccessMode, Object, ObjectId, ObjectRef, encode_object, encode_object_id, encode_object_ref};
+use fees::{FeeError, FeePayment, encode_fee_payment};
+use hashing::{BuiltinHashFunction, HashFunction, HashingError};
+use objects::{
+    AccessMode, Address, Object, ObjectId, ObjectRef, encode_object, encode_object_id,
+    encode_object_ref,
+};
 use protocol_types::{ChainId, Digest32, Epoch, HashPurpose, ProtocolVersion};
 use std::error::Error;
 
@@ -53,6 +57,8 @@ pub enum ExecutionError {
     Object(objects::ObjectError),
     /// Hashing failed.
     Hashing(HashingError),
+    /// Fee payment encoding failed.
+    Fee(FeeError),
     /// The transaction entrypoint name must not be empty.
     EmptyEntrypoint,
     /// The transaction must carry a non-empty signature.
@@ -66,6 +72,7 @@ impl fmt::Display for ExecutionError {
             Self::Abi(e) => write!(f, "abi error: {e}"),
             Self::Object(e) => write!(f, "object error: {e}"),
             Self::Hashing(e) => write!(f, "hashing error: {e}"),
+            Self::Fee(e) => write!(f, "fee error: {e}"),
             Self::EmptyEntrypoint => write!(f, "transaction entrypoint must not be empty"),
             Self::EmptySignature => write!(f, "transaction signature must not be empty"),
         }
@@ -95,6 +102,12 @@ impl From<objects::ObjectError> for ExecutionError {
 impl From<HashingError> for ExecutionError {
     fn from(value: HashingError) -> Self {
         Self::Hashing(value)
+    }
+}
+
+impl From<FeeError> for ExecutionError {
+    fn from(value: FeeError) -> Self {
+        Self::Fee(value)
     }
 }
 
@@ -131,13 +144,15 @@ pub struct Transaction {
     pub args: Vec<u8>,
     /// Maximum gas units the sender is willing to spend.
     pub gas_limit: u64,
-    /// Sender signature over the canonical transaction payload (fields 1-9).
+    /// Stablecoin-denominated fee payment authorization.
+    pub fee_payment: Option<FeePayment>,
+    /// Sender signature over the canonical transaction payload (fields 1-10 plus fee payment).
     pub signature: Vec<u8>,
 }
 
 /// Encodes a [`Transaction`] in the canonical wire format.
 ///
-/// The signature field (field 10) is included so that the full signed payload
+/// The signature field is included so that the full signed payload
 /// is preserved in storage and transmitted over the network.
 pub fn encode_transaction(tx: &Transaction) -> Result<Vec<u8>, ExecutionError> {
     if tx.entrypoint.is_empty() {
@@ -158,7 +173,10 @@ pub fn encode_transaction(tx: &Transaction) -> Result<Vec<u8>, ExecutionError> {
     canonical.field_str(8, &tx.entrypoint)?;
     canonical.field_bytes(9, tx.args.as_slice())?;
     canonical.field_u64(10, tx.gas_limit)?;
-    canonical.field_bytes(11, tx.signature.as_slice())?;
+    if let Some(fee_payment) = &tx.fee_payment {
+        canonical.field_bytes(11, encode_fee_payment(fee_payment)?)?;
+    }
+    canonical.field_bytes(12, tx.signature.as_slice())?;
     Ok(canonical.finish()?)
 }
 
@@ -183,6 +201,9 @@ pub fn encode_transaction_signable(tx: &Transaction) -> Result<Vec<u8>, Executio
     canonical.field_str(8, &tx.entrypoint)?;
     canonical.field_bytes(9, tx.args.as_slice())?;
     canonical.field_u64(10, tx.gas_limit)?;
+    if let Some(fee_payment) = &tx.fee_payment {
+        canonical.field_bytes(11, encode_fee_payment(fee_payment)?)?;
+    }
     Ok(canonical.finish()?)
 }
 
@@ -197,7 +218,12 @@ pub fn hash_transaction(
 ) -> Result<Digest32, ExecutionError> {
     let signable = encode_transaction_signable(tx)?;
     let hasher = BuiltinHashFunction::new(algorithm);
-    Ok(hasher.hash(HashPurpose::Transaction, tx.protocol_version, &tx.chain_id, &signable)?)
+    Ok(hasher.hash(
+        HashPurpose::Transaction,
+        tx.protocol_version,
+        &tx.chain_id,
+        &signable,
+    )?)
 }
 
 // ── ResolvedObject ────────────────────────────────────────────────────────
@@ -393,7 +419,12 @@ pub fn hash_execution_effects(
 ) -> Result<Digest32, ExecutionError> {
     let encoded = encode_execution_effects(effects)?;
     let hasher = BuiltinHashFunction::new(algorithm);
-    Ok(hasher.hash(HashPurpose::ExecutionEffects, protocol_version, chain_id, &encoded)?)
+    Ok(hasher.hash(
+        HashPurpose::ExecutionEffects,
+        protocol_version,
+        chain_id,
+        &encoded,
+    )?)
 }
 
 // ── ExecutionEngine ───────────────────────────────────────────────────────
@@ -452,6 +483,7 @@ impl ExecutionEngine for NullExecutionEngine {
 mod tests {
     use super::*;
     use abi::{AccessEntry, AccessManifest};
+    use fees::{Amount, AssetId, FeePayment};
     use objects::{AccessMode, Address, ObjectId, ObjectRef, Owner};
     use protocol_types::{ChainId, Digest32, Epoch, HashAlgorithmId, ProtocolVersion};
 
@@ -472,6 +504,14 @@ mod tests {
             id: ObjectId::new([id_byte; 32]),
             version,
             digest: sample_digest(id_byte),
+        }
+    }
+
+    fn sample_fee_payment() -> FeePayment {
+        FeePayment {
+            asset_id: AssetId::new([0xEE; 32]),
+            max_fee: Amount::new(250),
+            fee_object: sample_object_ref(0xEF, 3),
         }
     }
 
@@ -508,6 +548,7 @@ mod tests {
             entrypoint: "transfer".to_string(),
             args: vec![1, 2, 3, 4],
             gas_limit: 100_000,
+            fee_payment: Some(sample_fee_payment()),
             signature: vec![0xFF; 64],
         }
     }
@@ -528,8 +569,24 @@ mod tests {
         let tx = sample_transaction();
         let full = encode_transaction(&tx).unwrap();
         let signable = encode_transaction_signable(&tx).unwrap();
-        // The signable payload must be distinct (it lacks the signature field).
         assert_ne!(full, signable);
+    }
+
+    #[test]
+    fn fee_payment_affects_transaction_encoding() {
+        let mut with_fee = sample_transaction();
+        let mut without_fee = sample_transaction();
+        without_fee.fee_payment = None;
+
+        assert_ne!(
+            encode_transaction(&with_fee).unwrap(),
+            encode_transaction(&without_fee).unwrap()
+        );
+        with_fee.fee_payment = None;
+        assert_eq!(
+            encode_transaction_signable(&with_fee).unwrap(),
+            encode_transaction_signable(&without_fee).unwrap()
+        );
     }
 
     #[test]
@@ -546,10 +603,7 @@ mod tests {
     fn empty_signature_is_rejected() {
         let mut tx = sample_transaction();
         tx.signature = vec![];
-        assert_eq!(
-            encode_transaction(&tx),
-            Err(ExecutionError::EmptySignature)
-        );
+        assert_eq!(encode_transaction(&tx), Err(ExecutionError::EmptySignature));
     }
 
     #[test]
@@ -783,26 +837,10 @@ mod tests {
         let engine = NullExecutionEngine;
         let tx_hash = sample_digest(0x10);
         let e1 = engine
-            .execute(
-                sample_protocol_version(),
-                tx_hash,
-                b"",
-                "noop",
-                &[],
-                &[],
-                0,
-            )
+            .execute(sample_protocol_version(), tx_hash, b"", "noop", &[], &[], 0)
             .unwrap();
         let e2 = engine
-            .execute(
-                sample_protocol_version(),
-                tx_hash,
-                b"",
-                "noop",
-                &[],
-                &[],
-                0,
-            )
+            .execute(sample_protocol_version(), tx_hash, b"", "noop", &[], &[], 0)
             .unwrap();
         assert_eq!(e1, e2);
     }
@@ -830,6 +868,11 @@ mod tests {
             entrypoint: "run".to_string(),
             args: vec![],
             gas_limit: 1_000,
+            fee_payment: Some(FeePayment {
+                asset_id: AssetId::new([0xCC; 32]),
+                max_fee: Amount::new(9),
+                fee_object: sample_object_ref(0xDD, 2),
+            }),
             signature: vec![0x01; 32],
         };
 
@@ -839,7 +882,7 @@ mod tests {
         // Snapshot – must not change between releases.
         assert_eq!(
             hex,
-            "534e5245016001000b0001000a000000746573742d636861696e020004000000010000000300080000000000000000000000040020000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa05000800000001000000000000000600cd000000534e5245025001000200010004000000010000000200b3000000534e524501500100020001008c000000534e5245044001000300010030000000534e524501400100010001002000000011111111111111111111111111111111111111111111111111111111111111110200080000000100000000000000030038000000534e524503010100020001000200000001000200200000001111111111111111111111111111111111111111111111111111111111111111020011000000534e52450640010001000100010000000107008c000000534e5245044001000300010030000000534e5245014001000100010020000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0200080000000100000000000000030038000000534e52450301010002000100020000000100020020000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb08000300000072756e0900000000000a0008000000e8030000000000000b00200000000101010101010101010101010101010101010101010101010101010101010101"
+            "534e5245016001000c0001000a000000746573742d636861696e020004000000010000000300080000000000000000000000040020000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa05000800000001000000000000000600cd000000534e5245025001000200010004000000010000000200b3000000534e524501500100020001008c000000534e5245044001000300010030000000534e524501400100010001002000000011111111111111111111111111111111111111111111111111111111111111110200080000000100000000000000030038000000534e524503010100020001000200000001000200200000001111111111111111111111111111111111111111111111111111111111111111020011000000534e52450640010001000100010000000107008c000000534e5245044001000300010030000000534e5245014001000100010020000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0200080000000100000000000000030038000000534e52450301010002000100020000000100020020000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb08000300000072756e0900000000000a0008000000e8030000000000000b00e0000000534e5245027001000300010030000000534e5245017001000100010020000000cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc020008000000090000000000000003008c000000534e5245044001000300010030000000534e5245014001000100010020000000dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd0200080000000200000000000000030038000000534e52450301010002000100020000000100020020000000dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd0c00200000000101010101010101010101010101010101010101010101010101010101010101"
         );
     }
 }
