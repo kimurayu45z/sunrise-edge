@@ -72,29 +72,17 @@ impl CanonicalStruct {
     }
 
     /// Stores a `u16` field.
-    pub fn field_u16(
-        &mut self,
-        field_id: u16,
-        value: u16,
-    ) -> Result<(), CanonicalEncodingError> {
+    pub fn field_u16(&mut self, field_id: u16, value: u16) -> Result<(), CanonicalEncodingError> {
         self.insert(field_id, value.to_le_bytes().to_vec())
     }
 
     /// Stores a `u32` field.
-    pub fn field_u32(
-        &mut self,
-        field_id: u16,
-        value: u32,
-    ) -> Result<(), CanonicalEncodingError> {
+    pub fn field_u32(&mut self, field_id: u16, value: u32) -> Result<(), CanonicalEncodingError> {
         self.insert(field_id, value.to_le_bytes().to_vec())
     }
 
     /// Stores a `u64` field.
-    pub fn field_u64(
-        &mut self,
-        field_id: u16,
-        value: u64,
-    ) -> Result<(), CanonicalEncodingError> {
+    pub fn field_u64(&mut self, field_id: u16, value: u64) -> Result<(), CanonicalEncodingError> {
         self.insert(field_id, value.to_le_bytes().to_vec())
     }
 

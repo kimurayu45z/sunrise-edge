@@ -97,11 +97,7 @@ pub trait SignatureVerifier {
     fn scheme_id(&self) -> SignatureSchemeId;
 
     /// Verifies the provided framed message bytes.
-    fn verify_framed(
-        &self,
-        framed_message: &[u8],
-        signature: &[u8],
-    ) -> Result<bool, CryptoError>;
+    fn verify_framed(&self, framed_message: &[u8], signature: &[u8]) -> Result<bool, CryptoError>;
 
     /// Frames and verifies a canonical protocol payload.
     fn verify_canonical(
@@ -171,6 +167,9 @@ mod tests {
 
     #[test]
     fn message_type_must_not_be_empty() {
-        assert_eq!(SignatureMessageType::new("  "), Err(CryptoError::EmptyMessageType));
+        assert_eq!(
+            SignatureMessageType::new("  "),
+            Err(CryptoError::EmptyMessageType)
+        );
     }
 }

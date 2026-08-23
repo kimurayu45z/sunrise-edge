@@ -209,10 +209,7 @@ impl HashSuiteResolver {
     }
 }
 
-fn hash_unframed_bytes(
-    algorithm: HashAlgorithmId,
-    input: &[u8],
-) -> Result<[u8; 32], HashingError> {
+fn hash_unframed_bytes(algorithm: HashAlgorithmId, input: &[u8]) -> Result<[u8; 32], HashingError> {
     match algorithm {
         HashAlgorithmId::Sha2_256 => Ok(Sha256::digest(input).into()),
         HashAlgorithmId::Sha3_256 => Ok(Sha3_256::digest(input).into()),
@@ -338,14 +335,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(digest.algorithm(), HashAlgorithmId::Sha2_256);
-        assert!(verify_digest(
-            &digest,
-            HashPurpose::Object,
-            ProtocolVersion::new(1),
-            &chain_id,
-            b"object-v1"
-        )
-        .unwrap());
+        assert!(
+            verify_digest(
+                &digest,
+                HashPurpose::Object,
+                ProtocolVersion::new(1),
+                &chain_id,
+                b"object-v1"
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -355,8 +354,14 @@ mod tests {
         let before = resolver.suite_for_epoch(Epoch::new(499)).unwrap();
         let after = resolver.suite_for_epoch(Epoch::new(500)).unwrap();
 
-        assert_eq!(before.algorithm_for(HashPurpose::Transaction), HashAlgorithmId::Sha2_256);
-        assert_eq!(after.algorithm_for(HashPurpose::Transaction), HashAlgorithmId::Sha3_256);
+        assert_eq!(
+            before.algorithm_for(HashPurpose::Transaction),
+            HashAlgorithmId::Sha2_256
+        );
+        assert_eq!(
+            after.algorithm_for(HashPurpose::Transaction),
+            HashAlgorithmId::Sha3_256
+        );
     }
 
     #[test]
@@ -371,7 +376,9 @@ mod tests {
 
         assert_eq!(
             result,
-            Err(HashingError::UnsupportedAlgorithm(HashAlgorithmId::Blake3_256))
+            Err(HashingError::UnsupportedAlgorithm(
+                HashAlgorithmId::Blake3_256
+            ))
         );
     }
 
