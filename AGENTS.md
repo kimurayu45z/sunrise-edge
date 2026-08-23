@@ -187,7 +187,10 @@ environmental limitation precisely.
 The implementation covers the major foundations through the Phase 14
 commitment and execution-proof interfaces. Poseidon2/BN254 is experimental and
 inactive; BLS12-381 and concrete proof backends remain unsupported and must
-fail closed.
+fail closed. In `TODO.md`, an implemented Phase is only an As-Is milestone, not
+a production-readiness claim. Preserve and work backward from its To-Be
+production exit criteria; do not normalize temporary or experimental code into
+the final architecture after context compaction.
 
 The next planned technical phase in `TODO.md` is Phase 15, the native HTTP
 adapter. Keep adapter concerns outside protocol crates, and re-check `main`,
