@@ -1843,14 +1843,14 @@ Phase 14 To-Be production exit criteria:
     Poseidon2とexecution proofをproduction-readyまたはmainnet-readyと表現しない。
 
 Phase 15:
-- native HTTP adapter
+- native HTTP adapter (implemented As-Is)
 
 Phase 15 prerequisites:
 
 - bounded canonical frame decoder (implemented)
 - deterministic node-core event boundary with one-key CAS persistence
   (implemented As-Is)
-- adapter-neutral request/response contract (pending)
+- adapter-neutral canonical request/response contract (implemented As-Is)
 
 Phase 15 As-Is scope:
 
@@ -1865,6 +1865,16 @@ Phase 15 As-Is scope:
   保証しない。
 - 現在のsingle-key CASはnative adapter統合用の実験的境界であり、production persistence
   architectureの完成形ではない。
+- native adapterはPOST /v1/events、exact canonical binary media type、bounded body、
+  deterministic HTTP status mapping、GET /health/live、graceful shutdownを提供する。
+- outbound eventはCAS成功後にruntime transportへ渡すが、state commitとsendの間はまだ
+  atomicではない。send failureが503を返してもstateがcommit済みの場合があるため、
+  productionではpersisted deduplicationとtransactional outboxが必須。
+- TLS、authentication、rate limiting、durable StateStore、audit telemetry、reverse proxy
+  hardeningは未実装であり、このAs-Is adapterをinternet-facing production serverと扱わない。
+- 現在のRuntime traitは同期APIであるため、遅いdurable I/OをTokio request task上で直接行う
+  production実装にしない。async runtime boundaryまたは明示的なbounded blocking isolation、
+  concurrency limit、deadlineを設計する。
 
 Phase 15 To-Be production exit criteria:
 

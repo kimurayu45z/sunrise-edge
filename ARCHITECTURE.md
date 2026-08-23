@@ -358,6 +358,35 @@ write-set/transaction contract, durable request deduplication, crash-safe
 outbox publication, bounded retry policy, and conformance across every
 supported persistence adapter as recorded in the Phase 15 To-Be criteria.
 
+## 31. Native HTTP adapter
+
+Phase 15 adds the `native-http` crate around node-core using Axum and Tokio.
+`POST /v1/events` accepts exactly one body with media type
+`application/vnd.sunrise-edge.node-event`, no unrecognized media-type
+parameters, and no content encoding other than absent or `identity`. The body
+limit is 16 MiB plus a fixed 512-byte framing allowance; the inner node event
+still enforces its independent canonical and payload bounds. Successful calls
+return a versioned canonical `HttpNodeResult` as
+`application/vnd.sunrise-edge.node-result`. Nested responses retain stable
+request IDs and adapter-neutral canonical `NodeResponse` framing.
+
+Malformed events return 400, oversized bodies return 413, unsupported media or
+content encoding returns 415, context/CAS conflicts return 409, deterministic
+application rejection returns 422, and runtime/outbound delivery failure
+returns 503. Error bodies expose stable coarse codes rather than internal state
+or storage details. `GET /health/live` returns 204 without reading protocol
+state. The server entry point requires a shutdown future so the embedding
+native process can stop accepting work cleanly.
+
+The As-Is adapter dispatches outbound events only after state CAS succeeds.
+There is still a crash window between commit and transport send, and a send
+failure can therefore return 503 after state has committed. This is explicitly
+not production delivery semantics: persisted deduplication and a transactional
+outbox with recovery must replace this window before production use. TLS,
+authentication, rate limiting, production storage, audit telemetry, and proxy
+hardening also remain deployment requirements rather than claims of this
+milestone.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -380,3 +409,8 @@ supported persistence adapter as recorded in the Phase 15 To-Be criteria.
   before persistence succeeds, keep retries and delivery in adapters, and treat
   single-key CAS as an interim seam that must evolve into a crash-safe atomic
   write-set and outbox contract for production.
+- DR-0016: Use an exact, versioned canonical binary HTTP contract for the native
+  adapter, enforce independent transport and protocol bounds, and keep HTTP
+  status mapping outside node-core. Dispatch outbound events only after state
+  commit while treating the remaining commit/send window as deferred production
+  work requiring a transactional outbox.
