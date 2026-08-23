@@ -19,6 +19,8 @@ pub enum RuntimeError {
     EmptyScheduledPayload,
     /// The system clock appears to be before unix epoch.
     ClockBeforeUnixEpoch,
+    /// The system clock value exceeds supported range.
+    ClockOverflow,
 }
 
 impl fmt::Display for RuntimeError {
@@ -27,6 +29,7 @@ impl fmt::Display for RuntimeError {
             Self::EmptyKey => write!(f, "state keys must not be empty"),
             Self::EmptyScheduledPayload => write!(f, "scheduled payloads must not be empty"),
             Self::ClockBeforeUnixEpoch => write!(f, "clock is before unix epoch"),
+            Self::ClockOverflow => write!(f, "clock value exceeds u64 milliseconds range"),
         }
     }
 }
@@ -285,7 +288,7 @@ impl Clock for SystemClock {
         let duration = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| RuntimeError::ClockBeforeUnixEpoch)?;
-        Ok(duration.as_millis() as u64)
+        u64::try_from(duration.as_millis()).map_err(|_| RuntimeError::ClockOverflow)
     }
 }
 
@@ -329,11 +332,14 @@ impl Scheduler for MemoryScheduler {
         }
 
         let mut guard = self.queue.lock().expect("scheduler lock poisoned");
-        guard.push(ScheduledPayload {
+        let index = guard.partition_point(|item| item.at_unix_millis <= at_unix_millis);
+        guard.insert(
+            index,
+            ScheduledPayload {
             at_unix_millis,
             payload,
-        });
-        guard.sort_by_key(|item| item.at_unix_millis);
+            },
+        );
         Ok(())
     }
 
@@ -346,7 +352,7 @@ impl Scheduler for MemoryScheduler {
 }
 
 /// In-memory runtime composition.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct MemoryRuntime {
     state_store: MemoryStateStore,
     blob_store: MemoryBlobStore,
