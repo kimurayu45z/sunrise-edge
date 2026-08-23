@@ -60,7 +60,39 @@ Slashing is deferred, but the architecture already separates message families fo
 Stablecoin fee accounting is deferred.
 
 ## 19. Governance lifecycle
-Governance is deferred except for the hash-suite scheduling concept. Future governance actions will schedule suite upgrades for activation in a future epoch only.
+Governance is the mechanism by which the active validator set and protocol
+parameters can be changed after genesis. Phase 8 introduces the first
+governance primitives in the `governance` crate.
+
+**Proposal lifecycle:**
+1. A governance participant submits a `GovernanceProposal` carrying a
+   `GovernanceAction` and a `ProposalId`.
+2. The proposal stays open for at least `GovernanceConfig.voting_epochs` epochs.
+3. At tally time the `ProposalOutcome` (Approved / Rejected) is determined by
+   comparing the fraction of approving votes against the configured quorum
+   (`quorum_numerator / quorum_denominator`).
+4. If approved, the encoded action is applied atomically at the epoch boundary.
+
+**First concrete actions (Phase 8):**
+- `UpdateValidatorAdmissionPolicy(ValidatorAdmissionPolicy)` – changes the
+  active admission policy in `ProtocolConfig`.  The canonical genesis
+  transition path is `GenesisPermissioned → BondAndGovernance`.
+- `ApproveValidatorAdmission(ValidatorId)` – produces a `GovernanceApproval`
+  record that can be attached to a `ValidatorAdmission` to satisfy permissioned
+  admission checks.
+
+**`ProtocolConfig` integration:**
+`ProtocolConfig` now carries a `GovernanceConfig` field (field 8 in the
+canonical encoding).  `GovernanceConfig` encodes the active quorum fraction
+and minimum voting duration, keeping governance parameters in the same
+deterministic config commitment as fees, bonds, and hash-suite settings.
+
+**DR-008: `GenesisPermissioned → BondAndGovernance` transition**
+The only allowable governance-initiated transition away from
+`GenesisPermissioned` is to `BondAndGovernance`.  Direct transitions to
+`GovernancePermissioned` or `BondRequired` are also supported for future
+flexibility, but transitions back to `GenesisPermissioned` are rejected at the
+action-validation layer to prevent permanent lock-in of the genesis set.
 
 ## 20. Epoch transition
 Epoch transition activates configuration schedules lazily. New writes after activation may use the new suite, while historical data remains valid under its original algorithm identifier.

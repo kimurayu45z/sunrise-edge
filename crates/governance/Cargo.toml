@@ -1,13 +1,11 @@
 [package]
-name = "protocol-config"
-version.workspace = true
+name = "governance"
 edition.workspace = true
 license.workspace = true
+version.workspace = true
 
 [dependencies]
-governance.workspace = true
 bonds.workspace = true
 canonical-encoding.workspace = true
-commitments.workspace = true
-fees.workspace = true
 protocol-types.workspace = true
+runtime.workspace = true
