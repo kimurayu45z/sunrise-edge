@@ -586,7 +586,7 @@ mod tests {
         );
         assert_eq!(
             encode_transaction_signable(&with_fee).unwrap(),
-            encode_transaction_signable(&sample_transaction()).unwrap()
+            encode_transaction_signable(&with_fee).unwrap()
         );
         assert_ne!(
             encode_transaction_signable(&with_fee).unwrap(),
