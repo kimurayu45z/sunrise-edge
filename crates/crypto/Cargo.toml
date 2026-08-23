@@ -1,0 +1,9 @@
+[package]
+name = "crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+canonical-encoding.workspace = true
+protocol-types.workspace = true
