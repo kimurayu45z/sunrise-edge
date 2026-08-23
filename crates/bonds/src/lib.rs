@@ -643,6 +643,14 @@ mod tests {
         stricter_policy.enabled = false;
         stricter_policy.min_bond = Amount::new(200);
         registry.update_asset(stricter_policy).unwrap();
+        let updated_policy = registry.get(asset(0x12)).unwrap();
+
+        assert!(!updated_policy.enabled);
+        assert_eq!(updated_policy.min_bond, Amount::new(200));
+        assert_eq!(
+            bond.validate_against(updated_policy),
+            Err(BondError::AssetDisabled(asset(0x12)))
+        );
 
         bond.request_unbond(&registry, Epoch::new(40)).unwrap();
 
