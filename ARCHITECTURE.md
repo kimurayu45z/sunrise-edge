@@ -429,6 +429,14 @@ without weakening the shared bounds. The Cloudflare wrapper is the first
 conformance consumer and continues to pass its generated Service Binding;
 workerd tests exercise the extracted implementation unchanged.
 
+Providers may narrow the accepted request body when their documented platform
+capacity is below the protocol transport limit. The shared implementation
+validates this policy as a positive integer no greater than its default bound;
+provider configuration can therefore fail earlier with 413 but cannot expand
+the security envelope. A lower provider limit is an explicit compatibility gap
+that remains visible in Phase 17 production criteria rather than being called
+full protocol conformance.
+
 ## 34. Deno Web ingress adapter
 
 The Deno Phase 17 adapter uses the current Deno 2 default `fetch` export and
@@ -487,3 +495,6 @@ tests, observability, incident response, and rollback rehearsal.
   shared contract. Require an exact HTTPS node-core endpoint, inject only a
   secret Bearer capability, reject redirects, and treat stronger private or
   mutually authenticated transport as a production Phase 17 requirement.
+- DR-0020: Allow provider adapters to narrow the shared request-body capacity
+  when the hosting platform has a smaller hard limit, but reject zero,
+  non-integer, or larger values and record the resulting conformance gap.

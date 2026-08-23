@@ -1,5 +1,6 @@
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { handleWebRequest } from "../../shared/web-ingress";
 import {
   LIVENESS_PATH,
   MAX_HTTP_EVENT_BODY_BYTES,
@@ -93,6 +94,23 @@ describe("Cloudflare ingress", () => {
       status: 413,
       code: "body-too-large",
     });
+  });
+
+  it("allows a provider to narrow but never raise the shared body limit", async () => {
+    const fetch = vi.fn<Env["NODE_CORE"]["fetch"]>();
+    const narrowed = await handleWebRequest(
+      eventRequest(new Uint8Array([1, 2]), { "content-length": "2" }),
+      { fetch },
+      { maximumRequestBodyBytes: 1 },
+    );
+    expect(narrowed.status).toBe(413);
+    expect(fetch).not.toHaveBeenCalled();
+
+    await expect(
+      handleWebRequest(eventRequest(new Uint8Array([1])), { fetch }, {
+        maximumRequestBodyBytes: MAX_HTTP_EVENT_BODY_BYTES + 1,
+      }),
+    ).rejects.toThrow("maximumRequestBodyBytes");
   });
 
   it("fails closed when the node-core service binding throws", async () => {
