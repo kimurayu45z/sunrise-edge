@@ -1701,6 +1701,27 @@ production-quality Rust。
 
 # 65. Implementation Order
 
+## As-Is milestones and To-Be destination
+
+このPhase一覧はincremental deliveryの順序であり、最終品質の定義ではない。
+`implemented`はそのPhaseのAs-Is milestoneが実装・検証されたことだけを意味し、
+production-ready、mainnet-ready、監査済みを意味しない。
+
+この文書のTo-Beは一貫してproduction-grade L1である。したがって:
+
+- experimental、temporary、mock、reserved、deferred、interface-onlyな実装を
+  production上の完成形として扱ってはいけない。
+- 各experimental milestoneにはproduction exit criteriaを残し、criteriaを満たすまで
+  TODOから削除したり「完了」と解釈したりしてはいけない。
+- 後続PhaseはAs-Isの制約から逆算してTo-Beとの差分を閉じる。実験実装を別名で
+  複製するだけのPRを新しいPhaseの完了としてはいけない。
+- mainnet release判断はPhase番号ではなく、cross-phase production release gateと
+  security reviewの充足で行う。
+- READMEのcurrent statusとARCHITECTUREのimplemented behaviorはAs-Isを記録し、
+  TODOはTo-Beと未解決のproduction gapを保持する。
+- 各PhaseのPRを完了するときは、TODOのAs-Isと残存production exit criteriaを同時に
+  更新する。criteriaを満たしていない項目へ単に`implemented`だけを付けない。
+
 Phase 1:
 - workspace
 - protocol primitives
@@ -1778,6 +1799,49 @@ Phase 14:
   BLS12-381 identifier remains reserved and unsupported)
 - execution proof interfaces (implemented; concrete proof backends deferred)
 
+Phase 14 As-Is:
+
+- SHA-256とexperimental Poseidon2/BN254のleaf/node commitment framingがある。
+- Poseidon2/BN254はsafe Rustの監査容易性を優先した実装で、inactiveであり、
+  temporary 4 KiB leaf limitがある。
+- BLS12-381はidentifierのみ予約され、実装・activationされていない。
+- ExecutionProofはcanonical envelopeとexact-ID verifier dispatchまでであり、
+  concrete prover/verifier、verification key lifecycle、protocol activationはない。
+
+Phase 14 To-Be production exit criteria:
+
+1. Commitment scheme specificationを独立したprotocol specificationとして固定する。
+   field modulus、S-box、width/rate/capacity、round constants、byte-to-field mapping、
+   padding、endianness、tree depth、key-bit order、empty nodes、leaf/node domains、
+   proof encodingを曖昧さなく記述する。
+2. Poseidon2 implementationは独立レビュー済みの実装へ置換するか、現実装を
+   production cryptographyとして別実装とのcross-check、property/fuzz test、
+   side-channel評価、性能評価、暗号レビューまで完了させる。単一KATだけでは
+   production承認としない。
+3. temporary 4 KiB limitを、object size・proof cost・validator CPU budgetから導いた
+   protocol上の正式な上限へ置き換える。上限内のworst-case benchmarkとDoS budgetを
+   nativeおよび対象edge runtimeで満たす。
+4. 完全なversioned sparse-Merkle treeを実装する。empty root、membership/non-membership
+   proof、更新proof、複数objectのcanonical ordering、batch update、old/new root検証、
+   malformed proof rejection、stable vectorsを含める。
+5. CommitmentScheme activation/migrationをProtocolConfigとgovernance-controlled scheduleへ
+   統合する。validator capability、future activation、unknown/unsupported scheme rejection、
+   historical root/proof verification、rollback非依存のlazy migrationを検証する。
+6. BLS12-381 identifierはproduction parameter setと実装を完成させるか、未対応のまま
+   予約する理由とactivation禁止を明文化する。identifierの存在だけをsupportと数えない。
+7. ProofSystemIdはproof system名だけでなく、version、curve/field、transcript、proof format、
+   public statement version、verifying-key commitment、program image/circuit commitmentを
+   一意に固定するregistry/specificationへ接続する。
+8. 少なくとも1つのconcrete prover/verifier backendを実装し、Chain IR canonical executionと
+   proven executionのeffects/output commitment一致、invalid proof rejection、resource bounds、
+   deterministic cross-runtime verification、stable vectorsを検証する。
+9. validator quorum onlyからquorum + proof、さらにproof-centric verificationへ移る
+   activation policy、failure policy、fee/gas accounting、observability、
+   consensus rollbackに依存しないsafe disable/recovery planを実装する。
+10. cryptographic review、adversarial test、fuzzing、cross-implementation vectors、
+    reproducible benchmark、independent security auditを完了する。これらを満たすまで
+    Poseidon2とexecution proofをproduction-readyまたはmainnet-readyと表現しない。
+
 Phase 15:
 - native HTTP adapter
 
@@ -1786,6 +1850,18 @@ Phase 16:
 
 Phase 17:
 - Vercel / Supabase / AWS / Deno adapters
+
+Cross-phase production release gate（最後まで延期する単独Phaseではなく常時適用）:
+
+- Coding RequirementsとSecurity Invariantsを全crateで満たす。
+- experimental/deferred/mock/temporary項目に未充足のproduction exit criteriaがない。
+- protocol specification、migration/activation procedure、disaster recovery、monitoring、
+  capacity planning、key management、validator operationsを再現可能に文書化する。
+- supported runtime間でcanonical bytes、digests、execution effects、commitments、
+  consensus outcomes、proof verificationが一致する。
+- fuzz/property/adversarial/long-running testsと第三者security auditの重大指摘を解消する。
+- mainnet genesis前にrelease artifact、dependency、compiler、build provenanceを固定し、
+  reproducible buildとupgrade rehearsalを完了する。
 
 
 # 66. Architecture Documentation
