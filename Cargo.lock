@@ -78,6 +78,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "execution"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "canonical-encoding",
+ "hashing",
+ "objects",
+ "protocol-types",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
