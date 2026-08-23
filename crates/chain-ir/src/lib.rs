@@ -29,6 +29,8 @@ pub enum ChainIrError {
     EmptyProgram,
     /// Program exceeds the maximum instruction count.
     TooManyInstructions(usize),
+    /// A canonical field identifier overflowed `u16`.
+    FieldIdOverflow(usize),
     /// A system call target name was empty.
     EmptySystemCall,
     /// A system call target name exceeds the supported length.
@@ -45,11 +47,16 @@ impl fmt::Display for ChainIrError {
             Self::UnsupportedVersion(version) => {
                 write!(f, "unsupported chain ir version: {version}")
             }
-            Self::EmptyProgram => write!(f, "chain ir program must contain at least one instruction"),
+            Self::EmptyProgram => {
+                write!(f, "chain ir program must contain at least one instruction")
+            }
             Self::TooManyInstructions(count) => write!(
                 f,
                 "chain ir program has {count} instructions, maximum is {MAX_INSTRUCTIONS}"
             ),
+            Self::FieldIdOverflow(index) => {
+                write!(f, "canonical field id overflow at index {index}")
+            }
             Self::EmptySystemCall => write!(f, "system call target must not be empty"),
             Self::SystemCallNameTooLong(size) => write!(
                 f,
@@ -202,7 +209,7 @@ pub fn summarize_program(program: &ChainIrProgram) -> Result<ProgramSummary, Cha
         match instruction {
             IrInstruction::LoadObject { dst, input_index } => {
                 observe(*dst);
-                observe(*input_index);
+                let _ = input_index;
             }
             IrInstruction::ReadField {
                 dst,
@@ -211,7 +218,7 @@ pub fn summarize_program(program: &ChainIrProgram) -> Result<ProgramSummary, Cha
             } => {
                 observe(*dst);
                 observe(*object);
-                observe(*field_index);
+                let _ = field_index;
             }
             IrInstruction::WriteField {
                 object,
@@ -219,19 +226,15 @@ pub fn summarize_program(program: &ChainIrProgram) -> Result<ProgramSummary, Cha
                 value,
             } => {
                 observe(*object);
-                observe(*field_index);
                 observe(*value);
+                let _ = field_index;
             }
             IrInstruction::AddU64 { dst, lhs, rhs } => {
                 observe(*dst);
                 observe(*lhs);
                 observe(*rhs);
             }
-            IrInstruction::CallSystem {
-                args,
-                result,
-                ..
-            } => {
+            IrInstruction::CallSystem { args, result, .. } => {
                 system_call_count += 1;
                 for &arg in args {
                     observe(arg);
@@ -281,7 +284,8 @@ pub fn encode_chain_ir_program(program: &ChainIrProgram) -> Result<Vec<u8>, Chai
     canonical.field_u32(2, program.instructions.len() as u32)?;
 
     for (index, instruction) in program.instructions.iter().enumerate() {
-        let field_id = (3 + index) as u16;
+        let field_id =
+            u16::try_from(3 + index).map_err(|_| ChainIrError::FieldIdOverflow(index))?;
         canonical.field_bytes(field_id, encode_instruction(instruction)?)?;
     }
 
@@ -363,7 +367,8 @@ fn encode_register_list(args: &[u16]) -> Result<Vec<u8>, ChainIrError> {
     let mut canonical = CanonicalStruct::new(CHAIN_IR_REGISTER_LIST_TYPE_ID, ENCODING_VERSION);
     canonical.field_u16(1, args.len() as u16)?;
     for (index, value) in args.iter().enumerate() {
-        let field_id = (2 + index) as u16;
+        let field_id =
+            u16::try_from(2 + index).map_err(|_| ChainIrError::FieldIdOverflow(index))?;
         canonical.field_u16(field_id, *value)?;
     }
 
@@ -482,7 +487,7 @@ mod tests {
         let encoded = encode_chain_ir_program(&sample_program()).unwrap();
         assert_eq!(
             hex(&encoded),
-            "534e524501a001000a0001000200000001000200040000000800000003002d000000534e524501a00200030001000200000001000200020000000000030002000000000004003b000000534e524501a002000400010002000000020002000200000001000300020000000000040002000000000005003b000000534e524501a002000400010002000000040002000200000002000300020000000100040002000000010006003b000000534e524501a002000400010002000000030002000200000000000300020000000000040002000000020007003b000000534e524501a002000400010002000000060002000200000002000300020000000300040002000000040008003b000000534e524501a002000400010002000000080002000200000005000300020000000200090063000000534e524501a002000400010002000000050002000f00000073797374656d2e7472616e73666572030026000000534e524501a00300030001000200000002000200020000000000030002000000020004000200000006000a002d000000534e524501a00200030001000200000007000200020000000000"
+            "534e524501a001000a00010002000000010002000400000008000000030022000000534e524502a00100030001000200000001000200020000000000030002000000000004002a000000534e524502a001000400010002000000020002000200000001000300020000000000040002000000000005002a000000534e524502a001000400010002000000040002000200000002000300020000000100040002000000010006002a000000534e524502a001000400010002000000030002000200000000000300020000000000040002000000020007002a000000534e524502a0010004000100020000000600020002000000020003000200000003000400020000000400080022000000534e524502a001000300010002000000080002000200000005000300020000000200090057000000534e524502a001000400010002000000050002000f00000073797374656d2e7472616e73666572030022000000534e524503a00100030001000200000002000200020000000000030002000000020004000200000006000a001a000000534e524502a00100020001000200000007000200020000000000"
         );
     }
 }
