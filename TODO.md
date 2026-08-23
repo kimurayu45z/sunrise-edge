@@ -1,0 +1,1887 @@
+あなたはRust、分散システム、BFTコンセンサス、WebAssembly、暗号プロトコル、ゼロ知識証明に精通したシニアブロックチェーンエンジニアです。
+
+以下の設計思想に基づく、新しいproduction-grade L1 blockchainを実装してください。
+
+将来のmainnet運用、protocol upgrade、multi-cloud deployment、validator set変更、暗号アルゴリズム移行、state互換性、ZK executionを最初から前提として設計してください。
+
+
+# 0. Core Philosophy
+
+最重要原則:
+
+"A blockchain node is a state machine, not a process."
+
+従来型Blockchain Nodeのような、
+
+- 常駐daemon
+- while(true)
+- 常時接続P2P
+- persistent WebSocket
+- background worker
+- RAM上の巨大なmutable state
+
+をprotocolの前提にしてはいけません。
+
+validatorはrequest/event drivenなstate machineとして実装します。
+
+以下のruntime上で同一Node Coreを動作可能にしてください。
+
+- Cloudflare Workers
+- Vercel Functions
+- Supabase Edge Functions
+- AWS Lambda
+- Deno Deploy
+- Node.js
+- native server
+
+Cloudflare Workers等はruntime adapterに過ぎません。
+protocol/coreにvendor-specific dependencyを入れてはいけません。
+
+
+# 1. Fundamental Principles
+
+1. Node is a state machine, not a process
+2. Consensus does not require persistent processes
+3. Consensus does not require persistent connections
+4. Relay / client / schedulerはuntrusted
+5. Cloud providerはconsensus trust rootではない
+6. Object-centric versioned state
+7. ABI-driven concurrency
+8. Deterministic WASM execution
+9. Protocol upgradeabilityはfirst-class feature
+10. Native tokenをprotocol securityの前提にしない
+11. Validator bondとvoting powerを分離する
+12. Stablecoin-denominated transaction fees
+13. Validator rewardはtransaction feesを基本とする
+14. Dynamic governance-installed system modules
+15. Zero-knowledge proof friendly execution
+16. Cryptographic agilityを最初から設計する
+17. Hash algorithmはtransaction senderに選択させない
+18. Domain separationを全protocol hash/signatureに適用する
+19. Global mutable state/global mutexは禁止
+20. Massive stateでもserverless execution可能にする
+
+
+# 2. Technology Stack
+
+Core:
+- Rust
+
+Smart Contracts:
+- WebAssembly
+- Rustをfirst-class smart contract languageとする
+
+Canonical WASM Execution:
+- Rust製deterministic interpreter
+- wasmi等を候補とする
+
+Optional Optimized Execution:
+- Wasmtime
+- native/JIT/AOT
+- platform-specific accelerators
+
+ただしoptimized engineはcanonical semanticsを変更してはいけません。
+
+
+# 3. Repository Structure
+
+workspace/
+  Cargo.toml
+
+  crates/
+    protocol-types/
+    protocol-config/
+    canonical-encoding/
+    crypto/
+    hashing/
+    commitments/
+    objects/
+    abi/
+    execution/
+    chain-ir/
+    system-modules/
+    fees/
+    bonds/
+    validator-set/
+    consensus/
+    fast-path/
+    governance/
+    upgrades/
+    migrations/
+    zk/
+    node-core/
+    runtime/
+
+  adapters/
+    memory/
+    native-http/
+    cloudflare-workers/
+    vercel/
+    supabase/
+    aws-lambda/
+    deno/
+
+  sdk/
+    rust/
+    typescript/
+
+  contracts/
+    system/
+    examples/
+
+  tests/
+    integration/
+    adversarial/
+    upgrade/
+    determinism/
+    cryptography/
+    zk/
+
+
+# 4. Canonical Encoding
+
+Hash functionの選択以上に、
+「何をhash/signするか」のbyte representationを厳密に定義してください。
+
+protocol-criticalな型についてcanonical serializationを定義する。
+
+要件:
+
+- deterministic
+- injective
+- versioned
+- platform independent
+- architecture independent
+- map iteration orderに依存しない
+- float禁止
+- ambiguous concatenation禁止
+- length framing必須
+- enum discriminant明示
+- integer endian明示
+
+単純な
+
+H(a || b || c)
+
+は禁止。
+
+canonical framingを使用する。
+
+例:
+
+[protocol magic]
+[type/domain id]
+[encoding version]
+[field count]
+[field id]
+[field length]
+[field bytes]
+...
+
+
+# 5. Cryptographic Agility
+
+Hash algorithmを一種類へハードコードしない。
+
+ただしtransaction senderやsmart contractが
+consensus-critical hash algorithmを自由に選択できる設計にはしない。
+
+原則:
+
+"Hash algorithms are agile, but never negotiable per transaction."
+
+protocol/epochごとにHashSuiteを固定する。
+
+
+# 6. Self-Describing Digest
+
+裸の32-byte hashをprotocol typeとして乱用しない。
+
+例:
+
+#[repr(u16)]
+enum HashAlgorithmId {
+    Sha2_256   = 0x0001,
+    Sha3_256   = 0x0002,
+    Blake3_256 = 0x0003,
+}
+
+struct Digest32 {
+    algorithm: HashAlgorithmId,
+    bytes: [u8; 32],
+}
+
+algorithm identifierはcanonical serializationに含める。
+
+Digestは原則としてself-describingにする。
+
+
+# 7. Hash Suite
+
+用途ごとのhash algorithmをProtocolConfigで管理する。
+
+struct HashSuite {
+    id: HashSuiteId,
+
+    transaction_hash: HashAlgorithmId,
+    object_digest: HashAlgorithmId,
+    effects_hash: HashAlgorithmId,
+    code_hash: HashAlgorithmId,
+    config_hash: HashAlgorithmId,
+    certificate_hash: HashAlgorithmId,
+}
+
+Transaction自身がHashAlgorithmIdを自由指定してはいけない。
+
+使用するHashSuiteは:
+
+chain_id
+protocol_version
+epoch
+
+から一意に決定する。
+
+
+# 8. Genesis Hash Policy
+
+Genesisでは保守性を優先する。
+
+第一候補:
+
+SHA-256
+
+用途:
+
+- TransactionHash
+- ObjectDigest
+- ExecutionEffectsHash
+- CodeHash
+- ProtocolConfigHash
+- CertificateHash
+
+SHA3-256も最初からimplementation supportしておき、
+将来のalgorithm migration先として利用可能にする。
+
+BLAKE3は高速hashとしてsupportしてよいが、
+Genesis consensus root cryptographyとして必須にはしない。
+
+重要:
+
+HashAlgorithm implementationはinterfaceで抽象化する。
+
+
+# 9. Hash API
+
+例:
+
+trait HashFunction {
+    fn algorithm_id(&self) -> HashAlgorithmId;
+
+    fn hash(
+        &self,
+        domain: HashDomain,
+        protocol_version: ProtocolVersion,
+        chain_id: ChainId,
+        canonical_payload: &[u8],
+    ) -> Digest32;
+}
+
+Hash関数呼び出し側が勝手なprefixを作らない。
+
+domain separation framingはhashing crateで一元管理する。
+
+
+# 10. Domain Separation
+
+すべてのprotocol hashに明示的なdomain separationを適用する。
+
+例:
+
+enum HashDomain {
+    Transaction,
+    Object,
+    ExecutionEffects,
+    ContractCode,
+    ProtocolConfig,
+    Certificate,
+    ValidatorSet,
+    GovernanceAction,
+    SystemModule,
+    Migration,
+    StateNode,
+}
+
+hash inputの概念形:
+
+Hash(
+    MAGIC
+    || HashAlgorithmId
+    || HashDomain
+    || DomainVersion
+    || ChainId
+    || ProtocolVersion
+    || PayloadLength
+    || CanonicalPayload
+)
+
+ただし実際には単純concatではなくcanonical framingを使う。
+
+
+# 11. Signature Domain Separation
+
+署名対象も同様にdomain separationする。
+
+署名domainには最低限:
+
+- chain_id
+- protocol_version
+- epoch
+- message_type
+- signature_scheme_id
+
+を含める。
+
+cross-chain replay
+cross-message replay
+cross-version replay
+
+を防ぐ。
+
+
+# 12. Hash Suite Upgrade
+
+HashSuiteはfuture epochで切り替え可能にする。
+
+GovernanceAction:
+
+ScheduleHashSuite {
+    new_suite: HashSuiteId,
+    activation_epoch: Epoch,
+}
+
+即時切替は禁止。
+
+例:
+
+Epoch 1:
+HashSuiteV1 = SHA-256
+
+Epoch 500:
+HashSuiteV2 = SHA3-256
+
+古いDigestはalgorithm IDを保持するため、
+読み取り可能でなければならない。
+
+
+# 13. No Global Rehash Migration
+
+HashSuite変更時に全historical stateを一括rehashしてはいけない。
+
+例:
+
+Object@41
+digest = SHA2_256:abc...
+
+Epoch transition
+
+Object@42
+digest = SHA3_256:def...
+
+古いObjectRefは旧algorithm identifier付きで有効。
+
+更新されたversionから新HashSuiteを使える設計にする。
+
+100TB stateでもhash migrationのために一括scanを要求してはいけない。
+
+
+# 14. Adding Consensus-Critical Hash Algorithms
+
+System Moduleとconsensus hash algorithmを区別する。
+
+System Module内のcrypto primitive:
+- governance transactionだけで追加可能
+
+Consensus-critical hash algorithm:
+- node implementationが対応済みであること
+- protocol upgradeまたはsupported algorithm activationを経ること
+
+未知のconsensus hash algorithmを
+WASM moduleとして勝手に解釈してcore trust rootへ使用してはいけない。
+
+
+# 15. Commitment Schemes are Separate from General Hashes
+
+HashAlgorithmIdとCommitmentSchemeIdを分離する。
+
+ZK/state commitmentはgeneral-purpose transaction hashingとは別問題として扱う。
+
+例:
+
+enum CommitmentSchemeId {
+    SparseMerkleSha256V1,
+    SparseMerklePoseidon2Bn254V1,
+    SparseMerklePoseidon2Bls12381V1,
+}
+
+Poseidon2の場合は単に"Poseidon2"とだけ記録しない。
+
+最低限以下をschemeとして固定する:
+
+- finite field
+- width
+- rate/capacity
+- round parameters
+- constants version
+- tree construction
+- leaf encoding
+- node encoding
+- domain separation
+
+
+# 16. State Model
+
+EVM型global key-value storageは禁止。
+
+Versioned Object Modelを採用する。
+
+struct Object {
+    id: ObjectId,
+    version: u64,
+    owner: Owner,
+    type_hash: Digest32,
+    schema_version: u32,
+    data: Vec<u8>,
+}
+
+enum Owner {
+    Address(Address),
+    Shared,
+    Immutable,
+    System,
+}
+
+struct ObjectRef {
+    id: ObjectId,
+    version: u64,
+    digest: Digest32,
+}
+
+Object data:
+
+(ObjectId, Version)
+    -> immutable blob
+
+Object head:
+
+ObjectId
+    -> latest version / latest digest
+
+Object lock:
+
+(ObjectId, Version)
+    -> TxHash
+
+
+# 17. Transactions Declare State Access
+
+transactionはアクセスするObjectを事前宣言する。
+
+enum AccessMode {
+    Read,
+    Write,
+    Consume,
+}
+
+将来的に:
+
+Create
+Append
+Commutative(Operation)
+
+を追加可能にする。
+
+例:
+
+CommutativeAdd
+AppendOnly
+CRDT-like operation
+
+
+# 18. ABI as Execution and Concurrency Protocol
+
+ABIはfunction signatureだけではない。
+
+以下を含むprotocol-level manifestとする。
+
+- function types
+- argument schema
+- Object types
+- Read / Write / Consume
+- ownership rules
+- capabilities
+- execution limits
+- system module usage
+- expected access paths
+
+Rust contract例:
+
+#[entry]
+pub fn transfer(
+    token: Read<Token>,
+    from: Write<Balance>,
+    to: Write<Balance>,
+    amount: u128,
+)
+
+↓
+
+AccessManifest {
+    token: Read,
+    from: Write,
+    to: Write,
+}
+
+contractはtransactionで宣言されていないObjectへアクセスできない。
+
+違反時はexecution trap。
+
+
+# 19. Fine-Grained Parallelism
+
+将来的にはObject単位より細かいaccess pathも表現可能にする。
+
+例:
+
+Write(
+    object = DEX,
+    path = pool[ETH_USDC]
+)
+
+Tx1:
+DEX.pool[ETH_USDC]
+
+Tx2:
+DEX.pool[BTC_USDC]
+
+なら競合しない。
+
+AccessKey:
+
+(ObjectId, ObjectPath)
+
+まで拡張可能にする。
+
+
+# 20. Serverless Node Architecture
+
+validator invocation:
+
+Request/Event
+    ↓
+load only required persistent state
+    ↓
+NodeCore.handle_event()
+    ↓
+deterministic state transition
+    ↓
+atomic persistence / CAS
+    ↓
+signed response / outbound messages
+    ↓
+return
+    ↓
+process disappears
+
+process memoryはprotocol stateではない。
+
+
+# 21. Node Core API
+
+pub async fn handle_event<R: Runtime>(
+    runtime: &R,
+    config: &NodeConfig,
+    event: NodeEvent,
+) -> Result<NodeOutput>;
+
+enum NodeEvent {
+    SubmitTransaction(Transaction),
+    ReceiveVote(Vote),
+    ReceiveCertificate(Certificate),
+    ReceiveConsensusMessage(ConsensusMessage),
+    ApplyGovernanceCertificate(GovernanceCertificate),
+    ApplyProtocolUpgrade(ProtocolUpgradeCertificate),
+    ApplyValidatorSetChange(ValidatorSetChangeCertificate),
+    Tick(Tick),
+}
+
+struct NodeOutput {
+    responses: Vec<NodeResponse>,
+    outbound_messages: Vec<OutboundMessage>,
+}
+
+node-core内部で禁止:
+
+spawn()
+while(true)
+background jobs
+persistent sockets
+global mutable state
+
+
+# 22. Runtime Abstraction
+
+trait StateStore
+trait BlobStore
+trait Signer
+trait Transport
+trait Clock
+trait Scheduler
+
+等に分割する。
+
+StateStoreには最低限:
+
+get
+put
+compare_and_swap
+atomic conditional update
+
+を用意する。
+
+
+# 23. Untrusted Transport
+
+validator間常時P2Pを要求しない。
+
+messageを運ぶ主体は:
+
+- client
+- browser
+- RPC provider
+- relay
+- validator
+- keeper
+
+誰でもよい。
+
+relayは:
+
+drop
+duplicate
+reorder
+delay
+replay
+mutate
+
+できる前提。
+
+protocol safetyはcryptographic signatureとpersistent stateに依存する。
+
+
+# 24. Fast Path
+
+Owned / non-conflicting Object transactionはglobal consensus orderingなしで処理可能にする。
+
+validator:
+
+1. chain_id verify
+2. protocol_version verify
+3. epoch verify
+4. sender signature verify
+5. fee payment verify
+6. ObjectRef verify
+7. ABI / AccessManifest verify
+8. conflict check
+9. deterministic execution
+10. Object version lock
+11. execution effects hash
+12. Vote署名
+13. response
+
+validator同士の直接通信を必須にしない。
+
+
+# 25. Vote
+
+struct Vote {
+    chain_id: ChainId,
+    protocol_version: ProtocolVersion,
+    epoch: Epoch,
+
+    validator: ValidatorId,
+
+    tx_hash: Digest32,
+    execution_effects_hash: Digest32,
+
+    signature: Signature,
+}
+
+
+# 26. Certificate
+
+struct FastCertificate {
+    chain_id: ChainId,
+    protocol_version: ProtocolVersion,
+    epoch: Epoch,
+
+    tx_hash: Digest32,
+    execution_effects_hash: Digest32,
+
+    votes: Vec<Vote>,
+}
+
+quorum certificate成立後にcommit。
+
+certificate処理は完全idempotent。
+
+
+# 27. Shared Object Consensus
+
+Shared / conflicting ObjectのみBFT orderingへ送る。
+
+trait ConsensusEngine {
+    fn protocol_id(&self) -> ConsensusProtocolId;
+
+    fn on_event(
+        ...
+    ) -> Result<ConsensusOutput>;
+}
+
+候補:
+
+- HotStuff-derived event-driven BFT
+- DAG-BFT
+- Mysticeti-like architecture
+
+daemonを前提にしない。
+
+
+# 28. Timeout Model
+
+timeoutはNodeEvent::Tickとして外部入力する。
+
+Tick senderはuntrusted。
+
+利用可能:
+
+Cloudflare Cron
+Vercel Cron
+Supabase cron
+AWS EventBridge
+client
+random keeper
+
+protocol自身がepoch/view/deadlineを検証する。
+
+
+# 29. Validator Security Model
+
+Native token stakingを必須としない。
+
+以下を分離:
+
+Validator Identity
+Validator Membership
+Validator Voting Power
+Validator Bond
+Validator Economics
+
+
+# 30. Genesis Validator Model
+
+Genesis時点ではbond tokenが存在しない可能性がある。
+
+したがってpermissioned validator setでchainを起動可能にする。
+
+例:
+
+V1
+V2
+V3
+V4
+
+AdmissionPolicy:
+GenesisPermissioned
+
+BondAssets:
+empty
+
+BondRequirement:
+None
+
+
+# 31. Bond Assets After Genesis
+
+Stablecoin contractがdeployされた後、
+governance transactionでbond assetとして登録可能にする。
+
+例:
+
+Deploy USDC contract
+
+↓
+
+GovernanceTx:
+AddBondAsset {
+    asset_id: USDC,
+    min_bond: ...,
+}
+
+↓
+
+ScheduleValidatorPolicy {
+    activation_epoch: 100,
+    policy: BondAndGovernance,
+}
+
+
+# 32. Bond != Voting Power
+
+bond amountはvoting powerを増やさない。
+
+例:
+
+100,000 USDC bond
+-> voting power 1
+
+10,000,000 USDC bond
+-> voting power 1
+
+bondの目的:
+
+- Sybil cost
+- slashable collateral
+- validator eligibility
+
+wealth-based voting powerにはしない。
+
+
+# 33. Validator Admission Policies
+
+enum ValidatorAdmissionPolicy {
+    GenesisPermissioned,
+    GovernancePermissioned,
+    BondAndGovernance,
+    BondRequired,
+}
+
+想定transition:
+
+GenesisPermissioned
+    ↓
+BondAndGovernance
+    ↓
+必要ならBondRequired
+
+
+# 34. Bond Asset Config
+
+struct BondAssetConfig {
+    asset_id: AssetId,
+    min_bond: Amount,
+    enabled: bool,
+    unbonding_epochs: u64,
+    max_validator_exposure: Option<Amount>,
+}
+
+
+# 35. Bond Object
+
+struct BondObject {
+    validator_id: ValidatorId,
+    asset_id: AssetId,
+    amount: Amount,
+    bonded_epoch: Epoch,
+    unlock_epoch: Option<Epoch>,
+}
+
+bond:
+
+Stablecoin Object
+    ↓
+BondObject
+
+unbond:
+
+request_unbond
+    ↓
+unbonding period
+    ↓
+withdraw
+
+unbonding period中はslash可能。
+
+
+# 36. Slashing
+
+cryptographically provable misconductのみslash対象。
+
+Slash:
+
+- same Object versionへのconflicting vote
+- consensus equivocation
+- conflicting finalized statements
+- cryptographically provable double-signing
+
+原則Slashしない:
+
+- offline
+- slow response
+- request timeout
+- provider outage
+- Cloudflare outage
+- Vercel outage
+
+liveness failureとByzantine evidenceを明確に分離する。
+
+
+# 37. Stablecoin Transaction Fees
+
+native gas tokenは必須にしない。
+
+struct FeePayment {
+    asset: AssetId,
+    max_fee: Amount,
+    fee_object: ObjectRef,
+}
+
+approved stablecoin等で直接fee payment可能。
+
+
+# 38. Fee Asset Registry
+
+GovernanceAction:
+
+AddFeeAsset
+DisableFeeAsset
+UpdateFeeAssetParameters
+
+を実装。
+
+canonical AssetIdを使用し、
+symbol stringをidentityとして使わない。
+
+
+# 39. Deterministic Fee Calculation
+
+float禁止。
+
+内部canonical unitを使用。
+
+例:
+
+1 USD = 1_000_000 fee units
+
+Fee:
+
+base_fee
++ execution_units * execution_price
++ state_read_units * read_price
++ state_write_units * write_price
++ storage_units * storage_price
++ system_module_units
+
+
+# 40. Validator Fee Revenue
+
+inflation rewardをprotocol前提にしない。
+
+transaction fee:
+
+Transaction Fee
+    ↓
+Certificate Signers
+    ↓
+stablecoin distribution
+
+certificate signer setからdeterministically計算。
+
+
+# 41. Fee Settlement Separation
+
+Phase A:
+TransactionExecutionEffects
+
+Phase B:
+Certificate
+
+Phase C:
+FeeSettlementEffects
+
+最終signer set確定後にfee distributionを計算する。
+
+rounding remainderのrecipientもcanonicalに決定する。
+
+
+# 42. WASM Smart Contracts
+
+禁止:
+
+network
+filesystem
+wall clock
+OS randomness
+arbitrary external I/O
+arbitrary global state lookup
+
+許可:
+
+declared object read
+declared object write
+object create
+object consume
+event emit
+crypto functions
+system module calls
+deterministic protocol context
+
+
+# 43. Execution Engine
+
+trait ExecutionEngine {
+    fn execute(
+        &self,
+        protocol_version: ProtocolVersion,
+        module: &[u8],
+        entrypoint: &str,
+        inputs: &[ResolvedObject],
+        args: &[u8],
+    ) -> Result<ExecutionEffects>;
+}
+
+Canonical:
+deterministic WASM interpreter
+
+Optional:
+native/JIT/AOT
+
+output equivalence必須。
+
+
+# 44. Chain IR
+
+WASMを最終protocol semanticsへ固定しすぎず、
+versioned deterministic Chain IRを導入できる設計にする。
+
+Rust
+ ↓
+WASM
+ ↓
+Chain IR
+ ↓
+Execution
+
+IR例:
+
+LOAD_OBJECT
+READ_FIELD
+WRITE_FIELD
+ADD_U64
+CALL_SYSTEM
+CREATE_OBJECT
+CONSUME_OBJECT
+EMIT_EVENT
+
+Chain IR:
+
+- deterministic
+- versioned
+- bounded
+- statically inspectable
+- ZK-friendly
+
+
+# 45. ZK Architecture
+
+                Chain IR
+                   ↓
+       ┌───────────┼───────────┐
+       ↓           ↓           ↓
+ Interpreter   Native/JIT    ZK Prover
+
+初期は:
+
+canonical interpreter
+    ↓
+RISC-V zkVM
+
+等のbackendを許容。
+
+将来的にChain IR専用proverへ変更可能。
+
+
+# 46. Execution Proof
+
+struct ExecutionProof {
+    proof_system: ProofSystemId,
+
+    tx_hash: Digest32,
+
+    input_commitment: Commitment,
+
+    output_commitment: Commitment,
+
+    proof_bytes: Vec<u8>,
+}
+
+初期:
+validator quorum
+
+将来:
+validator quorum + execution proof
+
+さらに将来:
+proof verification中心のvalidator execution
+
+を可能にする。
+
+
+# 47. ZK-Friendly State Commitment
+
+transaction access setが事前確定していることを利用する。
+
+StateRoot
+
+├ proof A@12
+├ proof B@44
+└ proof C@8
+
+      ↓
+
+execution
+
+      ↓
+
+A@13
+B@45
+C@9
+
+      ↓
+
+NewStateRoot
+
+state commitment schemeはCommitmentSchemeIdで明示する。
+
+
+# 48. Dynamic System Modules
+
+precompile追加のためにnode binary updateを必須にしない。
+
+"precompile"をSystem Moduleへ一般化する。
+
+Governance Transaction
+    ↓
+SystemModuleRegistry
+    ↓
+activation
+    ↓
+contractから利用
+
+
+# 49. System Module
+
+struct SystemModule {
+    module_id: ModuleId,
+    version: u64,
+
+    canonical_code_hash: Digest32,
+    semantics_hash: Digest32,
+    manifest_hash: Digest32,
+
+    activation_epoch: Epoch,
+    status: ModuleStatus,
+}
+
+canonical implementationはportable deterministic codeを使用する。
+
+
+# 50. System Module Manifest
+
+struct SystemModuleManifest {
+    module_id: ModuleId,
+
+    input_schema: TypeSchema,
+    output_schema: TypeSchema,
+
+    max_input_size: u64,
+
+    gas_model: GasModel,
+
+    zk_hint: Option<ZkHint>,
+}
+
+
+# 51. Governance-Installed Crypto Modules
+
+protocol upgradeなしでGovernance Transactionにより追加可能:
+
+- Poseidon2
+- SHA variants
+- secp256k1 utilities
+- Ed25519 utilities
+- BLS utilities
+- Groth16 verifier
+- Plonk verifier
+- future crypto primitives
+
+ただしこれらはSystem Module level。
+
+TxHash等のconsensus root primitiveとは明確に分ける。
+
+
+# 52. Native System Module Acceleration
+
+native optimized implementationはoptional。
+
+CanonicalSystemModule(input)
+==
+NativeImplementation(input)
+
+であること。
+
+native implementation非対応validatorでも参加可能にする。
+
+
+# 53. ZK System Module Acceleration
+
+System Moduleにはzk_hintを設定可能。
+
+例:
+
+CALL_SYSTEM POSEIDON2
+
+をZK backendで専用gadgetへ置換可能にする。
+
+canonical semanticsとのequivalenceを保証する。
+
+
+# 54. Protocol Versioning
+
+type ProtocolVersion = u64;
+
+protocol-critical messageには必ず:
+
+chain_id
+protocol_version
+epoch
+
+を含める。
+
+unknown protocol version:
+reject
+
+silent fallback:
+禁止
+
+
+# 55. ProtocolConfig
+
+struct ProtocolConfig {
+    protocol_version: ProtocolVersion,
+
+    hash_suite: HashSuiteId,
+
+    commitment_scheme: CommitmentSchemeId,
+
+    execution_rules: ExecutionRules,
+
+    gas_schedule: GasSchedule,
+
+    fee_assets: FeeAssetConfig,
+
+    bond_assets: BondAssetConfig,
+
+    validator_policy: ValidatorPolicy,
+
+    consensus_parameters: ConsensusParameters,
+
+    object_rules: ObjectRules,
+
+    feature_flags: FeatureFlags,
+}
+
+ProtocolConfig自身もcanonical encodingしてhashする。
+
+
+# 56. Protocol Upgrade
+
+struct ProtocolUpgrade {
+    from_version: ProtocolVersion,
+    to_version: ProtocolVersion,
+
+    activation_epoch: Epoch,
+
+    new_config_hash: Digest32,
+
+    migration_hash: Option<Digest32>,
+
+    compatibility_policy: CompatibilityPolicy,
+}
+
+future epoch activationのみ。
+
+
+# 57. Governance
+
+trait GovernanceEngine {
+    fn verify_action(
+        action: &GovernanceAction,
+        certificate: &GovernanceCertificate,
+    ) -> Result<()>;
+}
+
+GovernanceAction例:
+
+RegisterSystemModule
+ActivateSystemModule
+DeactivateSystemModule
+
+AddFeeAsset
+DisableFeeAsset
+
+AddBondAsset
+DisableBondAsset
+
+ChangeValidatorAdmissionPolicy
+
+AddValidator
+RemoveValidator
+ScheduleValidatorSet
+
+ScheduleHashSuite
+ScheduleCommitmentScheme
+
+ScheduleProtocolUpgrade
+
+
+# 58. State Migration
+
+全state一括migration禁止。
+
+Objectにschema_versionを持たせる。
+
+lazy migration:
+
+Old Object
+    ↓
+deterministic migration function
+    ↓
+New Object
+
+migration functionもhash/versionで識別する。
+
+
+# 59. Genesis to Bonded Network Transition
+
+以下をprotocol-native lifecycleとして実装する。
+
+Genesis
+    ↓
+
+permissioned validator set
+bond assets = empty
+
+    ↓
+
+chain starts
+
+    ↓
+
+stablecoin contract deployed
+
+    ↓
+
+Governance:
+AddFeeAsset(USDC)
+
+    ↓
+
+Governance:
+AddBondAsset(USDC)
+
+    ↓
+
+Governance:
+ScheduleValidatorPolicy(
+    BondAndGovernance,
+    activation_epoch = N
+)
+
+    ↓
+
+grace period
+
+    ↓
+
+validators bond USDC
+
+    ↓
+
+Epoch N
+
+BondAndGovernance activated
+
+
+# 60. Runtime Adapters
+
+Cloudflare:
+- Workers
+- Durable Objects / D1 abstraction
+- R2
+
+Vercel:
+- Functions
+- Postgres-compatible StateStore
+- Blob/S3-compatible storage
+
+Supabase:
+- Edge Functions
+- Postgres
+- Storage
+
+AWS:
+- Lambda
+- DynamoDB/Postgres
+- S3
+
+Deno:
+- Edge/serverless adapter
+
+Cloudflare-specific semanticsをprotocol safety requirementにしない。
+
+
+# 61. Security Invariants
+
+Invariant 1:
+honest validatorは同一Object versionのconflicting transactionsへ二重voteしない。
+
+Invariant 2:
+quorum certificateなしにcommitted stateを変更できない。
+
+Invariant 3:
+同じcertificateから全validatorが同じstate transitionを導出する。
+
+Invariant 4:
+relayをtrustしない。
+
+Invariant 5:
+schedulerをtrustしない。
+
+Invariant 6:
+cloud providerをtrustしない。
+
+Invariant 7:
+process memoryをprotocol stateにしない。
+
+Invariant 8:
+protocol version mismatchはreject。
+
+Invariant 9:
+fee calculationはdeterministic。
+
+Invariant 10:
+fee settlementはdeterministic。
+
+Invariant 11:
+bond amountはvoting powerを増やさない。
+
+Invariant 12:
+slashにはcryptographic evidenceが必要。
+
+Invariant 13:
+native optimizationはcanonical semanticsを変更できない。
+
+Invariant 14:
+same transaction + same inputs + same protocol config
+から全runtimeで同じeffects hashを生成する。
+
+Invariant 15:
+HashSuiteはtransaction senderがnegotiationできない。
+
+Invariant 16:
+hash domain間でcross-protocol collision semanticsを共有しない。
+
+Invariant 17:
+HashSuite変更時もhistorical digestを検証可能。
+
+Invariant 18:
+unknown hash algorithmをsilent fallbackしない。
+
+Invariant 19:
+general-purpose hashとZK commitment schemeを混同しない。
+
+Invariant 20:
+normal executionとZK executionが同じstate transition semanticsを持つ。
+
+
+# 62. Required Cryptographic Tests
+
+必須:
+
+1. canonical encoding test vectors
+2. HashDomain test vectors
+3. SHA-256 hash vectors
+4. SHA3-256 hash vectors
+5. Digest algorithm ID serialization vectors
+6. cross-domain hashが異なること
+7. cross-chain hashが異なること
+8. cross-protocol-version hashが異なること
+9. equivalent structured payloadが同一canonical bytesになること
+10. ambiguous structured payloadが同一bytesにならないこと
+11. old HashSuite digest verification
+12. HashSuite epoch transition
+13. unknown HashAlgorithmId rejection
+14. unknown CommitmentSchemeId rejection
+15. no silent fallback
+
+
+# 63. Required Integration Tests
+
+Test 1:
+4 validators
+f=1
+quorum=3
+
+Alice -> Bob transaction
+
+certificate成立後、
+全validatorで同じdigest。
+
+
+Test 2:
+same Object version conflict
+double vote禁止。
+
+
+Test 3:
+independent Objects
+parallel execution可能。
+
+
+Test 4:
+certificate replay/idempotency。
+
+
+Test 5:
+requestごとにNode process完全破棄。
+
+
+Test 6:
+relay reorder/duplicate/delay/stale。
+
+
+Test 7:
+stablecoin transaction fee。
+
+
+Test 8:
+vote arrival orderが異なってもfee settlement一致。
+
+
+Test 9:
+Genesis permissioned modeでbond無しにchain起動。
+
+
+Test 10:
+stablecoin deployment後AddBondAsset。
+
+
+Test 11:
+BondAndGovernance future activation。
+
+
+Test 12:
+validator stablecoin bond。
+
+
+Test 13:
+bond額によらずequal voting power。
+
+
+Test 14:
+equivocation slash。
+
+
+Test 15:
+offlineのみではslashしない。
+
+
+Test 16:
+Protocol Version N -> N+1。
+
+
+Test 17:
+old epoch replay rejection。
+
+
+Test 18:
+lazy migration。
+
+
+Test 19:
+GovernanceのみでSystem Module追加。
+
+
+Test 20:
+node binary updateなしでportable System Module実行。
+
+
+Test 21:
+native System Module equivalence。
+
+
+Test 22:
+ZK gadget equivalence。
+
+
+Test 23:
+normal execution / ZK execution effects hash一致。
+
+
+Test 24:
+Cloudflare/native adapterでeffects hash一致。
+
+
+Test 25:
+HashSuiteV1 SHA-256でObject作成。
+
+
+Test 26:
+future epochでHashSuiteV2へ移行。
+
+
+Test 27:
+旧SHA-256 ObjectRefを新epochで正しくread。
+
+
+Test 28:
+Object更新後は新HashSuite digestを使用。
+
+
+Test 29:
+global state rehash無しにmigration可能。
+
+
+Test 30:
+HashAlgorithmId/domain/versionを変更するとhashが必ず変化。
+
+
+# 64. Coding Requirements
+
+production-quality Rust。
+
+必須:
+
+- unsafe原則禁止
+- library codeのunwrap乱用禁止
+- typed errors
+- thiserror等
+- structured logging
+- metrics abstraction
+- deterministic serialization
+- canonical cryptographic framing
+- no global mutable state
+- no background tasks in node-core
+- no vendor dependency in protocol core
+- domain-separated hashes
+- domain-separated signatures
+- explicit chain_id
+- explicit epoch
+- explicit protocol_version
+- explicit HashAlgorithmId
+- explicit CommitmentSchemeId
+- serialization test vectors
+- cryptographic test vectors
+- property-based testing
+- fuzz testing
+- adversarial tests
+- cross-runtime determinism tests
+- public API doc comments
+
+
+# 65. Implementation Order
+
+Phase 1:
+- workspace
+- protocol primitives
+- canonical encoding
+- HashAlgorithmId
+- Digest types
+- HashDomain
+- HashSuite
+- SHA-256 implementation
+- SHA3-256 implementation
+- crypto/signatures
+- cryptographic test vectors
+
+Phase 2:
+- Object model
+- ObjectRef
+- access modes
+- ABI
+
+Phase 3:
+- Runtime abstraction
+- MemoryRuntime
+- persistence layout
+
+Phase 4:
+- Validator identity
+- Genesis validator set
+- Epoch model
+
+Phase 5:
+- Fast Path
+- Object locks
+- Vote
+- Certificate
+
+Phase 6:
+- Fee asset registry
+- stablecoin fees
+- validator fee distribution
+
+Phase 7:
+- Bond assets
+- BondObject
+- slashing evidence
+- validator admission
+
+Phase 8:
+- Governance
+- GenesisPermissioned -> BondAndGovernance
+
+Phase 9:
+- deterministic WASM ExecutionEngine
+- Rust contract SDK
+
+Phase 10:
+- Chain IR
+
+Phase 11:
+- System Module Registry
+- governance-installed precompiles
+- native acceleration
+
+Phase 12:
+- Protocol upgrades
+- HashSuite upgrades
+- FeatureFlags
+- lazy migrations
+
+Phase 13:
+- Shared Object consensus
+
+Phase 14:
+- CommitmentScheme abstraction
+- Poseidon2-based experimental ZK commitment suite
+- execution proof interfaces
+
+Phase 15:
+- native HTTP adapter
+
+Phase 16:
+- Cloudflare Workers adapter
+
+Phase 17:
+- Vercel / Supabase / AWS / Deno adapters
+
+
+# 66. Architecture Documentation
+
+実装前にARCHITECTURE.mdを作成してください。
+
+最低限以下を明文化する:
+
+1. overall architecture
+2. crate boundaries
+3. canonical serialization rules
+4. hash architecture
+5. HashSuite lifecycle
+6. hash domain separation
+7. commitment scheme architecture
+8. signature domain separation
+9. Object lifecycle
+10. Transaction lifecycle
+11. Fast Path lifecycle
+12. Certificate lifecycle
+13. persistent state layout
+14. validator lifecycle
+15. Genesis bootstrap
+16. bond lifecycle
+17. slashing lifecycle
+18. stablecoin fee lifecycle
+19. governance lifecycle
+20. epoch transition
+21. protocol upgrade lifecycle
+22. hash algorithm migration lifecycle
+23. System Module lifecycle
+24. WASM / Chain IR execution
+25. ZK execution architecture
+26. security invariants
+27. failure scenarios
+28. serverless runtime constraints
+
+
+ARCHITECTURE.md完成後は停止せず、
+そのまま実装してください。
+
+各Phaseごとに:
+
+cargo fmt --check
+cargo clippy --all-targets --all-features
+cargo test --all
+
+を通してください。
+
+architecture上の矛盾を発見した場合は、
+場当たり的なhackを入れず、
+ARCHITECTURE.mdへdecision recordを追加してから修正してください。
+
+
+# 67. Highest Priority
+
+architectureの中心に置くもの:
+
+- Serverless-native validator
+- No daemon requirement
+- Object-centric state
+- ABI-driven parallel execution
+- Fast path for non-conflicting transactions
+- Deterministic WASM
+- Rust-first smart contracts
+- Native-token-independent security
+- Permissioned genesis bootstrap
+- Stablecoin validator bonds
+- Bond amount independent from voting power
+- Stablecoin transaction fees
+- Direct validator fee revenue
+- Dynamic governance-installed system modules
+- Protocol upgradeability
+- Cryptographic agility
+- Self-describing digests
+- Strict domain separation
+- SHA-256 as conservative Genesis general-purpose hash
+- SHA3-256 supported as migration alternative
+- No per-transaction hash negotiation
+- No global rehash migrations
+- Separate general-purpose hash and ZK commitment schemes
+- Lazy state migration
+- ZK-friendly execution
+- Multi-cloud / edge portability
+
+最重要の思想は以下です。
+
+"A blockchain node is not a continuously running server.
+It is a deterministic state-transition function over cryptographically authenticated events and persistent state."
+
+また暗号設計については、
+
+"Hash algorithms are agile, but never negotiable per transaction."
+
+を原則としてください。
+
+高速性だけを理由に暗号primitiveを選定せず、
+保守性、標準化、長期互換性、algorithm migration、
+domain separation、canonical encoding、ZK suitabilityを
+用途ごとに評価してください。
