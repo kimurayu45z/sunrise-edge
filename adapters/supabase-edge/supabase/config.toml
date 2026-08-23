@@ -1,0 +1,6 @@
+project_id = "sunrise-edge"
+
+[functions.sunrise-edge]
+enabled = true
+verify_jwt = true
+entrypoint = "./functions/sunrise-edge/index.ts"
