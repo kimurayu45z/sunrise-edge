@@ -1,12 +1,9 @@
 [package]
-name = "governance"
+name = "system-modules"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
-version.workspace = true
 
 [dependencies]
-bonds.workspace = true
 canonical-encoding.workspace = true
 protocol-types.workspace = true
-runtime.workspace = true
-system-modules.workspace = true

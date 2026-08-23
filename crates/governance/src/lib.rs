@@ -24,6 +24,7 @@ use core::fmt;
 use protocol_types::Epoch;
 use runtime::ValidatorId;
 use std::error::Error;
+use system_modules::{SystemModule, SystemModuleError, encode_system_module};
 
 const GOVERNANCE_ACTION_TYPE_ID: u16 = 0x9001;
 const GOVERNANCE_PROPOSAL_TYPE_ID: u16 = 0x9002;
@@ -51,6 +52,8 @@ pub enum GovernanceError {
     InvalidGenesisTransitionTarget(ValidatorAdmissionPolicy),
     /// Canonical encoding failed.
     CanonicalEncoding(CanonicalEncodingError),
+    /// System module registry action was invalid.
+    SystemModule(SystemModuleError),
 }
 
 impl fmt::Display for GovernanceError {
@@ -67,6 +70,7 @@ impl fmt::Display for GovernanceError {
                 "GenesisPermissioned can only transition to BondAndGovernance, not {policy:?}"
             ),
             Self::CanonicalEncoding(error) => error.fmt(f),
+            Self::SystemModule(error) => error.fmt(f),
         }
     }
 }
@@ -76,6 +80,12 @@ impl Error for GovernanceError {}
 impl From<CanonicalEncodingError> for GovernanceError {
     fn from(value: CanonicalEncodingError) -> Self {
         Self::CanonicalEncoding(value)
+    }
+}
+
+impl From<SystemModuleError> for GovernanceError {
+    fn from(value: SystemModuleError) -> Self {
+        Self::SystemModule(value)
     }
 }
 
@@ -112,6 +122,7 @@ impl fmt::Display for ProposalId {
 enum GovernanceActionTag {
     UpdateValidatorAdmissionPolicy = 0x0001,
     ApproveValidatorAdmission = 0x0002,
+    InstallSystemModule = 0x0003,
 }
 
 impl GovernanceActionTag {
@@ -131,6 +142,9 @@ pub enum GovernanceAction {
 
     /// Approve a specific validator for admission under a permissioned policy.
     ApproveValidatorAdmission(ValidatorId),
+
+    /// Install a new system module version through governance.
+    InstallSystemModule(SystemModule),
 }
 
 impl GovernanceAction {
@@ -146,6 +160,9 @@ impl GovernanceAction {
             {
                 return Err(GovernanceError::InvalidGenesisTransitionTarget(*policy));
             }
+        }
+        if let Self::InstallSystemModule(module) = self {
+            module.validate()?;
         }
         Ok(())
     }
@@ -265,6 +282,10 @@ pub fn encode_governance_action(action: &GovernanceAction) -> Result<Vec<u8>, Go
             canonical.field_u16(1, GovernanceActionTag::ApproveValidatorAdmission.as_u16())?;
             canonical.field_bytes(2, validator_id.as_bytes())?;
         }
+        GovernanceAction::InstallSystemModule(module) => {
+            canonical.field_u16(1, GovernanceActionTag::InstallSystemModule.as_u16())?;
+            canonical.field_bytes(2, encode_system_module(module)?)?;
+        }
     }
     Ok(canonical.finish()?)
 }
@@ -315,6 +336,8 @@ pub fn encode_governance_config(config: &GovernanceConfig) -> Result<Vec<u8>, Go
 mod tests {
     use super::*;
     use protocol_types::Epoch;
+    use protocol_types::{Digest32, HashAlgorithmId};
+    use system_modules::{ModuleId, ModuleStatus, SystemModule};
 
     fn proposal_id(byte: u8) -> ProposalId {
         ProposalId::new([byte; 32])
@@ -322,6 +345,22 @@ mod tests {
 
     fn validator(byte: u8) -> ValidatorId {
         ValidatorId::new([byte; 32])
+    }
+
+    fn digest(byte: u8) -> Digest32 {
+        Digest32::new(HashAlgorithmId::Sha2_256, [byte; 32])
+    }
+
+    fn system_module(byte: u8) -> SystemModule {
+        SystemModule {
+            module_id: ModuleId::new([byte; 32]),
+            version: 1,
+            canonical_code_hash: digest(0x11),
+            semantics_hash: digest(0x22),
+            manifest_hash: digest(0x33),
+            activation_epoch: Epoch::new(5),
+            status: ModuleStatus::Pending,
+        }
     }
 
     // ── GovernanceConfig ──────────────────────────────────────────────────────
@@ -411,6 +450,13 @@ mod tests {
     }
 
     #[test]
+    fn install_system_module_action_encodes() {
+        let action = GovernanceAction::InstallSystemModule(system_module(0xAC));
+        let bytes = encode_governance_action(&action).unwrap();
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
     fn different_actions_produce_different_bytes() {
         let a = encode_governance_action(&GovernanceAction::UpdateValidatorAdmissionPolicy(
             ValidatorAdmissionPolicy::BondAndGovernance,
@@ -421,6 +467,15 @@ mod tests {
         )))
         .unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn install_system_module_action_validates_module() {
+        let mut invalid = system_module(0xAD);
+        invalid.version = 0;
+        let action = GovernanceAction::InstallSystemModule(invalid);
+        let err = action.validate().unwrap_err();
+        assert_eq!(err, GovernanceError::SystemModule(SystemModuleError::ZeroModuleVersion));
     }
 
     #[test]

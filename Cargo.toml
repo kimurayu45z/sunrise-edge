@@ -15,6 +15,7 @@ members = [
     "crates/governance",
     "crates/contract-sdk",
     "crates/chain-ir",
+    "crates/system-modules",
 ]
 resolver = "3"
 
@@ -39,6 +40,7 @@ bonds = { path = "crates/bonds" }
 governance = { path = "crates/governance" }
 contract-sdk = { path = "crates/contract-sdk" }
 chain-ir = { path = "crates/chain-ir" }
+system-modules = { path = "crates/system-modules" }
 sha2 = "0.10.9"
 sha3 = "0.10.8"
 wasmi = "1.1.0"

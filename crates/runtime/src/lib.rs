@@ -478,6 +478,22 @@ impl PersistenceLayout {
         self.prefixed(&format!("effects/{digest_hex}"))
     }
 
+    /// Returns the system-module registry key.
+    #[must_use]
+    pub fn system_module_registry_key(&self) -> Vec<u8> {
+        self.prefixed("system-modules/registry")
+    }
+
+    /// Returns a system-module version record key.
+    #[must_use]
+    pub fn system_module_record_key(&self, module_id: [u8; 32], version: u64) -> Vec<u8> {
+        self.prefixed(&format!(
+            "system-modules/{}/versions/{:020}",
+            hex32(module_id),
+            version
+        ))
+    }
+
     fn prefixed(&self, suffix: &str) -> Vec<u8> {
         format!(
             "se/{}/v{}/{}",
@@ -573,6 +589,10 @@ mod tests {
         let key4 = layout.object_version_key([0x11; 32], 6);
         assert_ne!(key3, key4);
 
+        let key5 = layout.system_module_record_key([0xAA; 32], 1);
+        let key6 = layout.system_module_record_key([0xAA; 32], 2);
+        assert_ne!(key5, key6);
+
         let other_layout = PersistenceLayout::new(
             ChainId::new("other-chain").unwrap(),
             ProtocolVersion::new(3),
@@ -584,6 +604,8 @@ mod tests {
 
         let key1_text = String::from_utf8(key1).unwrap();
         assert!(key1_text.starts_with("se/sunrise-devnet/v3/epoch/"));
+        let key5_text = String::from_utf8(key5).unwrap();
+        assert!(key5_text.contains("system-modules/"));
     }
 
     #[test]
