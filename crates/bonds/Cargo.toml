@@ -1,12 +1,12 @@
 [package]
-name = "protocol-config"
-version.workspace = true
+name = "bonds"
 edition.workspace = true
 license.workspace = true
+version.workspace = true
 
 [dependencies]
-bonds.workspace = true
 canonical-encoding.workspace = true
-commitments.workspace = true
 fees.workspace = true
+objects.workspace = true
 protocol-types.workspace = true
+runtime.workspace = true

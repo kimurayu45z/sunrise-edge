@@ -21,6 +21,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bonds"
+version = "0.1.0"
+dependencies = [
+ "canonical-encoding",
+ "fees",
+ "objects",
+ "protocol-types",
+ "runtime",
+]
+
+[[package]]
 name = "canonical-encoding"
 version = "0.1.0"
 dependencies = [
@@ -146,6 +157,7 @@ dependencies = [
 name = "protocol-config"
 version = "0.1.0"
 dependencies = [
+ "bonds",
  "canonical-encoding",
  "commitments",
  "fees",
