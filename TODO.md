@@ -1949,6 +1949,45 @@ Phase 16 To-Be production exit criteria:
 Phase 17:
 - Vercel / Supabase / AWS / Deno adapters
 
+Phase 17 prerequisites:
+
+- provider-neutral Web Fetch API ingress core (implemented As-Is)
+- Cloudflare conformance consumer over the shared implementation (implemented)
+- Deno adapter wrapper (pending)
+- Vercel adapter wrapper (pending)
+- Supabase Edge adapter wrapper (pending)
+- AWS adapter wrapper and API Gateway mapping (pending)
+
+Phase 17 shared ingress As-Is scope:
+
+- provider wrapperはNodeCoreFetcher capabilityだけを注入し、path、media type、body limit、
+  stream read、status mapping、downstream validation、header sanitizationをshared moduleから使う。
+- shared moduleはenvironment lookup、provider SDK、credential、retry loop、durable state、
+  mutable global request stateを持たない。
+- provider wrapperは認証/private transportを追加できるが、shared boundやfail-closed mappingを
+  緩めたりprovider独自wire contractへforkしてはならない。
+- 現在のconformance consumerはCloudflare workerdのみであり、他provider runtimeの実装・検証は
+  まだ完了していない。
+
+Phase 17 To-Be production exit criteria:
+
+1. Deno、Vercel、Supabase、AWSそれぞれでpublic ingress、private node-core transport、
+   authentication、secret/key、durable state、outboxのdeployment architectureを固定する。
+2. shared ingress contractの同一fixtureを全provider実runtime/emulatorで実行し、path/media type、
+   bounds、stream cancellation、status/error、header sanitization、canonical bytesを一致させる。
+3. 各providerのbody/header/CPU/memory/duration/concurrency/subrequest limitを取得・固定し、
+   shared protocol limitより小さい場合の明示的413/429/503 behaviorとcapacity budgetを定める。
+4. freeze/thaw、isolate reuse、cold start、concurrent invocation、client cancellation、timeout、
+   platform retryでprocess memoryをprotocol stateにせず、duplicate effectsを発生させない。
+5. public URLへの無認証node-core forwardingを禁止し、service/private network/mTLS/signed request等の
+   provider別capabilityを実装する。secretをsource/config/logへ残さずrotationをrehearsalする。
+6. provider固有log/trace/metricを共通correlationとSLOへ接続し、redaction、sampling、alert、
+   cost/abuse guardrail、cross-provider incident responseを実装する。
+7. IaC、runtime/toolchain/version lock、staging/canary、schema/version skew、safe disable、
+   disaster recovery、provider outage時のrouting policyをrelease procedureとして固定する。
+8. fuzz/adversarial/load/soak/fault-injection test、dependency/SBOM/reproducible build、
+   independent security review、provider別operator runbookを完了する。
+
 Cross-phase production release gate（最後まで延期する単独Phaseではなく常時適用）:
 
 - Coding RequirementsとSecurity Invariantsを全crateで満たす。

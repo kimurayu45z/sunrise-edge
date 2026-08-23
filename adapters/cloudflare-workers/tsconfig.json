@@ -12,6 +12,7 @@
   },
   "include": [
     "worker-configuration.d.ts",
+    "../shared/**/*.ts",
     "src/**/*.ts",
     "test/**/*.ts",
     "vitest.config.ts",

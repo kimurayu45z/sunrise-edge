@@ -6,7 +6,7 @@
   "scripts": {
     "types": "wrangler types --include-runtime false",
     "typecheck": "wrangler types --include-runtime false --check && tsc --noEmit",
-    "lint": "eslint src test vitest.config.ts",
+    "lint": "cd .. && cloudflare-workers/node_modules/.bin/eslint --config cloudflare-workers/eslint.config.js cloudflare-workers/src cloudflare-workers/test shared cloudflare-workers/vitest.config.ts",
     "test": "vitest run",
     "check": "npm run typecheck && npm run lint && npm test"
   },
