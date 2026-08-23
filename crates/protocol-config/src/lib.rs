@@ -8,6 +8,7 @@ use bonds::{
 };
 use canonical_encoding::{CanonicalEncodingError, CanonicalStruct};
 use commitments::{CommitmentSchemeError, CommitmentSchemeId, encode_commitment_scheme_id};
+use consensus::{ConsensusError, ConsensusParameters, encode_consensus_parameters};
 use core::fmt;
 use fees::{
     FeeAssetRegistry, FeeError, GasSchedule, encode_fee_asset_registry, encode_gas_schedule,
@@ -33,6 +34,13 @@ pub enum ProtocolConfigError {
     ZeroHashSuiteId,
     /// The active hash-suite id must have a committed schedule definition.
     ActiveHashSuiteNotScheduled(HashSuiteId),
+    /// The first pending upgrade must start from the active protocol version.
+    UnanchoredProtocolUpgrade {
+        /// Active protocol version.
+        active: ProtocolVersion,
+        /// Source version declared by the first pending upgrade.
+        scheduled_from: ProtocolVersion,
+    },
     /// Commitment scheme encoding failed.
     CommitmentScheme(CommitmentSchemeError),
     /// Bond configuration is invalid.
@@ -47,6 +55,8 @@ pub enum ProtocolConfigError {
     SystemModules(SystemModuleError),
     /// Protocol-upgrade configuration is invalid.
     ProtocolUpgrade(ProtocolUpgradeError),
+    /// Shared-object consensus configuration is invalid.
+    Consensus(ConsensusError),
 }
 
 impl fmt::Display for ProtocolConfigError {
@@ -57,12 +67,22 @@ impl fmt::Display for ProtocolConfigError {
             Self::ActiveHashSuiteNotScheduled(id) => {
                 write!(f, "active hash-suite id {} is not scheduled", id.get())
             }
+            Self::UnanchoredProtocolUpgrade {
+                active,
+                scheduled_from,
+            } => write!(
+                f,
+                "first pending upgrade starts from protocol version {}, active version is {}",
+                scheduled_from.get(),
+                active.get()
+            ),
             Self::CommitmentScheme(error) => error.fmt(f),
             Self::Bond(error) => error.fmt(f),
             Self::Governance(error) => error.fmt(f),
             Self::Fee(error) => error.fmt(f),
             Self::SystemModules(error) => error.fmt(f),
             Self::ProtocolUpgrade(error) => error.fmt(f),
+            Self::Consensus(error) => error.fmt(f),
             Self::CanonicalEncoding(error) => error.fmt(f),
         }
     }
@@ -112,6 +132,12 @@ impl From<ProtocolUpgradeError> for ProtocolConfigError {
     }
 }
 
+impl From<ConsensusError> for ProtocolConfigError {
+    fn from(value: ConsensusError) -> Self {
+        Self::Consensus(value)
+    }
+}
+
 /// Protocol configuration fields that affect cryptographic commitments today.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtocolConfig {
@@ -139,6 +165,8 @@ pub struct ProtocolConfig {
     pub hash_suite_schedule: HashSuiteScheduleConfig,
     /// Pending protocol-version transitions.
     pub protocol_upgrades: ProtocolUpgradeSchedule,
+    /// Shared-object consensus protocol and resource limits.
+    pub consensus_parameters: ConsensusParameters,
 }
 
 impl ProtocolConfig {
@@ -158,6 +186,7 @@ impl ProtocolConfig {
             feature_flags: FeatureFlags::genesis(),
             hash_suite_schedule: HashSuiteScheduleConfig::genesis(),
             protocol_upgrades: ProtocolUpgradeSchedule::new(),
+            consensus_parameters: ConsensusParameters::genesis(),
         }
     }
 
@@ -186,6 +215,15 @@ impl ProtocolConfig {
             ));
         }
         self.protocol_upgrades.validate()?;
+        self.consensus_parameters.validate()?;
+        if let Some(first) = self.protocol_upgrades.upgrades().first()
+            && first.from_version != self.protocol_version
+        {
+            return Err(ProtocolConfigError::UnanchoredProtocolUpgrade {
+                active: self.protocol_version,
+                scheduled_from: first.from_version,
+            });
+        }
         Ok(())
     }
 
@@ -218,6 +256,10 @@ pub fn encode_protocol_config(config: &ProtocolConfig) -> Result<Vec<u8>, Protoc
         12,
         encode_protocol_upgrade_schedule(&config.protocol_upgrades)?,
     )?;
+    canonical.field_bytes(
+        13,
+        encode_consensus_parameters(config.consensus_parameters)?,
+    )?;
     Ok(canonical.finish()?)
 }
 
@@ -244,8 +286,8 @@ mod tests {
         assert_eq!(
             hex(&bytes),
             concat!(
-                // outer ProtocolConfig frame (field count 12)
-                "534e5245015001000c00",
+                // outer ProtocolConfig frame (field count 13)
+                "534e5245015001000d00",
                 "01000400000001000000",
                 "0200020000000100",
                 "03009f000000",
@@ -301,7 +343,13 @@ mod tests {
                 "0700020000000100",
                 // protocol_upgrade_schedule field (field 12)
                 "0c0012000000",
-                "534e524506c0010001000100020000000000"
+                "534e524506c0010001000100020000000000",
+                // consensus_parameters field (field 13)
+                "0d002a000000",
+                "534e524505d001000300",
+                "0100020000000100",
+                "02000400000000040000",
+                "0300080000001027000000000000"
             )
         );
     }
@@ -333,6 +381,7 @@ mod tests {
             feature_flags: FeatureFlags::genesis(),
             hash_suite_schedule: HashSuiteScheduleConfig::genesis(),
             protocol_upgrades: ProtocolUpgradeSchedule::new(),
+            consensus_parameters: ConsensusParameters::genesis(),
         })
         .unwrap_err();
 
@@ -354,6 +403,7 @@ mod tests {
             feature_flags: FeatureFlags::genesis(),
             hash_suite_schedule: HashSuiteScheduleConfig::genesis(),
             protocol_upgrades: ProtocolUpgradeSchedule::new(),
+            consensus_parameters: ConsensusParameters::genesis(),
         })
         .unwrap_err();
 
@@ -509,5 +559,44 @@ mod tests {
             .unwrap();
         updated.protocol_upgrades = upgrades;
         assert_ne!(genesis, encode_protocol_config(&updated).unwrap());
+    }
+
+    #[test]
+    fn consensus_parameters_are_committed() {
+        let genesis = encode_protocol_config(&ProtocolConfig::genesis()).unwrap();
+        let mut updated = ProtocolConfig::genesis();
+        updated.consensus_parameters.view_timeout_millis = 20_000;
+
+        assert_ne!(genesis, encode_protocol_config(&updated).unwrap());
+    }
+
+    #[test]
+    fn protocol_upgrade_schedule_must_start_from_active_version() {
+        let mut config = ProtocolConfig::genesis();
+        config
+            .protocol_upgrades
+            .schedule(
+                ProtocolUpgrade {
+                    from_version: ProtocolVersion::new(2),
+                    to_version: ProtocolVersion::new(3),
+                    activation_epoch: Epoch::new(100),
+                    new_config_hash: protocol_types::Digest32::new(
+                        HashAlgorithmId::Sha2_256,
+                        [0x99; 32],
+                    ),
+                    migration_hash: None,
+                    compatibility_policy: CompatibilityPolicy::Strict,
+                },
+                Epoch::new(10),
+            )
+            .unwrap();
+
+        assert_eq!(
+            config.validate(),
+            Err(ProtocolConfigError::UnanchoredProtocolUpgrade {
+                active: ProtocolVersion::new(1),
+                scheduled_from: ProtocolVersion::new(2),
+            })
+        );
     }
 }

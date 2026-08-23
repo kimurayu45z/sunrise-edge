@@ -1,0 +1,15 @@
+[package]
+name = "consensus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+canonical-encoding.workspace = true
+crypto.workspace = true
+hashing.workspace = true
+protocol-types.workspace = true
+validator-set.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true

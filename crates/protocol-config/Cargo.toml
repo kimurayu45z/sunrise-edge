@@ -9,6 +9,7 @@ governance.workspace = true
 bonds.workspace = true
 canonical-encoding.workspace = true
 commitments.workspace = true
+consensus.workspace = true
 fees.workspace = true
 protocol-types.workspace = true
 protocol-upgrades.workspace = true
