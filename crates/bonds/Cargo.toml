@@ -1,0 +1,12 @@
+[package]
+name = "bonds"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+canonical-encoding.workspace = true
+fees.workspace = true
+objects.workspace = true
+protocol-types.workspace = true
+runtime.workspace = true

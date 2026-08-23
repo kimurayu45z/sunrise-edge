@@ -11,6 +11,7 @@ members = [
     "crates/runtime",
     "crates/execution",
     "crates/fees",
+    "crates/bonds",
 ]
 resolver = "3"
 
@@ -31,5 +32,6 @@ protocol-config = { path = "crates/protocol-config" }
 runtime = { path = "crates/runtime" }
 execution = { path = "crates/execution" }
 fees = { path = "crates/fees" }
+bonds = { path = "crates/bonds" }
 sha2 = "0.10.9"
 sha3 = "0.10.8"
