@@ -27,7 +27,7 @@ use abi::{AbiError, AccessManifest, encode_access_manifest};
 use canonical_encoding::{CanonicalEncodingError, CanonicalStruct, encode_digest32};
 use core::fmt;
 use fees::{FeeError, FeePayment, encode_fee_payment};
-use hashing::{BuiltinHashFunction, HashFunction, HashingError};
+use hashing::{HashSuiteResolver, HashingError};
 use objects::{
     AccessMode, Address, Object, ObjectId, ObjectRef, encode_object, encode_object_id,
     encode_object_ref,
@@ -70,6 +70,15 @@ pub enum ExecutionError {
     MissingEntrypoint(String),
     /// An object at the maximum version cannot be mutated again.
     ObjectVersionOverflow(ObjectId),
+    /// A transaction's chain does not match the selected hash-suite resolver.
+    HashChainMismatch,
+    /// A transaction's protocol version does not match the selected resolver.
+    HashProtocolVersionMismatch {
+        /// Version carried by the transaction.
+        transaction: ProtocolVersion,
+        /// Version bound to the resolver.
+        resolver: ProtocolVersion,
+    },
 }
 
 impl fmt::Display for ExecutionError {
@@ -89,6 +98,18 @@ impl fmt::Display for ExecutionError {
             Self::ObjectVersionOverflow(id) => {
                 write!(f, "object version overflow while mutating {id}")
             }
+            Self::HashChainMismatch => {
+                write!(f, "transaction chain does not match hash-suite resolver")
+            }
+            Self::HashProtocolVersionMismatch {
+                transaction,
+                resolver,
+            } => write!(
+                f,
+                "transaction protocol version {} does not match resolver version {}",
+                transaction.get(),
+                resolver.get()
+            ),
         }
     }
 }
@@ -221,23 +242,26 @@ pub fn encode_transaction_signable(tx: &Transaction) -> Result<Vec<u8>, Executio
     Ok(canonical.finish()?)
 }
 
-/// Hashes the *signable* transaction payload using the supplied hash suite
-/// algorithm for the `Transaction` purpose.
+/// Hashes the signable transaction payload using the suite selected from the
+/// transaction's `(chain_id, protocol_version, epoch)` context.
 ///
 /// The resulting digest can be used as the authoritative transaction hash
 /// (`tx_hash`) included in votes and certificates.
 pub fn hash_transaction(
     tx: &Transaction,
-    algorithm: protocol_types::HashAlgorithmId,
+    resolver: &HashSuiteResolver,
 ) -> Result<Digest32, ExecutionError> {
+    if &tx.chain_id != resolver.chain_id() {
+        return Err(ExecutionError::HashChainMismatch);
+    }
+    if tx.protocol_version != resolver.protocol_version() {
+        return Err(ExecutionError::HashProtocolVersionMismatch {
+            transaction: tx.protocol_version,
+            resolver: resolver.protocol_version(),
+        });
+    }
     let signable = encode_transaction_signable(tx)?;
-    let hasher = BuiltinHashFunction::new(algorithm);
-    Ok(hasher.hash(
-        HashPurpose::Transaction,
-        tx.protocol_version,
-        &tx.chain_id,
-        &signable,
-    )?)
+    Ok(resolver.hash_for_purpose(tx.epoch, HashPurpose::Transaction, &signable)?)
 }
 
 // ── ResolvedObject ────────────────────────────────────────────────────────
@@ -427,18 +451,11 @@ pub fn encode_execution_effects(effects: &ExecutionEffects) -> Result<Vec<u8>, E
 /// Validators include this digest in their votes.
 pub fn hash_execution_effects(
     effects: &ExecutionEffects,
-    algorithm: protocol_types::HashAlgorithmId,
-    protocol_version: ProtocolVersion,
-    chain_id: &ChainId,
+    epoch: Epoch,
+    resolver: &HashSuiteResolver,
 ) -> Result<Digest32, ExecutionError> {
     let encoded = encode_execution_effects(effects)?;
-    let hasher = BuiltinHashFunction::new(algorithm);
-    Ok(hasher.hash(
-        HashPurpose::ExecutionEffects,
-        protocol_version,
-        chain_id,
-        &encoded,
-    )?)
+    Ok(resolver.hash_for_purpose(epoch, HashPurpose::ExecutionEffects, &encoded)?)
 }
 
 // ── ExecutionEngine ───────────────────────────────────────────────────────
@@ -506,7 +523,10 @@ mod tests {
     use abi::{AccessEntry, AccessManifest};
     use fees::{Amount, AssetId, FeePayment};
     use objects::{AccessMode, Address, ObjectId, ObjectRef, Owner};
-    use protocol_types::{ChainId, Digest32, Epoch, HashAlgorithmId, ProtocolVersion};
+    use protocol_types::{
+        ChainId, Digest32, Epoch, HashAlgorithmId, HashSuite, HashSuiteId, HashSuiteSchedule,
+        ProtocolVersion,
+    };
 
     fn sample_chain_id() -> ChainId {
         ChainId::new("sunrise-devnet").unwrap()
@@ -514,6 +534,18 @@ mod tests {
 
     fn sample_protocol_version() -> ProtocolVersion {
         ProtocolVersion::new(1)
+    }
+
+    fn sample_resolver() -> HashSuiteResolver {
+        HashSuiteResolver::new(
+            sample_chain_id(),
+            sample_protocol_version(),
+            vec![HashSuiteSchedule {
+                activation_epoch: Epoch::new(0),
+                suite: HashSuite::genesis(),
+            }],
+        )
+        .unwrap()
     }
 
     fn sample_digest(byte: u8) -> Digest32 {
@@ -642,16 +674,33 @@ mod tests {
     #[test]
     fn transaction_hash_is_deterministic() {
         let tx = sample_transaction();
-        let h1 = hash_transaction(&tx, HashAlgorithmId::Sha2_256).unwrap();
-        let h2 = hash_transaction(&tx, HashAlgorithmId::Sha2_256).unwrap();
+        let resolver = sample_resolver();
+        let h1 = hash_transaction(&tx, &resolver).unwrap();
+        let h2 = hash_transaction(&tx, &resolver).unwrap();
         assert_eq!(h1, h2);
     }
 
     #[test]
-    fn different_algorithm_produces_different_hash() {
-        let tx = sample_transaction();
-        let sha2 = hash_transaction(&tx, HashAlgorithmId::Sha2_256).unwrap();
-        let sha3 = hash_transaction(&tx, HashAlgorithmId::Sha3_256).unwrap();
+    fn hash_algorithm_is_selected_by_epoch_schedule() {
+        let resolver = HashSuiteResolver::new(
+            sample_chain_id(),
+            sample_protocol_version(),
+            vec![
+                HashSuiteSchedule {
+                    activation_epoch: Epoch::new(0),
+                    suite: HashSuite::genesis(),
+                },
+                HashSuiteSchedule {
+                    activation_epoch: Epoch::new(6),
+                    suite: HashSuite::uniform(HashSuiteId::new(2), HashAlgorithmId::Sha3_256),
+                },
+            ],
+        )
+        .unwrap();
+        let sha2 = hash_transaction(&sample_transaction(), &resolver).unwrap();
+        let mut upgraded = sample_transaction();
+        upgraded.epoch = Epoch::new(6);
+        let sha3 = hash_transaction(&upgraded, &resolver).unwrap();
         assert_ne!(sha2, sha3);
         assert_eq!(sha2.algorithm(), HashAlgorithmId::Sha2_256);
         assert_eq!(sha3.algorithm(), HashAlgorithmId::Sha3_256);
@@ -662,9 +711,27 @@ mod tests {
         let tx1 = sample_transaction();
         let mut tx2 = sample_transaction();
         tx2.nonce = 99;
-        let h1 = hash_transaction(&tx1, HashAlgorithmId::Sha2_256).unwrap();
-        let h2 = hash_transaction(&tx2, HashAlgorithmId::Sha2_256).unwrap();
+        let resolver = sample_resolver();
+        let h1 = hash_transaction(&tx1, &resolver).unwrap();
+        let h2 = hash_transaction(&tx2, &resolver).unwrap();
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn transaction_hash_rejects_mismatched_resolver_context() {
+        let resolver = HashSuiteResolver::new(
+            ChainId::new("other-chain").unwrap(),
+            sample_protocol_version(),
+            vec![HashSuiteSchedule {
+                activation_epoch: Epoch::new(0),
+                suite: HashSuite::genesis(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            hash_transaction(&sample_transaction(), &resolver),
+            Err(ExecutionError::HashChainMismatch)
+        );
     }
 
     // ── event record ─────────────────────────────────────────────────────
@@ -772,7 +839,7 @@ mod tests {
     #[test]
     fn execution_effects_encode_deterministically() {
         let tx = sample_transaction();
-        let tx_hash = hash_transaction(&tx, HashAlgorithmId::Sha2_256).unwrap();
+        let tx_hash = hash_transaction(&tx, &sample_resolver()).unwrap();
         let effects = sample_effects(tx_hash);
 
         let left = encode_execution_effects(&effects).unwrap();
@@ -810,20 +877,8 @@ mod tests {
         let tx_hash = sample_digest(0x01);
         let effects = sample_effects(tx_hash);
 
-        let h1 = hash_execution_effects(
-            &effects,
-            HashAlgorithmId::Sha2_256,
-            sample_protocol_version(),
-            &sample_chain_id(),
-        )
-        .unwrap();
-        let h2 = hash_execution_effects(
-            &effects,
-            HashAlgorithmId::Sha2_256,
-            sample_protocol_version(),
-            &sample_chain_id(),
-        )
-        .unwrap();
+        let h1 = hash_execution_effects(&effects, Epoch::new(5), &sample_resolver()).unwrap();
+        let h2 = hash_execution_effects(&effects, Epoch::new(5), &sample_resolver()).unwrap();
         assert_eq!(h1, h2);
         assert_eq!(h1.algorithm(), HashAlgorithmId::Sha2_256);
     }

@@ -5,6 +5,7 @@
 use canonical_encoding::{CanonicalEncodingError, CanonicalStruct, encode_digest32};
 use core::fmt;
 use protocol_types::Digest32;
+use protocol_upgrades::{MigrationDescriptor, ProtocolUpgradeError};
 use std::error::Error;
 
 const OBJECT_ID_TYPE_ID: u16 = 0x4001;
@@ -50,6 +51,56 @@ impl Error for ObjectError {}
 impl From<CanonicalEncodingError> for ObjectError {
     fn from(value: CanonicalEncodingError) -> Self {
         Self::CanonicalEncoding(value)
+    }
+}
+
+/// Errors returned while applying a deterministic lazy object migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationError {
+    /// The committed migration descriptor is invalid.
+    InvalidDescriptor(ProtocolUpgradeError),
+    /// The object's type does not match the migration's committed type.
+    ObjectTypeMismatch {
+        /// Type required by the migration.
+        expected: Digest32,
+        /// Type present on the object.
+        actual: Digest32,
+    },
+    /// The object's schema does not match the migration source schema.
+    SchemaVersionMismatch {
+        /// Schema required by the migration.
+        expected: u32,
+        /// Schema present on the object.
+        actual: u32,
+    },
+    /// The object version cannot be incremented.
+    ObjectVersionOverflow,
+    /// The deterministic migration implementation rejected the object data.
+    ExecutionFailed(String),
+}
+
+impl fmt::Display for MigrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidDescriptor(error) => error.fmt(f),
+            Self::ObjectTypeMismatch { expected, actual } => {
+                write!(f, "migration expected object type {expected}, got {actual}")
+            }
+            Self::SchemaVersionMismatch { expected, actual } => write!(
+                f,
+                "migration expected schema version {expected}, got {actual}"
+            ),
+            Self::ObjectVersionOverflow => write!(f, "object version overflow during migration"),
+            Self::ExecutionFailed(message) => write!(f, "object migration failed: {message}"),
+        }
+    }
+}
+
+impl Error for MigrationError {}
+
+impl From<ProtocolUpgradeError> for MigrationError {
+    fn from(value: ProtocolUpgradeError) -> Self {
+        Self::InvalidDescriptor(value)
     }
 }
 
@@ -197,6 +248,52 @@ pub struct ObjectRef {
     pub digest: Digest32,
 }
 
+/// Runtime implementation of one governance-committed deterministic migration.
+///
+/// Only the descriptor is protocol state. Implementations are runtime wiring
+/// and must be selected by the descriptor's `migration_hash`.
+pub trait ObjectMigration {
+    /// Returns the canonical descriptor committed by protocol configuration.
+    fn descriptor(&self) -> &MigrationDescriptor;
+
+    /// Migrates canonical object data without accessing global state.
+    fn migrate_data(&self, canonical_data: &[u8]) -> Result<Vec<u8>, MigrationError>;
+}
+
+/// Applies one migration to a single object when that object is read or written.
+///
+/// The input is left untouched. The returned object preserves identity,
+/// ownership, and type, increments its object version, and adopts the target
+/// schema version. No state scan is required.
+pub fn apply_lazy_migration(
+    object: &Object,
+    migration: &impl ObjectMigration,
+) -> Result<Object, MigrationError> {
+    let descriptor = migration.descriptor();
+    descriptor.validate()?;
+    if object.type_hash != descriptor.object_type {
+        return Err(MigrationError::ObjectTypeMismatch {
+            expected: descriptor.object_type,
+            actual: object.type_hash,
+        });
+    }
+    if object.schema_version != descriptor.from_schema_version {
+        return Err(MigrationError::SchemaVersionMismatch {
+            expected: descriptor.from_schema_version,
+            actual: object.schema_version,
+        });
+    }
+
+    let mut migrated = object.clone();
+    migrated.version = migrated
+        .version
+        .checked_add(1)
+        .ok_or(MigrationError::ObjectVersionOverflow)?;
+    migrated.schema_version = descriptor.to_schema_version;
+    migrated.data = migration.migrate_data(&object.data)?;
+    Ok(migrated)
+}
+
 /// Access mode requested for an object.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -286,6 +383,7 @@ pub fn encode_access_mode(mode: AccessMode) -> Result<Vec<u8>, ObjectError> {
 mod tests {
     use super::*;
     use protocol_types::{Digest32, HashAlgorithmId};
+    use protocol_upgrades::MigrationDescriptor;
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -348,6 +446,82 @@ mod tests {
         assert_eq!(
             Address::try_from_slice(&[0u8; 31]),
             Err(ObjectError::InvalidAddressLength(31))
+        );
+    }
+
+    struct AppendMigration {
+        descriptor: MigrationDescriptor,
+    }
+
+    impl ObjectMigration for AppendMigration {
+        fn descriptor(&self) -> &MigrationDescriptor {
+            &self.descriptor
+        }
+
+        fn migrate_data(&self, canonical_data: &[u8]) -> Result<Vec<u8>, MigrationError> {
+            let mut migrated = canonical_data.to_vec();
+            migrated.push(0xFF);
+            Ok(migrated)
+        }
+    }
+
+    #[test]
+    fn lazy_migration_updates_only_the_requested_object() {
+        let object_type = Digest32::new(HashAlgorithmId::Sha2_256, [0x33; 32]);
+        let original = Object {
+            id: ObjectId::new([0x11; 32]),
+            version: 7,
+            owner: Owner::Shared,
+            type_hash: object_type,
+            schema_version: 1,
+            data: vec![1, 2],
+        };
+        let migration = AppendMigration {
+            descriptor: MigrationDescriptor {
+                migration_version: 1,
+                object_type,
+                from_schema_version: 1,
+                to_schema_version: 2,
+                migration_hash: Digest32::new(HashAlgorithmId::Sha2_256, [0x44; 32]),
+            },
+        };
+
+        let migrated = apply_lazy_migration(&original, &migration).unwrap();
+        assert_eq!(original.version, 7);
+        assert_eq!(original.schema_version, 1);
+        assert_eq!(migrated.id, original.id);
+        assert_eq!(migrated.version, 8);
+        assert_eq!(migrated.schema_version, 2);
+        assert_eq!(migrated.data, vec![1, 2, 0xFF]);
+    }
+
+    #[test]
+    fn lazy_migration_rejects_wrong_schema() {
+        let object_type = Digest32::new(HashAlgorithmId::Sha2_256, [0x33; 32]);
+        let object = Object {
+            id: ObjectId::new([0x11; 32]),
+            version: 7,
+            owner: Owner::Shared,
+            type_hash: object_type,
+            schema_version: 2,
+            data: vec![],
+        };
+        let migration = AppendMigration {
+            descriptor: MigrationDescriptor {
+                migration_version: 1,
+                object_type,
+                from_schema_version: 1,
+                to_schema_version: 2,
+                migration_hash: Digest32::new(HashAlgorithmId::Sha2_256, [0x44; 32]),
+            },
+        };
+
+        assert_eq!(
+            apply_lazy_migration(&object, &migration),
+            Err(MigrationError::SchemaVersionMismatch {
+                expected: 1,
+                actual: 2
+            })
         );
     }
 }

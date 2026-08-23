@@ -67,6 +67,17 @@ pub enum BondError {
     MissingGovernanceApproval,
     /// A valid slashable bond is required for admission.
     MissingBond,
+    /// A governance approval was issued for a different validator.
+    ApprovalValidatorMismatch,
+    /// An attached bond belongs to a different validator.
+    BondValidatorMismatch,
+    /// A bond cannot satisfy admission before its bonded epoch.
+    BondNotYetActive {
+        /// Epoch being evaluated.
+        epoch: Epoch,
+        /// Epoch when the bond becomes active.
+        bonded_epoch: Epoch,
+    },
     /// The bond is no longer active at the requested epoch.
     BondNotActive {
         /// Epoch being evaluated.
@@ -121,6 +132,21 @@ impl fmt::Display for BondError {
                 write!(f, "governance approval is required for validator admission")
             }
             Self::MissingBond => write!(f, "validator admission requires a valid bond"),
+            Self::ApprovalValidatorMismatch => {
+                write!(f, "governance approval belongs to a different validator")
+            }
+            Self::BondValidatorMismatch => {
+                write!(f, "bond belongs to a different validator")
+            }
+            Self::BondNotYetActive {
+                epoch,
+                bonded_epoch,
+            } => write!(
+                f,
+                "bond is not active at epoch {}; bonded epoch is {}",
+                epoch.get(),
+                bonded_epoch.get()
+            ),
             Self::BondNotActive {
                 epoch,
                 unlock_epoch,
@@ -432,29 +458,49 @@ impl SlashingEvidence {
     }
 }
 
-/// Admission record evaluated against an epoch's validator policy.
+/// Authenticated governance approval accepted by validator admission.
+pub trait ValidatorAdmissionApproval {
+    /// Returns the validator approved by governance.
+    fn approved_validator_id(&self) -> ValidatorId;
+}
+
+/// Admission record evaluated against an epoch's externally supplied policy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatorAdmission {
     /// Validator being considered for admission.
     pub validator_id: ValidatorId,
-    /// Active epoch policy.
-    pub policy: ValidatorAdmissionPolicy,
-    /// Whether governance approved the validator under permissioned policies.
-    pub governance_approved: bool,
     /// Optional slashable bond carried by the validator.
     pub bond: Option<BondObject>,
 }
 
 impl ValidatorAdmission {
-    /// Validates the admission request under the active policy.
-    pub fn validate(&self, registry: &BondAssetRegistry, epoch: Epoch) -> Result<(), BondError> {
-        if self.policy.requires_governance_approval() && !self.governance_approved {
-            return Err(BondError::MissingGovernanceApproval);
+    /// Validates the admission request under authenticated epoch context.
+    pub fn validate(
+        &self,
+        registry: &BondAssetRegistry,
+        active_policy: ValidatorAdmissionPolicy,
+        approval: Option<&dyn ValidatorAdmissionApproval>,
+        epoch: Epoch,
+    ) -> Result<(), BondError> {
+        if active_policy.requires_governance_approval() {
+            let approval = approval.ok_or(BondError::MissingGovernanceApproval)?;
+            if approval.approved_validator_id() != self.validator_id {
+                return Err(BondError::ApprovalValidatorMismatch);
+            }
         }
 
         if let Some(bond) = &self.bond {
+            if bond.validator_id != self.validator_id {
+                return Err(BondError::BondValidatorMismatch);
+            }
+            if bond.bonded_epoch > epoch {
+                return Err(BondError::BondNotYetActive {
+                    epoch,
+                    bonded_epoch: bond.bonded_epoch,
+                });
+            }
             validate_bond_for_epoch(bond, registry, epoch)?;
-        } else if self.policy.requires_bond() {
+        } else if active_policy.requires_bond() {
             return Err(BondError::MissingBond);
         }
 
@@ -561,10 +607,8 @@ pub fn encode_slashing_evidence(evidence: &SlashingEvidence) -> Result<Vec<u8>, 
 pub fn encode_validator_admission(admission: &ValidatorAdmission) -> Result<Vec<u8>, BondError> {
     let mut canonical = CanonicalStruct::new(VALIDATOR_ADMISSION_TYPE_ID, ENCODING_VERSION);
     canonical.field_bytes(1, admission.validator_id.as_bytes())?;
-    canonical.field_bytes(2, encode_validator_admission_policy(admission.policy)?)?;
-    canonical.field_bytes(3, [u8::from(admission.governance_approved)])?;
     if let Some(bond) = &admission.bond {
-        canonical.field_bytes(4, encode_bond_object(bond)?)?;
+        canonical.field_bytes(2, encode_bond_object(bond)?)?;
     }
     Ok(canonical.finish()?)
 }
@@ -659,6 +703,13 @@ mod tests {
 
     #[test]
     fn validator_admission_enforces_bond_and_governance_policy() {
+        struct Approval(ValidatorId);
+        impl ValidatorAdmissionApproval for Approval {
+            fn approved_validator_id(&self) -> ValidatorId {
+                self.0
+            }
+        }
+
         let mut registry = BondAssetRegistry::new();
         registry.add_asset(sample_asset_config(0x33)).unwrap();
 
@@ -672,22 +723,57 @@ mod tests {
 
         let missing_governance = ValidatorAdmission {
             validator_id: validator(0x44),
-            policy: ValidatorAdmissionPolicy::BondAndGovernance,
-            governance_approved: false,
             bond: Some(bond.clone()),
         };
         assert_eq!(
-            missing_governance.validate(&registry, Epoch::new(5)),
+            missing_governance.validate(
+                &registry,
+                ValidatorAdmissionPolicy::BondAndGovernance,
+                None,
+                Epoch::new(5)
+            ),
             Err(BondError::MissingGovernanceApproval)
         );
 
         let valid = ValidatorAdmission {
             validator_id: validator(0x44),
-            policy: ValidatorAdmissionPolicy::BondAndGovernance,
-            governance_approved: true,
             bond: Some(bond),
         };
-        assert_eq!(valid.validate(&registry, Epoch::new(5)), Ok(()));
+        let approval = Approval(validator(0x44));
+        assert_eq!(
+            valid.validate(
+                &registry,
+                ValidatorAdmissionPolicy::BondAndGovernance,
+                Some(&approval),
+                Epoch::new(5)
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validator_admission_rejects_another_validators_bond() {
+        let mut registry = BondAssetRegistry::new();
+        registry.add_asset(sample_asset_config(0x33)).unwrap();
+        let admission = ValidatorAdmission {
+            validator_id: validator(0x44),
+            bond: Some(BondObject {
+                validator_id: validator(0x45),
+                asset_id: asset(0x33),
+                amount: Amount::new(150),
+                bonded_epoch: Epoch::new(3),
+                unlock_epoch: None,
+            }),
+        };
+        assert_eq!(
+            admission.validate(
+                &registry,
+                ValidatorAdmissionPolicy::BondRequired,
+                None,
+                Epoch::new(5)
+            ),
+            Err(BondError::BondValidatorMismatch)
+        );
     }
 
     #[test]

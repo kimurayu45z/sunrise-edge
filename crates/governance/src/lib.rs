@@ -18,13 +18,19 @@
 //! - [`GovernanceConfig`] – on-chain governance parameters included in
 //!   `ProtocolConfig`.
 
-use bonds::ValidatorAdmissionPolicy;
+use bonds::{ValidatorAdmissionApproval, ValidatorAdmissionPolicy};
 use canonical_encoding::{CanonicalEncodingError, CanonicalStruct, encode_epoch};
 use core::fmt;
-use protocol_types::Epoch;
+use protocol_types::{Epoch, HashSuiteSchedule};
+use protocol_upgrades::{
+    ProtocolUpgrade, ProtocolUpgradeError, encode_hash_suite_schedule_entry,
+    encode_protocol_upgrade, validate_future_activation,
+};
 use runtime::ValidatorId;
 use std::error::Error;
-use system_modules::{SystemModule, SystemModuleError, encode_system_module};
+use system_modules::{
+    ModuleId, SystemModule, SystemModuleError, encode_module_id, encode_system_module,
+};
 
 const GOVERNANCE_ACTION_TYPE_ID: u16 = 0x9001;
 const GOVERNANCE_PROPOSAL_TYPE_ID: u16 = 0x9002;
@@ -54,6 +60,8 @@ pub enum GovernanceError {
     CanonicalEncoding(CanonicalEncodingError),
     /// System module registry action was invalid.
     SystemModule(SystemModuleError),
+    /// Protocol-upgrade action was invalid.
+    ProtocolUpgrade(ProtocolUpgradeError),
 }
 
 impl fmt::Display for GovernanceError {
@@ -71,6 +79,7 @@ impl fmt::Display for GovernanceError {
             ),
             Self::CanonicalEncoding(error) => error.fmt(f),
             Self::SystemModule(error) => error.fmt(f),
+            Self::ProtocolUpgrade(error) => error.fmt(f),
         }
     }
 }
@@ -86,6 +95,12 @@ impl From<CanonicalEncodingError> for GovernanceError {
 impl From<SystemModuleError> for GovernanceError {
     fn from(value: SystemModuleError) -> Self {
         Self::SystemModule(value)
+    }
+}
+
+impl From<ProtocolUpgradeError> for GovernanceError {
+    fn from(value: ProtocolUpgradeError) -> Self {
+        Self::ProtocolUpgrade(value)
     }
 }
 
@@ -123,6 +138,10 @@ enum GovernanceActionTag {
     UpdateValidatorAdmissionPolicy = 0x0001,
     ApproveValidatorAdmission = 0x0002,
     InstallSystemModule = 0x0003,
+    ScheduleHashSuite = 0x0004,
+    ScheduleProtocolUpgrade = 0x0005,
+    ActivateSystemModule = 0x0006,
+    DeactivateSystemModule = 0x0007,
 }
 
 impl GovernanceActionTag {
@@ -145,6 +164,28 @@ pub enum GovernanceAction {
 
     /// Install a new system module version through governance.
     InstallSystemModule(SystemModule),
+
+    /// Schedule a complete hash-suite definition for future activation.
+    ScheduleHashSuite(HashSuiteSchedule),
+
+    /// Schedule a protocol-version transition for future activation.
+    ScheduleProtocolUpgrade(ProtocolUpgrade),
+
+    /// Activate a previously installed system module version.
+    ActivateSystemModule {
+        /// Module identifier.
+        module_id: ModuleId,
+        /// Installed module version.
+        version: u64,
+    },
+
+    /// Disable an installed system module version.
+    DeactivateSystemModule {
+        /// Module identifier.
+        module_id: ModuleId,
+        /// Installed module version.
+        version: u64,
+    },
 }
 
 impl GovernanceAction {
@@ -163,6 +204,36 @@ impl GovernanceAction {
         }
         if let Self::InstallSystemModule(module) = self {
             module.validate()?;
+        }
+        if let Self::ScheduleHashSuite(entry) = self {
+            encode_hash_suite_schedule_entry(entry)?;
+        }
+        if let Self::ScheduleProtocolUpgrade(upgrade) = self {
+            upgrade.validate()?;
+        }
+        if let Self::ActivateSystemModule { version, .. }
+        | Self::DeactivateSystemModule { version, .. } = self
+        {
+            if *version == 0 {
+                return Err(GovernanceError::SystemModule(
+                    SystemModuleError::ZeroModuleVersion,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates action invariants that require the enactment epoch.
+    pub fn validate_for_enactment(&self, current_epoch: Epoch) -> Result<(), GovernanceError> {
+        self.validate()?;
+        match self {
+            Self::ScheduleHashSuite(entry) => {
+                validate_future_activation(entry.activation_epoch, current_epoch)?;
+            }
+            Self::ScheduleProtocolUpgrade(upgrade) => {
+                upgrade.validate_for_enactment(current_epoch)?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -183,6 +254,11 @@ impl GovernanceProposal {
     /// Validates the proposal.
     pub fn validate(&self) -> Result<(), GovernanceError> {
         self.action.validate()
+    }
+
+    /// Validates the proposal against the epoch in which it is enacted.
+    pub fn validate_for_enactment(&self, current_epoch: Epoch) -> Result<(), GovernanceError> {
+        self.action.validate_for_enactment(current_epoch)
     }
 }
 
@@ -218,6 +294,12 @@ pub struct GovernanceApproval {
     pub validator_id: ValidatorId,
     /// Epoch in which the approving proposal was enacted.
     pub approved_epoch: Epoch,
+}
+
+impl ValidatorAdmissionApproval for GovernanceApproval {
+    fn approved_validator_id(&self) -> ValidatorId {
+        self.validator_id
+    }
 }
 
 /// On-chain governance parameters stored in `ProtocolConfig`.
@@ -285,6 +367,24 @@ pub fn encode_governance_action(action: &GovernanceAction) -> Result<Vec<u8>, Go
         GovernanceAction::InstallSystemModule(module) => {
             canonical.field_u16(1, GovernanceActionTag::InstallSystemModule.as_u16())?;
             canonical.field_bytes(2, encode_system_module(module)?)?;
+        }
+        GovernanceAction::ScheduleHashSuite(entry) => {
+            canonical.field_u16(1, GovernanceActionTag::ScheduleHashSuite.as_u16())?;
+            canonical.field_bytes(2, encode_hash_suite_schedule_entry(entry)?)?;
+        }
+        GovernanceAction::ScheduleProtocolUpgrade(upgrade) => {
+            canonical.field_u16(1, GovernanceActionTag::ScheduleProtocolUpgrade.as_u16())?;
+            canonical.field_bytes(2, encode_protocol_upgrade(upgrade)?)?;
+        }
+        GovernanceAction::ActivateSystemModule { module_id, version } => {
+            canonical.field_u16(1, GovernanceActionTag::ActivateSystemModule.as_u16())?;
+            canonical.field_bytes(2, encode_module_id(*module_id)?)?;
+            canonical.field_u64(3, *version)?;
+        }
+        GovernanceAction::DeactivateSystemModule { module_id, version } => {
+            canonical.field_u16(1, GovernanceActionTag::DeactivateSystemModule.as_u16())?;
+            canonical.field_bytes(2, encode_module_id(*module_id)?)?;
+            canonical.field_u64(3, *version)?;
         }
     }
     Ok(canonical.finish()?)

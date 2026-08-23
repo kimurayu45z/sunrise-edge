@@ -43,6 +43,27 @@ pub enum SystemModuleError {
     },
     /// Registry entries are not in canonical `(module_id, version)` order.
     RegistryOutOfOrder,
+    /// The requested module version is not installed.
+    UnknownModuleVersion {
+        /// Requested module id.
+        module_id: ModuleId,
+        /// Requested version.
+        version: u64,
+    },
+    /// A module cannot be activated before its committed activation epoch.
+    ActivationTooEarly {
+        /// Earliest activation epoch.
+        activation_epoch: Epoch,
+        /// Current enactment epoch.
+        current_epoch: Epoch,
+    },
+    /// The requested module lifecycle transition is invalid.
+    InvalidStatusTransition {
+        /// Current status.
+        from: ModuleStatus,
+        /// Requested status.
+        to: ModuleStatus,
+    },
     /// Canonical encoding failed.
     CanonicalEncoding(CanonicalEncodingError),
 }
@@ -73,6 +94,21 @@ impl fmt::Display for SystemModuleError {
                     f,
                     "system-module registry entries are out of canonical order"
                 )
+            }
+            Self::UnknownModuleVersion { module_id, version } => {
+                write!(f, "unknown system module: {module_id} version {version}")
+            }
+            Self::ActivationTooEarly {
+                activation_epoch,
+                current_epoch,
+            } => write!(
+                f,
+                "module activates at epoch {}, current epoch is {}",
+                activation_epoch.get(),
+                current_epoch.get()
+            ),
+            Self::InvalidStatusTransition { from, to } => {
+                write!(f, "invalid module status transition: {from:?} -> {to:?}")
             }
             Self::CanonicalEncoding(error) => error.fmt(f),
         }
@@ -302,6 +338,65 @@ impl SystemModuleRegistry {
             })
             .ok()
             .map(|index| &self.modules[index])
+    }
+
+    /// Activates a pending module once its committed epoch has arrived.
+    pub fn activate(
+        &mut self,
+        module_id: ModuleId,
+        version: u64,
+        current_epoch: Epoch,
+    ) -> Result<(), SystemModuleError> {
+        let index = self
+            .modules
+            .binary_search_by_key(&(module_id, version), |entry| {
+                (entry.module_id, entry.version)
+            })
+            .map_err(|_| SystemModuleError::UnknownModuleVersion { module_id, version })?;
+        let module = &mut self.modules[index];
+        if module.status != ModuleStatus::Pending {
+            return Err(SystemModuleError::InvalidStatusTransition {
+                from: module.status,
+                to: ModuleStatus::Active,
+            });
+        }
+        if current_epoch < module.activation_epoch {
+            return Err(SystemModuleError::ActivationTooEarly {
+                activation_epoch: module.activation_epoch,
+                current_epoch,
+            });
+        }
+        module.status = ModuleStatus::Active;
+        Ok(())
+    }
+
+    /// Disables a pending or active module version permanently.
+    pub fn disable(&mut self, module_id: ModuleId, version: u64) -> Result<(), SystemModuleError> {
+        let index = self
+            .modules
+            .binary_search_by_key(&(module_id, version), |entry| {
+                (entry.module_id, entry.version)
+            })
+            .map_err(|_| SystemModuleError::UnknownModuleVersion { module_id, version })?;
+        let module = &mut self.modules[index];
+        if module.status == ModuleStatus::Disabled {
+            return Err(SystemModuleError::InvalidStatusTransition {
+                from: module.status,
+                to: ModuleStatus::Disabled,
+            });
+        }
+        module.status = ModuleStatus::Disabled;
+        Ok(())
+    }
+
+    /// Resolves the highest active version available at an epoch.
+    #[must_use]
+    pub fn active_at(&self, module_id: ModuleId, epoch: Epoch) -> Option<&SystemModule> {
+        self.modules.iter().rev().find(|module| {
+            module.module_id == module_id
+                && module.status == ModuleStatus::Active
+                && module.activation_epoch <= epoch
+        })
     }
 
     /// Validates registry bounds and uniqueness.
@@ -546,5 +641,34 @@ mod tests {
         let a = encode_system_module_registry(&registry).unwrap();
         let b = encode_system_module_registry(&registry).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn module_activation_respects_epoch_and_is_irreversible_after_disable() {
+        let mut registry = SystemModuleRegistry::new();
+        registry
+            .add_module(sample_module(0xAA, 1, ModuleStatus::Pending))
+            .unwrap();
+
+        assert_eq!(
+            registry.activate(module_id(0xAA), 1, Epoch::new(6)),
+            Err(SystemModuleError::ActivationTooEarly {
+                activation_epoch: Epoch::new(7),
+                current_epoch: Epoch::new(6)
+            })
+        );
+        registry
+            .activate(module_id(0xAA), 1, Epoch::new(7))
+            .unwrap();
+        assert!(registry.active_at(module_id(0xAA), Epoch::new(7)).is_some());
+        registry.disable(module_id(0xAA), 1).unwrap();
+        assert!(registry.active_at(module_id(0xAA), Epoch::new(8)).is_none());
+        assert_eq!(
+            registry.activate(module_id(0xAA), 1, Epoch::new(8)),
+            Err(SystemModuleError::InvalidStatusTransition {
+                from: ModuleStatus::Disabled,
+                to: ModuleStatus::Active
+            })
+        );
     }
 }
