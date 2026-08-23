@@ -1773,9 +1773,10 @@ Phase 13:
 - Shared Object consensus
 
 Phase 14:
-- CommitmentScheme abstraction
-- Poseidon2-based experimental ZK commitment suite
-- execution proof interfaces
+- CommitmentScheme abstraction (implemented)
+- Poseidon2-based experimental ZK commitment suite (BN254 implemented;
+  BLS12-381 identifier remains reserved and unsupported)
+- execution proof interfaces (implemented; concrete proof backends deferred)
 
 Phase 15:
 - native HTTP adapter

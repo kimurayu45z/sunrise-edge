@@ -30,7 +30,35 @@ Hashing is centralized in the `hashing` crate. Callers provide a canonical paylo
 Every protocol hash includes the protocol magic, selected `HashAlgorithmId`, `HashDomain`, domain version, `ChainId`, `ProtocolVersion`, and canonical payload in a framed structure.
 
 ## 7. Commitment scheme architecture
-Commitment schemes are separate from general-purpose hashes. This phase does not implement commitments, but later commitment crates must follow the same explicit algorithm-ID and framing discipline without reusing general hash identifiers.
+Commitment schemes are separate from general-purpose hashes. Phase 14 adds a
+`CommitmentScheme` boundary with versioned sparse-Merkle leaf and internal-node
+framing. Leaves bind a 256-bit tree key to canonical value bytes; internal
+nodes bind their level and ordered child commitments. Every output remains
+self-describing through `CommitmentSchemeId`, and cross-scheme children are
+rejected rather than converted or downgraded. Tree traversal reads key bits
+most-significant-bit first; level zero is the root and level 255 is the parent
+of a leaf.
+
+The built-in genesis implementation is SHA-256. Phase 14 also provides an
+experimental Poseidon2/BN254 scheme using width 3, rate 2, capacity 1, the
+`x^5` S-box, 8 full rounds, and 56 partial rounds. Canonical bytes are injected
+as little-endian chunks of at most 31 bytes, with byte length in the capacity
+lane; one permutation runs per rate block. The permutation parameters and
+known-answer vector are pinned to the
+[Horizen Labs reference implementation](https://github.com/HorizenLabs/poseidon2/commit/055bde3f4782731ba5f5ce5888a440a94327eaf3),
+corresponding to the [Poseidon2 paper](https://eprint.iacr.org/2023/323)
+(IACR ePrint 2023/323). The experimental implementation uses safe Rust only,
+keeps the field arithmetic and pinned constants inside the `commitments` crate,
+and repeats the reference known-answer test. SHA-256 outputs retain conventional
+digest-byte order; BN254 field elements use fixed 32-byte little-endian form.
+Until a separately reviewed constant-time implementation is selected, the
+experimental Poseidon2 path accepts at most 4 KiB per leaf; SHA-256 retains the
+general 16 MiB leaf bound. This prevents the intentionally simple safe-Rust
+field arithmetic from becoming an unbounded CPU surface.
+
+`SparseMerklePoseidon2Bls12381V1` remains a reserved identifier. Resolving it
+as a built-in implementation fails explicitly; adding an identifier does not
+activate or implement a cryptographic primitive.
 
 ## 8. Signature domain separation
 Signature framing is distinct from hash framing. Signed payloads include `ChainId`, `ProtocolVersion`, `Epoch`, `message_type`, `SignatureSchemeId`, and the canonical payload to prevent replay across chains, epochs, protocol versions, and message families.
@@ -236,7 +264,18 @@ IR becomes the protocol-level seam for future native/JIT and ZK proving
 back-ends that must preserve identical execution effects.
 
 ## 25. ZK execution architecture
-ZK execution is deferred. The architecture reserves separate commitment-scheme evolution so ZK-specific cryptography can change independently from consensus hashes.
+Phase 14 introduces proof envelopes and the verifier boundary, while concrete
+provers and proof-system backends remain deferred. An `ExecutionProofStatement`
+binds `chain_id`, `protocol_version`, `epoch`, transaction digest, and the input
+and output state commitments. `ExecutionProof` adds a non-zero,
+protocol-assigned `ProofSystemId` and bounded opaque proof bytes.
+
+Verification requires an expected statement supplied by the caller and an
+`ExecutionProofVerifier` implementing the exact proof-system ID. Statement or
+ID mismatch fails before backend dispatch, and there is no default verifier or
+algorithm fallback. A proof-system ID is not active merely because it can be
+encoded; protocol selection and concrete verifier implementations are future
+work.
 
 ## 26. Security invariants
 - No protocol-critical naked byte digests.
@@ -296,3 +335,7 @@ parameters (protocol ID, block transaction bound, and timeout) are committed in
 - DR-0013: Use event-driven three-chain HotStuff for shared-object ordering.
   Keep the protocol state explicit and persistable, accept untrusted relay and
   Tick delivery, and require authenticated quorum certificates for safety.
+- DR-0014: Keep state commitments and execution proofs independently agile.
+  Use versioned leaf/node framing, ship Poseidon2/BN254 only as an experimental
+  inactive alternative to genesis SHA-256, reserve unsupported schemes without
+  fallback, and dispatch bounded proof envelopes only to an exact-ID verifier.

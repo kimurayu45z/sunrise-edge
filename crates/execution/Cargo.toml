@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 protocol-types = { workspace = true }
 canonical-encoding = { workspace = true }
+commitments = { workspace = true }
 hashing = { workspace = true }
 objects = { workspace = true }
 abi = { workspace = true }

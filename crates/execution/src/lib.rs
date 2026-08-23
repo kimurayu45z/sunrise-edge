@@ -16,6 +16,7 @@
 //! | [`ExecutionEngine`]         | Trait implemented by execution back-ends.                |
 //! | [`NullExecutionEngine`]     | No-op back-end useful for wiring tests.                  |
 //! | [`WasmExecutionEngine`]     | Deterministic WASM back-end built on `wasmi`.            |
+//! | [`ExecutionProof`]          | Self-describing proof envelope for execution results.    |
 //!
 //! # Canonical encoding
 //!
@@ -519,6 +520,14 @@ impl ExecutionEngine for NullExecutionEngine {
 
 mod wasm_engine;
 pub use wasm_engine::WasmExecutionEngine;
+
+mod execution_proof;
+pub use execution_proof::{
+    ExecutionProof, ExecutionProofError, ExecutionProofStatement, ExecutionProofVerifier,
+    MAX_EXECUTION_PROOF_BYTES, ProofSystemId, ProofVerificationError, encode_execution_proof,
+    encode_execution_proof_statement, encode_proof_system_id, validate_execution_proof,
+    verify_execution_proof,
+};
 
 // ── tests ─────────────────────────────────────────────────────────────────
 

@@ -62,7 +62,7 @@ lifetime, or cloud provider.
 ## Current status
 
 The workspace currently contains the foundations implemented through the
-shared-object consensus milestone:
+experimental ZK commitment and execution-proof interface milestone:
 
 - Canonical framed encoding for protocol-critical values.
 - SHA-256 and SHA3-256 support with epoch-selected hash suites.
@@ -80,23 +80,26 @@ shared-object consensus milestone:
 - Event-driven chained-HotStuff ordering for shared/conflicting transactions,
   including signed proposals, votes, quorum certificates, locking, and
   three-certificate commit.
+- Versioned sparse-Merkle leaf/node commitment framing with SHA-256 and an
+  experimental, inactive Poseidon2/BN254 implementation.
+- Canonical execution-proof statements and bounded, exact-ID verifier dispatch;
+  concrete proof backends are not yet implemented.
 
 Important remaining work includes the owned-object fast path, complete node-core
 event orchestration, portable system-module execution, cryptographic slashing
 proof verification, fee-object debiting, production persistence, runtime
 adapters, networking/RPC surfaces, and independent security review.
 
-The next planned technical milestone is the Phase 14 work described in
-[`TODO.md`](TODO.md): commitment-scheme evolution, an experimental Poseidon2
-ZK commitment suite, and execution-proof interfaces.
+The next planned technical milestone is the Phase 15 native HTTP adapter work
+described in [`TODO.md`](TODO.md).
 
 ## Workspace map
 
 | Area | Crates | Responsibility |
 | --- | --- | --- |
-| Protocol foundation | `protocol-types`, `canonical-encoding`, `hashing`, `crypto`, `commitments` | Stable identifiers, canonical bytes, domain separation, hash suites, signatures, and commitment identifiers |
+| Protocol foundation | `protocol-types`, `canonical-encoding`, `hashing`, `crypto`, `commitments` | Stable identifiers, canonical bytes, domain separation, hash suites, signatures, and state commitment schemes |
 | State and access | `objects`, `abi` | Versioned objects, ownership, object references, access modes, and transaction access manifests |
-| Execution | `execution`, `contract-sdk`, `chain-ir`, `system-modules` | Transactions/effects, deterministic WASM, contract host APIs, portable IR, and governed modules |
+| Execution | `execution`, `contract-sdk`, `chain-ir`, `system-modules` | Transactions/effects, deterministic WASM, proof envelopes/verifier interfaces, contract host APIs, portable IR, and governed modules |
 | Economics and governance | `fees`, `bonds`, `governance`, `protocol-upgrades`, `protocol-config` | Stablecoin fees/bonds, admission, governance actions, upgrades, migrations, and committed configuration |
 | Runtime and consensus | `runtime`, `validator-set`, `consensus` | Persistence/runtime interfaces, epoch validator snapshots, and event-driven shared-object ordering |
 
