@@ -207,6 +207,6 @@ The cryptographic core is pure, synchronous, and free of background workers, dae
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
 - DR-0003: Treat hash-suite scheduling as configuration resolution, not as a bulk migration job.
-- DR-011: Introduce a governance-managed `SystemModuleRegistry` with versioned
+- DR-0011: Introduce a governance-managed `SystemModuleRegistry` with versioned
   module commitments (`code`, `semantics`, `manifest`) and optional native/ZK
   acceleration hints while preserving canonical execution equivalence.

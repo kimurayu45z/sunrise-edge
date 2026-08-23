@@ -16,7 +16,8 @@ const SYSTEM_MODULE_TYPE_ID: u16 = 0xB006;
 const SYSTEM_MODULE_REGISTRY_TYPE_ID: u16 = 0xB007;
 const ENCODING_VERSION: u16 = 1;
 const IDENTIFIER_LEN: usize = 32;
-const MAX_MODULES: usize = u16::MAX as usize - 1;
+// Field 1 stores count, field IDs for entries start at 2.
+const MAX_MODULES: usize = u16::MAX as usize - 2;
 
 /// Errors returned by system-module helpers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +41,8 @@ pub enum SystemModuleError {
         /// Duplicate version.
         version: u64,
     },
+    /// Registry entries are not in canonical `(module_id, version)` order.
+    RegistryOutOfOrder,
     /// Canonical encoding failed.
     CanonicalEncoding(CanonicalEncodingError),
 }
@@ -63,6 +66,12 @@ impl fmt::Display for SystemModuleError {
                 write!(
                     f,
                     "duplicate system module entry: {module_id} version {version}"
+                )
+            }
+            Self::RegistryOutOfOrder => {
+                write!(
+                    f,
+                    "system-module registry entries are out of canonical order"
                 )
             }
             Self::CanonicalEncoding(error) => error.fmt(f),
@@ -288,7 +297,9 @@ impl SystemModuleRegistry {
     #[must_use]
     pub fn get(&self, module_id: ModuleId, version: u64) -> Option<&SystemModule> {
         self.modules
-            .binary_search_by_key(&(module_id, version), |entry| (entry.module_id, entry.version))
+            .binary_search_by_key(&(module_id, version), |entry| {
+                (entry.module_id, entry.version)
+            })
             .ok()
             .map(|index| &self.modules[index])
     }
@@ -303,11 +314,16 @@ impl SystemModuleRegistry {
         for module in &self.modules {
             module.validate()?;
             let current = (module.module_id, module.version);
-            if previous == Some(current) {
-                return Err(SystemModuleError::DuplicateModuleVersion {
-                    module_id: module.module_id,
-                    version: module.version,
-                });
+            if let Some(prev) = previous {
+                if prev > current {
+                    return Err(SystemModuleError::RegistryOutOfOrder);
+                }
+                if prev == current {
+                    return Err(SystemModuleError::DuplicateModuleVersion {
+                        module_id: module.module_id,
+                        version: module.version,
+                    });
+                }
             }
             previous = Some(current);
         }
@@ -388,7 +404,9 @@ pub fn encode_system_module_registry(
     registry.validate()?;
 
     let mut canonical = CanonicalStruct::new(SYSTEM_MODULE_REGISTRY_TYPE_ID, ENCODING_VERSION);
-    canonical.field_u16(1, registry.modules().len() as u16)?;
+    let module_count = u16::try_from(registry.modules().len())
+        .map_err(|_| SystemModuleError::RegistryTooLarge(registry.modules().len()))?;
+    canonical.field_u16(1, module_count)?;
     for (index, module) in registry.modules().iter().enumerate() {
         let field_id = u16::try_from(2 + index)
             .map_err(|_| SystemModuleError::RegistryTooLarge(registry.modules().len()))?;

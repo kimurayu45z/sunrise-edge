@@ -146,9 +146,11 @@ fn read_from_wasm(caller: &Caller<HostState>, ptr: i32, len: i32) -> Option<Vec<
 
 fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiError> {
     // ── get_object_count ─────────────────────────────────────────────────
-    linker.func_wrap("env", "get_object_count", |caller: Caller<HostState>| -> i32 {
-        caller.data().inputs.len() as i32
-    })?;
+    linker.func_wrap(
+        "env",
+        "get_object_count",
+        |caller: Caller<HostState>| -> i32 { caller.data().inputs.len() as i32 },
+    )?;
 
     // ── get_object_data_len ──────────────────────────────────────────────
     linker.func_wrap(
@@ -173,7 +175,11 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
     linker.func_wrap(
         "env",
         "read_object_data",
-        |mut caller: Caller<HostState>, index: i32, offset: i32, buf_ptr: i32, buf_len: i32|
+        |mut caller: Caller<HostState>,
+         index: i32,
+         offset: i32,
+         buf_ptr: i32,
+         buf_len: i32|
          -> i32 {
             let idx = index as usize;
             let off = offset as usize;
@@ -328,7 +334,10 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
                 Some(d) => d,
                 None => return -1,
             };
-            caller.data_mut().events.push(EventRecord { type_tag, data });
+            caller
+                .data_mut()
+                .events
+                .push(EventRecord { type_tag, data });
             0
         },
     )?;
@@ -367,7 +376,7 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmiEr
                 .unwrap_or_else(|| "contract aborted".to_string());
             caller.data_mut().trap = Some(msg.clone());
             // Return a wasmi trap to halt WASM execution immediately.
-        Err(WasmiError::new(msg))
+            Err(WasmiError::new(msg))
         },
     )?;
 
@@ -411,8 +420,8 @@ impl ExecutionEngine for WasmExecutionEngine {
             .map_err(|e| ExecutionError::WasmEngine(e.to_string()))?;
 
         // ── module compilation ───────────────────────────────────────────
-        let wasm_module = Module::new(&engine, module)
-            .map_err(|e| ExecutionError::WasmEngine(e.to_string()))?;
+        let wasm_module =
+            Module::new(&engine, module).map_err(|e| ExecutionError::WasmEngine(e.to_string()))?;
 
         // ── linker with host functions ────────────────────────────────────
         let mut linker: Linker<HostState> = Linker::new(&engine);
@@ -681,7 +690,10 @@ mod tests {
             .unwrap();
         assert_eq!(effects.status, ExecutionStatus::Success);
         assert_eq!(effects.object_effects.len(), 1);
-        if let ObjectEffect::Mutated { previous_version, new_object } = &effects.object_effects[0]
+        if let ObjectEffect::Mutated {
+            previous_version,
+            new_object,
+        } = &effects.object_effects[0]
         {
             assert_eq!(*previous_version, 5);
             assert_eq!(new_object.version, 6);

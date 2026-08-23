@@ -43,11 +43,11 @@ use core::fmt;
 
 // ── re-exports ────────────────────────────────────────────────────────────
 
-pub use owner::Owner;
 pub use owner::OWNER_TAG_ADDRESS;
 pub use owner::OWNER_TAG_IMMUTABLE;
 pub use owner::OWNER_TAG_SHARED;
 pub use owner::OWNER_TAG_SYSTEM;
+pub use owner::Owner;
 
 // ── raw host bindings ─────────────────────────────────────────────────────
 
@@ -74,12 +74,7 @@ pub mod host {
     ///
     /// `buf_ptr` must point to at least `buf_len` bytes of writable memory
     /// within the WASM linear memory region.
-    pub unsafe fn read_object_data(
-        index: i32,
-        offset: i32,
-        buf_ptr: *mut u8,
-        buf_len: i32,
-    ) -> i32 {
+    pub unsafe fn read_object_data(index: i32, offset: i32, buf_ptr: *mut u8, buf_len: i32) -> i32 {
         unsafe { raw::read_object_data(index, offset, buf_ptr, buf_len) }
     }
 
@@ -197,12 +192,8 @@ pub mod host {
         unsafe extern "C" {
             pub fn get_object_count() -> i32;
             pub fn get_object_data_len(index: i32) -> i32;
-            pub fn read_object_data(
-                index: i32,
-                offset: i32,
-                buf_ptr: *mut u8,
-                buf_len: i32,
-            ) -> i32;
+            pub fn read_object_data(index: i32, offset: i32, buf_ptr: *mut u8, buf_len: i32)
+            -> i32;
             pub fn write_object_data(index: i32, data_ptr: *const u8, data_len: i32) -> i32;
             pub fn consume_object(index: i32) -> i32;
             pub fn create_object(

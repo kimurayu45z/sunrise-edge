@@ -475,7 +475,10 @@ mod tests {
         invalid.version = 0;
         let action = GovernanceAction::InstallSystemModule(invalid);
         let err = action.validate().unwrap_err();
-        assert_eq!(err, GovernanceError::SystemModule(SystemModuleError::ZeroModuleVersion));
+        assert_eq!(
+            err,
+            GovernanceError::SystemModule(SystemModuleError::ZeroModuleVersion)
+        );
     }
 
     #[test]
