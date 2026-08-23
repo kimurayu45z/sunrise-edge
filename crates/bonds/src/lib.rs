@@ -376,7 +376,6 @@ impl BondObject {
         let config = registry
             .get(self.asset_id)
             .ok_or(BondError::UnknownAsset(self.asset_id))?;
-        self.validate_against(config)?;
         let unlock_epoch = epoch
             .get()
             .checked_add(config.unbonding_epochs)
@@ -625,6 +624,29 @@ mod tests {
         assert_eq!(bond.unlock_epoch, Some(Epoch::new(47)));
         assert!(bond.is_active_at(Epoch::new(46)));
         assert!(!bond.is_active_at(Epoch::new(47)));
+    }
+
+    #[test]
+    fn request_unbond_allows_withdrawal_after_policy_tightens() {
+        let mut registry = BondAssetRegistry::new();
+        registry.add_asset(sample_asset_config(0x12)).unwrap();
+
+        let mut bond = BondObject {
+            validator_id: validator(0x23),
+            asset_id: asset(0x12),
+            amount: Amount::new(150),
+            bonded_epoch: Epoch::new(10),
+            unlock_epoch: None,
+        };
+
+        let mut stricter_policy = sample_asset_config(0x12);
+        stricter_policy.enabled = false;
+        stricter_policy.min_bond = Amount::new(200);
+        registry.update_asset(stricter_policy).unwrap();
+
+        bond.request_unbond(&registry, Epoch::new(40)).unwrap();
+
+        assert_eq!(bond.unlock_epoch, Some(Epoch::new(47)));
     }
 
     #[test]
