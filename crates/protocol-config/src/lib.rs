@@ -153,4 +153,16 @@ mod tests {
 
         assert_eq!(err, ProtocolConfigError::ZeroProtocolVersion);
     }
+
+    #[test]
+    fn zero_hash_suite_id_is_rejected() {
+        let err = encode_protocol_config(&ProtocolConfig {
+            protocol_version: ProtocolVersion::new(1),
+            hash_suite_id: HashSuiteId::new(0),
+            commitment_scheme_id: CommitmentSchemeId::SparseMerkleSha256V1,
+        })
+        .unwrap_err();
+
+        assert_eq!(err, ProtocolConfigError::ZeroHashSuiteId);
+    }
 }

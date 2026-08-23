@@ -270,7 +270,7 @@ pub fn encode_commitment_scheme_id(
 pub fn encode_commitment(commitment: &Commitment) -> Result<Vec<u8>, CommitmentSchemeError> {
     let mut canonical = CanonicalStruct::new(COMMITMENT_TYPE_ID, ENCODING_VERSION);
     canonical.field_bytes(1, encode_commitment_scheme_id(commitment.scheme_id)?)?;
-    canonical.field_bytes(2, commitment.bytes.clone())?;
+    canonical.field_bytes(2, commitment.bytes.as_slice())?;
     Ok(canonical.finish()?)
 }
 

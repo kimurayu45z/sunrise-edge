@@ -271,7 +271,7 @@ pub fn encode_object(object: &Object) -> Result<Vec<u8>, ObjectError> {
     canonical.field_bytes(3, encode_owner(&object.owner)?)?;
     canonical.field_bytes(4, encode_digest32(&object.type_hash)?)?;
     canonical.field_u32(5, object.schema_version)?;
-    canonical.field_bytes(6, object.data.clone())?;
+    canonical.field_bytes(6, object.data.as_slice())?;
     Ok(canonical.finish()?)
 }
 
