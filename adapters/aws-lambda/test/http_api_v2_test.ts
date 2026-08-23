@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import { deepStrictEqual, equal } from "node:assert/strict";
+import { WEB_INGRESS_CONFORMANCE_FIXTURES } from "../../shared/conformance-fixtures.ts";
 import {
   LIVENESS_PATH,
   NODE_EVENT_MEDIA_TYPE,
@@ -13,6 +14,27 @@ import {
 } from "../src/http-api-v2.ts";
 
 const NODE_CORE_URL = "https://node.internal.example/v1/events";
+
+for (const fixture of WEB_INGRESS_CONFORMANCE_FIXTURES) {
+  Deno.test(`AWS matches shared fixture: ${fixture.name}`, async () => {
+    const handler = createAwsLambdaHandler({
+      nodeCoreUrl: NODE_CORE_URL,
+      bearerToken: "test-token",
+      fetch: () => Promise.reject(new Error("must not be called")),
+    });
+    const body = fixture.body === null ? undefined : new Uint8Array(fixture.body);
+    const input = event(fixture.path, fixture.method, body);
+    input.headers = fixture.headers;
+    const result = await handler(input);
+    equal(result.statusCode, fixture.expectedStatus);
+    equal(result.headers["cache-control"], "no-store");
+    equal(result.headers.allow ?? null, fixture.expectedAllow);
+    equal(
+      new TextDecoder().decode(decodeResultBody(result)),
+      fixture.expectedBody ?? "",
+    );
+  });
+}
 
 function event(
   rawPath: string,
