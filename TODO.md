@@ -1938,7 +1938,7 @@ Phase 15 As-Is scope:
   definite Rejected、Indeterminateへ閉じた。revision conflict、stale fence、serialization abort、
   commit dispatch前に証明されたdeadline/unavailabilityだけをdefinite abortとし、dispatch後のdeadline、
   connection loss、cancellationはbackendのauthoritative abort evidenceなしに失敗扱いしない
-  （boundary implemented As-Is; node-core/native/durable adapter wiring pending）。correlation ID、fence、deadlineを
+  （boundary implemented As-Is; node-core/native composition implemented; durable adapter wiring pending）。correlation ID、fence、deadlineを
   protocol canonical input、request dedup identity、HTTP caller-selected authorityにしてはならない。
 - runtimeはnormalized store向け`DurableInvocationTransaction`を持つ。logical domain、read-onlyも許すoptional
   complete state section、typed canonical receipt、optional typed ordered outbox、explicit object sectionを分離し、
@@ -1947,11 +1947,13 @@ Phase 15 As-Is scope:
   node-core additive handlerはmanifest domainをI/O前にresolveし、typed receipt replayをstate readより先に行い、
   read-only assertionを含むstate/receipt/outboxをこのenvelopeへ構築する。definite commitまたはexact replay以外では
   outputを返さない。single-lock memory conformance storeでatomic publication、conflict、read-only、fence、deadline、
-  node-core commit/replayを検証する（runtime/node-core/memory implemented As-Is; native/durable store wiring pending）。
+  node-core commit/replayを検証する（runtime/node-core/memory/native composition implemented As-Is; durable store wiring pending）。
 - request pathのcommit直後deliveryはdomain-wide `claim_due_outbox`を流用しない。同じdomainのolder due workを
   今回requestと誤認しないよう、trusted `(domain, request_id, now, lease, expiry)`を持つexact-request claimを使う。
   memory conformanceはolder due rowが存在しても指定requestだけをclaimし、cross-request/domain lease reuseを拒否する
-  （contract/memory implemented As-Is; native/durable adapter wiring pending）。
+  native structured request pathは同一operation contextでcommit後にexact requestを最大1 message claimし、
+  Indeterminate claim/ackを同一identityで1回reconcileし、未解決claimをsendしない
+  （contract/memory/native implemented As-Is; durable adapter wiring pending）。
 - indexed production outbox boundaryはtrusted runtime timeとbounded restart-safe leaseを受け、
   `(available_at, request_id)`のstable index順で最大1件だけclaimする。scheduler cursorやprefix scanを
   authorityにせず、同じlease IDの再claimはindeterminate claimのreconciliationとして同じworkを返し、
@@ -2052,7 +2054,7 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
 3. `POSTGRES.md`のexact namespace、unsigned SQL representation、normalized relation、attempt history、
    transaction order、migration policyを維持する。adapterがopaque PersistenceLayout key prefixをparseせずに済むよう、
    state/object/receipt/outboxを明示的sectionとして持つstructured durable transaction envelopeを先に実装する
-   （runtime/node-core/memory conformance implemented As-Is; native wiring/migration/adapter pending）。その後explicit migration、bounded pool/deadline、
+   （runtime/node-core/memory/native composition implemented As-Is; migration/durable adapter pending）。その後explicit migration、bounded pool/deadline、
    typed conflictを持つPostgreSQL adapterを実装する。
 4. shared conformanceにwrite skew、absent-key race、serialization failure、lease fencing、schema/version skewを追加する。
 5. kill/power fault、disk full、connection exhaustion、capacity/load/soak、backup/restore、writer failoverをrehearsalする。

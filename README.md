@@ -109,8 +109,8 @@ cross-provider ingress milestones implemented through Phase 17:
   state reads, supports read-only state assertions, and withholds output for
   rejected or indeterminate commits. A single-lock in-memory conformance store
   validates atomic state/receipt/outbox publication, trusted time, fencing,
-  conflicts, and exact replay. Native composition and durable stores have not
-  yet migrated to it.
+  conflicts, and exact replay. An additive native composition uses this
+  boundary; no restart-safe durable store implements it yet.
 - An additive indexed durable-outbox repository contract that claims at most
   one due message in stable availability/request order, installs a bounded
   restart-safe lease atomically, and makes same-lease claim and acknowledgement
@@ -122,9 +122,11 @@ cross-provider ingress milestones implemented through Phase 17:
   restart-safe adapter uses this contract yet; prefix scanning remains
   compatibility-only recovery.
 - An exact-request durable outbox claim beside the unattended due-work claim.
-  Native request composition can target only the request that just committed,
-  even when older work is due in the same domain, while sharing the same lease
-  identity, expiry, acknowledgement, and reconciliation invariants.
+  The additive structured native request path targets only the request that
+  just committed, even when older work is due in the same domain. Commit,
+  claim, and acknowledgement share one bounded operational context; an
+  indeterminate claim receives one same-identity reconciliation attempt and is
+  never sent while unresolved.
 - A transactional node-core path that declares bounded state access before
   reads, transitions over an immutable versioned snapshot, and rejects
   undeclared or read-only updates before atomic commit. Every declared
@@ -198,11 +200,9 @@ independent security review.
 
 The next planned technical milestones work backward through the Phase 15
 production exit criteria in [`TODO.md`](TODO.md) and the accepted
-[persistence design](PERSISTENCE.md): wire the durable operation boundary
-through node-core using the implemented structured state/receipt/outbox
-envelope, then
-implement the accepted [PostgreSQL reference design](POSTGRES.md) and adapter
-that back indexed native recovery.
+[persistence design](PERSISTENCE.md): implement the accepted
+[PostgreSQL reference design](POSTGRES.md) and adapter behind the structured
+native request and indexed recovery boundaries.
 Deadline/cancellation, abrupt
 fault, backup/restore, capacity, and provider conformance follow on that
 foundation. Phase 16/17 provider trust, deployment, observability, and release

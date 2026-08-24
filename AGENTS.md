@@ -219,12 +219,14 @@ bytes. Additive node-core handlers resolve it from one access-plan derivation
 before storage reads and return the domain beside output. An additive native
 router uses that result for request-scoped delivery and accepts no HTTP domain,
 but SQLite/default routing and scan recovery remain legacy. The current Phase
-15 sequence is: preserve and wire the additive fenced/deadline-aware durable
-domain boundary; implement the structured state/object/receipt/outbox durable
-envelope required by [`POSTGRES.md`](POSTGRES.md) through node-core and shared
-conformance (runtime, node-core, and ephemeral structured/indexed memory conformance exist, including exact-request claims, but native/durable wiring is pending);
-implement the normalized PostgreSQL adapter behind the additive indexed native
-recovery seam; then run
+15 sequence is: preserve the additive fenced/deadline-aware structured
+state/object/receipt/outbox boundary now wired through node-core, ephemeral
+memory conformance, and an explicit native request composition. Native commits
+the typed invocation and uses the same operation context to claim/ack at most
+one message for that exact request; it never sends an unresolved claim. Next,
+implement the normalized PostgreSQL adapter required by
+[`POSTGRES.md`](POSTGRES.md) behind both the structured request and indexed
+native recovery seams; then run
 shared conformance, deadline/cancellation, abrupt fault,
 backup/restore, capacity, and provider implementations. Do not spend further
 effort treating the opaque SQLite table or prefix scanner as the production
