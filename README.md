@@ -76,6 +76,11 @@ cross-provider ingress milestones implemented through Phase 17:
   identity/version checks. It also implements bounded, cursor-paginated binary
   prefix key discovery for recovery adapters; it is not yet composed into a
   production native runtime.
+- An explicit `ComposedRuntime` for assembling independently selected state,
+  blob, signer, transport, clock, and scheduler components without hidden
+  defaults. Native conformance tests close/reopen SQLite into a new composition,
+  recover committed outboxes without reapplying state, preserve failed-send
+  leases, and redeliver only after expiry.
 - A bounded, replay-context-aware node-core invocation boundary that persists
   one pure transition with compare-and-swap before releasing output.
 - A bounded, versioned multi-key transaction contract with ABA-safe tombstone
@@ -125,17 +130,17 @@ cross-provider ingress milestones implemented through Phase 17:
 
 Important remaining work includes the owned-object fast path, concrete
 node-event dispatch and protocol handlers, cancellable durable-I/O deadlines,
-real provider trigger wiring and durable recovery fault conformance, portable
-system-module
+real provider trigger wiring, abrupt process/power-fault recovery conformance,
+portable system-module
 execution, cryptographic slashing proof verification, fee-object debiting,
 provider persistence bindings, runtime adapters, networking/RPC surfaces, and
 independent security review.
 
 The next planned technical milestone works backward through the Phase 15
-production exit criteria in [`TODO.md`](TODO.md): exercise one-shot recovery
-against SQLite reopen/process-fault boundaries, wire authenticated provider
-triggers without trusting their delivery, define storage-aware
-deadlines/cancellation, and prove power-fault recovery
+production exit criteria in [`TODO.md`](TODO.md): wire authenticated provider
+triggers without trusting their delivery, add abrupt kill/power-loss recovery
+harnesses beyond orderly SQLite reopen, and define storage-aware
+deadlines/cancellation
 conformance. Phase 16/17 provider trust, deployment, capacity,
 observability, and release rehearsal remain required after that shared
 foundation exists.
