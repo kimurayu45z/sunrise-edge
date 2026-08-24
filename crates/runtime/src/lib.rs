@@ -18,6 +18,33 @@ pub enum RuntimeError {
     EmptyKey,
     /// Scheduled payloads must not be empty.
     EmptyScheduledPayload,
+    /// Atomic state transactions must contain at least one write.
+    EmptyWriteSet,
+    /// An atomic state transaction exceeded its write-count bound.
+    TooManyStateWrites {
+        /// Actual write count.
+        count: usize,
+        /// Maximum accepted write count.
+        maximum: usize,
+    },
+    /// A state key exceeded its byte-length bound.
+    StateKeyTooLong {
+        /// Actual byte length.
+        length: usize,
+        /// Maximum accepted byte length.
+        maximum: usize,
+    },
+    /// A state value exceeded its byte-length bound.
+    StateValueTooLarge {
+        /// Actual byte length.
+        length: usize,
+        /// Maximum accepted byte length.
+        maximum: usize,
+    },
+    /// An atomic state transaction contained the same key more than once.
+    DuplicateStateWriteKey,
+    /// A state revision could not be incremented without wrapping.
+    StateRevisionOverflow,
     /// The system clock appears to be before unix epoch.
     ClockBeforeUnixEpoch,
     /// The system clock value exceeds supported range.
@@ -29,6 +56,21 @@ impl fmt::Display for RuntimeError {
         match self {
             Self::EmptyKey => write!(f, "state keys must not be empty"),
             Self::EmptyScheduledPayload => write!(f, "scheduled payloads must not be empty"),
+            Self::EmptyWriteSet => write!(f, "atomic state write set must not be empty"),
+            Self::TooManyStateWrites { count, maximum } => write!(
+                f,
+                "atomic state write set has {count} writes, maximum is {maximum}"
+            ),
+            Self::StateKeyTooLong { length, maximum } => {
+                write!(f, "state key is {length} bytes, maximum is {maximum}")
+            }
+            Self::StateValueTooLarge { length, maximum } => {
+                write!(f, "state value is {length} bytes, maximum is {maximum}")
+            }
+            Self::DuplicateStateWriteKey => {
+                write!(f, "atomic state write set contains a duplicate key")
+            }
+            Self::StateRevisionOverflow => write!(f, "state revision overflow"),
             Self::ClockBeforeUnixEpoch => write!(f, "clock is before unix epoch"),
             Self::ClockOverflow => write!(f, "clock value exceeds u64 milliseconds range"),
         }
@@ -36,6 +78,178 @@ impl fmt::Display for RuntimeError {
 }
 
 impl Error for RuntimeError {}
+
+/// Maximum key size accepted by one transactional state operation.
+pub const MAX_STATE_KEY_BYTES: usize = 4 * 1024;
+/// Maximum value size accepted by one transactional state operation.
+pub const MAX_STATE_VALUE_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum distinct keys mutated by one atomic state transaction.
+pub const MAX_ATOMIC_STATE_WRITES: usize = 4_096;
+
+/// Monotonic optimistic-concurrency token for one state key.
+///
+/// Revision zero means that the key has never been written. Deletions retain a
+/// tombstone revision so a delete/recreate cycle cannot cause an ABA match.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StateRevision(u64);
+
+impl StateRevision {
+    /// Revision returned for a key that has never been written.
+    pub const INITIAL: Self = Self(0);
+
+    /// Creates a revision from its storage representation.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the storage representation.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    fn checked_next(self) -> Result<Self, RuntimeError> {
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or(RuntimeError::StateRevisionOverflow)
+    }
+}
+
+/// One versioned state observation, including a retained deletion tombstone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VersionedStateValue {
+    revision: StateRevision,
+    value: Option<Vec<u8>>,
+}
+
+impl VersionedStateValue {
+    /// Returns the monotonic revision observed for this key.
+    #[must_use]
+    pub const fn revision(&self) -> StateRevision {
+        self.revision
+    }
+
+    /// Returns the present value, or `None` for an unwritten/deleted key.
+    #[must_use]
+    pub fn value(&self) -> Option<&[u8]> {
+        self.value.as_deref()
+    }
+}
+
+/// Mutation applied after its expected revision has been validated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StateMutation {
+    /// Stores or replaces a value.
+    Put(Vec<u8>),
+    /// Deletes a value while retaining a revision tombstone.
+    Delete,
+}
+
+/// One conditional mutation in an atomic write set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateWrite {
+    key: Vec<u8>,
+    expected_revision: StateRevision,
+    mutation: StateMutation,
+}
+
+impl StateWrite {
+    /// Creates and validates one conditional state mutation.
+    pub fn new(
+        key: Vec<u8>,
+        expected_revision: StateRevision,
+        mutation: StateMutation,
+    ) -> Result<Self, RuntimeError> {
+        validate_state_key(&key)?;
+        if let StateMutation::Put(value) = &mutation {
+            validate_state_value(value)?;
+        }
+        Ok(Self {
+            key,
+            expected_revision,
+            mutation,
+        })
+    }
+
+    /// Returns the state key.
+    #[must_use]
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// Returns the revision that must still be current at commit time.
+    #[must_use]
+    pub const fn expected_revision(&self) -> StateRevision {
+        self.expected_revision
+    }
+
+    /// Returns the requested mutation.
+    #[must_use]
+    pub const fn mutation(&self) -> &StateMutation {
+        &self.mutation
+    }
+}
+
+/// Bounded, unique, canonically key-ordered atomic state write set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AtomicStateWriteSet {
+    writes: Vec<StateWrite>,
+}
+
+impl AtomicStateWriteSet {
+    /// Validates, sorts, and constructs an atomic write set.
+    pub fn new(mut writes: Vec<StateWrite>) -> Result<Self, RuntimeError> {
+        if writes.is_empty() {
+            return Err(RuntimeError::EmptyWriteSet);
+        }
+        if writes.len() > MAX_ATOMIC_STATE_WRITES {
+            return Err(RuntimeError::TooManyStateWrites {
+                count: writes.len(),
+                maximum: MAX_ATOMIC_STATE_WRITES,
+            });
+        }
+
+        writes.sort_by(|left, right| left.key.cmp(&right.key));
+        if writes.windows(2).any(|pair| pair[0].key == pair[1].key) {
+            return Err(RuntimeError::DuplicateStateWriteKey);
+        }
+        Ok(Self { writes })
+    }
+
+    /// Returns writes in deterministic key order.
+    #[must_use]
+    pub fn writes(&self) -> &[StateWrite] {
+        &self.writes
+    }
+}
+
+/// Result of one atomic state transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AtomicStateWriteResult {
+    /// Every expected revision matched and every mutation committed.
+    Committed,
+    /// No mutation was applied because one key's revision did not match.
+    Conflict {
+        /// First conflicting key in canonical key order.
+        key: Vec<u8>,
+        /// Revision observed while holding the transaction lock.
+        current_revision: StateRevision,
+    },
+}
+
+/// Versioned multi-key state interface for production node-core transactions.
+pub trait TransactionalStateStore: StateStore {
+    /// Reads a value and its ABA-safe revision token.
+    fn get_versioned(&self, key: &[u8]) -> Result<VersionedStateValue, RuntimeError>;
+
+    /// Atomically checks all revisions and then applies all or none of the writes.
+    fn commit_atomic(
+        &self,
+        write_set: AtomicStateWriteSet,
+    ) -> Result<AtomicStateWriteResult, RuntimeError>;
+}
 
 /// The result of a compare-and-swap state operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,20 +360,35 @@ pub trait Runtime {
 /// In-memory `StateStore` implementation for tests and local execution.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryStateStore {
-    inner: Arc<RwLock<BTreeMap<Vec<u8>, Vec<u8>>>>,
+    inner: Arc<RwLock<BTreeMap<Vec<u8>, StoredStateValue>>>,
+}
+
+#[derive(Clone, Debug)]
+struct StoredStateValue {
+    revision: StateRevision,
+    value: Option<Vec<u8>>,
 }
 
 impl StateStore for MemoryStateStore {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, RuntimeError> {
         ensure_non_empty_key(key)?;
         let guard = self.inner.read().expect("state store lock poisoned");
-        Ok(guard.get(key).cloned())
+        Ok(guard.get(key).and_then(|stored| stored.value.clone()))
     }
 
     fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), RuntimeError> {
         ensure_non_empty_key(&key)?;
+        validate_state_key(&key)?;
+        validate_state_value(&value)?;
         let mut guard = self.inner.write().expect("state store lock poisoned");
-        guard.insert(key, value);
+        let revision = current_revision(&guard, &key).checked_next()?;
+        guard.insert(
+            key,
+            StoredStateValue {
+                revision,
+                value: Some(value),
+            },
+        );
         Ok(())
     }
 
@@ -170,11 +399,20 @@ impl StateStore for MemoryStateStore {
         new_value: Vec<u8>,
     ) -> Result<CompareAndSwapResult, RuntimeError> {
         ensure_non_empty_key(&key)?;
+        validate_state_key(&key)?;
+        validate_state_value(&new_value)?;
 
         let mut guard = self.inner.write().expect("state store lock poisoned");
-        let current = guard.get(&key).cloned();
+        let current = guard.get(&key).and_then(|stored| stored.value.clone());
         if current == expected {
-            guard.insert(key, new_value);
+            let revision = current_revision(&guard, &key).checked_next()?;
+            guard.insert(
+                key,
+                StoredStateValue {
+                    revision,
+                    value: Some(new_value),
+                },
+            );
             return Ok(CompareAndSwapResult {
                 swapped: true,
                 current,
@@ -185,6 +423,55 @@ impl StateStore for MemoryStateStore {
             swapped: false,
             current,
         })
+    }
+}
+
+impl TransactionalStateStore for MemoryStateStore {
+    fn get_versioned(&self, key: &[u8]) -> Result<VersionedStateValue, RuntimeError> {
+        validate_state_key(key)?;
+        let guard = self.inner.read().expect("state store lock poisoned");
+        Ok(match guard.get(key) {
+            Some(stored) => VersionedStateValue {
+                revision: stored.revision,
+                value: stored.value.clone(),
+            },
+            None => VersionedStateValue {
+                revision: StateRevision::INITIAL,
+                value: None,
+            },
+        })
+    }
+
+    fn commit_atomic(
+        &self,
+        write_set: AtomicStateWriteSet,
+    ) -> Result<AtomicStateWriteResult, RuntimeError> {
+        let mut guard = self.inner.write().expect("state store lock poisoned");
+
+        for write in write_set.writes() {
+            let current = current_revision(&guard, write.key());
+            if current != write.expected_revision() {
+                return Ok(AtomicStateWriteResult::Conflict {
+                    key: write.key().to_vec(),
+                    current_revision: current,
+                });
+            }
+        }
+
+        let revisions = write_set
+            .writes()
+            .iter()
+            .map(|write| current_revision(&guard, write.key()).checked_next())
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (write, revision) in write_set.writes.into_iter().zip(revisions) {
+            let value = match write.mutation {
+                StateMutation::Put(value) => Some(value),
+                StateMutation::Delete => None,
+            };
+            guard.insert(write.key, StoredStateValue { revision, value });
+        }
+        Ok(AtomicStateWriteResult::Committed)
     }
 }
 
@@ -508,6 +795,33 @@ fn ensure_non_empty_key(key: &[u8]) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+fn validate_state_key(key: &[u8]) -> Result<(), RuntimeError> {
+    ensure_non_empty_key(key)?;
+    if key.len() > MAX_STATE_KEY_BYTES {
+        return Err(RuntimeError::StateKeyTooLong {
+            length: key.len(),
+            maximum: MAX_STATE_KEY_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn validate_state_value(value: &[u8]) -> Result<(), RuntimeError> {
+    if value.len() > MAX_STATE_VALUE_BYTES {
+        return Err(RuntimeError::StateValueTooLarge {
+            length: value.len(),
+            maximum: MAX_STATE_VALUE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn current_revision(state: &BTreeMap<Vec<u8>, StoredStateValue>, key: &[u8]) -> StateRevision {
+    state
+        .get(key)
+        .map_or(StateRevision::INITIAL, |stored| stored.revision)
+}
+
 fn hex32(bytes: [u8; 32]) -> String {
     let mut out = String::with_capacity(64);
     for byte in bytes {
@@ -551,6 +865,172 @@ mod tests {
         assert!(!result.swapped);
         assert_eq!(result.current, Some(vec![9]));
         assert_eq!(store.get(b"k").unwrap(), Some(vec![9]));
+    }
+
+    #[test]
+    fn atomic_write_set_commits_multiple_keys_in_canonical_order() {
+        let store = MemoryStateStore::default();
+        let writes = AtomicStateWriteSet::new(vec![
+            StateWrite::new(
+                key("z"),
+                StateRevision::INITIAL,
+                StateMutation::Put(vec![2]),
+            )
+            .unwrap(),
+            StateWrite::new(
+                key("a"),
+                StateRevision::INITIAL,
+                StateMutation::Put(vec![1]),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+
+        assert_eq!(writes.writes()[0].key(), b"a");
+        assert_eq!(writes.writes()[1].key(), b"z");
+        assert_eq!(
+            store.commit_atomic(writes).unwrap(),
+            AtomicStateWriteResult::Committed
+        );
+        assert_eq!(store.get(b"a").unwrap(), Some(vec![1]));
+        assert_eq!(store.get(b"z").unwrap(), Some(vec![2]));
+        assert_eq!(
+            store.get_versioned(b"a").unwrap().revision(),
+            StateRevision::new(1)
+        );
+    }
+
+    #[test]
+    fn atomic_conflict_applies_none_of_the_write_set() {
+        let store = MemoryStateStore::default();
+        store.put(key("a"), vec![1]).unwrap();
+        let observed_a = store.get_versioned(b"a").unwrap();
+        let observed_b = store.get_versioned(b"b").unwrap();
+
+        store.put(key("a"), vec![9]).unwrap();
+        let writes = AtomicStateWriteSet::new(vec![
+            StateWrite::new(key("a"), observed_a.revision(), StateMutation::Put(vec![2])).unwrap(),
+            StateWrite::new(key("b"), observed_b.revision(), StateMutation::Put(vec![3])).unwrap(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            store.commit_atomic(writes).unwrap(),
+            AtomicStateWriteResult::Conflict {
+                key: key("a"),
+                current_revision: StateRevision::new(2),
+            }
+        );
+        assert_eq!(store.get(b"a").unwrap(), Some(vec![9]));
+        assert_eq!(store.get(b"b").unwrap(), None);
+    }
+
+    #[test]
+    fn tombstone_revision_prevents_delete_recreate_aba() {
+        let store = MemoryStateStore::default();
+        store.put(key("k"), vec![1]).unwrap();
+        let stale = store.get_versioned(b"k").unwrap();
+
+        let delete = AtomicStateWriteSet::new(vec![
+            StateWrite::new(key("k"), stale.revision(), StateMutation::Delete).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(
+            store.commit_atomic(delete).unwrap(),
+            AtomicStateWriteResult::Committed
+        );
+        let deleted = store.get_versioned(b"k").unwrap();
+        assert_eq!(deleted.value(), None);
+        assert_eq!(deleted.revision(), StateRevision::new(2));
+
+        let recreate = AtomicStateWriteSet::new(vec![
+            StateWrite::new(key("k"), deleted.revision(), StateMutation::Put(vec![1])).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(
+            store.commit_atomic(recreate).unwrap(),
+            AtomicStateWriteResult::Committed
+        );
+
+        let stale_write = AtomicStateWriteSet::new(vec![
+            StateWrite::new(key("k"), stale.revision(), StateMutation::Put(vec![7])).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(
+            store.commit_atomic(stale_write).unwrap(),
+            AtomicStateWriteResult::Conflict {
+                key: key("k"),
+                current_revision: StateRevision::new(3),
+            }
+        );
+        assert_eq!(store.get(b"k").unwrap(), Some(vec![1]));
+    }
+
+    #[test]
+    fn atomic_write_set_rejects_duplicates_and_resource_excess() {
+        let duplicate =
+            StateWrite::new(key("same"), StateRevision::INITIAL, StateMutation::Delete).unwrap();
+        assert_eq!(
+            AtomicStateWriteSet::new(vec![duplicate.clone(), duplicate]),
+            Err(RuntimeError::DuplicateStateWriteKey)
+        );
+        assert_eq!(
+            AtomicStateWriteSet::new(Vec::new()),
+            Err(RuntimeError::EmptyWriteSet)
+        );
+        assert!(matches!(
+            StateWrite::new(
+                vec![0; MAX_STATE_KEY_BYTES + 1],
+                StateRevision::INITIAL,
+                StateMutation::Delete,
+            ),
+            Err(RuntimeError::StateKeyTooLong { .. })
+        ));
+        assert!(matches!(
+            StateWrite::new(
+                key("large"),
+                StateRevision::INITIAL,
+                StateMutation::Put(vec![0; MAX_STATE_VALUE_BYTES + 1]),
+            ),
+            Err(RuntimeError::StateValueTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn revision_overflow_aborts_before_any_atomic_mutation() {
+        let store = MemoryStateStore::default();
+        {
+            let mut guard = store.inner.write().unwrap();
+            guard.insert(
+                key("a"),
+                StoredStateValue {
+                    revision: StateRevision::new(u64::MAX),
+                    value: Some(vec![1]),
+                },
+            );
+        }
+        let writes = AtomicStateWriteSet::new(vec![
+            StateWrite::new(
+                key("a"),
+                StateRevision::new(u64::MAX),
+                StateMutation::Put(vec![2]),
+            )
+            .unwrap(),
+            StateWrite::new(
+                key("b"),
+                StateRevision::INITIAL,
+                StateMutation::Put(vec![3]),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            store.commit_atomic(writes),
+            Err(RuntimeError::StateRevisionOverflow)
+        );
+        assert_eq!(store.get(b"a").unwrap(), Some(vec![1]));
+        assert_eq!(store.get(b"b").unwrap(), None);
     }
 
     #[test]

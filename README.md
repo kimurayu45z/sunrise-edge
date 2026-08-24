@@ -61,8 +61,8 @@ lifetime, or cloud provider.
 
 ## Current status
 
-The workspace currently contains the foundations implemented through the
-experimental Cloudflare Workers ingress milestone:
+The workspace currently contains the foundations and experimental
+cross-provider ingress milestones implemented through Phase 17:
 
 - Canonical framed encoding for protocol-critical values.
 - Bounded, zero-copy canonical frame decoding with strict order and length
@@ -73,6 +73,8 @@ experimental Cloudflare Workers ingress milestone:
 - Runtime traits and an in-memory runtime for deterministic tests.
 - A bounded, replay-context-aware node-core invocation boundary that persists
   one pure transition with compare-and-swap before releasing output.
+- A bounded, versioned multi-key transaction contract with ABA-safe tombstone
+  revisions and an atomic in-memory conformance implementation.
 - A native Axum/Tokio HTTP adapter with strict canonical binary media types,
   bounded bodies, deterministic status mapping, and graceful shutdown wiring.
 - A bounded Cloudflare Workers ingress that uses a generated private Service
@@ -101,10 +103,12 @@ and outbox delivery, portable system-module execution, cryptographic slashing
 proof verification, fee-object debiting, production persistence, runtime
 adapters, networking/RPC surfaces, and independent security review.
 
-The next planned technical milestone is completing the Phase 17 production
-exit criteria in [`TODO.md`](TODO.md): real provider deployment conformance,
-private trust boundaries, durable effects, capacity tests, observability, and
-release rehearsal for the implemented adapter family.
+The next planned technical milestone works backward through the Phase 15
+production exit criteria in [`TODO.md`](TODO.md): move node-core onto the atomic
+write-set, persist request deduplication and outbox records in the same commit,
+then add a durable implementation and crash-recovery conformance. Phase 16/17
+provider trust, deployment, capacity, observability, and release rehearsal
+remain required after that shared foundation exists.
 
 ## Workspace map
 
