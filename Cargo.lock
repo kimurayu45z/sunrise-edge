@@ -518,6 +518,7 @@ version = "0.1.0"
 dependencies = [
  "canonical-encoding",
  "hashing",
+ "protocol-config",
  "protocol-types",
  "runtime",
 ]

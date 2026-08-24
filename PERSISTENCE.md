@@ -99,9 +99,11 @@ a configuration carrying the manifest uses encoding version 2 and requires
 protocol version 2 or later. Version 2 without the manifest and version 1 with
 it both fail closed. The manifest has stable canonical vectors and rejects a
 zero rule version, zero domain ID, an empty access plan, and use before its
-activation epoch. Node-core/native composition does not yet consume this
-resolver, so canonical commitment is implemented but routing integration is
-still pending.
+activation epoch. Node-core now has additive resolved transactional and
+idempotent handlers that derive the bounded application access plan exactly
+once, resolve the committed manifest before storage reads, and return the
+resolved domain beside committed output. Native composition does not yet use
+that path, so adapter routing integration is still pending.
 
 Node-core resolves this manifest after validating event context and after
 constructing the bounded access plan, but before any state read. Every

@@ -215,9 +215,10 @@ domain and dedicated read/mutation envelope with memory conformance; additive
 node-core transaction and outbox delivery entrypoints now use it, while native
 composition and durable stores have not migrated. The logical-domain manifest
 is committed as ProtocolConfig encoding v2 without changing historical v1
-bytes, but node-core must resolve it before native routing trusts a domain. The
-current Phase 15 sequence is: resolve that manifest in node-core, wire native
-composition, add an indexed outbox claim contract,
+bytes. Additive node-core handlers resolve it from one access-plan derivation
+before storage reads and return the domain beside output; native routing must
+use that result rather than caller input. The current Phase 15 sequence is:
+wire resolved-domain native composition, add an indexed outbox claim contract,
 implement the normalized PostgreSQL reference adapter, run shared
 conformance, then deadline/cancellation, abrupt fault, backup/restore, capacity,
 and provider implementations. Do not spend further effort treating the opaque
