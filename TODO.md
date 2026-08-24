@@ -1867,6 +1867,9 @@ Phase 15 prerequisites:
   domains, normalized logical data, indexed outbox recovery, provider mappings,
   migration, retention, and disaster recovery from the SQLite reference
   (design accepted; implementation pending)
+- complete declared read-set revision assertion in transactional and
+  idempotent node-core commits, including read-only and absent keys
+  (implemented As-Is; explicit atomicity domain/read-set API pending)
 
 Phase 15 As-Is scope:
 
@@ -1908,7 +1911,9 @@ Phase 15 As-Is scope:
   kill -9、torn write、filesystem failure、power lossの証明ではない。
 - node-coreのtransactional pathはcontext検証後かつstate read前にevent-specific access planを
   確定し、全keyをrevision付きsnapshotとしてpure transitionへ渡す。undeclared/read-only updateを
-  rejectし、観測revisionをnode-core自身がwrite-setへbindし、全commit成功までoutputを返さない。
+  rejectし、更新しないread-write/read-only/absent/tombstoneを含む全観測revisionを
+  `StateMutation::Assert`としてwrite-setへbindし、全commit成功までoutputを返さない
+  （complete read-set assertion implemented As-Is）。
   native HTTP adapterはこのrecoverable transactional pathをdefaultにした。edge adapterの
   downstream service実装とdurable provider storeは別途必要である。
 - recoverable transactional pathはcomplete canonical NodeEventをdedicated hash domain 0x000Dと
@@ -1978,7 +1983,8 @@ Phase 15 To-Be production exit criteria:
 
 Phase 15 persistence implementation order（To-Beからの逆算）:
 
-1. atomicity domainとcomplete read-set assertionをruntime/node-core transaction contractへ追加する。
+1. implemented As-Isのcomplete read-set assertionを、明示的atomicity domainとdedicated read-setを持つ
+   runtime/node-core transaction contractへ発展させる。
 2. indexed due-outbox repository/claim contractを追加し、StateKeyScannerはmaintenance/compatibilityへ戻す。
 3. normalized schema、explicit migration、bounded pool/deadline、typed conflictを持つPostgreSQL adapterを実装する。
 4. shared conformanceにwrite skew、absent-key race、serialization failure、lease fencing、schema/version skewを追加する。

@@ -430,13 +430,14 @@ not the required durable production store.
 Node-core exposes this seam through `handle_transactional_event`. A state
 machine derives a bounded, unique access plan from the already context-checked
 event before any storage read. Node-core loads a revision-bearing snapshot,
-passes it into one pure transition, rejects undeclared or read-only updates,
-and binds each accepted update to the revision it observed. Responses and
-outbound messages remain withheld until the complete write set commits. The
-legacy single-key handler remains for the current adapters, so this is not yet
-a migration or production durability claim. Canonical deduplication records,
-persisted outbox entries, adapter migration, and crash recovery remain
-subsequent Phase 15 work.
+passes it into one pure transition, and rejects undeclared or read-only
+updates. Every declared observation enters the final atomic write set: an
+updated read-write key carries its mutation, while untouched read-write,
+read-only, absent, and tombstoned keys carry `StateMutation::Assert`. A
+concurrent dependency revision therefore rejects the whole commit before any
+candidate update or output is released. The API still lacks an explicit
+atomicity domain and dedicated read-set type, so this is not yet the production
+persistence contract.
 
 The recoverable transactional path additionally hashes the complete canonical
 `NodeEvent` under dedicated hash domain `0x000D`, using the active epoch hash
@@ -868,3 +869,7 @@ certification requirements live in [`PERSISTENCE.md`](PERSISTENCE.md).
   reference, map one Cloudflare Durable Object to one domain, begin AWS with one
   fenced writer region, and prohibit cross-domain or multi-region authoritative
   writes until their protocol and conformance evidence exist.
+- DR-0040: Bind every key in a transactional node-core access plan into the
+  atomic commit. Encode untouched read-write, read-only, absent, and tombstoned
+  observations as revision-only `Assert` entries so a dependency change
+  rejects application state, receipt, and outbox publication together.
