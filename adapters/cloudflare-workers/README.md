@@ -24,5 +24,11 @@ the no-floating-promises lint rule, and executes integration tests inside
 workerd with a mock Service Binding. No deployment is performed by these
 commands.
 
+Project typechecking intentionally invokes the `typescript-7` package alias,
+currently TypeScript 7.0.2. The separately pinned `typescript` 6.x package is
+only the compiler API used by `typescript-eslint` until its peer range supports
+TypeScript 7. Do not bypass that peer range with forced installation or replace
+ESLint as a dependency-upgrade shortcut.
+
 Production gaps and exit criteria are tracked under Phase 16 in the repository
 [`TODO.md`](../../TODO.md).

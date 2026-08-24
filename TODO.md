@@ -2077,6 +2077,11 @@ Phase 16 As-Is scope:
   observabilityを固定し、binding typeはwrangler typesで生成する。
 - workerd integration testはmock Service Bindingでsuccess、liveness、method/media/encoding、
   declared/streamed oversize、downstream failureを検証する。
+- toolchain compatibility debtとして、project typecheckは`typescript-7` aliasのTypeScript 7.0.2を
+  使用し、`typescript-eslint` 8.xのpeer rangeを満たすTypeScript 6.xはESLint parser専用に隔離している。
+  `typescript-eslint`がTypeScript 7を正式supportした時点で、通常の`typescript` dependencyを
+  TypeScript 7へ統一し、`typescript-7` aliasと一時的なTypeScript 6.xを削除する。その変更は
+  forced peer resolutionを使わず、ESLintのtype-aware rulesとrepository全gateの通過を必須とする。
 - 現実装はbounded ingress/relayだけであり、Cloudflare上でnode-core transitionやdurable stateを
   実行するproduction validatorの完成形ではない。
 
