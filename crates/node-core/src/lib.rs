@@ -2602,8 +2602,8 @@ mod tests {
     use super::*;
     use protocol_types::{HashSuite, HashSuiteSchedule};
     use runtime::{
-        DurableDomainStateStore, MemoryRuntime, StateRevision, StateStore, StorageCorrelationId,
-        StorageDeadline, TransactionalStateStore, WriterFenceGeneration,
+        DurableDomainStateStore, MemoryDurableStateStore, MemoryRuntime, StateRevision, StateStore,
+        StorageCorrelationId, StorageDeadline, TransactionalStateStore, WriterFenceGeneration,
     };
     use std::sync::{
         Mutex,
@@ -3290,6 +3290,51 @@ mod tests {
             Err(NodeCoreError::RequestIdReuse)
         );
         assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn durable_idempotent_handler_conforms_against_memory_store() {
+        let store = MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        let input = event("sunrise-test", request(0x93));
+        let context = durable_context();
+        let first = handle_resolved_durable_idempotent_event(
+            &store,
+            &context,
+            &placement(0xC3, 7),
+            &config("sunrise-test"),
+            &resolver("sunrise-test"),
+            input.clone(),
+            &machine,
+        )
+        .unwrap();
+        let replay = handle_resolved_durable_idempotent_event(
+            &store,
+            &context,
+            &placement(0xC3, 7),
+            &config("sunrise-test"),
+            &resolver("sunrise-test"),
+            input,
+            &machine,
+        )
+        .unwrap();
+
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first.output().responses(), replay.output().responses());
+        assert!(replay.output().outbound_messages().is_empty());
+        let persisted = store
+            .get_versioned_durable(&context, domain(0xC3), b"state/idempotent")
+            .unwrap();
+        assert_eq!(persisted.revision(), StateRevision::new(1));
+        assert_eq!(
+            decode_canonical_frame(persisted.value().unwrap())
+                .unwrap()
+                .required_u64(1),
+            Ok(1)
+        );
     }
 
     struct ReadOnlyMachine;

@@ -2112,6 +2112,265 @@ fn read_memory_versioned(
     }
 }
 
+type MemoryDurableInvocationKey = ([u8; 32], [u8; 32]);
+
+#[derive(Debug)]
+struct MemoryDurableStoreData {
+    active_writer_fence: WriterFenceGeneration,
+    now_unix_millis: u64,
+    state_domains: MemoryDomainState,
+    receipts: BTreeMap<MemoryDurableInvocationKey, DurableRequestReceipt>,
+    outboxes: BTreeMap<MemoryDurableInvocationKey, DurableOutboxBatch>,
+}
+
+/// In-memory conformance fixture for the fenced structured durable contract.
+///
+/// This store keeps state, typed receipts, and typed outboxes under one lock so
+/// tests observe the same all-or-none commit boundary expected from durable
+/// adapters. Trusted time and writer generation are explicitly injected. It is
+/// not a production persistence implementation and does not survive restart.
+#[derive(Clone, Debug)]
+pub struct MemoryDurableStateStore {
+    inner: Arc<RwLock<MemoryDurableStoreData>>,
+}
+
+impl MemoryDurableStateStore {
+    /// Creates an empty fixture with one authoritative writer generation.
+    #[must_use]
+    pub fn new(active_writer_fence: WriterFenceGeneration) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(MemoryDurableStoreData {
+                active_writer_fence,
+                now_unix_millis: 0,
+                state_domains: BTreeMap::new(),
+                receipts: BTreeMap::new(),
+                outboxes: BTreeMap::new(),
+            })),
+        }
+    }
+
+    /// Sets trusted fixture time used for deadline validation.
+    pub fn set_time(&self, now_unix_millis: u64) {
+        self.inner
+            .write()
+            .expect("durable state store lock poisoned")
+            .now_unix_millis = now_unix_millis;
+    }
+
+    /// Replaces the authoritative writer generation to exercise fencing.
+    pub fn set_active_writer_fence(&self, active_writer_fence: WriterFenceGeneration) {
+        self.inner
+            .write()
+            .expect("durable state store lock poisoned")
+            .active_writer_fence = active_writer_fence;
+    }
+}
+
+fn validate_memory_durable_read_authority(
+    data: &MemoryDurableStoreData,
+    context: &DurableOperationContext,
+) -> Result<(), DurableReadError> {
+    if context.writer_fence() != data.active_writer_fence {
+        return Err(DurableReadError::WriterFenced {
+            active_generation: data.active_writer_fence,
+        });
+    }
+    if context.deadline().is_expired_at(data.now_unix_millis) {
+        return Err(DurableReadError::DeadlineExceeded);
+    }
+    Ok(())
+}
+
+fn validate_memory_durable_commit_authority(
+    data: &MemoryDurableStoreData,
+    context: &DurableOperationContext,
+) -> Result<(), DurableCommitRejection> {
+    if context.writer_fence() != data.active_writer_fence {
+        return Err(DurableCommitRejection::WriterFenced {
+            active_generation: data.active_writer_fence,
+        });
+    }
+    if context.deadline().is_expired_at(data.now_unix_millis) {
+        return Err(DurableCommitRejection::DeadlineExceededBeforeCommit);
+    }
+    Ok(())
+}
+
+fn validate_memory_durable_reads(
+    state: Option<&BTreeMap<Vec<u8>, StoredStateValue>>,
+    reads: &[StateReadAssertion],
+) -> Result<(), DurableCommitRejection> {
+    for read in reads {
+        let current = state.map_or(StateRevision::INITIAL, |state| {
+            current_revision(state, read.key())
+        });
+        if current != read.expected_revision() {
+            return Err(DurableCommitRejection::Conflict {
+                key: read.key().to_vec(),
+                current_revision: current,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn memory_durable_revisions(
+    state: Option<&BTreeMap<Vec<u8>, StoredStateValue>>,
+    mutations: &[StateMutationEntry],
+) -> Result<Vec<StateRevision>, DurableCommitRejection> {
+    mutations
+        .iter()
+        .map(|mutation| {
+            if matches!(mutation.mutation(), StateMutation::Assert) {
+                return Err(DurableCommitRejection::InvalidPersistedState);
+            }
+            state
+                .map_or(StateRevision::INITIAL, |state| {
+                    current_revision(state, mutation.key())
+                })
+                .checked_next()
+                .map_err(|_| DurableCommitRejection::StateRevisionOverflow)
+        })
+        .collect()
+}
+
+fn apply_memory_durable_mutations(
+    state: &mut BTreeMap<Vec<u8>, StoredStateValue>,
+    mutations: Vec<StateMutationEntry>,
+    revisions: Vec<StateRevision>,
+) -> Result<(), DurableCommitRejection> {
+    for (mutation, revision) in mutations.into_iter().zip(revisions) {
+        let value = match mutation.mutation {
+            StateMutation::Put(value) => Some(value),
+            StateMutation::Delete => None,
+            StateMutation::Assert => {
+                return Err(DurableCommitRejection::InvalidPersistedState);
+            }
+        };
+        state.insert(mutation.key, StoredStateValue { revision, value });
+    }
+    Ok(())
+}
+
+impl DurableDomainStateStore for MemoryDurableStateStore {
+    fn get_versioned_durable(
+        &self,
+        context: &DurableOperationContext,
+        domain: AtomicityDomainId,
+        key: &[u8],
+    ) -> Result<VersionedStateValue, DurableReadError> {
+        validate_state_key(key).map_err(DurableReadError::InvalidRequest)?;
+        let data = self
+            .inner
+            .read()
+            .expect("durable state store lock poisoned");
+        validate_memory_durable_read_authority(&data, context)?;
+        Ok(read_memory_versioned(
+            data.state_domains.get(domain.as_bytes()),
+            key,
+        ))
+    }
+
+    fn commit_durable(
+        &self,
+        context: &DurableOperationContext,
+        transaction: AtomicStateTransaction,
+    ) -> DurableCommitOutcome {
+        let mut data = self
+            .inner
+            .write()
+            .expect("durable state store lock poisoned");
+        if let Err(reason) = validate_memory_durable_commit_authority(&data, context) {
+            return DurableCommitOutcome::Rejected(reason);
+        }
+        let domain = *transaction.domain.as_bytes();
+        let state = data.state_domains.get(&domain);
+        if let Err(reason) = validate_memory_durable_reads(state, transaction.reads()) {
+            return DurableCommitOutcome::Rejected(reason);
+        }
+        let revisions = match memory_durable_revisions(state, transaction.mutations()) {
+            Ok(revisions) => revisions,
+            Err(reason) => return DurableCommitOutcome::Rejected(reason),
+        };
+        let state = data.state_domains.entry(domain).or_default();
+        match apply_memory_durable_mutations(state, transaction.mutations.mutations, revisions) {
+            Ok(()) => DurableCommitOutcome::Committed,
+            Err(reason) => DurableCommitOutcome::Rejected(reason),
+        }
+    }
+}
+
+impl StructuredDurableDomainStateStore for MemoryDurableStateStore {
+    fn get_request_receipt(
+        &self,
+        context: &DurableOperationContext,
+        domain: AtomicityDomainId,
+        request_id: DurableRequestId,
+    ) -> Result<Option<DurableRequestReceipt>, DurableReadError> {
+        let data = self
+            .inner
+            .read()
+            .expect("durable state store lock poisoned");
+        validate_memory_durable_read_authority(&data, context)?;
+        Ok(data
+            .receipts
+            .get(&(*domain.as_bytes(), *request_id.as_bytes()))
+            .cloned())
+    }
+
+    fn commit_invocation(
+        &self,
+        context: &DurableOperationContext,
+        transaction: DurableInvocationTransaction,
+    ) -> DurableCommitOutcome {
+        let mut data = self
+            .inner
+            .write()
+            .expect("durable state store lock poisoned");
+        if let Err(reason) = validate_memory_durable_commit_authority(&data, context) {
+            return DurableCommitOutcome::Rejected(reason);
+        }
+
+        let domain = *transaction.domain.as_bytes();
+        let request_key = (domain, *transaction.receipt.request_id.as_bytes());
+        if data.receipts.contains_key(&request_key) {
+            return DurableCommitOutcome::Rejected(DurableCommitRejection::Conflict {
+                key: transaction.receipt.request_id.as_bytes().to_vec(),
+                current_revision: StateRevision::new(1),
+            });
+        }
+
+        let revisions = if let Some(state_transaction) = transaction.state.as_ref() {
+            let state = data.state_domains.get(&domain);
+            if let Err(reason) = validate_memory_durable_reads(state, state_transaction.reads()) {
+                return DurableCommitOutcome::Rejected(reason);
+            }
+            match memory_durable_revisions(state, state_transaction.mutations()) {
+                Ok(revisions) => revisions,
+                Err(reason) => return DurableCommitOutcome::Rejected(reason),
+            }
+        } else {
+            Vec::new()
+        };
+
+        if let Some(state_transaction) = transaction.state {
+            let state = data.state_domains.entry(domain).or_default();
+            if let Err(reason) = apply_memory_durable_mutations(
+                state,
+                state_transaction.mutations.mutations,
+                revisions,
+            ) {
+                return DurableCommitOutcome::Rejected(reason);
+            }
+        }
+        data.receipts.insert(request_key, transaction.receipt);
+        if let Some(outbox) = transaction.outbox {
+            data.outboxes.insert(request_key, outbox);
+        }
+        DurableCommitOutcome::Committed
+    }
+}
+
 /// In-memory `BlobStore` implementation.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryBlobStore {
@@ -2604,6 +2863,52 @@ mod tests {
         )
     }
 
+    fn durable_context(fence: u64, deadline: u64, correlation: u8) -> DurableOperationContext {
+        DurableOperationContext::new(
+            WriterFenceGeneration::new(fence).unwrap(),
+            StorageDeadline::new(deadline).unwrap(),
+            StorageCorrelationId::new([correlation; 16]).unwrap(),
+        )
+    }
+
+    fn durable_invocation(
+        domain: AtomicityDomainId,
+        request_byte: u8,
+        expected_revision: StateRevision,
+        mutation_value: Option<u8>,
+        include_outbox: bool,
+    ) -> DurableInvocationTransaction {
+        let request_id = DurableRequestId::new([request_byte; 32]).unwrap();
+        let event_digest = Digest32::new(HashAlgorithmId::Sha2_256, [request_byte + 1; 32]);
+        let receipt =
+            DurableRequestReceipt::new(request_id, event_digest, vec![request_byte]).unwrap();
+        let mutations = mutation_value
+            .map(|value| vec![mutation("state", StateMutation::Put(vec![value]))])
+            .unwrap_or_default();
+        let state = DurableStateTransaction::new(
+            domain,
+            AtomicStateReadSet::new(vec![read("state", expected_revision)]).unwrap(),
+            mutations,
+        )
+        .unwrap();
+        let outbox = include_outbox.then(|| {
+            let message = DurableOutboxMessage::new(
+                Digest32::new(HashAlgorithmId::Sha2_256, [request_byte + 2; 32]),
+                vec![request_byte + 3],
+            )
+            .unwrap();
+            DurableOutboxBatch::new(request_id, event_digest, vec![message]).unwrap()
+        });
+        DurableInvocationTransaction::new(
+            domain,
+            Some(state),
+            DurableObjectChanges::empty(),
+            receipt,
+            outbox,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn compare_and_swap_writes_when_expected_matches() {
         let store = MemoryStateStore::default();
@@ -2922,6 +3227,128 @@ mod tests {
                 None,
             ),
             Err(DurableInvocationError::StateDomainMismatch)
+        );
+    }
+
+    #[test]
+    fn memory_durable_store_commits_state_receipt_and_outbox_atomically() {
+        let fence = WriterFenceGeneration::new(7).unwrap();
+        let store = MemoryDurableStateStore::new(fence);
+        store.set_time(100);
+        let context = durable_context(7, 1_000, 1);
+        let invocation = durable_invocation(domain(3), 0xA1, StateRevision::INITIAL, Some(9), true);
+        let request_id = invocation.receipt().request_id();
+        let receipt = invocation.receipt().clone();
+
+        assert_eq!(
+            store.commit_invocation(&context, invocation),
+            DurableCommitOutcome::Committed
+        );
+        assert_eq!(
+            store
+                .get_versioned_durable(&context, domain(3), b"state")
+                .unwrap(),
+            VersionedStateValue::from_persisted_parts(StateRevision::new(1), Some(vec![9]))
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_request_receipt(&context, domain(3), request_id)
+                .unwrap(),
+            Some(receipt)
+        );
+        let data = store.inner.read().unwrap();
+        assert_eq!(data.receipts.len(), 1);
+        assert_eq!(data.outboxes.len(), 1);
+    }
+
+    #[test]
+    fn memory_durable_store_conflict_publishes_no_partial_invocation() {
+        let store = MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        let context = durable_context(1, 1_000, 2);
+        let initialize = AtomicStateTransaction::new(
+            domain(4),
+            AtomicStateReadSet::new(vec![read("state", StateRevision::INITIAL)]).unwrap(),
+            AtomicStateMutationSet::new(vec![mutation("state", StateMutation::Put(vec![7]))])
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.commit_durable(&context, initialize),
+            DurableCommitOutcome::Committed
+        );
+        let invocation = durable_invocation(domain(4), 0xB1, StateRevision::INITIAL, Some(8), true);
+        let request_id = invocation.receipt().request_id();
+
+        assert_eq!(
+            store.commit_invocation(&context, invocation),
+            DurableCommitOutcome::Rejected(DurableCommitRejection::Conflict {
+                key: key("state"),
+                current_revision: StateRevision::new(1),
+            })
+        );
+        assert_eq!(
+            store
+                .get_versioned_durable(&context, domain(4), b"state")
+                .unwrap()
+                .value(),
+            Some([7].as_slice())
+        );
+        assert_eq!(
+            store
+                .get_request_receipt(&context, domain(4), request_id)
+                .unwrap(),
+            None
+        );
+        assert!(store.inner.read().unwrap().outboxes.is_empty());
+    }
+
+    #[test]
+    fn memory_durable_store_preserves_read_only_revision_and_fails_closed_on_authority() {
+        let store = MemoryDurableStateStore::new(WriterFenceGeneration::new(5).unwrap());
+        store.set_time(100);
+        let context = durable_context(5, 1_000, 3);
+        let read_only = durable_invocation(domain(5), 0xC1, StateRevision::INITIAL, None, false);
+        assert_eq!(
+            store.commit_invocation(&context, read_only),
+            DurableCommitOutcome::Committed
+        );
+        assert_eq!(
+            store
+                .get_versioned_durable(&context, domain(5), b"state")
+                .unwrap()
+                .revision(),
+            StateRevision::INITIAL
+        );
+
+        store.set_active_writer_fence(WriterFenceGeneration::new(6).unwrap());
+        assert_eq!(
+            store.get_versioned_durable(&context, domain(5), b"state"),
+            Err(DurableReadError::WriterFenced {
+                active_generation: WriterFenceGeneration::new(6).unwrap(),
+            })
+        );
+        assert_eq!(
+            store.commit_invocation(
+                &context,
+                durable_invocation(domain(5), 0xC2, StateRevision::INITIAL, None, false,),
+            ),
+            DurableCommitOutcome::Rejected(DurableCommitRejection::WriterFenced {
+                active_generation: WriterFenceGeneration::new(6).unwrap(),
+            })
+        );
+
+        let current_context = durable_context(6, 100, 4);
+        assert_eq!(
+            store.get_versioned_durable(&current_context, domain(5), b"state"),
+            Err(DurableReadError::DeadlineExceeded)
+        );
+        assert_eq!(
+            store.commit_invocation(
+                &current_context,
+                durable_invocation(domain(5), 0xC3, StateRevision::INITIAL, None, false,),
+            ),
+            DurableCommitOutcome::Rejected(DurableCommitRejection::DeadlineExceededBeforeCommit)
         );
     }
 
