@@ -1857,6 +1857,8 @@ Phase 15 prerequisites:
   and atomic write sets (implemented As-Is)
 - canonical request-id/event-digest dedup record and request-scoped outbox batch
   in the same atomic commit (implemented As-Is)
+- ordered one-message outbox claim/lease/ack cursor with explicit at-least-once
+  redelivery semantics (implemented As-Is)
 
 Phase 15 As-Is scope:
 
@@ -1883,8 +1885,14 @@ Phase 15 As-Is scope:
   active epoch hash suiteでdigest化する。application update、request_id/event digest/responseを持つ
   dedup record、ordered outbound messageを持つrequest-scoped outbox batchを同一commitへ含める。
   同一request/digestのretryはtransitionを再実行せずresponseだけを返し、別eventへのrequest ID
-  reuseはfail closedする。adapter migration、outbox claim/send/ack/redelivery、retention/compaction、
-  durable crash recoveryは未実装であり、persistしただけでproduction delivery完成とはみなさない。
+  reuseはfail closedする。adapter migration、transport send/scheduling integration、
+  retention/compaction、durable crash recoveryは未実装であり、persistしただけでproduction
+  delivery完成とはみなさない。
+- outbox delivery cursorは1 messageずつnon-zero lease IDと5分以下のdeadlineでclaimし、batch
+  revisionを同一transactionでassertする。matching lease/indexのackだけがcursorを進め、期限切れ
+  claimは同じindexを再配信する。これはsend後ack前crashでmessageを失わないat-least-onceであり、
+  exactly-onceではない。provider scheduler、time policy、transport integration、poison message、
+  retention/compaction、durable fault testはTo-Beに残る。
 - native adapterはPOST /v1/events、exact canonical binary media type、bounded body、
   deterministic HTTP status mapping、GET /health/live、graceful shutdownを提供する。
 - outbound eventはCAS成功後にruntime transportへ渡すが、state commitとsendの間はまだ

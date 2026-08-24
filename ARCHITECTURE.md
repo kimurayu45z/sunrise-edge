@@ -388,8 +388,18 @@ the same atomic write set. A retry with the same request ID and event digest
 replays persisted responses without re-running the transition or returning the
 outbox again; the same request ID with different event bytes fails closed.
 Outbox presence makes committed messages recoverable and at-least-once, but no
-adapter uses this path yet and acknowledgement, redelivery, lease/claim policy,
-retention, compaction, and durable crash tests remain production work.
+adapter uses this path yet.
+
+The outbox delivery cursor (`0xE005`) advances one message at a time. A caller
+supplies a non-zero lease ID, an observed time, and a duration bounded to five
+minutes. Claim atomically asserts the immutable batch revision and records the
+lease, deadline, and checked attempt count. A matching acknowledgement advances
+the cursor and clears the lease. An expired lease may be replaced for the same
+message index, so send-then-crash-before-ack intentionally redelivers rather
+than loses data. This is at-least-once, not exactly-once; downstream delivery
+must be idempotent. Provider scheduling, trusted time policy, transport send,
+adapter integration, retention/compaction, poison-message policy, durable
+storage, and crash/fault conformance remain production work.
 
 ## 31. Native HTTP adapter
 
@@ -678,3 +688,8 @@ license/SBOM policy, and protected review/merge controls.
   ordered at-least-once outbox batch with application state, reject request-ID
   reuse for different bytes, and do not equate persisted batches with a
   completed delivery/acknowledgement recovery protocol.
+- DR-0032: Deliver a persisted outbox in order, one message per bounded lease.
+  Assert the immutable batch revision when claiming or acknowledging, replace
+  only expired leases, and redeliver send-without-ack after expiry. Preserve
+  explicit at-least-once semantics rather than claiming transport-level
+  exactly-once delivery.

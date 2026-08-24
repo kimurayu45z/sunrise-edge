@@ -141,6 +141,8 @@ impl VersionedStateValue {
 /// Mutation applied after its expected revision has been validated.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StateMutation {
+    /// Checks the revision without changing the key.
+    Assert,
     /// Stores or replaces a value.
     Put(Vec<u8>),
     /// Deletes a value while retaining a revision tombstone.
@@ -461,11 +463,22 @@ impl TransactionalStateStore for MemoryStateStore {
         let revisions = write_set
             .writes()
             .iter()
-            .map(|write| current_revision(&guard, write.key()).checked_next())
+            .map(|write| match write.mutation() {
+                StateMutation::Assert => Ok(None),
+                StateMutation::Put(_) | StateMutation::Delete => {
+                    current_revision(&guard, write.key())
+                        .checked_next()
+                        .map(Some)
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         for (write, revision) in write_set.writes.into_iter().zip(revisions) {
+            let Some(revision) = revision else {
+                continue;
+            };
             let value = match write.mutation {
+                StateMutation::Assert => continue,
                 StateMutation::Put(value) => Some(value),
                 StateMutation::Delete => None,
             };
@@ -749,6 +762,12 @@ impl PersistenceLayout {
     #[must_use]
     pub fn outbox_batch_key(&self, request_id: [u8; 32]) -> Vec<u8> {
         self.prefixed(&format!("outbox/{}/batch", hex32(request_id)))
+    }
+
+    /// Returns the mutable outbound delivery-state key for one request.
+    #[must_use]
+    pub fn outbox_delivery_key(&self, request_id: [u8; 32]) -> Vec<u8> {
+        self.prefixed(&format!("outbox/{}/delivery", hex32(request_id)))
     }
 
     /// Returns the system-module registry key.
@@ -1046,6 +1065,23 @@ mod tests {
     }
 
     #[test]
+    fn atomic_assert_checks_revision_without_incrementing_it() {
+        let store = MemoryStateStore::default();
+        store.put(key("a"), vec![1]).unwrap();
+        let observed = store.get_versioned(b"a").unwrap();
+        let write_set = AtomicStateWriteSet::new(vec![
+            StateWrite::new(key("a"), observed.revision(), StateMutation::Assert).unwrap(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            store.commit_atomic(write_set).unwrap(),
+            AtomicStateWriteResult::Committed
+        );
+        assert_eq!(store.get_versioned(b"a").unwrap(), observed);
+    }
+
+    #[test]
     fn scheduler_returns_only_ready_payloads() {
         let scheduler = MemoryScheduler::default();
         scheduler.schedule(20, vec![2]).unwrap();
@@ -1105,6 +1141,10 @@ mod tests {
         assert_ne!(
             layout.request_dedup_key([0xCC; 32]),
             layout.outbox_batch_key([0xCC; 32])
+        );
+        assert_ne!(
+            layout.outbox_batch_key([0xCC; 32]),
+            layout.outbox_delivery_key([0xCC; 32])
         );
         assert_ne!(
             layout.request_dedup_key([0xCC; 32]),
