@@ -26,7 +26,8 @@ use node_core::{
 use runtime::{
     Clock, PersistenceLayout, Runtime, RuntimeError, TransactionalStateStore, Transport,
 };
-use std::{error::Error, future::Future, sync::Arc};
+use std::{error::Error, future::Future, num::NonZeroUsize, sync::Arc};
+use tokio::sync::{Semaphore, TryAcquireError};
 
 const HTTP_RESULT_TYPE_ID: u16 = 0xE101;
 const HTTP_RESULT_ENCODING_VERSION: u16 = 1;
@@ -43,6 +44,32 @@ pub const LIVENESS_PATH: &str = "/health/live";
 pub const MAX_HTTP_EVENT_BODY_BYTES: usize = MAX_NODE_PAYLOAD_BYTES + 512;
 /// Bounded native delivery lease; expired work is deliberately redelivered.
 pub const NATIVE_OUTBOX_LEASE_MILLIS: u64 = 30_000;
+
+/// Admission policy for synchronous node and runtime work.
+///
+/// The limit is intentionally supplied by the embedding process because its
+/// safe value depends on the database connection strategy and host capacity.
+/// There is no hidden unbounded queue: excess requests fail immediately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeBlockingPolicy {
+    max_concurrent_invocations: NonZeroUsize,
+}
+
+impl NativeBlockingPolicy {
+    /// Creates a policy with an explicit non-zero concurrency limit.
+    #[must_use]
+    pub const fn new(max_concurrent_invocations: NonZeroUsize) -> Self {
+        Self {
+            max_concurrent_invocations,
+        }
+    }
+
+    /// Returns the maximum synchronous invocations admitted at once.
+    #[must_use]
+    pub const fn max_concurrent_invocations(self) -> NonZeroUsize {
+        self.max_concurrent_invocations
+    }
+}
 
 /// Supplies process-independent identities for persisted outbox leases.
 ///
@@ -275,6 +302,7 @@ struct NativeHttpState<R, M, L> {
     resolver: HashSuiteResolver,
     machine: Arc<M>,
     lease_ids: Arc<L>,
+    blocking_permits: Arc<Semaphore>,
 }
 
 /// Builds the recoverable native HTTP router.
@@ -288,6 +316,7 @@ pub fn router<R, M, L>(
     resolver: HashSuiteResolver,
     machine: Arc<M>,
     lease_ids: Arc<L>,
+    blocking_policy: NativeBlockingPolicy,
 ) -> Router
 where
     R: Runtime + Send + Sync + 'static,
@@ -301,6 +330,9 @@ where
         resolver,
         machine,
         lease_ids,
+        blocking_permits: Arc::new(Semaphore::new(
+            blocking_policy.max_concurrent_invocations().get(),
+        )),
     });
     Router::new()
         .route(LIVENESS_PATH, get(liveness))
@@ -309,29 +341,21 @@ where
         .with_state(state)
 }
 
-/// Serves the native router until the supplied shutdown future completes.
-pub async fn serve<R, M, L, F>(
+/// Serves a configured native router until the shutdown future completes.
+///
+/// Build `app` with [`router`] so the blocking admission policy is explicit at
+/// the composition boundary.
+pub async fn serve<F>(
     listener: tokio::net::TcpListener,
-    runtime: Arc<R>,
-    config: NodeConfig,
-    resolver: HashSuiteResolver,
-    machine: Arc<M>,
-    lease_ids: Arc<L>,
+    app: Router,
     shutdown: F,
 ) -> std::io::Result<()>
 where
-    R: Runtime + Send + Sync + 'static,
-    R::State: TransactionalStateStore,
-    M: TransactionalNodeStateMachine + Send + Sync + 'static,
-    L: OutboxLeaseIdSource + Send + Sync + 'static,
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(
-        listener,
-        router(runtime, config, resolver, machine, lease_ids),
-    )
-    .with_graceful_shutdown(shutdown)
-    .await
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
 }
 
 async fn liveness() -> StatusCode {
@@ -365,45 +389,23 @@ where
         Ok(body) => body,
         Err(error) => return error_response(error.status(), "body-rejected"),
     };
-    let event = match NodeEvent::decode(&body) {
-        Ok(event) => event,
-        Err(error) => return node_error_response(&error),
+    let permit = match Arc::clone(&state.blocking_permits).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => return overload_response(),
+        Err(TryAcquireError::Closed) => {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "blocking-admission-closed");
+        }
     };
-    let request_id = event.request_id();
-    let output = match handle_idempotent_event(
-        state.runtime.as_ref(),
-        &state.config,
-        &state.resolver,
-        event,
-        state.machine.as_ref(),
-    ) {
-        Ok(output) => output,
-        Err(error) => return node_error_response(&error),
-    };
-
-    if let Err(error) = deliver_request_outbox(state.as_ref(), request_id) {
-        return match error {
-            OutboxDeliveryError::Node(error) => node_error_response(&error),
-            OutboxDeliveryError::Send => {
-                error_response(StatusCode::SERVICE_UNAVAILABLE, "outbound-send-failed")
-            }
-            OutboxDeliveryError::LeaseId(OutboxLeaseIdSourceError::Unavailable) => error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "lease-id-source-unavailable",
-            ),
-            OutboxDeliveryError::LeaseId(OutboxLeaseIdSourceError::Exhausted) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "lease-id-source-exhausted",
-            ),
-        };
-    }
-
-    let result = match HttpNodeResult::new(request_id, output.responses().to_vec())
-        .and_then(|result| result.encode())
-    {
-        Ok(result) => result,
+    let blocking_state = Arc::clone(&state);
+    let work = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        invoke_event(blocking_state.as_ref(), &body)
+    });
+    let result = match work.await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => return invocation_error_response(&error),
         Err(_) => {
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "result-encoding-failed");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "blocking-task-failed");
         }
     };
     (
@@ -415,6 +417,63 @@ where
         result,
     )
         .into_response()
+}
+
+enum InvocationError {
+    Node(NodeCoreError),
+    Delivery(OutboxDeliveryError),
+    ResultEncoding,
+}
+
+fn invoke_event<R, M, L>(
+    state: &NativeHttpState<R, M, L>,
+    body: &[u8],
+) -> Result<Vec<u8>, InvocationError>
+where
+    R: Runtime,
+    R::State: TransactionalStateStore,
+    M: TransactionalNodeStateMachine,
+    L: OutboxLeaseIdSource,
+{
+    let event = NodeEvent::decode(body).map_err(InvocationError::Node)?;
+    let request_id = event.request_id();
+    let output = handle_idempotent_event(
+        state.runtime.as_ref(),
+        &state.config,
+        &state.resolver,
+        event,
+        state.machine.as_ref(),
+    )
+    .map_err(InvocationError::Node)?;
+    deliver_request_outbox(state, request_id).map_err(InvocationError::Delivery)?;
+    HttpNodeResult::new(request_id, output.responses().to_vec())
+        .and_then(|result| result.encode())
+        .map_err(|_| InvocationError::ResultEncoding)
+}
+
+fn invocation_error_response(error: &InvocationError) -> Response {
+    match error {
+        InvocationError::Node(error) => node_error_response(error),
+        InvocationError::Delivery(OutboxDeliveryError::Node(error)) => node_error_response(error),
+        InvocationError::Delivery(OutboxDeliveryError::Send) => {
+            error_response(StatusCode::SERVICE_UNAVAILABLE, "outbound-send-failed")
+        }
+        InvocationError::Delivery(OutboxDeliveryError::LeaseId(
+            OutboxLeaseIdSourceError::Unavailable,
+        )) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "lease-id-source-unavailable",
+        ),
+        InvocationError::Delivery(OutboxDeliveryError::LeaseId(
+            OutboxLeaseIdSourceError::Exhausted,
+        )) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "lease-id-source-exhausted",
+        ),
+        InvocationError::ResultEncoding => {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "result-encoding-failed")
+        }
+    }
 }
 
 enum OutboxDeliveryError {
@@ -556,6 +615,18 @@ fn error_response(status: StatusCode, code: &'static str) -> Response {
         .into_response()
 }
 
+fn overload_response() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        "blocking-capacity-exhausted",
+    )
+        .into_response()
+}
+
 fn take_list_bytes<'a>(
     bytes: &'a [u8],
     offset: &mut usize,
@@ -591,7 +662,8 @@ mod tests {
         ManualClock, MemoryBlobStore, MemoryRuntime, MemoryScheduler, MemorySigner,
         MemoryStateStore, RuntimeError, StateStore, TransactionalStateStore,
     };
-    use std::sync::Mutex;
+    use std::sync::{Condvar, Mutex};
+    use tokio::sync::Notify;
     use tower::ServiceExt;
 
     const TEST_STATE_TYPE_ID: u16 = 0xEF11;
@@ -705,6 +777,36 @@ mod tests {
         }
     }
 
+    struct BlockingMachine {
+        inner: IncrementMachine,
+        entered: Arc<Notify>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl TransactionalNodeStateMachine for BlockingMachine {
+        fn access_plan(&self, event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            self.inner.access_plan(event)
+        }
+
+        fn transition(
+            &self,
+            state: &NodeStateSnapshot,
+            event: &NodeEvent,
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            self.entered.notify_one();
+            let (released, release_signal) = self.release.as_ref();
+            let mut is_released = released
+                .lock()
+                .map_err(|_| NodeCoreError::TransitionRejected("test release lock poisoned"))?;
+            while !*is_released {
+                is_released = release_signal
+                    .wait(is_released)
+                    .map_err(|_| NodeCoreError::TransitionRejected("test release lock poisoned"))?;
+            }
+            self.inner.transition(state, event)
+        }
+    }
+
     #[derive(Default)]
     struct SequenceLeaseIds {
         next: Mutex<u64>,
@@ -740,6 +842,7 @@ mod tests {
             resolver(),
             machine,
             Arc::new(SequenceLeaseIds::default()),
+            NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
         )
     }
 
@@ -942,6 +1045,67 @@ mod tests {
             1
         );
         assert!(runtime.transport().drain_outbound().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_work_is_isolated_and_excess_requests_are_not_queued() {
+        let runtime = Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
+        let config = config();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let machine = Arc::new(BlockingMachine {
+            inner: IncrementMachine::new(config.state_key()),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let app = router(
+            runtime,
+            config,
+            resolver(),
+            machine,
+            Arc::new(SequenceLeaseIds::default()),
+            NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap()),
+        );
+
+        let first_app = app.clone();
+        let first = tokio::spawn(async move {
+            first_app
+                .oneshot(
+                    Request::post(NODE_EVENT_PATH)
+                        .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                        .body(Body::from(event(request_id(0x51)).encode().unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        entered.notified().await;
+
+        let live = app
+            .clone()
+            .oneshot(Request::get(LIVENESS_PATH).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let overloaded = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event(request_id(0x52)).encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let (released, release_signal) = release.as_ref();
+        *released.lock().unwrap() = true;
+        release_signal.notify_all();
+        let first = first.await.unwrap();
+
+        assert_eq!(live.status(), StatusCode::NO_CONTENT);
+        assert_eq!(overloaded.status(), StatusCode::TOO_MANY_REQUESTS);
+        let overload_body = to_bytes(overloaded.into_body(), 128).await.unwrap();
+        assert_eq!(overload_body, "blocking-capacity-exhausted");
+        assert_eq!(first.status(), StatusCode::OK);
     }
 
     #[tokio::test]
