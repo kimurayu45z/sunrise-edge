@@ -2035,7 +2035,11 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
    durable domain adapter boundaryを定義する（implemented As-Is; composition/provider implementation pending）。
 2. indexed due-outbox repository/claim contractを追加し、domain-aware unattended recoveryを接続して
    StateKeyScannerはmaintenance/compatibilityへ戻す（contract/native seam implemented As-Is; durable adapter pending）。
-3. normalized schema、explicit migration、bounded pool/deadline、typed conflictを持つPostgreSQL adapterを実装する。
+3. `POSTGRES.md`のexact namespace、unsigned SQL representation、normalized relation、attempt history、
+   transaction order、migration policyを維持する。adapterがopaque PersistenceLayout key prefixをparseせずに済むよう、
+   state/object/receipt/outboxを明示的sectionとして持つstructured durable transaction envelopeを先に実装する
+   （design accepted; envelope/migration/adapter pending）。その後explicit migration、bounded pool/deadline、
+   typed conflictを持つPostgreSQL adapterを実装する。
 4. shared conformanceにwrite skew、absent-key race、serialization failure、lease fencing、schema/version skewを追加する。
 5. kill/power fault、disk full、connection exhaustion、capacity/load/soak、backup/restore、writer failoverをrehearsalする。
 6. 同じcontractをCloudflare Durable ObjectとAWS persistenceへ実装し、real providerでcertifyする。

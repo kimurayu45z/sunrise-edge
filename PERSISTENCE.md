@@ -260,6 +260,13 @@ not a claim that a single database can hold unbounded chain state. Capacity,
 partition count, connection budget, failover fencing, replica freshness,
 backup/restore, and load/soak results are certification inputs.
 
+The exact first-backend namespace, unsigned SQL representation, normalized
+relations, attempt-history semantics, transaction order, migration policy, and
+required evidence are fixed in [`POSTGRES.md`](POSTGRES.md). That design also
+records a prerequisite: node-core must pass receipt/outbox/object sections in a
+structured durable transaction envelope. A PostgreSQL adapter must not decode
+opaque `PersistenceLayout` key prefixes to choose relational tables.
+
 ## 7. Provider mappings
 
 | Environment | Authoritative hot state | Immutable data | Initial production boundary |
@@ -312,13 +319,13 @@ not general state reads:
 
 ## 9. Implementation order and certification
 
-1. Preserve the additive fenced/deadline-aware durable boundary and wire it
-   through node-core composition and durable stores without silently migrating
-   legacy data.
+1. Preserve the additive fenced/deadline-aware durable boundary and add the
+   structured state/receipt/outbox/object transaction envelope required by
+   normalized stores without silently migrating legacy data.
 2. Add a dedicated indexed outbox repository/claim contract; retain key scans
    only for maintenance and compatibility.
-3. Implement the normalized PostgreSQL schema and adapter, with migrations and
-   the shared conformance suite.
+3. Apply the accepted PostgreSQL schema design, explicit migrations, and
+   adapter, then run the shared conformance suite.
 4. Add deadline/cancellation semantics, bounded retry, capacity tests, abrupt
    fault tests, backup/restore rehearsal, and writer-fencing failover tests.
 5. Implement Cloudflare Durable Object and AWS mappings against the same

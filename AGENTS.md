@@ -220,13 +220,15 @@ before storage reads and return the domain beside output. An additive native
 router uses that result for request-scoped delivery and accepts no HTTP domain,
 but SQLite/default routing and scan recovery remain legacy. The current Phase
 15 sequence is: preserve and wire the additive fenced/deadline-aware durable
-domain boundary, implement the normalized PostgreSQL reference adapter behind
-the additive indexed native recovery seam,
-run shared conformance, then deadline/cancellation, abrupt fault,
+domain boundary; implement the structured state/object/receipt/outbox durable
+envelope required by [`POSTGRES.md`](POSTGRES.md); implement the normalized
+PostgreSQL adapter behind the additive indexed native recovery seam; then run
+shared conformance, deadline/cancellation, abrupt fault,
 backup/restore, capacity, and provider implementations. Do not spend further
 effort treating the opaque SQLite table or prefix scanner as the production
-schema. SQLite remains a local
-durable reference. Do not jump to provider deployment claims before the shared
+schema. The adapter must not infer normalized rows from opaque key prefixes.
+SQLite remains a local durable reference. Do not jump to provider deployment
+claims before the shared
 contract and evidence exist. Native blocking work already has explicit
 admission isolation, but its configured limit is not a validated capacity
 budget and started work is not cancellable.
