@@ -100,6 +100,11 @@ cross-provider ingress milestones implemented through Phase 17:
   and typed commit outcomes. Proven conflicts, fencing, serialization aborts,
   and pre-commit deadline/unavailability remain distinct from an indeterminate
   commit that must be reconciled by persisted request identity.
+- An additive indexed durable-outbox repository contract that claims at most
+  one due message in stable availability/request order, installs a bounded
+  restart-safe lease atomically, and makes same-lease claim and acknowledgement
+  retries reconcilable after an indeterminate commit. No durable adapter uses
+  this contract yet; prefix scanning remains compatibility-only recovery.
 - A transactional node-core path that declares bounded state access before
   reads, transitions over an immutable versioned snapshot, and rejects
   undeclared or read-only updates before atomic commit. Every declared
@@ -173,8 +178,8 @@ independent security review.
 
 The next planned technical milestones work backward through the Phase 15
 production exit criteria in [`TODO.md`](TODO.md) and the accepted
-[persistence design](PERSISTENCE.md): connect an indexed outbox claim contract
-to domain-aware recovery, wire the durable operation boundary through
+[persistence design](PERSISTENCE.md): connect the indexed outbox contract to
+domain-aware native recovery, wire the durable operation boundary through
 composition, and implement the normalized PostgreSQL reference adapter.
 Deadline/cancellation, abrupt
 fault, backup/restore, capacity, and provider conformance follow on that

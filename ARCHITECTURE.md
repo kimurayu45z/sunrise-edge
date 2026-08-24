@@ -806,6 +806,25 @@ abort; reconciliation must read the persisted request receipt before effects
 are retried. Node-core, native composition, SQLite, and provider adapters have
 not migrated to this new production boundary yet.
 
+The additive `IndexedOutboxRepository` is the production discovery and lease
+boundary. A claim receives one resolved logical domain, trusted runtime time,
+and a bounded restart-safe lease identity, then selects at most one eligible
+row through stable `(available_at, request_id)` index order and installs the
+lease atomically. It accepts no key-scan cursor or scheduler-selected domain.
+The claimed payload is the exact bounded canonical outbound event projection.
+Repeating the same lease ID reconciles an indeterminate claim by returning the
+identical work while owned; reuse for another message fails closed. A matching
+acknowledgement advances one message, while replay of the same acknowledged
+`(request, index, lease)` succeeds idempotently. The normalized delivery model
+therefore retains a uniquely bound delivery-attempt record through the owning
+batch's retention window rather than erasing evidence when it clears the active
+lease. Keeping only the most recent acknowledgement would fail after a later
+message advances. Both claim and acknowledgement distinguish
+definite pre-commit rejection from indeterminate commit. Callers never send an
+indeterminate claim before reconciliation. Native recovery and durable stores
+do not implement this boundary yet, so `StateKeyScanner` remains only the
+current compatibility path.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -985,3 +1004,9 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   require receipt reconciliation whenever commit may have succeeded invisibly.
   Introduce the boundary additively so legacy SQLite data is not migrated by
   implication.
+- DR-0049: Replace production outbox scans with an indexed, one-row claim that
+  orders by availability and request identity and atomically installs a bounded
+  restart-safe lease. Make same-lease claim retry a reconciliation operation,
+  retain uniquely bound lease-attempt history for idempotent acknowledgement retry,
+  and separate indeterminate claim/ack commits from proven aborts. Keep
+  scheduler cursors and caller-selected domains outside authority.
