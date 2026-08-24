@@ -308,6 +308,26 @@ work.
 ## 28. Serverless runtime constraints
 The cryptographic core is pure, synchronous, and free of background workers, daemons, mutable globals, and runtime-vendor dependencies. This keeps the implementation portable to edge and serverless adapters.
 
+`runtime-sqlite` is the first durable implementation of the versioned state
+contracts. It uses an exact-pinned bundled SQLite release, WAL journaling,
+`synchronous=FULL`, a five-second busy timeout, and `BEGIN IMMEDIATE` for every
+write transaction. Revisions are stored as exact eight-byte big-endian values;
+deletes retain rows with null values, so reopening the database preserves ABA
+protection. Atomic write sets validate every expected revision in canonical key
+order before applying any mutation. Schema and application identifiers fail
+closed instead of adopting an unrelated database.
+
+The workspace crate itself keeps `#![forbid(unsafe_code)]` and uses rusqlite's
+safe API. The exact-pinned bundled dependency encapsulates the SQLite C/FFI
+boundary; no repository-owned unsafe block or raw SQLite handle is introduced.
+
+This is a local-disk durability component, not an adapter deployment claim.
+SQLite WAL needs local shared-memory filesystem semantics, the API is blocking,
+and the current tests prove reopen persistence, ordered conflict rollback,
+revision-overflow rollback, CAS behavior, and schema rejection—not kill/power
+fault recovery. Native HTTP must place it behind bounded blocking isolation,
+deadlines, admission control, and cancellation policy before integration.
+
 ## 29. Shared-object consensus
 
 Phase 13 routes shared or conflicting-object transactions through an
@@ -709,3 +729,8 @@ license/SBOM policy, and protected review/merge controls.
   persisted outbox cursor, acknowledge only after transport success, and replay
   completed responses without rerunning or resending acknowledged work. Keep
   unattended scheduling and durable crash recovery as explicit later gates.
+- DR-0034: Implement the first durable transactional store with exact-pinned
+  bundled SQLite, WAL plus synchronous FULL, immediate write transactions,
+  revision tombstones, and fail-closed application/schema identity. Keep its
+  blocking local-disk boundary out of async request tasks until bounded
+  isolation and fault conformance are implemented.

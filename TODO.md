@@ -1861,6 +1861,8 @@ Phase 15 prerequisites:
   redelivery semantics (implemented As-Is)
 - native HTTP default path using atomic deduplication and request-scoped
   persisted outbox lease/send/ack delivery (implemented As-Is)
+- local durable SQLite TransactionalStateStore with WAL, synchronous FULL,
+  BEGIN IMMEDIATE, revision tombstones, and schema identity checks (implemented As-Is)
 
 Phase 15 As-Is scope:
 
@@ -1879,6 +1881,11 @@ Phase 15 As-Is scope:
   revision、delete tombstoneによるABA防止、全revision一致時だけall-or-noneでcommitする
   TransactionalStateStoreを追加した。MemoryStateStoreはatomicity/conflict/bounds検証用の
   As-Is referenceでありdurable実装ではない。
+- runtime-sqliteはexact-pinned bundled SQLiteを使い、WAL + synchronous FULL、5秒busy timeout、
+  BEGIN IMMEDIATE、8-byte revision、delete tombstone、application/schema ID fail-closedを実装する。
+  reopen persistence、ordered conflict、revision overflow、CASを検証するが、blocking local-disk storeで
+  ありnative HTTPには未接続である。network filesystem、kill -9/power-loss、backup/restore、bounded
+  blocking isolationの検証なしにprovider production persistence完成とはみなさない。
 - node-coreのtransactional pathはcontext検証後かつstate read前にevent-specific access planを
   確定し、全keyをrevision付きsnapshotとしてpure transitionへ渡す。undeclared/read-only updateを
   rejectし、観測revisionをnode-core自身がwrite-setへbindし、全commit成功までoutputを返さない。
@@ -1902,8 +1909,8 @@ Phase 15 As-Is scope:
 - native outbound eventはatomic commit済みoutboxからlease後にruntime transportへ渡し、send成功後
   にmatching lease/indexをackする。send failureは503とactive leaseを残し、期限切れ後のretryで
   at-least-once redeliveryする。process crash後にrequestなしで回復するschedulerは未実装である。
-- TLS、authentication、rate limiting、durable StateStore、audit telemetry、reverse proxy
-  hardeningは未実装であり、このAs-Is adapterをinternet-facing production serverと扱わない。
+- TLS、authentication、rate limiting、durable StateStoreのbounded wiring、audit telemetry、reverse
+  proxy hardeningは未実装であり、このAs-Is adapterをinternet-facing production serverと扱わない。
 - 現在のRuntime traitは同期APIであるため、遅いdurable I/OをTokio request task上で直接行う
   production実装にしない。async runtime boundaryまたは明示的なbounded blocking isolation、
   concurrency limit、deadlineを設計する。

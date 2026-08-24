@@ -71,6 +71,9 @@ cross-provider ingress milestones implemented through Phase 17:
 - Self-describing digests and domain-separated hash/signature framing.
 - Versioned objects, object references, access manifests, and lazy migration.
 - Runtime traits and an in-memory runtime for deterministic tests.
+- A local durable SQLite transactional store using WAL, synchronous FULL,
+  immediate write transactions, revision tombstones, and fail-closed schema
+  identity/version checks. It is not yet wired into an async adapter.
 - A bounded, replay-context-aware node-core invocation boundary that persists
   one pure transition with compare-and-swap before releasing output.
 - A bounded, versioned multi-key transaction contract with ABA-safe tombstone
@@ -110,18 +113,19 @@ cross-provider ingress milestones implemented through Phase 17:
   concrete proof backends are not yet implemented.
 
 Important remaining work includes the owned-object fast path, concrete
-node-event dispatch and protocol handlers, durable transactional persistence,
-scheduled outbox recovery and fault conformance, portable system-module
+node-event dispatch and protocol handlers, bounded async isolation for durable
+I/O, scheduled outbox recovery and fault conformance, portable system-module
 execution, cryptographic slashing proof verification, fee-object debiting,
-production persistence, runtime adapters, networking/RPC surfaces, and
+provider persistence bindings, runtime adapters, networking/RPC surfaces, and
 independent security review.
 
 The next planned technical milestone works backward through the Phase 15
-production exit criteria in [`TODO.md`](TODO.md): add a durable transactional
-store, integrate provider scheduling for committed outboxes that are not tied
-to an active request, and prove crash-recovery conformance. Phase 16/17
-provider trust, deployment, capacity, observability, and release rehearsal
-remain required after that shared foundation exists.
+production exit criteria in [`TODO.md`](TODO.md): place blocking durable I/O
+behind bounded async isolation, integrate provider scheduling for committed
+outboxes that are not tied to an active request, and prove process/power-fault
+recovery conformance. Phase 16/17 provider trust, deployment, capacity,
+observability, and release rehearsal remain required after that shared
+foundation exists.
 
 ## Workspace map
 
@@ -131,7 +135,7 @@ remain required after that shared foundation exists.
 | State and access | `objects`, `abi` | Versioned objects, ownership, object references, access modes, and transaction access manifests |
 | Execution | `execution`, `contract-sdk`, `chain-ir`, `system-modules` | Transactions/effects, deterministic WASM, proof envelopes/verifier interfaces, contract host APIs, portable IR, and governed modules |
 | Economics and governance | `fees`, `bonds`, `governance`, `protocol-upgrades`, `protocol-config` | Stablecoin fees/bonds, admission, governance actions, upgrades, migrations, and committed configuration |
-| Runtime and consensus | `runtime`, `validator-set`, `consensus`, `node-core` | Persistence/runtime interfaces, epoch validator snapshots, event-driven shared-object ordering, and one-event conditional transitions |
+| Runtime and consensus | `runtime`, `runtime-sqlite`, `validator-set`, `consensus`, `node-core` | Persistence/runtime interfaces, local durable SQLite state, epoch validator snapshots, event-driven shared-object ordering, and one-event conditional transitions |
 | Adapters | `native-http`, `adapters/shared`, `adapters/cloudflare-workers`, `adapters/deno`, `adapters/vercel`, `adapters/supabase-edge`, `adapters/aws-lambda` | Bounded native routing, shared Web ingress, Cloudflare Service-Binding ingress, authenticated Deno/Vercel/Supabase ingress, and AWS HTTP API v2 mapping around the canonical contract |
 
 The repository intentionally keeps vendor-specific dependencies out of the
