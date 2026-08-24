@@ -90,6 +90,11 @@ cross-provider ingress milestones implemented through Phase 17:
   one pure transition with compare-and-swap before releasing output.
 - A bounded, versioned multi-key transaction contract with ABA-safe tombstone
   revisions and an atomic in-memory conformance implementation.
+- A domain-aware transaction envelope that separates a complete bounded
+  `AtomicStateReadSet` from put/delete mutations, requires every mutation to
+  have a matching read assertion, caps aggregate represented bytes, and keeps
+  identical keys isolated across atomicity domains in memory. Node-core and
+  durable providers have not yet migrated to this new contract.
 - A transactional node-core path that declares bounded state access before
   reads, transitions over an immutable versioned snapshot, and rejects
   undeclared or read-only updates before atomic commit. Every declared

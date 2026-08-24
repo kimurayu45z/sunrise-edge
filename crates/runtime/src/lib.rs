@@ -2,7 +2,7 @@
 
 //! Runtime abstraction and in-memory adapters for serverless-safe node execution.
 
-use core::fmt;
+use core::{fmt, mem::size_of};
 pub use protocol_types::ValidatorId;
 use protocol_types::{ChainId, Digest32, Epoch, ProtocolVersion};
 use std::collections::{BTreeMap, HashMap};
@@ -15,12 +15,30 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Errors produced by runtime adapters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
+    /// Atomicity-domain identifiers must not be all zeroes.
+    ZeroAtomicityDomainId,
     /// State keys must not be empty.
     EmptyKey,
     /// Scheduled payloads must not be empty.
     EmptyScheduledPayload,
     /// Atomic state transactions must contain at least one write.
     EmptyWriteSet,
+    /// Domain transactions must assert at least one state read.
+    EmptyReadSet,
+    /// A domain transaction exceeded its read-count bound.
+    TooManyStateReads {
+        /// Actual read count.
+        count: usize,
+        /// Maximum accepted read count.
+        maximum: usize,
+    },
+    /// A domain transaction exceeded its aggregate byte bound.
+    StateTransactionTooLarge {
+        /// Aggregate bytes represented by the transaction envelope.
+        bytes: usize,
+        /// Maximum accepted aggregate bytes.
+        maximum: usize,
+    },
     /// An atomic state transaction exceeded its write-count bound.
     TooManyStateWrites {
         /// Actual write count.
@@ -44,6 +62,12 @@ pub enum RuntimeError {
     },
     /// An atomic state transaction contained the same key more than once.
     DuplicateStateWriteKey,
+    /// A domain transaction contained the same read key more than once.
+    DuplicateStateReadKey,
+    /// A domain mutation had no matching read assertion.
+    StateMutationWithoutRead,
+    /// A revision-only assertion was supplied as a domain mutation.
+    StateAssertionAsMutation,
     /// A state revision could not be incremented without wrapping.
     StateRevisionOverflow,
     /// The system clock appears to be before unix epoch.
@@ -72,9 +96,21 @@ pub enum RuntimeError {
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ZeroAtomicityDomainId => {
+                write!(f, "atomicity domain id must not be all zeroes")
+            }
             Self::EmptyKey => write!(f, "state keys must not be empty"),
             Self::EmptyScheduledPayload => write!(f, "scheduled payloads must not be empty"),
             Self::EmptyWriteSet => write!(f, "atomic state write set must not be empty"),
+            Self::EmptyReadSet => write!(f, "atomic state read set must not be empty"),
+            Self::TooManyStateReads { count, maximum } => write!(
+                f,
+                "atomic state read set has {count} reads, maximum is {maximum}"
+            ),
+            Self::StateTransactionTooLarge { bytes, maximum } => write!(
+                f,
+                "atomic state transaction represents {bytes} bytes, maximum is {maximum}"
+            ),
             Self::TooManyStateWrites { count, maximum } => write!(
                 f,
                 "atomic state write set has {count} writes, maximum is {maximum}"
@@ -87,6 +123,15 @@ impl fmt::Display for RuntimeError {
             }
             Self::DuplicateStateWriteKey => {
                 write!(f, "atomic state write set contains a duplicate key")
+            }
+            Self::DuplicateStateReadKey => {
+                write!(f, "atomic state read set contains a duplicate key")
+            }
+            Self::StateMutationWithoutRead => {
+                write!(f, "atomic state mutation has no matching read assertion")
+            }
+            Self::StateAssertionAsMutation => {
+                write!(f, "revision assertion cannot be used as a state mutation")
             }
             Self::StateRevisionOverflow => write!(f, "state revision overflow"),
             Self::ClockBeforeUnixEpoch => write!(f, "clock is before unix epoch"),
@@ -116,8 +161,36 @@ pub const MAX_STATE_KEY_BYTES: usize = 4 * 1024;
 pub const MAX_STATE_VALUE_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum distinct keys mutated by one atomic state transaction.
 pub const MAX_ATOMIC_STATE_WRITES: usize = 4_096;
+/// Maximum distinct keys observed by one atomic state transaction.
+pub const MAX_ATOMIC_STATE_READS: usize = 4_096;
+/// Maximum aggregate key, revision, tag, value, and domain bytes in one domain transaction.
+pub const MAX_ATOMIC_STATE_TRANSACTION_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum keys returned by one bounded state scan page.
 pub const MAX_STATE_SCAN_KEYS: usize = 1_024;
+
+/// Stable, non-zero identity for one independently writable state authority.
+///
+/// Placement and routing are external to this dependency-light runtime type.
+/// Production protocol configuration must commit the selected derivation and
+/// placement rule before the domain controls transaction validity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AtomicityDomainId([u8; 32]);
+
+impl AtomicityDomainId {
+    /// Creates a non-zero atomicity-domain identifier.
+    pub fn new(bytes: [u8; 32]) -> Result<Self, RuntimeError> {
+        if bytes == [0; 32] {
+            return Err(RuntimeError::ZeroAtomicityDomainId);
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the exact identifier bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
 
 /// Monotonic optimistic-concurrency token for one state key.
 ///
@@ -275,6 +348,227 @@ impl AtomicStateWriteSet {
     }
 }
 
+/// One exact revision assertion from a domain transaction's complete read set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateReadAssertion {
+    key: Vec<u8>,
+    expected_revision: StateRevision,
+}
+
+impl StateReadAssertion {
+    /// Creates one bounded exact-key revision assertion.
+    pub fn new(key: Vec<u8>, expected_revision: StateRevision) -> Result<Self, RuntimeError> {
+        validate_state_key(&key)?;
+        Ok(Self {
+            key,
+            expected_revision,
+        })
+    }
+
+    /// Returns the exact state key read by the transition.
+    #[must_use]
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// Returns the revision that must remain current at commit time.
+    #[must_use]
+    pub const fn expected_revision(&self) -> StateRevision {
+        self.expected_revision
+    }
+}
+
+/// Bounded, unique, canonically key-ordered complete read set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AtomicStateReadSet {
+    reads: Vec<StateReadAssertion>,
+}
+
+impl AtomicStateReadSet {
+    /// Validates and canonicalizes exact-key revision assertions.
+    pub fn new(mut reads: Vec<StateReadAssertion>) -> Result<Self, RuntimeError> {
+        if reads.is_empty() {
+            return Err(RuntimeError::EmptyReadSet);
+        }
+        if reads.len() > MAX_ATOMIC_STATE_READS {
+            return Err(RuntimeError::TooManyStateReads {
+                count: reads.len(),
+                maximum: MAX_ATOMIC_STATE_READS,
+            });
+        }
+        reads.sort_by(|left, right| left.key.cmp(&right.key));
+        if reads.windows(2).any(|pair| pair[0].key == pair[1].key) {
+            return Err(RuntimeError::DuplicateStateReadKey);
+        }
+        Ok(Self { reads })
+    }
+
+    /// Returns all exact read assertions in canonical key order.
+    #[must_use]
+    pub fn reads(&self) -> &[StateReadAssertion] {
+        &self.reads
+    }
+}
+
+/// One state mutation separated from the transaction's revision assertions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateMutationEntry {
+    key: Vec<u8>,
+    mutation: StateMutation,
+}
+
+impl StateMutationEntry {
+    /// Creates one bounded put/delete mutation.
+    pub fn new(key: Vec<u8>, mutation: StateMutation) -> Result<Self, RuntimeError> {
+        validate_state_key(&key)?;
+        match &mutation {
+            StateMutation::Assert => return Err(RuntimeError::StateAssertionAsMutation),
+            StateMutation::Put(value) => validate_state_value(value)?,
+            StateMutation::Delete => {}
+        }
+        Ok(Self { key, mutation })
+    }
+
+    /// Returns the exact state key to mutate.
+    #[must_use]
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// Returns the put/delete mutation.
+    #[must_use]
+    pub const fn mutation(&self) -> &StateMutation {
+        &self.mutation
+    }
+}
+
+/// Bounded, unique, canonically key-ordered put/delete mutation set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AtomicStateMutationSet {
+    mutations: Vec<StateMutationEntry>,
+}
+
+impl AtomicStateMutationSet {
+    /// Validates and canonicalizes put/delete mutations.
+    pub fn new(mut mutations: Vec<StateMutationEntry>) -> Result<Self, RuntimeError> {
+        if mutations.is_empty() {
+            return Err(RuntimeError::EmptyWriteSet);
+        }
+        if mutations.len() > MAX_ATOMIC_STATE_WRITES {
+            return Err(RuntimeError::TooManyStateWrites {
+                count: mutations.len(),
+                maximum: MAX_ATOMIC_STATE_WRITES,
+            });
+        }
+        mutations.sort_by(|left, right| left.key.cmp(&right.key));
+        if mutations.windows(2).any(|pair| pair[0].key == pair[1].key) {
+            return Err(RuntimeError::DuplicateStateWriteKey);
+        }
+        Ok(Self { mutations })
+    }
+
+    /// Returns all put/delete mutations in canonical key order.
+    #[must_use]
+    pub fn mutations(&self) -> &[StateMutationEntry] {
+        &self.mutations
+    }
+}
+
+/// Bounded domain-scoped transaction with separate reads and mutations.
+///
+/// Every mutation key must appear in `reads`. Reads may additionally contain
+/// untouched read-write, read-only, absent, and tombstoned observations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AtomicStateTransaction {
+    domain: AtomicityDomainId,
+    reads: AtomicStateReadSet,
+    mutations: AtomicStateMutationSet,
+    represented_bytes: usize,
+}
+
+impl AtomicStateTransaction {
+    /// Validates and canonicalizes one complete domain transaction envelope.
+    pub fn new(
+        domain: AtomicityDomainId,
+        reads: AtomicStateReadSet,
+        mutations: AtomicStateMutationSet,
+    ) -> Result<Self, RuntimeError> {
+        if mutations.mutations().iter().any(|mutation| {
+            reads
+                .reads()
+                .binary_search_by(|read| read.key.as_slice().cmp(mutation.key()))
+                .is_err()
+        }) {
+            return Err(RuntimeError::StateMutationWithoutRead);
+        }
+
+        let represented_bytes = represented_transaction_bytes(domain, &reads, &mutations);
+        if represented_bytes > MAX_ATOMIC_STATE_TRANSACTION_BYTES {
+            return Err(RuntimeError::StateTransactionTooLarge {
+                bytes: represented_bytes,
+                maximum: MAX_ATOMIC_STATE_TRANSACTION_BYTES,
+            });
+        }
+
+        Ok(Self {
+            domain,
+            reads,
+            mutations,
+            represented_bytes,
+        })
+    }
+
+    /// Returns the only atomicity domain this transaction may affect.
+    #[must_use]
+    pub const fn domain(&self) -> AtomicityDomainId {
+        self.domain
+    }
+
+    /// Returns all exact read assertions in canonical key order.
+    #[must_use]
+    pub fn reads(&self) -> &[StateReadAssertion] {
+        self.reads.reads()
+    }
+
+    /// Returns all put/delete mutations in canonical key order.
+    #[must_use]
+    pub fn mutations(&self) -> &[StateMutationEntry] {
+        self.mutations.mutations()
+    }
+
+    /// Returns bytes covered by the shared envelope accounting rule.
+    #[must_use]
+    pub const fn represented_bytes(&self) -> usize {
+        self.represented_bytes
+    }
+}
+
+fn represented_transaction_bytes(
+    domain: AtomicityDomainId,
+    reads: &AtomicStateReadSet,
+    mutations: &AtomicStateMutationSet,
+) -> usize {
+    let mut bytes = domain.as_bytes().len().saturating_add(2 * size_of::<u32>());
+    for read in reads.reads() {
+        bytes = bytes
+            .saturating_add(size_of::<u32>())
+            .saturating_add(read.key().len())
+            .saturating_add(size_of::<u64>());
+    }
+    for mutation in mutations.mutations() {
+        bytes = bytes
+            .saturating_add(size_of::<u32>())
+            .saturating_add(mutation.key().len())
+            .saturating_add(1);
+        if let StateMutation::Put(value) = mutation.mutation() {
+            bytes = bytes
+                .saturating_add(size_of::<u64>())
+                .saturating_add(value.len());
+        }
+    }
+    bytes
+}
+
 /// Result of one atomic state transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AtomicStateWriteResult {
@@ -298,6 +592,25 @@ pub trait TransactionalStateStore: StateStore {
     fn commit_atomic(
         &self,
         write_set: AtomicStateWriteSet,
+    ) -> Result<AtomicStateWriteResult, RuntimeError>;
+}
+
+/// Domain-aware transaction interface for production persistence adapters.
+///
+/// Implementations may host many domains, but one transaction is confined to
+/// the single domain carried by [`AtomicStateTransaction`].
+pub trait DomainTransactionalStateStore {
+    /// Reads a value and revision from one explicit atomicity domain.
+    fn get_versioned_in_domain(
+        &self,
+        domain: AtomicityDomainId,
+        key: &[u8],
+    ) -> Result<VersionedStateValue, RuntimeError>;
+
+    /// Validates the complete read set and applies every mutation or none.
+    fn commit_transaction(
+        &self,
+        transaction: AtomicStateTransaction,
     ) -> Result<AtomicStateWriteResult, RuntimeError>;
 }
 
@@ -526,10 +839,14 @@ pub trait Runtime {
 }
 
 /// In-memory `StateStore` implementation for tests and local execution.
+type MemoryDomainState = BTreeMap<AtomicityDomainId, BTreeMap<Vec<u8>, StoredStateValue>>;
+
 #[derive(Clone, Debug, Default)]
 pub struct MemoryStateStore {
-    inner: Arc<RwLock<BTreeMap<Vec<u8>, StoredStateValue>>>,
+    inner: Arc<RwLock<MemoryDomainState>>,
 }
+
+const LEGACY_MEMORY_DOMAIN: AtomicityDomainId = AtomicityDomainId([0; 32]);
 
 #[derive(Clone, Debug)]
 struct StoredStateValue {
@@ -541,16 +858,20 @@ impl StateStore for MemoryStateStore {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, RuntimeError> {
         ensure_non_empty_key(key)?;
         let guard = self.inner.read().expect("state store lock poisoned");
-        Ok(guard.get(key).and_then(|stored| stored.value.clone()))
+        Ok(guard
+            .get(&LEGACY_MEMORY_DOMAIN)
+            .and_then(|state| state.get(key))
+            .and_then(|stored| stored.value.clone()))
     }
 
     fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), RuntimeError> {
         ensure_non_empty_key(&key)?;
         validate_state_key(&key)?;
         validate_state_value(&value)?;
-        let mut guard = self.inner.write().expect("state store lock poisoned");
-        let revision = current_revision(&guard, &key).checked_next()?;
-        guard.insert(
+        let mut domains = self.inner.write().expect("state store lock poisoned");
+        let state = domains.entry(LEGACY_MEMORY_DOMAIN).or_default();
+        let revision = current_revision(state, &key).checked_next()?;
+        state.insert(
             key,
             StoredStateValue {
                 revision,
@@ -570,11 +891,12 @@ impl StateStore for MemoryStateStore {
         validate_state_key(&key)?;
         validate_state_value(&new_value)?;
 
-        let mut guard = self.inner.write().expect("state store lock poisoned");
-        let current = guard.get(&key).and_then(|stored| stored.value.clone());
+        let mut domains = self.inner.write().expect("state store lock poisoned");
+        let state = domains.entry(LEGACY_MEMORY_DOMAIN).or_default();
+        let current = state.get(&key).and_then(|stored| stored.value.clone());
         if current == expected {
-            let revision = current_revision(&guard, &key).checked_next()?;
-            guard.insert(
+            let revision = current_revision(state, &key).checked_next()?;
+            state.insert(
                 key,
                 StoredStateValue {
                     revision,
@@ -596,9 +918,11 @@ impl StateStore for MemoryStateStore {
 
 impl StateKeyScanner for MemoryStateStore {
     fn scan_keys(&self, scan: &StateKeyScan) -> Result<StateKeyPage, RuntimeError> {
-        let guard = self.inner.read().expect("state store lock poisoned");
-        let candidates = guard
-            .keys()
+        let domains = self.inner.read().expect("state store lock poisoned");
+        let candidates = domains
+            .get(&LEGACY_MEMORY_DOMAIN)
+            .into_iter()
+            .flat_map(BTreeMap::keys)
             .filter(|key| key.starts_with(scan.prefix()))
             .filter(|key| scan.after().is_none_or(|after| key.as_slice() > after))
             .take(scan.limit().get() + 1)
@@ -611,27 +935,22 @@ impl StateKeyScanner for MemoryStateStore {
 impl TransactionalStateStore for MemoryStateStore {
     fn get_versioned(&self, key: &[u8]) -> Result<VersionedStateValue, RuntimeError> {
         validate_state_key(key)?;
-        let guard = self.inner.read().expect("state store lock poisoned");
-        Ok(match guard.get(key) {
-            Some(stored) => VersionedStateValue {
-                revision: stored.revision,
-                value: stored.value.clone(),
-            },
-            None => VersionedStateValue {
-                revision: StateRevision::INITIAL,
-                value: None,
-            },
-        })
+        let domains = self.inner.read().expect("state store lock poisoned");
+        Ok(read_memory_versioned(
+            domains.get(&LEGACY_MEMORY_DOMAIN),
+            key,
+        ))
     }
 
     fn commit_atomic(
         &self,
         write_set: AtomicStateWriteSet,
     ) -> Result<AtomicStateWriteResult, RuntimeError> {
-        let mut guard = self.inner.write().expect("state store lock poisoned");
+        let mut domains = self.inner.write().expect("state store lock poisoned");
+        let state = domains.entry(LEGACY_MEMORY_DOMAIN).or_default();
 
         for write in write_set.writes() {
-            let current = current_revision(&guard, write.key());
+            let current = current_revision(state, write.key());
             if current != write.expected_revision() {
                 return Ok(AtomicStateWriteResult::Conflict {
                     key: write.key().to_vec(),
@@ -646,7 +965,7 @@ impl TransactionalStateStore for MemoryStateStore {
             .map(|write| match write.mutation() {
                 StateMutation::Assert => Ok(None),
                 StateMutation::Put(_) | StateMutation::Delete => {
-                    current_revision(&guard, write.key())
+                    current_revision(state, write.key())
                         .checked_next()
                         .map(Some)
                 }
@@ -662,9 +981,71 @@ impl TransactionalStateStore for MemoryStateStore {
                 StateMutation::Put(value) => Some(value),
                 StateMutation::Delete => None,
             };
-            guard.insert(write.key, StoredStateValue { revision, value });
+            state.insert(write.key, StoredStateValue { revision, value });
         }
         Ok(AtomicStateWriteResult::Committed)
+    }
+}
+
+impl DomainTransactionalStateStore for MemoryStateStore {
+    fn get_versioned_in_domain(
+        &self,
+        domain: AtomicityDomainId,
+        key: &[u8],
+    ) -> Result<VersionedStateValue, RuntimeError> {
+        validate_state_key(key)?;
+        let domains = self.inner.read().expect("state store lock poisoned");
+        Ok(read_memory_versioned(domains.get(&domain), key))
+    }
+
+    fn commit_transaction(
+        &self,
+        transaction: AtomicStateTransaction,
+    ) -> Result<AtomicStateWriteResult, RuntimeError> {
+        let mut domains = self.inner.write().expect("state store lock poisoned");
+        let state = domains.entry(transaction.domain).or_default();
+
+        for read in transaction.reads() {
+            let current = current_revision(state, read.key());
+            if current != read.expected_revision() {
+                return Ok(AtomicStateWriteResult::Conflict {
+                    key: read.key().to_vec(),
+                    current_revision: current,
+                });
+            }
+        }
+
+        let revisions = transaction
+            .mutations()
+            .iter()
+            .map(|mutation| current_revision(state, mutation.key()).checked_next())
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (mutation, revision) in transaction.mutations.mutations.into_iter().zip(revisions) {
+            let value = match mutation.mutation {
+                StateMutation::Assert => return Err(RuntimeError::StateAssertionAsMutation),
+                StateMutation::Put(value) => Some(value),
+                StateMutation::Delete => None,
+            };
+            state.insert(mutation.key, StoredStateValue { revision, value });
+        }
+        Ok(AtomicStateWriteResult::Committed)
+    }
+}
+
+fn read_memory_versioned(
+    state: Option<&BTreeMap<Vec<u8>, StoredStateValue>>,
+    key: &[u8],
+) -> VersionedStateValue {
+    match state.and_then(|state| state.get(key)) {
+        Some(stored) => VersionedStateValue {
+            revision: stored.revision,
+            value: stored.value.clone(),
+        },
+        None => VersionedStateValue {
+            revision: StateRevision::INITIAL,
+            value: None,
+        },
     }
 }
 
@@ -1136,6 +1517,30 @@ mod tests {
         text.as_bytes().to_vec()
     }
 
+    fn domain(byte: u8) -> AtomicityDomainId {
+        AtomicityDomainId::new([byte; 32]).unwrap()
+    }
+
+    fn read(text: &str, revision: StateRevision) -> StateReadAssertion {
+        StateReadAssertion::new(key(text), revision).unwrap()
+    }
+
+    fn mutation(text: &str, mutation: StateMutation) -> StateMutationEntry {
+        StateMutationEntry::new(key(text), mutation).unwrap()
+    }
+
+    fn transaction(
+        domain: AtomicityDomainId,
+        reads: Vec<StateReadAssertion>,
+        mutations: Vec<StateMutationEntry>,
+    ) -> Result<AtomicStateTransaction, RuntimeError> {
+        AtomicStateTransaction::new(
+            domain,
+            AtomicStateReadSet::new(reads)?,
+            AtomicStateMutationSet::new(mutations)?,
+        )
+    }
+
     #[test]
     fn compare_and_swap_writes_when_expected_matches() {
         let store = MemoryStateStore::default();
@@ -1162,6 +1567,117 @@ mod tests {
         assert!(!result.swapped);
         assert_eq!(result.current, Some(vec![9]));
         assert_eq!(store.get(b"k").unwrap(), Some(vec![9]));
+    }
+
+    #[test]
+    fn domain_transaction_envelope_is_bounded_ordered_and_complete() {
+        assert_eq!(
+            AtomicityDomainId::new([0; 32]),
+            Err(RuntimeError::ZeroAtomicityDomainId)
+        );
+        assert_eq!(
+            StateMutationEntry::new(key("a"), StateMutation::Assert),
+            Err(RuntimeError::StateAssertionAsMutation)
+        );
+        assert_eq!(
+            AtomicStateReadSet::new(Vec::new()),
+            Err(RuntimeError::EmptyReadSet)
+        );
+        let duplicate_read = read("same", StateRevision::INITIAL);
+        assert_eq!(
+            AtomicStateReadSet::new(vec![duplicate_read.clone(), duplicate_read]),
+            Err(RuntimeError::DuplicateStateReadKey)
+        );
+        assert_eq!(
+            AtomicStateMutationSet::new(Vec::new()),
+            Err(RuntimeError::EmptyWriteSet)
+        );
+        let duplicate_mutation = mutation("same", StateMutation::Delete);
+        assert_eq!(
+            AtomicStateMutationSet::new(vec![duplicate_mutation.clone(), duplicate_mutation,]),
+            Err(RuntimeError::DuplicateStateWriteKey)
+        );
+        assert_eq!(
+            transaction(
+                domain(1),
+                vec![read("a", StateRevision::INITIAL)],
+                vec![mutation("b", StateMutation::Delete)],
+            ),
+            Err(RuntimeError::StateMutationWithoutRead)
+        );
+
+        let transaction = transaction(
+            domain(1),
+            vec![
+                read("z", StateRevision::INITIAL),
+                read("a", StateRevision::INITIAL),
+            ],
+            vec![
+                mutation("z", StateMutation::Put(vec![2])),
+                mutation("a", StateMutation::Put(vec![1])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(transaction.reads()[0].key(), b"a");
+        assert_eq!(transaction.reads()[1].key(), b"z");
+        assert_eq!(transaction.mutations()[0].key(), b"a");
+        assert_eq!(transaction.mutations()[1].key(), b"z");
+        assert_eq!(transaction.represented_bytes(), 96);
+    }
+
+    #[test]
+    fn memory_domain_transactions_isolate_domains_and_assert_every_read() {
+        let store = MemoryStateStore::default();
+        let first_domain = domain(1);
+        let second_domain = domain(2);
+
+        let initialize_dependency = transaction(
+            first_domain,
+            vec![read("dependency", StateRevision::INITIAL)],
+            vec![mutation("dependency", StateMutation::Put(vec![9]))],
+        )
+        .unwrap();
+        assert_eq!(
+            store.commit_transaction(initialize_dependency).unwrap(),
+            AtomicStateWriteResult::Committed
+        );
+
+        let stale = transaction(
+            first_domain,
+            vec![
+                read("dependency", StateRevision::INITIAL),
+                read("result", StateRevision::INITIAL),
+            ],
+            vec![mutation("result", StateMutation::Put(vec![1]))],
+        )
+        .unwrap();
+        assert_eq!(
+            store.commit_transaction(stale).unwrap(),
+            AtomicStateWriteResult::Conflict {
+                key: key("dependency"),
+                current_revision: StateRevision::new(1),
+            }
+        );
+        assert_eq!(
+            store
+                .get_versioned_in_domain(first_domain, b"result")
+                .unwrap()
+                .value(),
+            None
+        );
+        assert_eq!(
+            store
+                .get_versioned_in_domain(first_domain, b"dependency")
+                .unwrap()
+                .value(),
+            Some([9].as_slice())
+        );
+        assert_eq!(
+            store
+                .get_versioned_in_domain(second_domain, b"dependency")
+                .unwrap(),
+            VersionedStateValue::from_persisted_parts(StateRevision::INITIAL, None).unwrap()
+        );
     }
 
     #[test]
@@ -1353,8 +1869,8 @@ mod tests {
     fn revision_overflow_aborts_before_any_atomic_mutation() {
         let store = MemoryStateStore::default();
         {
-            let mut guard = store.inner.write().unwrap();
-            guard.insert(
+            let mut domains = store.inner.write().unwrap();
+            domains.entry(LEGACY_MEMORY_DOMAIN).or_default().insert(
                 key("a"),
                 StoredStateValue {
                     revision: StateRevision::new(u64::MAX),
