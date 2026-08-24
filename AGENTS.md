@@ -204,10 +204,10 @@ In `TODO.md`, an implemented Phase is only an As-Is milestone, never a
 production-readiness claim. Preserve and work backward from each To-Be exit
 criterion after context compaction. Re-check `main`, the open stacked PR chain,
 and `TODO.md` before starting because repository state may have advanced. The
-next work is closing Phase 15-17 production gaps, especially atomic durable
-state/outbox behavior, provider trust boundaries, real runtime conformance,
-capacity/fault tests, observability, and rollout/rollback rehearsal.
-The current Phase 15 sequence is adapter migration to the recoverable
-transactional path and outbox cursor, a durable store, provider scheduling and
-transport integration, and crash recovery conformance; do not jump to provider
-deployment claims before that shared foundation is complete.
+next work is closing Phase 15-17 production gaps, especially bounded async
+isolation for durable state, unattended outbox scheduling, provider trust
+boundaries, real runtime conformance, capacity/fault tests, observability, and
+rollout/rollback rehearsal. The current Phase 15 sequence is bounded blocking
+isolation around the local durable store, provider scheduling and transport
+integration, and process/power-fault recovery conformance; do not jump to
+provider deployment claims before that shared foundation is complete.

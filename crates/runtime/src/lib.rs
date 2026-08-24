@@ -51,6 +51,10 @@ pub enum RuntimeError {
     ClockOverflow,
     /// The configured outbound transport is temporarily unavailable.
     TransportUnavailable,
+    /// A durable state store could not complete the requested operation.
+    DurableStoreUnavailable,
+    /// Persisted state violated the runtime revision/value invariants.
+    InvalidPersistedState,
 }
 
 impl fmt::Display for RuntimeError {
@@ -76,6 +80,8 @@ impl fmt::Display for RuntimeError {
             Self::ClockBeforeUnixEpoch => write!(f, "clock is before unix epoch"),
             Self::ClockOverflow => write!(f, "clock value exceeds u64 milliseconds range"),
             Self::TransportUnavailable => write!(f, "outbound transport is unavailable"),
+            Self::DurableStoreUnavailable => write!(f, "durable state store is unavailable"),
+            Self::InvalidPersistedState => write!(f, "persisted state violates runtime invariants"),
         }
     }
 }
@@ -112,7 +118,8 @@ impl StateRevision {
         self.0
     }
 
-    fn checked_next(self) -> Result<Self, RuntimeError> {
+    /// Returns the next revision without permitting wraparound.
+    pub fn checked_next(self) -> Result<Self, RuntimeError> {
         self.0
             .checked_add(1)
             .map(Self)
@@ -128,6 +135,20 @@ pub struct VersionedStateValue {
 }
 
 impl VersionedStateValue {
+    /// Reconstructs one validated persisted state observation.
+    pub fn from_persisted_parts(
+        revision: StateRevision,
+        value: Option<Vec<u8>>,
+    ) -> Result<Self, RuntimeError> {
+        if revision == StateRevision::INITIAL && value.is_some() {
+            return Err(RuntimeError::InvalidPersistedState);
+        }
+        if let Some(value) = value.as_deref() {
+            validate_state_value(value)?;
+        }
+        Ok(Self { revision, value })
+    }
+
     /// Returns the monotonic revision observed for this key.
     #[must_use]
     pub const fn revision(&self) -> StateRevision {
@@ -829,7 +850,8 @@ fn ensure_non_empty_key(key: &[u8]) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-fn validate_state_key(key: &[u8]) -> Result<(), RuntimeError> {
+/// Validates one runtime state key against the shared persistence bounds.
+pub fn validate_state_key(key: &[u8]) -> Result<(), RuntimeError> {
     ensure_non_empty_key(key)?;
     if key.len() > MAX_STATE_KEY_BYTES {
         return Err(RuntimeError::StateKeyTooLong {
@@ -840,7 +862,8 @@ fn validate_state_key(key: &[u8]) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-fn validate_state_value(value: &[u8]) -> Result<(), RuntimeError> {
+/// Validates one runtime state value against the shared persistence bounds.
+pub fn validate_state_value(value: &[u8]) -> Result<(), RuntimeError> {
     if value.len() > MAX_STATE_VALUE_BYTES {
         return Err(RuntimeError::StateValueTooLarge {
             length: value.len(),
