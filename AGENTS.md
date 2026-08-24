@@ -222,7 +222,7 @@ but SQLite/default routing and scan recovery remain legacy. The current Phase
 15 sequence is: preserve and wire the additive fenced/deadline-aware durable
 domain boundary; implement the structured state/object/receipt/outbox durable
 envelope required by [`POSTGRES.md`](POSTGRES.md) through node-core and shared
-conformance (runtime, node-core, and ephemeral structured/indexed memory conformance exist, but native/durable wiring is pending);
+conformance (runtime, node-core, and ephemeral structured/indexed memory conformance exist, including exact-request claims, but native/durable wiring is pending);
 implement the normalized PostgreSQL adapter behind the additive indexed native
 recovery seam; then run
 shared conformance, deadline/cancellation, abrupt fault,

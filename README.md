@@ -121,6 +121,10 @@ cross-provider ingress milestones implemented through Phase 17:
   same-lease reconciliation, and retained delayed acknowledgement. No
   restart-safe adapter uses this contract yet; prefix scanning remains
   compatibility-only recovery.
+- An exact-request durable outbox claim beside the unattended due-work claim.
+  Native request composition can target only the request that just committed,
+  even when older work is due in the same domain, while sharing the same lease
+  identity, expiry, acknowledgement, and reconciliation invariants.
 - A transactional node-core path that declares bounded state access before
   reads, transitions over an immutable versioned snapshot, and rejects
   undeclared or read-only updates before atomic commit. Every declared
