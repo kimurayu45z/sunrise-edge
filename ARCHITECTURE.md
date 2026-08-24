@@ -413,6 +413,22 @@ provide the production node-core service, durable state, deduplication,
 transactional outbox, authentication policy, WAF/rate-limit policy, or rollout
 runbook required by the Phase 16 To-Be criteria.
 
+## 33. Portable Web ingress core
+
+The first Phase 17 prerequisite extracts the Fetch API request contract into
+`adapters/shared/web-ingress.ts`. Provider wrappers now supply only a
+`NodeCoreFetcher` capability. Paths, media types, bounded stream consumption,
+status mapping, downstream content-type validation, response-header
+sanitization, and fail-closed errors remain one implementation rather than
+being copied across Cloudflare, Deno, Vercel, and Supabase adapters.
+
+The shared module contains no environment lookup, provider SDK, credential,
+retry loop, mutable global state, or durable-state assumption. Provider wrappers
+remain responsible for constructing an authenticated/private `NodeCoreFetcher`
+without weakening the shared bounds. The Cloudflare wrapper is the first
+conformance consumer and continues to pass its generated Service Binding;
+workerd tests exercise the extracted implementation unchanged.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -444,3 +460,7 @@ runbook required by the Phase 16 To-Be criteria.
   call the private node service through a generated, awaited Service Binding.
   Treat the binding as routing/capability isolation rather than event
   authentication, and keep the ingress independently testable in workerd.
+- DR-0018: Share one Web Fetch API ingress implementation across edge providers
+  and inject only a minimal node-core fetch capability. Provider wrappers may
+  add authentication and deployment wiring but must not fork canonical paths,
+  media types, bounds, status rules, or response sanitization.

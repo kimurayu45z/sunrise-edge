@@ -77,6 +77,8 @@ experimental Cloudflare Workers ingress milestone:
   bounded bodies, deterministic status mapping, and graceful shutdown wiring.
 - A bounded Cloudflare Workers ingress that uses a generated private Service
   Binding, strict TypeScript, and workerd integration tests.
+- A provider-neutral Web Fetch API ingress core for keeping future edge
+  wrappers conformant with the same bounds and error contract.
 - Transactions, execution effects, deterministic `wasmi` execution, and a
   Rust contract SDK.
 - Stablecoin fee assets, deterministic fee calculation, bond assets, validator
@@ -112,7 +114,7 @@ HTTP contract.
 | Execution | `execution`, `contract-sdk`, `chain-ir`, `system-modules` | Transactions/effects, deterministic WASM, proof envelopes/verifier interfaces, contract host APIs, portable IR, and governed modules |
 | Economics and governance | `fees`, `bonds`, `governance`, `protocol-upgrades`, `protocol-config` | Stablecoin fees/bonds, admission, governance actions, upgrades, migrations, and committed configuration |
 | Runtime and consensus | `runtime`, `validator-set`, `consensus`, `node-core` | Persistence/runtime interfaces, epoch validator snapshots, event-driven shared-object ordering, and one-event conditional transitions |
-| Adapters | `native-http`, `adapters/cloudflare-workers` | Bounded native routing plus Cloudflare Service-Binding ingress around the canonical HTTP contract |
+| Adapters | `native-http`, `adapters/shared`, `adapters/cloudflare-workers` | Bounded native routing, a shared Web ingress core, and Cloudflare Service-Binding ingress around the canonical HTTP contract |
 
 The repository intentionally keeps vendor-specific dependencies out of the
 protocol core. Future Cloudflare, Vercel, Supabase, AWS, Deno, and native HTTP
