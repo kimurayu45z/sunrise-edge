@@ -1851,6 +1851,8 @@ Phase 15 prerequisites:
 - deterministic node-core event boundary with one-key CAS persistence
   (implemented As-Is)
 - adapter-neutral canonical request/response contract (implemented As-Is)
+- bounded versioned multi-key StateStore transaction contract with an in-memory
+  atomic reference implementation (implemented As-Is)
 
 Phase 15 As-Is scope:
 
@@ -1865,6 +1867,10 @@ Phase 15 As-Is scope:
   保証しない。
 - 現在のsingle-key CASはnative adapter統合用の実験的境界であり、production persistence
   architectureの完成形ではない。
+- runtimeにはuniqueかつkey順へcanonicalizeされたbounded write-set、monotonic per-key
+  revision、delete tombstoneによるABA防止、全revision一致時だけall-or-noneでcommitする
+  TransactionalStateStoreを追加した。MemoryStateStoreはatomicity/conflict/bounds検証用の
+  As-Is referenceであり、node-coreはまだこの契約へ移行しておらずdurable実装でもない。
 - native adapterはPOST /v1/events、exact canonical binary media type、bounded body、
   deterministic HTTP status mapping、GET /health/live、graceful shutdownを提供する。
 - outbound eventはCAS成功後にruntime transportへ渡すが、state commitとsendの間はまだ

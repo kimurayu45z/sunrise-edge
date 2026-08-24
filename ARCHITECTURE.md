@@ -358,6 +358,18 @@ write-set/transaction contract, durable request deduplication, crash-safe
 outbox publication, bounded retry policy, and conformance across every
 supported persistence adapter as recorded in the Phase 15 To-Be criteria.
 
+The runtime now also defines the next As-Is persistence seam: a bounded
+`TransactionalStateStore` accepts a unique, canonically key-ordered write set,
+checks every expected per-key revision while holding one transaction boundary,
+and applies all mutations or none. Revisions are monotonic optimistic-
+concurrency tokens rather than protocol object versions. A delete retains a
+tombstone revision, so delete/recreate cannot produce an ABA match. The memory
+implementation validates atomicity, deterministic conflict selection,
+resource bounds, and revision-overflow behavior; it is test infrastructure,
+not the required durable production store. Node-core integration, canonical
+deduplication records, persisted outbox entries, and crash recovery remain
+subsequent Phase 15 work.
+
 ## 31. Native HTTP adapter
 
 Phase 15 adds the `native-http` crate around node-core using Axum and Tokio.
@@ -631,3 +643,8 @@ license/SBOM policy, and protected review/merge controls.
 - DR-0028: Ask Dependabot for bounded weekly Cargo, npm, and GitHub Actions
   update PRs, but never auto-merge them. Require human compatibility review and
   the complete repository gate for every proposed supply-chain change.
+- DR-0029: Use monotonic per-key storage revisions and one bounded,
+  canonically ordered atomic write set as the provider-neutral persistence
+  contract. Retain deletion tombstones to prevent ABA, reject the complete
+  transaction on the first ordered conflict, and treat the in-memory
+  implementation as conformance evidence rather than durable storage.
