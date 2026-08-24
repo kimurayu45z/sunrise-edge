@@ -219,12 +219,13 @@ bytes. Additive node-core handlers resolve it from one access-plan derivation
 before storage reads and return the domain beside output. An additive native
 router uses that result for request-scoped delivery and accepts no HTTP domain,
 but SQLite/default routing and scan recovery remain legacy. The current Phase
-15 sequence is: define the fenced/deadline-aware durable domain adapter
-boundary, add an indexed outbox claim contract and domain-aware unattended
-recovery, implement the normalized PostgreSQL reference adapter, run shared
-conformance, then deadline/cancellation, abrupt fault, backup/restore, capacity,
-and provider implementations. Do not spend further effort treating the opaque
-SQLite table or prefix scanner as the production schema. SQLite remains a local
+15 sequence is: preserve and wire the additive fenced/deadline-aware durable
+domain boundary, add an indexed outbox claim contract and domain-aware
+unattended recovery, implement the normalized PostgreSQL reference adapter,
+run shared conformance, then deadline/cancellation, abrupt fault,
+backup/restore, capacity, and provider implementations. Do not spend further
+effort treating the opaque SQLite table or prefix scanner as the production
+schema. SQLite remains a local
 durable reference. Do not jump to provider deployment claims before the shared
 contract and evidence exist. Native blocking work already has explicit
 admission isolation, but its configured limit is not a validated capacity

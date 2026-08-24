@@ -791,6 +791,21 @@ The immutable batch observation and delivery-cursor mutation remain one domain
 transaction. An additive native request path now composes these operations, but
 durable-store migration and indexed unattended recovery are still pending.
 
+The additive `DurableDomainStateStore` boundary makes production operation
+authority and uncertainty explicit without changing the legacy or domain
+transaction traits. One `DurableOperationContext` carries a non-zero monotonic
+writer-fence generation, an absolute storage deadline, and a fixed-size
+non-zero correlation ID across reads and commit. These are deployment and
+observability inputs, never canonical protocol fields, deduplication identity,
+or HTTP-selected authority. A durable commit has exactly three top-level
+states: committed, definitely rejected, or indeterminate. Revision conflict,
+stale writer fence, exhausted serialization retry, and failures proved to
+precede commit dispatch are definite rejections. Deadline, cancellation, or
+connection loss after dispatch is indeterminate unless the backend proves an
+abort; reconciliation must read the persisted request receipt before effects
+are retried. Node-core, native composition, SQLite, and provider adapters have
+not migrated to this new production boundary yet.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -963,3 +978,10 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   the legacy SQLite route and scan recovery until a durable domain store and
   indexed due-work contract exist; do not mislabel the memory-backed route as
   production persistence.
+- DR-0048: Model production durable operations with one non-zero writer fence,
+  absolute deadline, and bounded correlation identity shared across reads and
+  commit. Keep those values out of canonical protocol and HTTP authority.
+  Return proven abort reasons separately from an indeterminate commit, and
+  require receipt reconciliation whenever commit may have succeeded invisibly.
+  Introduce the boundary additively so legacy SQLite data is not migrated by
+  implication.

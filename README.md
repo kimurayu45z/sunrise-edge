@@ -93,8 +93,13 @@ cross-provider ingress milestones implemented through Phase 17:
 - A domain-aware transaction envelope that separates a complete bounded
   `AtomicStateReadSet` from put/delete mutations, requires every mutation to
   have a matching read assertion, caps aggregate represented bytes, and keeps
-  identical keys isolated across atomicity domains in memory. Node-core and
-  durable providers have not yet migrated to this new contract.
+  identical keys isolated across atomicity domains in memory. Additive
+  node-core and native paths use it; durable providers have not yet migrated.
+- An additive production durable-store boundary with a non-zero monotonic
+  writer fence, absolute storage deadline, bounded operational correlation ID,
+  and typed commit outcomes. Proven conflicts, fencing, serialization aborts,
+  and pre-commit deadline/unavailability remain distinct from an indeterminate
+  commit that must be reconciled by persisted request identity.
 - A transactional node-core path that declares bounded state access before
   reads, transitions over an immutable versioned snapshot, and rejects
   undeclared or read-only updates before atomic commit. Every declared
@@ -112,8 +117,8 @@ cross-provider ingress milestones implemented through Phase 17:
   deployment coordinates. The initial canonical manifest uses one closed
   `AllState` domain under an explicit ProtocolConfig v2 boundary while
   preserving historical v1 bytes. Node-core resolves it once before storage
-  reads and returns the committed domain with output; native integration is
-  pending.
+  reads and returns the committed domain with output; an additive native route
+  carries that domain through request-scoped delivery.
 - A one-message bounded outbox lease/ack cursor with explicit at-least-once
   redelivery after lease expiry; it does not claim transport exactly-once.
 - Domain-aware outbox lease/ack entrypoints that keep immutable-batch assertions
@@ -168,9 +173,9 @@ independent security review.
 
 The next planned technical milestones work backward through the Phase 15
 production exit criteria in [`TODO.md`](TODO.md) and the accepted
-[persistence design](PERSISTENCE.md): define the fenced/deadline-aware durable
-domain adapter boundary, add an indexed outbox claim contract and domain-aware
-recovery, and implement the normalized PostgreSQL reference adapter.
+[persistence design](PERSISTENCE.md): connect an indexed outbox claim contract
+to domain-aware recovery, wire the durable operation boundary through
+composition, and implement the normalized PostgreSQL reference adapter.
 Deadline/cancellation, abrupt
 fault, backup/restore, capacity, and provider conformance follow on that
 foundation. Phase 16/17 provider trust, deployment, observability, and release

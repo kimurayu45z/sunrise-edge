@@ -65,10 +65,11 @@ isolation and complete-read conflict behavior. Node-core now has additive
 domain-aware transactional and idempotent handlers that commit application
 state, request receipt, outbox batch, and initial delivery cursor through that
 contract. Domain-aware outbox claim/ack uses the same shared delivery logic and
-keeps the immutable batch assertion plus cursor mutation in one domain. Native
-composition, SQLite, and durable providers still use the legacy interface, and
-no indexed due-work claim exists yet, so this remains an As-Is contract
-milestone rather than the completed production API.
+keeps the immutable batch assertion plus cursor mutation in one domain. An
+additive native route carries node-core's resolved domain through
+request-scoped delivery. SQLite/default composition and durable providers still
+use the legacy interface, and no indexed due-work claim exists yet, so this
+remains an As-Is contract milestone rather than the completed production API.
 
 ## 3. Atomicity domains and scale
 
@@ -186,6 +187,18 @@ The target runtime operation accepts one bounded transaction envelope:
 - one request receipt and zero or one immutable outbox batch;
 - a storage deadline and correlation identity.
 
+Runtime now defines this operational boundary additively as
+`DurableDomainStateStore`. `DurableOperationContext` carries a non-zero
+monotonic `WriterFenceGeneration`, absolute `StorageDeadline`, and fixed-size
+non-zero `StorageCorrelationId`; none is canonical protocol input or accepted
+from HTTP. A durable commit returns `Committed`, a definite `Rejected` reason,
+or `Indeterminate`. Conflict, stale fencing, exhausted serialization retries,
+and failures proved to occur before commit dispatch are definite rejections.
+Deadline, connection loss, or cancellation after dispatch is indeterminate
+unless the backend supplies authoritative abort evidence. Callers reconcile
+that case through the persisted request receipt instead of rerunning effects
+blindly. No durable adapter or node-core composition uses this boundary yet.
+
 The store validates the complete read set and fencing generation, then commits
 all rows or none. A pure transition is not re-run inside a storage driver. An
 adapter may retry a serialization/transport failure only within a fixed budget
@@ -275,9 +288,9 @@ not general state reads:
 
 ## 9. Implementation order and certification
 
-1. Finish wiring the implemented atomicity-domain/read-set envelope through
-   native composition, then implement it in durable stores without silently
-   migrating legacy data.
+1. Preserve the additive fenced/deadline-aware durable boundary and wire it
+   through node-core composition and durable stores without silently migrating
+   legacy data.
 2. Add a dedicated indexed outbox repository/claim contract; retain key scans
    only for maintenance and compatibility.
 3. Implement the normalized PostgreSQL schema and adapter, with migrations and
