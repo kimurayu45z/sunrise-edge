@@ -213,10 +213,11 @@ next work is closing Phase 15-17 production gaps using the accepted
 read revision in its atomic write set. Runtime has the explicit atomicity
 domain and dedicated read/mutation envelope with memory conformance; additive
 node-core transaction and outbox delivery entrypoints now use it, while native
-composition and durable stores have not migrated. The accepted logical-domain
-manifest must be implemented in canonical protocol configuration before native
-routing trusts a domain. The current Phase 15 sequence is: implement and resolve
-that manifest, wire native composition, add an indexed outbox claim contract,
+composition and durable stores have not migrated. The logical-domain manifest
+is committed as ProtocolConfig encoding v2 without changing historical v1
+bytes, but node-core must resolve it before native routing trusts a domain. The
+current Phase 15 sequence is: resolve that manifest in node-core, wire native
+composition, add an indexed outbox claim contract,
 implement the normalized PostgreSQL reference adapter, run shared
 conformance, then deadline/cancellation, abrupt fault, backup/restore, capacity,
 and provider implementations. Do not spend further effort treating the opaque

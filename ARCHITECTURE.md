@@ -751,6 +751,16 @@ metadata separately binds `(chain, validator, logical domain)` to PostgreSQL,
 one Durable Object, or one fenced regional authority, so provider migration
 does not change protocol identity.
 
+`AtomicityDomainId` now lives in dependency-light `protocol-types` and rejects
+the all-zero value. `ProtocolConfig` optionally carries the manifest as field
+14 under encoding version 2. The historical version-1 genesis bytes remain
+unchanged. Protocol version 1 rejects a manifest, while protocol version 2 and
+later reject its absence. The manifest canonically commits its non-zero rule
+version, logical domain, closed rule tag, and activation epoch; resolution
+rejects empty plans and pre-activation events. Node-core integration remains a
+separate step so an adapter cannot start trusting caller-selected domains merely
+because the config type exists.
+
 The runtime now models that boundary explicitly with a non-zero 32-byte
 `AtomicityDomainId`, a separately validated `AtomicStateReadSet`, a put/delete
 `AtomicStateMutationSet`, and `AtomicStateTransaction`. Read and mutation sets
@@ -930,3 +940,9 @@ transaction. Native composition and durable-store migration are still pending.
   before reads, and make receipt/outbox records inherit the invocation domain.
   Bind that logical domain to provider resources only in fenced deployment
   metadata so migration does not rewrite protocol identity.
+- DR-0045: Commit the first `DomainPlacementManifest` only through an explicit
+  ProtocolConfig encoding-version boundary. Preserve historical version-1
+  bytes, require field 14 for protocol version 2 and later, reject the field on
+  version 1, and fail closed on zero identity/rule version, empty access, or
+  pre-activation routing. Keep the logical ID in `protocol-types` and defer
+  native trust until node-core resolves the committed manifest.

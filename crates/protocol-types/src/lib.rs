@@ -16,6 +16,8 @@ pub enum TypeError {
     UnknownHashDomain(u16),
     /// The signature scheme identifier is unknown.
     UnknownSignatureSchemeId(u16),
+    /// Atomicity-domain identifiers must not be all zeroes.
+    ZeroAtomicityDomainId,
 }
 
 impl fmt::Display for TypeError {
@@ -26,6 +28,9 @@ impl fmt::Display for TypeError {
             Self::UnknownHashDomain(id) => write!(f, "unknown hash domain id: {id:#06x}"),
             Self::UnknownSignatureSchemeId(id) => {
                 write!(f, "unknown signature scheme id: {id:#06x}")
+            }
+            Self::ZeroAtomicityDomainId => {
+                write!(f, "atomicity domain id must not be all zeroes")
             }
         }
     }
@@ -116,6 +121,38 @@ impl ValidatorId {
 }
 
 impl fmt::Display for ValidatorId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Stable logical identity for one independently writable state authority.
+///
+/// This is protocol identity, not a provider resource name or database
+/// location. Physical placement belongs to fenced deployment metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AtomicityDomainId([u8; 32]);
+
+impl AtomicityDomainId {
+    /// Creates a non-zero logical atomicity-domain identifier.
+    pub fn new(bytes: [u8; 32]) -> Result<Self, TypeError> {
+        if bytes == [0; 32] {
+            return Err(TypeError::ZeroAtomicityDomainId);
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the exact logical identifier bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for AtomicityDomainId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for byte in self.0 {
             write!(f, "{byte:02x}")?;
@@ -447,5 +484,16 @@ mod tests {
 
         assert!(text.starts_with("sha2-256:"));
         assert!(text.ends_with(&"ab".repeat(32)));
+    }
+
+    #[test]
+    fn atomicity_domain_identity_is_non_zero_and_stably_displayed() {
+        assert_eq!(
+            AtomicityDomainId::new([0; 32]),
+            Err(TypeError::ZeroAtomicityDomainId)
+        );
+        let domain = AtomicityDomainId::new([0xAB; 32]).unwrap();
+        assert_eq!(domain.as_bytes(), &[0xAB; 32]);
+        assert_eq!(domain.to_string(), "ab".repeat(32));
     }
 }
