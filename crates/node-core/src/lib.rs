@@ -16,6 +16,7 @@ use runtime::{Runtime, RuntimeError, StateStore};
 use std::error::Error;
 
 const NODE_EVENT_TYPE_ID: u16 = 0xE001;
+const NODE_RESPONSE_TYPE_ID: u16 = 0xE002;
 const ENCODING_VERSION: u16 = 1;
 
 /// Maximum UTF-8 byte length of a chain identifier accepted at node ingress.
@@ -520,6 +521,35 @@ impl NodeResponse {
     pub fn payload(&self) -> Option<&[u8]> {
         self.payload.as_deref()
     }
+
+    /// Encodes this response into its adapter-neutral canonical wire form.
+    pub fn encode(&self) -> Result<Vec<u8>, NodeCoreError> {
+        let mut frame = CanonicalStruct::new(NODE_RESPONSE_TYPE_ID, ENCODING_VERSION);
+        frame.field_bytes(1, self.request_id.as_bytes().to_vec())?;
+        frame.field_u16(2, self.status.as_u16())?;
+        if let Some(payload) = &self.payload {
+            frame.field_bytes(3, payload.clone())?;
+        }
+        Ok(frame.finish()?)
+    }
+
+    /// Decodes one adapter-neutral canonical response.
+    pub fn decode(bytes: &[u8]) -> Result<Self, NodeCoreError> {
+        let frame = decode_canonical_frame(bytes)?;
+        frame.require_type(NODE_RESPONSE_TYPE_ID)?;
+        frame.require_version(ENCODING_VERSION)?;
+        frame.require_only_fields(&[1, 2, 3])?;
+
+        let request_bytes = frame.required_field(1)?;
+        let request_array: [u8; 32] = request_bytes
+            .try_into()
+            .map_err(|_| NodeCoreError::InvalidRequestIdLength(request_bytes.len()))?;
+        Self::new(
+            RequestId::new(request_array)?,
+            NodeResponseStatus::try_from(frame.required_u16(2)?)?,
+            frame.field(3).map(<[u8]>::to_vec),
+        )
+    }
 }
 
 /// Adapter-neutral outbound delivery request.
@@ -837,6 +867,32 @@ mod tests {
             ),
             Err(NodeCoreError::CanonicalDecoding(_))
         ));
+    }
+
+    #[test]
+    fn response_round_trip_preserves_optional_payload() {
+        let response = NodeResponse::new(
+            request(0x21),
+            NodeResponseStatus::Accepted,
+            Some(canonical(TEST_PAYLOAD_TYPE_ID, 42)),
+        )
+        .unwrap();
+        let encoded = response.encode().unwrap();
+
+        assert_eq!(NodeResponse::decode(&encoded).unwrap(), response);
+        assert_eq!(
+            hex(&encoded),
+            "534e524502e001000300010020000000212121212121212121212121212121212121212121212121\
+             21212121212121210200020000000100030018000000534e524502ef010001000100080000002a00\
+             000000000000"
+                .replace(' ', "")
+        );
+
+        let empty = NodeResponse::new(request(0x22), NodeResponseStatus::Rejected, None).unwrap();
+        assert_eq!(
+            NodeResponse::decode(&empty.encode().unwrap()).unwrap(),
+            empty
+        );
     }
 
     #[test]
