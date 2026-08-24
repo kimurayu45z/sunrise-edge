@@ -99,6 +99,10 @@ cross-provider ingress milestones implemented through Phase 17:
   run outside Tokio request tasks with a host-selected non-zero concurrency
   bound. Excess work is rejected with 429 instead of entering an unbounded
   adapter queue.
+- A scheduler-callable, one-shot native outbox recovery API that scans bounded
+  durable pages, skips completed and actively leased records, recovers at most
+  one outbox, returns an explicit continuation cursor, and shares the HTTP
+  blocking admission pool. It creates no resident loop or scheduler trust root.
 - A bounded Cloudflare Workers ingress that uses a generated private Service
   Binding, strict TypeScript, and workerd integration tests.
 - A provider-neutral Web Fetch API ingress core for keeping future edge
@@ -121,16 +125,17 @@ cross-provider ingress milestones implemented through Phase 17:
 
 Important remaining work includes the owned-object fast path, concrete
 node-event dispatch and protocol handlers, cancellable durable-I/O deadlines,
-scheduled outbox recovery and fault conformance, portable system-module
+real provider trigger wiring and durable recovery fault conformance, portable
+system-module
 execution, cryptographic slashing proof verification, fee-object debiting,
 provider persistence bindings, runtime adapters, networking/RPC surfaces, and
 independent security review.
 
 The next planned technical milestone works backward through the Phase 15
-production exit criteria in [`TODO.md`](TODO.md): integrate provider scheduling
-by connecting bounded durable key discovery to one-shot recovery of committed
-outboxes that are not tied to an active request, define
-storage-aware deadlines/cancellation, and prove process/power-fault recovery
+production exit criteria in [`TODO.md`](TODO.md): exercise one-shot recovery
+against SQLite reopen/process-fault boundaries, wire authenticated provider
+triggers without trusting their delivery, define storage-aware
+deadlines/cancellation, and prove power-fault recovery
 conformance. Phase 16/17 provider trust, deployment, capacity,
 observability, and release rehearsal remain required after that shared
 foundation exists.
