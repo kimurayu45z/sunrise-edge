@@ -505,6 +505,7 @@ dependencies = [
  "canonical-encoding",
  "hashing",
  "node-core",
+ "protocol-config",
  "protocol-types",
  "runtime",
  "runtime-sqlite",

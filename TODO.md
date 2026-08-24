@@ -1918,7 +1918,9 @@ Phase 15 As-Is scope:
   historical ProtocolConfig encoding v1を維持したままprotocol version 2+のfield 14/encoding v2としてcommitする。
   v1+manifest、v2+-manifest、empty access、pre-activation resolveはfail closedする（implemented As-Is;
   node-coreはevent context検証後にaccess planを1回だけderiveし、storage read前にmanifestをresolveして、
-  committed outputと同じdomainを返すadditive handlerを持つ（implemented As-Is; native routing integration pending）。
+  committed outputと同じdomainを返すadditive handlerを持つ。native-httpはDomainTransactionalStateStore限定の
+  additive routerでそのdomainをrequest-scoped outbox claim/ackまで引き回し、HTTPからdomainを受け取らない
+  （implemented As-Is; durable domain store/indexed unattended recovery pending）。
 - runtimeはnon-zero 32-byte AtomicityDomainId、unique/canonicalなAtomicStateReadSetと
   AtomicStateMutationSet、それらを1 domainへ閉じ込めるAtomicStateTransactionを持つ。
   全mutation keyはread assertionを必須とし、各set 4,096 keysおよびaggregate represented bytes 64 MiBを
@@ -1929,7 +1931,8 @@ Phase 15 As-Is scope:
   domain isolation、replay、dependency conflict時にresult/receipt/outboxを一切publishしないことを検証する。
   outbox lease/ackにもdomain-aware entrypointを追加し、legacy/domainでidentity、lease、cursor検証を共有しつつ、
   immutable batch assertionとdelivery mutationを1 domain transactionへ閉じ込めた（implemented As-Is）。
-  native composition、runtime-sqlite、provider adapterはまだnew contractへ移行していない。
+  resolved-domain native request compositionは接続済みだが、runtime-sqlite、legacy default router、scan-based
+  unattended recovery、provider adapterはまだnew contractへ移行していない。
 - ComposedRuntimeはStateStore、BlobStore、Signer、Transport、Clock、Schedulerをhidden defaultなしで
   明示的に所有・合成する。SQLiteへstate/dedup/outboxをcommit後にruntimeをdropし、同じDBを別compositionで
   reopenしてstateを再適用せずoutboxを送ること、send failure leaseがreopen後もexpiry前は抑止されexpiry時だけ
@@ -2009,9 +2012,10 @@ Phase 15 To-Be production exit criteria:
 
 Phase 15 persistence implementation order（To-Beからの逆算）:
 
-1. node-coreでresolve済みの`DomainPlacementManifest` domainを初期commit、outbox delivery、native compositionの
-   全経路へ接続する。SQLite既存dataを暗黙migrationせずdurable store contractへ実装する。
-2. indexed due-outbox repository/claim contractを追加し、StateKeyScannerはmaintenance/compatibilityへ戻す。
+1. SQLite既存dataを暗黙migrationせず、writer fence、deadline、typed conflict/indeterminate failureを持つ
+   durable domain adapter boundaryを定義する。
+2. indexed due-outbox repository/claim contractを追加し、domain-aware unattended recoveryを接続して
+   StateKeyScannerはmaintenance/compatibilityへ戻す。
 3. normalized schema、explicit migration、bounded pool/deadline、typed conflictを持つPostgreSQL adapterを実装する。
 4. shared conformanceにwrite skew、absent-key race、serialization failure、lease fencing、schema/version skewを追加する。
 5. kill/power fault、disk full、connection exhaustion、capacity/load/soak、backup/restore、writer failoverをrehearsalする。

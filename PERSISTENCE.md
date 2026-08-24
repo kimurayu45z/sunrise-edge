@@ -102,8 +102,11 @@ zero rule version, zero domain ID, an empty access plan, and use before its
 activation epoch. Node-core now has additive resolved transactional and
 idempotent handlers that derive the bounded application access plan exactly
 once, resolve the committed manifest before storage reads, and return the
-resolved domain beside committed output. Native composition does not yet use
-that path, so adapter routing integration is still pending.
+resolved domain beside committed output. Native HTTP now has an additive router
+restricted to `DomainTransactionalStateStore`: it invokes that resolved path
+and carries the returned domain through request-scoped outbox claim/ack. The
+legacy/SQLite router and scan-based unattended recovery remain unscoped; no
+durable production domain store is implemented yet.
 
 Node-core resolves this manifest after validating event context and after
 constructing the bounded access plan, but before any state read. Every

@@ -20,13 +20,15 @@ use core::fmt;
 use hashing::HashSuiteResolver;
 use node_core::{
     MAX_NODE_OUTPUT_ITEMS, MAX_NODE_PAYLOAD_BYTES, NodeConfig, NodeCoreError, NodeEvent,
-    NodeOutboxBatch, NodeOutboxDelivery, NodeResponse, OutboxLeaseId, RequestId,
-    TransactionalNodeStateMachine, acknowledge_outbox_message, claim_next_outbox_message,
-    handle_idempotent_event,
+    NodeOutboxBatch, NodeOutboxDelivery, NodeResponse, OutboxClaim, OutboxLeaseId, RequestId,
+    TransactionalNodeStateMachine, acknowledge_outbox_message,
+    acknowledge_outbox_message_in_domain, claim_next_outbox_message,
+    claim_next_outbox_message_in_domain, handle_idempotent_event, handle_resolved_idempotent_event,
 };
+use protocol_config::DomainPlacementManifest;
 use runtime::{
-    Clock, PersistenceLayout, Runtime, RuntimeError, StateKeyScan, StateKeyScanner,
-    TransactionalStateStore, Transport,
+    AtomicityDomainId, Clock, DomainTransactionalStateStore, PersistenceLayout, Runtime,
+    RuntimeError, StateKeyScan, StateKeyScanner, TransactionalStateStore, Transport,
 };
 use std::{error::Error, future::Future, num::NonZeroUsize, sync::Arc};
 use tokio::sync::{Semaphore, TryAcquireError};
@@ -330,6 +332,16 @@ struct NativeHttpState<R, M, L> {
     blocking_executor: NativeBlockingExecutor,
 }
 
+struct ResolvedDomainNativeHttpState<R, M, L> {
+    runtime: Arc<R>,
+    placement: DomainPlacementManifest,
+    config: NodeConfig,
+    resolver: HashSuiteResolver,
+    machine: Arc<M>,
+    lease_ids: Arc<L>,
+    blocking_executor: NativeBlockingExecutor,
+}
+
 /// Builds the recoverable native HTTP router.
 ///
 /// Application state, request deduplication, responses, and the ordered outbox
@@ -388,6 +400,72 @@ where
     Router::new()
         .route(LIVENESS_PATH, get(liveness))
         .route(NODE_EVENT_PATH, post(submit_event::<R, M, L>))
+        .layer(DefaultBodyLimit::max(MAX_HTTP_EVENT_BODY_BYTES))
+        .with_state(state)
+}
+
+/// Builds a native router that resolves state authority from protocol config.
+///
+/// This route is available only for stores implementing the explicit-domain
+/// transaction contract. It never accepts a domain from the HTTP request and
+/// carries node-core's resolved domain into request-scoped outbox delivery.
+pub fn resolved_domain_router<R, M, L>(
+    runtime: Arc<R>,
+    placement: DomainPlacementManifest,
+    config: NodeConfig,
+    resolver: HashSuiteResolver,
+    machine: Arc<M>,
+    lease_ids: Arc<L>,
+    blocking_policy: NativeBlockingPolicy,
+) -> Router
+where
+    R: Runtime + Send + Sync + 'static,
+    R::State: DomainTransactionalStateStore,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    L: OutboxLeaseIdSource + Send + Sync + 'static,
+{
+    resolved_domain_router_with_executor(
+        runtime,
+        placement,
+        config,
+        resolver,
+        machine,
+        lease_ids,
+        NativeBlockingExecutor::new(blocking_policy),
+    )
+}
+
+/// Builds a resolved-domain router with shared blocking admission.
+pub fn resolved_domain_router_with_executor<R, M, L>(
+    runtime: Arc<R>,
+    placement: DomainPlacementManifest,
+    config: NodeConfig,
+    resolver: HashSuiteResolver,
+    machine: Arc<M>,
+    lease_ids: Arc<L>,
+    blocking_executor: NativeBlockingExecutor,
+) -> Router
+where
+    R: Runtime + Send + Sync + 'static,
+    R::State: DomainTransactionalStateStore,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    L: OutboxLeaseIdSource + Send + Sync + 'static,
+{
+    let state = Arc::new(ResolvedDomainNativeHttpState {
+        runtime,
+        placement,
+        config,
+        resolver,
+        machine,
+        lease_ids,
+        blocking_executor,
+    });
+    Router::new()
+        .route(LIVENESS_PATH, get(liveness))
+        .route(
+            NODE_EVENT_PATH,
+            post(submit_resolved_domain_event::<R, M, L>),
+        )
         .layer(DefaultBodyLimit::max(MAX_HTTP_EVENT_BODY_BYTES))
         .with_state(state)
 }
@@ -682,6 +760,63 @@ where
         .into_response()
 }
 
+async fn submit_resolved_domain_event<R, M, L>(
+    State(state): State<Arc<ResolvedDomainNativeHttpState<R, M, L>>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response
+where
+    R: Runtime + Send + Sync + 'static,
+    R::State: DomainTransactionalStateStore,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    L: OutboxLeaseIdSource + Send + Sync + 'static,
+{
+    if !has_supported_content_type(&headers) {
+        return error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported-content-type",
+        );
+    }
+    if has_unsupported_content_encoding(&headers) {
+        return error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported-content-encoding",
+        );
+    }
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => return error_response(error.status(), "body-rejected"),
+    };
+    let permit = match state.blocking_executor.try_acquire() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => return overload_response(),
+        Err(TryAcquireError::Closed) => {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "blocking-admission-closed");
+        }
+    };
+    let blocking_state = Arc::clone(&state);
+    let work = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        invoke_resolved_domain_event(blocking_state.as_ref(), &body)
+    });
+    let result = match work.await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => return invocation_error_response(&error),
+        Err(_) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "blocking-task-failed");
+        }
+    };
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, NODE_RESULT_MEDIA_TYPE),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        result,
+    )
+        .into_response()
+}
+
 enum InvocationError {
     Node(NodeCoreError),
     Delivery(OutboxDeliveryError),
@@ -716,6 +851,40 @@ where
     )
     .map_err(InvocationError::Delivery)?;
     HttpNodeResult::new(request_id, output.responses().to_vec())
+        .and_then(|result| result.encode())
+        .map_err(|_| InvocationError::ResultEncoding)
+}
+
+fn invoke_resolved_domain_event<R, M, L>(
+    state: &ResolvedDomainNativeHttpState<R, M, L>,
+    body: &[u8],
+) -> Result<Vec<u8>, InvocationError>
+where
+    R: Runtime,
+    R::State: DomainTransactionalStateStore,
+    M: TransactionalNodeStateMachine,
+    L: OutboxLeaseIdSource,
+{
+    let event = NodeEvent::decode(body).map_err(InvocationError::Node)?;
+    let request_id = event.request_id();
+    let resolved = handle_resolved_idempotent_event(
+        state.runtime.as_ref(),
+        &state.placement,
+        &state.config,
+        &state.resolver,
+        event,
+        state.machine.as_ref(),
+    )
+    .map_err(InvocationError::Node)?;
+    let _delivered_messages = deliver_request_outbox_in_domain(
+        state.runtime.as_ref(),
+        resolved.domain(),
+        &state.config,
+        state.lease_ids.as_ref(),
+        request_id,
+    )
+    .map_err(InvocationError::Delivery)?;
+    HttpNodeResult::new(request_id, resolved.output().responses().to_vec())
         .and_then(|result| result.encode())
         .map_err(|_| InvocationError::ResultEncoding)
 }
@@ -788,20 +957,93 @@ where
     R::State: TransactionalStateStore,
     L: OutboxLeaseIdSource,
 {
+    deliver_request_outbox_inner(
+        runtime,
+        config,
+        lease_ids,
+        request_id,
+        |layout, request_id, lease_id, now_unix_millis| {
+            claim_next_outbox_message(
+                runtime.state_store(),
+                layout,
+                request_id,
+                lease_id,
+                now_unix_millis,
+                NATIVE_OUTBOX_LEASE_MILLIS,
+            )
+        },
+        |layout, request_id, index, lease_id| {
+            acknowledge_outbox_message(runtime.state_store(), layout, request_id, index, lease_id)
+        },
+    )
+}
+
+fn deliver_request_outbox_in_domain<R, L>(
+    runtime: &R,
+    domain: AtomicityDomainId,
+    config: &NodeConfig,
+    lease_ids: &L,
+    request_id: RequestId,
+) -> Result<usize, OutboxDeliveryError>
+where
+    R: Runtime,
+    R::State: DomainTransactionalStateStore,
+    L: OutboxLeaseIdSource,
+{
+    deliver_request_outbox_inner(
+        runtime,
+        config,
+        lease_ids,
+        request_id,
+        |layout, request_id, lease_id, now_unix_millis| {
+            claim_next_outbox_message_in_domain(
+                runtime.state_store(),
+                domain,
+                layout,
+                request_id,
+                lease_id,
+                now_unix_millis,
+                NATIVE_OUTBOX_LEASE_MILLIS,
+            )
+        },
+        |layout, request_id, index, lease_id| {
+            acknowledge_outbox_message_in_domain(
+                runtime.state_store(),
+                domain,
+                layout,
+                request_id,
+                index,
+                lease_id,
+            )
+        },
+    )
+}
+
+fn deliver_request_outbox_inner<R, L, C, A>(
+    runtime: &R,
+    config: &NodeConfig,
+    lease_ids: &L,
+    request_id: RequestId,
+    mut claim_next: C,
+    mut acknowledge: A,
+) -> Result<usize, OutboxDeliveryError>
+where
+    R: Runtime,
+    L: OutboxLeaseIdSource,
+    C: FnMut(
+        &PersistenceLayout,
+        RequestId,
+        OutboxLeaseId,
+        u64,
+    ) -> Result<Option<OutboxClaim>, NodeCoreError>,
+    A: FnMut(&PersistenceLayout, RequestId, u32, OutboxLeaseId) -> Result<(), NodeCoreError>,
+{
     let layout = PersistenceLayout::new(config.chain_id().clone(), config.protocol_version());
     let mut delivered_messages = 0_usize;
     for _ in 0..MAX_NODE_OUTPUT_ITEMS {
         let lease_id = lease_ids.next_lease_id(request_id)?;
         let now_unix_millis = runtime.clock().now_unix_millis()?;
-        let Some(claim) = claim_next_outbox_message(
-            runtime.state_store(),
-            &layout,
-            request_id,
-            lease_id,
-            now_unix_millis,
-            NATIVE_OUTBOX_LEASE_MILLIS,
-        )?
-        else {
+        let Some(claim) = claim_next(&layout, request_id, lease_id, now_unix_millis)? else {
             return Ok(delivered_messages);
         };
         let encoded = claim.message().event().encode()?;
@@ -809,13 +1051,7 @@ where
             .transport()
             .send(encoded)
             .map_err(|_| OutboxDeliveryError::Send)?;
-        acknowledge_outbox_message(
-            runtime.state_store(),
-            &layout,
-            claim.request_id(),
-            claim.index(),
-            claim.lease_id(),
-        )?;
+        acknowledge(&layout, claim.request_id(), claim.index(), claim.lease_id())?;
         delivered_messages = delivered_messages
             .checked_add(1)
             .ok_or(NodeCoreError::OutboxArithmeticOverflow)?;
@@ -864,6 +1100,10 @@ fn node_error_response(error: &NodeCoreError) -> Response {
             (StatusCode::UNPROCESSABLE_ENTITY, "transition-rejected")
         }
         NodeCoreError::Runtime(_) => (StatusCode::SERVICE_UNAVAILABLE, "runtime-unavailable"),
+        NodeCoreError::ProtocolConfig(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "protocol-config-unavailable",
+        ),
         NodeCoreError::ResponseRequestMismatch { .. }
         | NodeCoreError::StateTooLarge(_)
         | NodeCoreError::TooManyOutputItems { .. }
@@ -1011,6 +1251,15 @@ mod tests {
             ProtocolVersion::new(3),
             Epoch::new(7),
             b"http/node-state".to_vec(),
+        )
+        .unwrap()
+    }
+
+    fn placement(byte: u8, activation_epoch: u64) -> DomainPlacementManifest {
+        DomainPlacementManifest::single_domain(
+            1,
+            AtomicityDomainId::new([byte; 32]).unwrap(),
+            Epoch::new(activation_epoch),
         )
         .unwrap()
     }
@@ -1182,6 +1431,23 @@ mod tests {
         let machine = Arc::new(IncrementMachine::new(config.state_key()));
         router(
             runtime,
+            config,
+            resolver(),
+            machine,
+            Arc::new(SequenceLeaseIds::default()),
+            NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+        )
+    }
+
+    fn resolved_app(
+        runtime: Arc<MemoryRuntime>,
+        placement: DomainPlacementManifest,
+        config: NodeConfig,
+    ) -> Router {
+        let machine = Arc::new(IncrementMachine::new(config.state_key()));
+        resolved_domain_router(
+            runtime,
+            placement,
             config,
             resolver(),
             machine,
@@ -1387,6 +1653,91 @@ mod tests {
                 .required_u64(1)
                 .unwrap(),
             1
+        );
+        assert!(runtime.transport().drain_outbound().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolved_domain_route_commits_and_delivers_only_in_manifest_domain() {
+        let runtime = Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
+        let config = config();
+        let placement = placement(0x51, 7);
+        let domain = placement.domain();
+        let id = request_id(0x52);
+        let event_bytes = event(id).encode().unwrap();
+        let app = resolved_app(Arc::clone(&runtime), placement, config.clone());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event_bytes.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(runtime.transport().drain_outbound().unwrap().len(), 1);
+        assert_eq!(runtime.state_store().get(config.state_key()).unwrap(), None);
+
+        let state = runtime
+            .state_store()
+            .get_versioned_in_domain(domain, config.state_key())
+            .unwrap();
+        assert_eq!(
+            decode_canonical_frame(state.value().unwrap())
+                .unwrap()
+                .required_u64(1),
+            Ok(1)
+        );
+        let layout = PersistenceLayout::new(config.chain_id().clone(), config.protocol_version());
+        let delivery = runtime
+            .state_store()
+            .get_versioned_in_domain(domain, &layout.outbox_delivery_key(*id.as_bytes()))
+            .unwrap();
+        let delivery = NodeOutboxDelivery::decode(delivery.value().unwrap()).unwrap();
+        assert_eq!(delivery.next_index(), 1);
+        assert_eq!(delivery.lease(), None);
+
+        let duplicate = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        assert!(runtime.transport().drain_outbound().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolved_domain_route_rejects_inactive_placement_without_state() {
+        let runtime = Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
+        let config = config();
+        let placement = placement(0x53, 8);
+        let domain = placement.domain();
+        let app = resolved_app(Arc::clone(&runtime), placement, config.clone());
+        let response = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event(request_id(0x54)).encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            runtime
+                .state_store()
+                .get_versioned_in_domain(domain, config.state_key())
+                .unwrap()
+                .value(),
+            None
         );
         assert!(runtime.transport().drain_outbound().unwrap().is_empty());
     }
