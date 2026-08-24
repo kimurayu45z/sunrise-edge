@@ -1908,7 +1908,43 @@ Phase 15 To-Be production exit criteria:
     rehearsalし、independent security reviewを完了する。
 
 Phase 16:
-- Cloudflare Workers adapter
+- Cloudflare Workers ingress adapter (implemented As-Is)
+
+Phase 16 As-Is scope:
+
+- ES module WorkerがPOST /v1/eventsとGET /health/liveをPhase 15 contractと同じpath、
+  exact media type、identity-only content encoding、no-store semanticsで提供する。
+- request bodyはReadableStreamから固定上限までだけ読み、unbounded arrayBuffer/text/JSON
+  bufferingを行わない。
+- node-core serviceはpublic URLではなくgenerated Env.NODE_CORE Service Bindingでawaitして呼ぶ。
+- module-level mutable request state、floating Promise、Cloudflare REST API、hardcoded secret、
+  passThroughOnExceptionを使用しない。
+- downstream response headerをallow-listで再構築し、binding内部500をsanitized 502へ変換する。
+- wrangler.jsoncはtested workerdがsupportする最新compatibility date、nodejs_compat、
+  observabilityを固定し、binding typeはwrangler typesで生成する。
+- workerd integration testはmock Service Bindingでsuccess、liveness、method/media/encoding、
+  declared/streamed oversize、downstream failureを検証する。
+- 現実装はbounded ingress/relayだけであり、Cloudflare上でnode-core transitionやdurable stateを
+  実行するproduction validatorの完成形ではない。
+
+Phase 16 To-Be production exit criteria:
+
+1. NODE_CORE serviceのdeployment architectureを固定し、Worker/WASM、Durable Object、
+   Workflows/Queues、外部durable storeの責務とtrust boundaryをprotocol/runtime仕様へ接続する。
+2. atomic multi-key state、persisted deduplication、transactional outbox、crash recoveryを
+   Cloudflare binding/storage semantics上で実装し、duplicate/replay/concurrent invocationで検証する。
+3. Cloudflare Access contextがService Binding先へ自動伝播しない前提で、public ingress認証、
+   protocol署名検証、service capability、operator/admin routeを分離しfail closedにする。
+4. WAF、API Shield、rate limiting、bot/DDoS policy、request/header limits、custom domain/TLS、
+   Cache RulesをIaC化し、dashboard driftとsecretのsource管理混入を防ぐ。
+5. CPU/memory/subrequest/invocation limits内のworst-case event benchmark、load/soak test、
+   backpressure、bounded concurrency、deadline、cancellation、overload behaviorを固定する。
+6. structured logs、traces、metrics、request correlation、sampling、PII/secret redaction、SLO、
+   alert、cost guardrailをproduction observabilityとして実装する。
+7. compatibility_date、Wrangler、workerd、generated types、service versionをrelease artifactへ固定し、
+   staged rollout、version skew、rollback非依存safe disable、binding target切替をrehearsalする。
+8. native adapterとのcanonical/status/error conformance、real binding integration、fault injection、
+   fuzz/adversarial/security test、independent review、operator/disaster-recovery runbookを完了する。
 
 Phase 17:
 - Vercel / Supabase / AWS / Deno adapters
