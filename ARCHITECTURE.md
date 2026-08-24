@@ -15,6 +15,8 @@ Sunrise Edge is designed as a deterministic state-transition system over authent
   power, quorum calculation, and validator-set commitments.
 - `consensus`: canonical proposal/vote/certificate types and the event-driven
   shared-object chained-HotStuff state machine.
+- `node-core`: bounded node-event ingress, replay-context validation, pure
+  application transition dispatch, and conditional state persistence.
 - `protocol-upgrades`: canonical feature flags, hash-suite schedules, protocol-version transitions, and lazy-migration descriptors.
 
 ## 3. Canonical serialization rules
@@ -330,6 +332,32 @@ affect liveness but cannot create a certificate or commit state. Consensus
 parameters (protocol ID, block transaction bound, and timeout) are committed in
 `ProtocolConfig`, and consensus state uses an epoch-namespaced persistence key.
 
+## 30. Node-core invocation boundary
+
+Phase 15 prerequisites introduce the runtime-neutral `node-core` crate. One
+invocation accepts exactly one `NodeEvent` with explicit chain ID, protocol
+version, epoch, non-zero request ID, closed event-kind ID, and a bounded
+canonical application payload. Generic frame validation is only an ingress
+property: the selected application state machine must still decode the exact
+payload type/version and perform authentication, authorization, membership,
+signature, quorum, and transition checks appropriate to that event kind.
+
+`handle_event` validates replay context before storage access, reads one
+explicit canonical state value, invokes a synchronous `NodeStateMachine`, and
+uses compare-and-swap to persist the candidate next state. Responses and
+outbound events remain held until the conditional write succeeds. CAS conflicts
+are returned to the adapter without an internal retry, signature, send,
+scheduling action, or background task. Request IDs enable application-level
+idempotency records; their presence alone does not make a state machine
+idempotent.
+
+This first boundary intentionally performs a single-key state replacement. It
+is the As-Is integration seam for the native adapter, not the production
+persistence endpoint. Production completion requires a versioned atomic
+write-set/transaction contract, durable request deduplication, crash-safe
+outbox publication, bounded retry policy, and conformance across every
+supported persistence adapter as recorded in the Phase 15 To-Be criteria.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -347,3 +375,8 @@ parameters (protocol ID, block transaction bound, and timeout) are committed in
   Use versioned leaf/node framing, ship Poseidon2/BN254 only as an experimental
   inactive alternative to genesis SHA-256, reserve unsupported schemes without
   fallback, and dispatch bounded proof envelopes only to an exact-ID verifier.
+- DR-0015: Put one bounded canonical event and one explicit conditional state
+  transition behind a runtime-neutral node-core boundary. Publish no output
+  before persistence succeeds, keep retries and delivery in adapters, and treat
+  single-key CAS as an interim seam that must evolve into a crash-safe atomic
+  write-set and outbox contract for production.
