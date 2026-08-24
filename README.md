@@ -116,9 +116,11 @@ cross-provider ingress milestones implemented through Phase 17:
   restart-safe lease atomically, and makes same-lease claim and acknowledgement
   retries reconcilable after an indeterminate commit. An additive native
   one-shot recovery path consumes trusted deployment domain/fence authority,
-  sends no unreconciled claim, and shares blocking admission. No durable
-  adapter uses this contract yet; prefix scanning remains compatibility-only
-  recovery.
+  sends no unreconciled claim, and shares blocking admission. The in-memory
+  conformance repository now validates stable due order, expiry replacement,
+  same-lease reconciliation, and retained delayed acknowledgement. No
+  restart-safe adapter uses this contract yet; prefix scanning remains
+  compatibility-only recovery.
 - A transactional node-core path that declares bounded state access before
   reads, transitions over an immutable versioned snapshot, and rejects
   undeclared or read-only updates before atomic commit. Every declared

@@ -1088,3 +1088,9 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   conflicts, stale fences, and pre-dispatch deadlines publish no partial rows;
   and use the real node-core handler for commit and replay conformance. Treat
   this fixture as ephemeral evidence, not production persistence.
+- DR-0055: Make the ephemeral structured store implement the same indexed
+  outbox contract required of durable drivers. Create delivery state with the
+  invocation commit, claim in stable availability/request order, reconcile an
+  active same-lease claim, expire replaced attempts, and retain every lease
+  binding so a delayed acknowledgement remains idempotent after later messages
+  advance. Reject cross-domain lease reuse and keep this evidence non-durable.
