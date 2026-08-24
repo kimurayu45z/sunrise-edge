@@ -1933,6 +1933,13 @@ Phase 15 As-Is scope:
   immutable batch assertionとdelivery mutationを1 domain transactionへ閉じ込めた（implemented As-Is）。
   resolved-domain native request compositionは接続済みだが、runtime-sqlite、legacy default router、scan-based
   unattended recovery、provider adapterはまだnew contractへ移行していない。
+- production durable operation boundaryはnon-zero monotonic writer fence、absolute storage deadline、
+  bounded non-zero correlation IDを1 invocation contextとして分離し、commit outcomeをCommitted、
+  definite Rejected、Indeterminateへ閉じた。revision conflict、stale fence、serialization abort、
+  commit dispatch前に証明されたdeadline/unavailabilityだけをdefinite abortとし、dispatch後のdeadline、
+  connection loss、cancellationはbackendのauthoritative abort evidenceなしに失敗扱いしない
+  （boundary implemented As-Is; node-core/native/durable adapter wiring pending）。correlation ID、fence、deadlineを
+  protocol canonical input、request dedup identity、HTTP caller-selected authorityにしてはならない。
 - ComposedRuntimeはStateStore、BlobStore、Signer、Transport、Clock、Schedulerをhidden defaultなしで
   明示的に所有・合成する。SQLiteへstate/dedup/outboxをcommit後にruntimeをdropし、同じDBを別compositionで
   reopenしてstateを再適用せずoutboxを送ること、send failure leaseがreopen後もexpiry前は抑止されexpiry時だけ
@@ -2013,7 +2020,7 @@ Phase 15 To-Be production exit criteria:
 Phase 15 persistence implementation order（To-Beからの逆算）:
 
 1. SQLite既存dataを暗黙migrationせず、writer fence、deadline、typed conflict/indeterminate failureを持つ
-   durable domain adapter boundaryを定義する。
+   durable domain adapter boundaryを定義する（implemented As-Is; composition/provider implementation pending）。
 2. indexed due-outbox repository/claim contractを追加し、domain-aware unattended recoveryを接続して
    StateKeyScannerはmaintenance/compatibilityへ戻す。
 3. normalized schema、explicit migration、bounded pool/deadline、typed conflictを持つPostgreSQL adapterを実装する。

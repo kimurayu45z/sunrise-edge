@@ -7,7 +7,7 @@ pub use protocol_types::{AtomicityDomainId, ValidatorId};
 use protocol_types::{ChainId, Digest32, Epoch, ProtocolVersion};
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -162,6 +162,142 @@ pub const MAX_ATOMIC_STATE_READS: usize = 4_096;
 pub const MAX_ATOMIC_STATE_TRANSACTION_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum keys returned by one bounded state scan page.
 pub const MAX_STATE_SCAN_KEYS: usize = 1_024;
+
+/// Monotonic deployment-generation token for one domain's authoritative writer.
+///
+/// This token belongs to fenced deployment metadata, not canonical protocol
+/// state. Generation zero is reserved so an omitted fence cannot authorize a
+/// write accidentally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WriterFenceGeneration(NonZeroU64);
+
+impl WriterFenceGeneration {
+    /// Creates a non-zero writer generation.
+    #[must_use]
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Returns the deployment-metadata representation.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    /// Returns the next generation without permitting wraparound.
+    #[must_use]
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.get().checked_add(1) {
+            Some(value) => Self::new(value),
+            None => None,
+        }
+    }
+}
+
+/// Absolute storage-operation deadline in Unix milliseconds.
+///
+/// Adapters must propagate this deadline through acquisition, statements, and
+/// commit. Expiry does not by itself prove that an already-dispatched commit
+/// aborted; such a result is [`DurableCommitOutcome::Indeterminate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StorageDeadline(NonZeroU64);
+
+impl StorageDeadline {
+    /// Creates a non-zero absolute deadline.
+    #[must_use]
+    pub const fn new(unix_millis: u64) -> Option<Self> {
+        match NonZeroU64::new(unix_millis) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Returns the absolute Unix-millisecond deadline.
+    #[must_use]
+    pub const fn unix_millis(self) -> u64 {
+        self.0.get()
+    }
+
+    /// Returns whether the deadline has elapsed at the supplied trusted time.
+    #[must_use]
+    pub const fn is_expired_at(self, now_unix_millis: u64) -> bool {
+        now_unix_millis >= self.unix_millis()
+    }
+}
+
+/// Bounded operational identity used to correlate one durable invocation.
+///
+/// Correlation IDs are observability metadata. They are not accepted as
+/// request identity, deduplication identity, or a protocol authorization input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StorageCorrelationId([u8; 16]);
+
+impl StorageCorrelationId {
+    /// Creates a non-zero correlation identity.
+    #[must_use]
+    pub fn new(bytes: [u8; 16]) -> Option<Self> {
+        if bytes == [0; 16] {
+            None
+        } else {
+            Some(Self(bytes))
+        }
+    }
+
+    /// Returns the exact operational identity bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+/// Authority and budget shared by every storage operation in one invocation.
+///
+/// The same context must be used for all reads and the corresponding commit.
+/// A store must revalidate the writer fence at commit even if earlier reads
+/// accepted it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DurableOperationContext {
+    writer_fence: WriterFenceGeneration,
+    deadline: StorageDeadline,
+    correlation_id: StorageCorrelationId,
+}
+
+impl DurableOperationContext {
+    /// Creates the bounded operational context for one durable invocation.
+    #[must_use]
+    pub const fn new(
+        writer_fence: WriterFenceGeneration,
+        deadline: StorageDeadline,
+        correlation_id: StorageCorrelationId,
+    ) -> Self {
+        Self {
+            writer_fence,
+            deadline,
+            correlation_id,
+        }
+    }
+
+    /// Returns the writer generation that the adapter must validate.
+    #[must_use]
+    pub const fn writer_fence(self) -> WriterFenceGeneration {
+        self.writer_fence
+    }
+
+    /// Returns the deadline covering acquisition through commit resolution.
+    #[must_use]
+    pub const fn deadline(self) -> StorageDeadline {
+        self.deadline
+    }
+
+    /// Returns the operational correlation identity.
+    #[must_use]
+    pub const fn correlation_id(self) -> StorageCorrelationId {
+        self.correlation_id
+    }
+}
 
 /// Monotonic optimistic-concurrency token for one state key.
 ///
@@ -554,6 +690,103 @@ pub enum AtomicStateWriteResult {
     },
 }
 
+/// Definite, all-or-none rejection of one durable commit.
+///
+/// Returning any variant proves that the transaction did not commit. An
+/// adapter must not use this type after losing the ability to determine the
+/// commit result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DurableCommitRejection {
+    /// The complete read set no longer matched and no mutation was applied.
+    Conflict {
+        /// First conflicting key in canonical key order.
+        key: Vec<u8>,
+        /// Revision observed while the store held commit authority.
+        current_revision: StateRevision,
+    },
+    /// The supplied writer generation was not the active generation.
+    WriterFenced {
+        /// Generation that is currently authoritative.
+        active_generation: WriterFenceGeneration,
+    },
+    /// The deadline elapsed before the adapter dispatched the commit.
+    DeadlineExceededBeforeCommit,
+    /// The backend aborted a serialization attempt and the bounded retry budget ended.
+    SerializationFailure,
+    /// A mutation revision would overflow, so no row was changed.
+    StateRevisionOverflow,
+    /// Persisted state or an operational projection violated invariants before commit.
+    InvalidPersistedState,
+    /// The durable schema identity or generation is unsupported by this adapter.
+    SchemaMismatch,
+    /// The backend was unavailable before any commit could be dispatched.
+    UnavailableBeforeCommit,
+}
+
+/// Why a durable adapter can no longer prove whether a commit happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndeterminateCommitReason {
+    /// The deadline elapsed after commit may already have been dispatched.
+    DeadlineExceeded,
+    /// The connection or response was lost across the commit boundary.
+    ConnectionLost,
+    /// Cancellation arrived after commit may already have been dispatched.
+    CancellationRequested,
+}
+
+/// Exhaustive result of one production durable commit attempt.
+///
+/// Callers may retry a [`Self::Rejected`] transaction according to policy.
+/// They must reconcile [`Self::Indeterminate`] by persisted request identity;
+/// blindly rerunning the transition can duplicate effects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DurableCommitOutcome {
+    /// Every assertion matched and all rows committed atomically.
+    Committed,
+    /// The store proves that no mutation committed.
+    Rejected(DurableCommitRejection),
+    /// The store cannot prove whether all mutations committed.
+    Indeterminate(IndeterminateCommitReason),
+}
+
+impl From<AtomicStateWriteResult> for DurableCommitOutcome {
+    fn from(value: AtomicStateWriteResult) -> Self {
+        match value {
+            AtomicStateWriteResult::Committed => Self::Committed,
+            AtomicStateWriteResult::Conflict {
+                key,
+                current_revision,
+            } => Self::Rejected(DurableCommitRejection::Conflict {
+                key,
+                current_revision,
+            }),
+        }
+    }
+}
+
+/// A read failure from the durable domain boundary.
+///
+/// Reads have no commit ambiguity. They may be retried only within the original
+/// operation deadline and bounded adapter policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DurableReadError {
+    /// The caller supplied an invalid bounded key before storage I/O began.
+    InvalidRequest(RuntimeError),
+    /// The supplied writer generation was not the active generation.
+    WriterFenced {
+        /// Generation that is currently authoritative.
+        active_generation: WriterFenceGeneration,
+    },
+    /// The operation deadline elapsed before the read completed.
+    DeadlineExceeded,
+    /// The backend could not complete the read.
+    Unavailable,
+    /// Stored bytes or projections violated persistence invariants.
+    InvalidPersistedState,
+    /// The durable schema identity or generation is unsupported by this adapter.
+    SchemaMismatch,
+}
+
 /// Versioned multi-key state interface for production node-core transactions.
 pub trait TransactionalStateStore: StateStore {
     /// Reads a value and its ABA-safe revision token.
@@ -583,6 +816,34 @@ pub trait DomainTransactionalStateStore {
         &self,
         transaction: AtomicStateTransaction,
     ) -> Result<AtomicStateWriteResult, RuntimeError>;
+}
+
+/// Fenced, deadline-aware boundary for production durable domain adapters.
+///
+/// This is additive while node-core, SQLite, and provider adapters migrate.
+/// Implementations are bound at construction to one `(chain, validator)`
+/// namespace. The logical domain comes from protocol placement; the operation
+/// context comes from trusted deployment composition. Neither may be selected
+/// by an untrusted transport request.
+pub trait DurableDomainStateStore {
+    /// Reads one exact key under the invocation's fence and deadline.
+    fn get_versioned_durable(
+        &self,
+        context: &DurableOperationContext,
+        domain: AtomicityDomainId,
+        key: &[u8],
+    ) -> Result<VersionedStateValue, DurableReadError>;
+
+    /// Revalidates the fence and complete read set, then commits all or none.
+    ///
+    /// Once commit is dispatched, deadline, cancellation, or connection loss
+    /// must produce [`DurableCommitOutcome::Indeterminate`] unless the backend
+    /// supplies authoritative evidence that the transaction aborted.
+    fn commit_durable(
+        &self,
+        context: &DurableOperationContext,
+        transaction: AtomicStateTransaction,
+    ) -> DurableCommitOutcome;
 }
 
 /// The result of a compare-and-swap state operation.
@@ -1594,6 +1855,54 @@ mod tests {
         assert_eq!(transaction.mutations()[0].key(), b"a");
         assert_eq!(transaction.mutations()[1].key(), b"z");
         assert_eq!(transaction.represented_bytes(), 96);
+    }
+
+    #[test]
+    fn durable_operation_context_requires_explicit_non_zero_authority_and_identity() {
+        assert_eq!(WriterFenceGeneration::new(0), None);
+        assert_eq!(StorageDeadline::new(0), None);
+        assert_eq!(StorageCorrelationId::new([0; 16]), None);
+
+        let fence = WriterFenceGeneration::new(7).unwrap();
+        let deadline = StorageDeadline::new(1_000).unwrap();
+        let correlation_id = StorageCorrelationId::new([9; 16]).unwrap();
+        let context = DurableOperationContext::new(fence, deadline, correlation_id);
+
+        assert_eq!(context.writer_fence().get(), 7);
+        assert_eq!(context.writer_fence().checked_next().unwrap().get(), 8);
+        assert_eq!(context.deadline().unix_millis(), 1_000);
+        assert!(!context.deadline().is_expired_at(999));
+        assert!(context.deadline().is_expired_at(1_000));
+        assert_eq!(context.correlation_id().as_bytes(), &[9; 16]);
+        assert_eq!(
+            WriterFenceGeneration::new(u64::MAX).unwrap().checked_next(),
+            None
+        );
+    }
+
+    #[test]
+    fn durable_commit_outcome_does_not_blur_conflict_and_ambiguity() {
+        assert_eq!(
+            DurableCommitOutcome::from(AtomicStateWriteResult::Conflict {
+                key: key("dependency"),
+                current_revision: StateRevision::new(4),
+            }),
+            DurableCommitOutcome::Rejected(DurableCommitRejection::Conflict {
+                key: key("dependency"),
+                current_revision: StateRevision::new(4),
+            })
+        );
+        assert_ne!(
+            DurableCommitOutcome::Rejected(DurableCommitRejection::DeadlineExceededBeforeCommit),
+            DurableCommitOutcome::Indeterminate(IndeterminateCommitReason::DeadlineExceeded)
+        );
+        assert_ne!(
+            DurableCommitOutcome::Rejected(DurableCommitRejection::SerializationFailure),
+            DurableCommitOutcome::Rejected(DurableCommitRejection::Conflict {
+                key: key("dependency"),
+                current_revision: StateRevision::new(4),
+            })
+        );
     }
 
     #[test]
