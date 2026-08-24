@@ -325,8 +325,26 @@ This is a local-disk durability component, not an adapter deployment claim.
 SQLite WAL needs local shared-memory filesystem semantics, the API is blocking,
 and the current tests prove reopen persistence, ordered conflict rollback,
 revision-overflow rollback, CAS behavior, and schema rejection—not kill/power
-fault recovery. Native HTTP must place it behind bounded blocking isolation,
-deadlines, admission control, and cancellation policy before integration.
+fault recovery. Native HTTP now places synchronous work behind bounded blocking
+admission, but production runtime composition, storage-aware deadlines,
+cancellation, and capacity evidence remain open.
+
+Recovery and maintenance adapters may additionally require bounded discovery
+of persisted keys. `StateKeyScanner` is deliberately separate from the
+point-read `StateStore` contract. A validated request fixes a non-empty binary
+prefix, an optional exclusive cursor inside that prefix, and a non-zero page
+limit capped at 1,024. Results are strictly byte-ordered, carry a continuation
+cursor only when one lookahead row proves another page exists, and include
+revision tombstones. SQLite performs the range query over its BLOB primary key;
+the memory store is a conformance reference.
+
+Pagination is not a cross-page snapshot. A concurrently inserted key before a
+cursor can be absent from that sweep, so unattended recovery must periodically
+restart at the prefix. The scanner exposes keys only; it neither decodes
+protocol records nor sends messages, schedules itself, or makes process
+lifetime a correctness assumption. Native request work now has bounded blocking
+admission, but storage-aware cancellation and a validated host capacity budget
+remain open.
 
 ## 29. Shared-object consensus
 
@@ -756,3 +774,8 @@ license/SBOM policy, and protected review/merge controls.
   or claim cancellable deadlines
   by timing out a started `spawn_blocking` job; design deadlines with the
   storage operation and commit boundary instead.
+- DR-0036: Add optional bounded state-key discovery outside the protocol
+  transition store contract. Require binary-prefix, exclusive-cursor pagination
+  with a fixed page ceiling, canonical ordering, validated provider pages, and
+  tombstone visibility. Treat pages as non-snapshot observations and require
+  periodic prefix restarts before using the seam for unattended recovery.

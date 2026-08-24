@@ -7,13 +7,17 @@
 //! expected revision in canonical key order, and then commits all mutations or
 //! none. Deleted keys retain revision-bearing tombstones.
 //!
+//! Recovery adapters can discover keys through bounded, exclusive-cursor BLOB
+//! prefix pages. A multi-page scan is not a database snapshot; callers must
+//! periodically restart from the prefix to observe concurrent earlier inserts.
+//!
 //! SQLite WAL requires local storage with working shared-memory semantics. This
 //! crate does not make network filesystems or serverless ephemeral disks durable.
 
 use runtime::{
-    AtomicStateWriteResult, AtomicStateWriteSet, CompareAndSwapResult, RuntimeError, StateMutation,
-    StateRevision, StateStore, TransactionalStateStore, VersionedStateValue, validate_state_key,
-    validate_state_value,
+    AtomicStateWriteResult, AtomicStateWriteSet, CompareAndSwapResult, RuntimeError, StateKeyPage,
+    StateKeyScan, StateKeyScanner, StateMutation, StateRevision, StateStore,
+    TransactionalStateStore, VersionedStateValue, validate_state_key, validate_state_value,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::{
@@ -189,6 +193,41 @@ impl StateStore for SqliteStateStore {
     }
 }
 
+impl StateKeyScanner for SqliteStateStore {
+    fn scan_keys(&self, scan: &StateKeyScan) -> Result<StateKeyPage, RuntimeError> {
+        let connection = self.connection().map_err(runtime_failure)?;
+        let upper_bound = prefix_upper_bound(scan.prefix());
+        let candidate_limit = i64::try_from(scan.limit().get() + 1)
+            .map_err(|_| RuntimeError::InvalidStateScanPage)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT key FROM sunrise_state
+                 WHERE key >= ?1
+                   AND (?2 IS NULL OR key > ?2)
+                   AND (?3 IS NULL OR key < ?3)
+                 ORDER BY key
+                 LIMIT ?4",
+            )
+            .map_err(database_failure)?;
+        let rows = statement
+            .query_map(
+                params![
+                    scan.prefix(),
+                    scan.after(),
+                    upper_bound.as_deref(),
+                    candidate_limit
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map_err(database_failure)?;
+        let mut keys = Vec::new();
+        for row in rows {
+            keys.push(row.map_err(database_failure)?);
+        }
+        StateKeyPage::from_ordered_candidates(scan, keys)
+    }
+}
+
 impl TransactionalStateStore for SqliteStateStore {
     fn get_versioned(&self, key: &[u8]) -> Result<VersionedStateValue, RuntimeError> {
         validate_state_key(key)?;
@@ -342,6 +381,14 @@ fn decode_revision(bytes: &[u8]) -> Result<StateRevision, SqliteStateStoreError>
     Ok(StateRevision::new(u64::from_be_bytes(bytes)))
 }
 
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    let index = upper.iter().rposition(|byte| *byte != u8::MAX)?;
+    upper[index] += 1;
+    upper.truncate(index + 1);
+    Some(upper)
+}
+
 fn database_failure(_error: rusqlite::Error) -> RuntimeError {
     RuntimeError::DurableStoreUnavailable
 }
@@ -357,9 +404,10 @@ fn runtime_failure(error: SqliteStateStoreError) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runtime::{StateMutation, StateWrite};
+    use runtime::{StateKeyScan, StateKeyScanner, StateMutation, StateWrite};
     use std::{
         fs,
+        num::NonZeroUsize,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
@@ -484,6 +532,60 @@ mod tests {
 
         let reopened = SqliteStateStore::open(&database.path).unwrap();
         assert_eq!(reopened.get(b"key").unwrap(), Some(vec![1]));
+    }
+
+    #[test]
+    fn ordered_prefix_scan_paginates_tombstones_and_survives_reopen() {
+        let database = TestDatabase::new();
+        let store = SqliteStateStore::open(&database.path).unwrap();
+        for key in [b"outbox/c".as_slice(), b"other/a", b"outbox/a", b"outbox/b"] {
+            store.put(key.to_vec(), vec![1]).unwrap();
+        }
+        let observed = store.get_versioned(b"outbox/b").unwrap();
+        store
+            .commit_atomic(
+                AtomicStateWriteSet::new(vec![
+                    StateWrite::new(
+                        b"outbox/b".to_vec(),
+                        observed.revision(),
+                        StateMutation::Delete,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+
+        let first_scan =
+            StateKeyScan::new(b"outbox/".to_vec(), None, NonZeroUsize::new(2).unwrap()).unwrap();
+        let first = store.scan_keys(&first_scan).unwrap();
+        assert_eq!(first.keys(), &[b"outbox/a".to_vec(), b"outbox/b".to_vec()]);
+        assert_eq!(first.continuation_cursor(), Some(b"outbox/b".as_slice()));
+        drop(store);
+
+        let reopened = SqliteStateStore::open(&database.path).unwrap();
+        let second_scan = StateKeyScan::new(
+            b"outbox/".to_vec(),
+            first.continuation_cursor().map(<[u8]>::to_vec),
+            NonZeroUsize::new(2).unwrap(),
+        )
+        .unwrap();
+        let second = reopened.scan_keys(&second_scan).unwrap();
+        assert_eq!(second.keys(), &[b"outbox/c".to_vec()]);
+        assert_eq!(second.continuation_cursor(), None);
+    }
+
+    #[test]
+    fn binary_prefix_scan_handles_prefix_without_finite_upper_bound() {
+        let database = TestDatabase::new();
+        let store = SqliteStateStore::open(&database.path).unwrap();
+        for key in [vec![0xFE, 0xFF], vec![0xFF], vec![0xFF, 0x00]] {
+            store.put(key, vec![1]).unwrap();
+        }
+        let scan = StateKeyScan::new(vec![0xFF], None, NonZeroUsize::new(4).unwrap()).unwrap();
+        let page = store.scan_keys(&scan).unwrap();
+        assert_eq!(page.keys(), &[vec![0xFF], vec![0xFF, 0x00]]);
+        assert_eq!(page.continuation_cursor(), None);
     }
 
     #[test]

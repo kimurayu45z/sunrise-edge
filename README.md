@@ -73,7 +73,9 @@ cross-provider ingress milestones implemented through Phase 17:
 - Runtime traits and an in-memory runtime for deterministic tests.
 - A local durable SQLite transactional store using WAL, synchronous FULL,
   immediate write transactions, revision tombstones, and fail-closed schema
-  identity/version checks. It is not yet wired into an async adapter.
+  identity/version checks. It also implements bounded, cursor-paginated binary
+  prefix key discovery for recovery adapters; it is not yet composed into a
+  production native runtime.
 - A bounded, replay-context-aware node-core invocation boundary that persists
   one pure transition with compare-and-swap before releasing output.
 - A bounded, versioned multi-key transaction contract with ABA-safe tombstone
@@ -126,7 +128,8 @@ independent security review.
 
 The next planned technical milestone works backward through the Phase 15
 production exit criteria in [`TODO.md`](TODO.md): integrate provider scheduling
-for committed outboxes that are not tied to an active request, define
+by connecting bounded durable key discovery to one-shot recovery of committed
+outboxes that are not tied to an active request, define
 storage-aware deadlines/cancellation, and prove process/power-fault recovery
 conformance. Phase 16/17 provider trust, deployment, capacity,
 observability, and release rehearsal remain required after that shared

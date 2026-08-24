@@ -1883,9 +1883,12 @@ Phase 15 As-Is scope:
   As-Is referenceでありdurable実装ではない。
 - runtime-sqliteはexact-pinned bundled SQLiteを使い、WAL + synchronous FULL、5秒busy timeout、
   BEGIN IMMEDIATE、8-byte revision、delete tombstone、application/schema ID fail-closedを実装する。
-  reopen persistence、ordered conflict、revision overflow、CASを検証するが、blocking local-disk storeで
-  ありnative HTTPには未接続である。network filesystem、kill -9/power-loss、backup/restore、bounded
-  blocking isolationの検証なしにprovider production persistence完成とはみなさない。
+  reopen persistence、ordered conflict、revision overflow、CASを検証する。recovery adapter向けには
+  StateStore point-readと分離したStateKeyScannerを実装し、non-empty binary prefix、prefix内exclusive
+  cursor、1,024以下のnon-zero limit、canonical order、1-row lookahead continuation、tombstone visibilityを
+  強制する（implemented As-Is）。page間snapshotではないため各sweepをprefix先頭から再開する必要がある。
+  blocking local-disk storeでありproduction runtime compositionは未実装である。network filesystem、
+  kill -9/power-loss、backup/restore、capacity検証なしにprovider production persistence完成とはみなさない。
 - node-coreのtransactional pathはcontext検証後かつstate read前にevent-specific access planを
   確定し、全keyをrevision付きsnapshotとしてpure transitionへ渡す。undeclared/read-only updateを
   rejectし、観測revisionをnode-core自身がwrite-setへbindし、全commit成功までoutputを返さない。

@@ -7,6 +7,7 @@ pub use protocol_types::ValidatorId;
 use protocol_types::{ChainId, Digest32, Epoch, ProtocolVersion};
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -55,6 +56,17 @@ pub enum RuntimeError {
     DurableStoreUnavailable,
     /// Persisted state violated the runtime revision/value invariants.
     InvalidPersistedState,
+    /// A state-key scan requested more keys than one page permits.
+    StateScanLimitTooLarge {
+        /// Requested page size.
+        requested: usize,
+        /// Maximum supported page size.
+        maximum: usize,
+    },
+    /// A state-key scan cursor did not belong to the requested prefix.
+    StateScanCursorOutsidePrefix,
+    /// A store returned an invalid, unordered, or out-of-range scan page.
+    InvalidStateScanPage,
 }
 
 impl fmt::Display for RuntimeError {
@@ -82,6 +94,16 @@ impl fmt::Display for RuntimeError {
             Self::TransportUnavailable => write!(f, "outbound transport is unavailable"),
             Self::DurableStoreUnavailable => write!(f, "durable state store is unavailable"),
             Self::InvalidPersistedState => write!(f, "persisted state violates runtime invariants"),
+            Self::StateScanLimitTooLarge { requested, maximum } => write!(
+                f,
+                "state scan requested {requested} keys, maximum is {maximum}"
+            ),
+            Self::StateScanCursorOutsidePrefix => {
+                write!(f, "state scan cursor is outside the requested prefix")
+            }
+            Self::InvalidStateScanPage => {
+                write!(f, "state store returned an invalid key scan page")
+            }
         }
     }
 }
@@ -94,6 +116,8 @@ pub const MAX_STATE_KEY_BYTES: usize = 4 * 1024;
 pub const MAX_STATE_VALUE_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum distinct keys mutated by one atomic state transaction.
 pub const MAX_ATOMIC_STATE_WRITES: usize = 4_096;
+/// Maximum keys returned by one bounded state scan page.
+pub const MAX_STATE_SCAN_KEYS: usize = 1_024;
 
 /// Monotonic optimistic-concurrency token for one state key.
 ///
@@ -303,6 +327,124 @@ pub trait StateStore {
     ) -> Result<CompareAndSwapResult, RuntimeError>;
 }
 
+/// One validated, bounded, forward-only state-key scan request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateKeyScan {
+    prefix: Vec<u8>,
+    after: Option<Vec<u8>>,
+    limit: NonZeroUsize,
+}
+
+impl StateKeyScan {
+    /// Creates a scan over keys with `prefix`, strictly after an optional cursor.
+    pub fn new(
+        prefix: Vec<u8>,
+        after: Option<Vec<u8>>,
+        limit: NonZeroUsize,
+    ) -> Result<Self, RuntimeError> {
+        validate_state_key(&prefix)?;
+        if limit.get() > MAX_STATE_SCAN_KEYS {
+            return Err(RuntimeError::StateScanLimitTooLarge {
+                requested: limit.get(),
+                maximum: MAX_STATE_SCAN_KEYS,
+            });
+        }
+        if let Some(after) = after.as_deref() {
+            validate_state_key(after)?;
+            if !after.starts_with(&prefix) {
+                return Err(RuntimeError::StateScanCursorOutsidePrefix);
+            }
+        }
+        Ok(Self {
+            prefix,
+            after,
+            limit,
+        })
+    }
+
+    /// Returns the required key prefix.
+    #[must_use]
+    pub fn prefix(&self) -> &[u8] {
+        &self.prefix
+    }
+
+    /// Returns the exclusive continuation cursor, when present.
+    #[must_use]
+    pub fn after(&self) -> Option<&[u8]> {
+        self.after.as_deref()
+    }
+
+    /// Returns the maximum keys exposed by the page.
+    #[must_use]
+    pub const fn limit(&self) -> NonZeroUsize {
+        self.limit
+    }
+}
+
+/// One validated page of canonical state keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateKeyPage {
+    keys: Vec<Vec<u8>>,
+    continuation_cursor: Option<Vec<u8>>,
+}
+
+impl StateKeyPage {
+    /// Validates and truncates at most one lookahead key from a store query.
+    ///
+    /// Store implementations query up to `scan.limit() + 1` keys. The extra
+    /// key proves that another page exists but is not exposed to the caller.
+    pub fn from_ordered_candidates(
+        scan: &StateKeyScan,
+        mut keys: Vec<Vec<u8>>,
+    ) -> Result<Self, RuntimeError> {
+        let candidate_limit = scan.limit().get() + 1;
+        if keys.len() > candidate_limit
+            || keys.iter().any(|key| {
+                validate_state_key(key).is_err()
+                    || !key.starts_with(scan.prefix())
+                    || scan.after().is_some_and(|after| key.as_slice() <= after)
+            })
+            || keys.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(RuntimeError::InvalidStateScanPage);
+        }
+        let has_more = keys.len() > scan.limit().get();
+        if has_more {
+            keys.pop();
+        }
+        let continuation_cursor = has_more.then(|| keys.last().cloned()).flatten();
+        Ok(Self {
+            keys,
+            continuation_cursor,
+        })
+    }
+
+    /// Returns keys in strictly increasing byte order.
+    #[must_use]
+    pub fn keys(&self) -> &[Vec<u8>] {
+        &self.keys
+    }
+
+    /// Returns the last exposed key when another page is known to exist.
+    #[must_use]
+    pub fn continuation_cursor(&self) -> Option<&[u8]> {
+        self.continuation_cursor.as_deref()
+    }
+}
+
+/// Optional bounded key discovery used by recovery and maintenance adapters.
+///
+/// This is separate from [`StateStore`] so protocol transitions retain their
+/// point-read contract and stores that cannot support ordered scans need not
+/// pretend otherwise. Implementations return revision-bearing tombstone keys
+/// as well as present values. Pages are individually ordered but are not a
+/// multi-page snapshot: recovery callers must periodically restart at the
+/// prefix to discover keys inserted before a previous cursor.
+pub trait StateKeyScanner: StateStore {
+    /// Returns one canonical page for a validated scan request.
+    fn scan_keys(&self, scan: &StateKeyScan) -> Result<StateKeyPage, RuntimeError>;
+}
+
 /// Content-addressed blob storage interface.
 pub trait BlobStore {
     /// Stores a blob under its digest key.
@@ -449,6 +591,20 @@ impl StateStore for MemoryStateStore {
             swapped: false,
             current,
         })
+    }
+}
+
+impl StateKeyScanner for MemoryStateStore {
+    fn scan_keys(&self, scan: &StateKeyScan) -> Result<StateKeyPage, RuntimeError> {
+        let guard = self.inner.read().expect("state store lock poisoned");
+        let candidates = guard
+            .keys()
+            .filter(|key| key.starts_with(scan.prefix()))
+            .filter(|key| scan.after().is_none_or(|after| key.as_slice() > after))
+            .take(scan.limit().get() + 1)
+            .cloned()
+            .collect();
+        StateKeyPage::from_ordered_candidates(scan, candidates)
     }
 }
 
@@ -922,6 +1078,62 @@ mod tests {
         assert!(!result.swapped);
         assert_eq!(result.current, Some(vec![9]));
         assert_eq!(store.get(b"k").unwrap(), Some(vec![9]));
+    }
+
+    #[test]
+    fn state_key_scan_is_prefix_bounded_and_cursor_paginated() {
+        let store = MemoryStateStore::default();
+        for name in ["outbox/c", "other/a", "outbox/a", "outbox/b"] {
+            store.put(key(name), vec![1]).unwrap();
+        }
+        let first_scan =
+            StateKeyScan::new(key("outbox/"), None, NonZeroUsize::new(2).unwrap()).unwrap();
+        let first = store.scan_keys(&first_scan).unwrap();
+        assert_eq!(first.keys(), &[key("outbox/a"), key("outbox/b")]);
+        assert_eq!(first.continuation_cursor(), Some(b"outbox/b".as_slice()));
+
+        let second_scan = StateKeyScan::new(
+            key("outbox/"),
+            first.continuation_cursor().map(<[u8]>::to_vec),
+            NonZeroUsize::new(2).unwrap(),
+        )
+        .unwrap();
+        let second = store.scan_keys(&second_scan).unwrap();
+        assert_eq!(second.keys(), &[key("outbox/c")]);
+        assert_eq!(second.continuation_cursor(), None);
+    }
+
+    #[test]
+    fn state_key_scan_rejects_unbounded_or_invalid_pages() {
+        assert_eq!(
+            StateKeyScan::new(
+                key("outbox/"),
+                Some(key("other/a")),
+                NonZeroUsize::new(1).unwrap(),
+            ),
+            Err(RuntimeError::StateScanCursorOutsidePrefix)
+        );
+        assert_eq!(
+            StateKeyScan::new(
+                key("outbox/"),
+                None,
+                NonZeroUsize::new(MAX_STATE_SCAN_KEYS + 1).unwrap(),
+            ),
+            Err(RuntimeError::StateScanLimitTooLarge {
+                requested: MAX_STATE_SCAN_KEYS + 1,
+                maximum: MAX_STATE_SCAN_KEYS,
+            })
+        );
+
+        let scan = StateKeyScan::new(key("outbox/"), None, NonZeroUsize::new(2).unwrap()).unwrap();
+        assert_eq!(
+            StateKeyPage::from_ordered_candidates(&scan, vec![key("outbox/b"), key("outbox/a")],),
+            Err(RuntimeError::InvalidStateScanPage)
+        );
+        assert_eq!(
+            StateKeyPage::from_ordered_candidates(&scan, vec![key("other/a")]),
+            Err(RuntimeError::InvalidStateScanPage)
+        );
     }
 
     #[test]
