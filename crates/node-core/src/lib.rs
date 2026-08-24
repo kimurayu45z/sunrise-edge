@@ -12,7 +12,12 @@ use canonical_encoding::{
 };
 use core::fmt;
 use protocol_types::{ChainId, Epoch, ProtocolVersion, TypeError};
-use runtime::{Runtime, RuntimeError, StateStore};
+use runtime::{
+    AtomicStateWriteResult, AtomicStateWriteSet, MAX_ATOMIC_STATE_WRITES, MAX_STATE_KEY_BYTES,
+    Runtime, RuntimeError, StateMutation, StateStore, StateWrite, TransactionalStateStore,
+    VersionedStateValue,
+};
+use std::collections::BTreeMap;
 use std::error::Error;
 
 const NODE_EVENT_TYPE_ID: u16 = 0xE001;
@@ -72,6 +77,32 @@ pub enum NodeCoreError {
     },
     /// A persistence key was empty.
     EmptyStateKey,
+    /// A transactional invocation declared no state access.
+    EmptyStateAccessPlan,
+    /// A transactional invocation declared too many state accesses.
+    TooManyStateAccesses {
+        /// Actual access count.
+        count: usize,
+        /// Maximum accepted access count.
+        maximum: usize,
+    },
+    /// A transactional invocation declared the same state key twice.
+    DuplicateStateAccessKey,
+    /// A transactional transition returned no state updates.
+    EmptyStateUpdates,
+    /// A transactional transition returned too many state updates.
+    TooManyStateUpdates {
+        /// Actual update count.
+        count: usize,
+        /// Maximum accepted update count.
+        maximum: usize,
+    },
+    /// A transactional transition returned the same state key twice.
+    DuplicateStateUpdateKey,
+    /// A transactional transition updated a key absent from its access plan.
+    UndeclaredStateUpdate(Vec<u8>),
+    /// A transactional transition attempted to update a read-only key.
+    ReadOnlyStateUpdate(Vec<u8>),
     /// An event or response payload exceeded its resource bound.
     PayloadTooLarge(usize),
     /// A state value exceeded its resource bound.
@@ -134,6 +165,36 @@ impl fmt::Display for NodeCoreError {
                 actual.get()
             ),
             Self::EmptyStateKey => f.write_str("node-core state key must not be empty"),
+            Self::EmptyStateAccessPlan => {
+                f.write_str("transactional node state access plan must not be empty")
+            }
+            Self::TooManyStateAccesses { count, maximum } => write!(
+                f,
+                "transactional node state access plan has {count} keys, maximum is {maximum}"
+            ),
+            Self::DuplicateStateAccessKey => {
+                f.write_str("transactional node state access plan contains a duplicate key")
+            }
+            Self::EmptyStateUpdates => {
+                f.write_str("transactional node transition must update at least one state key")
+            }
+            Self::TooManyStateUpdates { count, maximum } => write!(
+                f,
+                "transactional node transition has {count} updates, maximum is {maximum}"
+            ),
+            Self::DuplicateStateUpdateKey => {
+                f.write_str("transactional node transition contains a duplicate update key")
+            }
+            Self::UndeclaredStateUpdate(key) => write!(
+                f,
+                "transactional node transition updated an undeclared {}-byte state key",
+                key.len()
+            ),
+            Self::ReadOnlyStateUpdate(key) => write!(
+                f,
+                "transactional node transition updated a read-only {}-byte state key",
+                key.len()
+            ),
             Self::PayloadTooLarge(length) => write!(
                 f,
                 "node payload is {length} bytes, maximum is {MAX_NODE_PAYLOAD_BYTES}"
@@ -628,6 +689,197 @@ impl NodeOutput {
     }
 }
 
+/// Storage access granted to one deterministic transactional transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeStateAccessMode {
+    /// The transition may inspect but not mutate the key.
+    ReadOnly,
+    /// The transition may inspect and conditionally mutate the key.
+    ReadWrite,
+}
+
+/// One key in a transactional node invocation's declared state access plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeStateAccess {
+    key: Vec<u8>,
+    mode: NodeStateAccessMode,
+}
+
+impl NodeStateAccess {
+    /// Creates a bounded state-access declaration.
+    pub fn new(key: Vec<u8>, mode: NodeStateAccessMode) -> Result<Self, NodeCoreError> {
+        validate_transactional_state_key(&key)?;
+        Ok(Self { key, mode })
+    }
+
+    /// Returns the storage key.
+    #[must_use]
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// Returns the allowed access mode.
+    #[must_use]
+    pub const fn mode(&self) -> NodeStateAccessMode {
+        self.mode
+    }
+}
+
+/// Bounded, unique, canonically key-ordered state access plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeStateAccessPlan {
+    accesses: Vec<NodeStateAccess>,
+}
+
+impl NodeStateAccessPlan {
+    /// Validates and sorts an event-specific state access plan.
+    pub fn new(mut accesses: Vec<NodeStateAccess>) -> Result<Self, NodeCoreError> {
+        if accesses.is_empty() {
+            return Err(NodeCoreError::EmptyStateAccessPlan);
+        }
+        if accesses.len() > MAX_ATOMIC_STATE_WRITES {
+            return Err(NodeCoreError::TooManyStateAccesses {
+                count: accesses.len(),
+                maximum: MAX_ATOMIC_STATE_WRITES,
+            });
+        }
+        accesses.sort_by(|left, right| left.key.cmp(&right.key));
+        if accesses.windows(2).any(|pair| pair[0].key == pair[1].key) {
+            return Err(NodeCoreError::DuplicateStateAccessKey);
+        }
+        Ok(Self { accesses })
+    }
+
+    /// Returns state accesses in deterministic raw-key order.
+    #[must_use]
+    pub fn accesses(&self) -> &[NodeStateAccess] {
+        &self.accesses
+    }
+
+    fn access(&self, key: &[u8]) -> Option<&NodeStateAccess> {
+        self.accesses
+            .binary_search_by(|access| access.key.as_slice().cmp(key))
+            .ok()
+            .map(|index| &self.accesses[index])
+    }
+}
+
+/// Immutable versioned snapshot supplied to a pure transactional transition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeStateSnapshot {
+    values: BTreeMap<Vec<u8>, VersionedStateValue>,
+}
+
+impl NodeStateSnapshot {
+    /// Returns the observation for a key declared by the access plan.
+    #[must_use]
+    pub fn get(&self, key: &[u8]) -> Option<&VersionedStateValue> {
+        self.values.get(key)
+    }
+
+    /// Iterates over observations in deterministic raw-key order.
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8], &VersionedStateValue)> {
+        self.values
+            .iter()
+            .map(|(key, value)| (key.as_slice(), value))
+    }
+}
+
+/// One state mutation produced by a pure transactional transition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeStateUpdate {
+    key: Vec<u8>,
+    mutation: StateMutation,
+}
+
+impl NodeStateUpdate {
+    /// Creates a bounded canonical state replacement.
+    pub fn put(key: Vec<u8>, value: Vec<u8>) -> Result<Self, NodeCoreError> {
+        validate_transactional_state_key(&key)?;
+        validate_state(&value)?;
+        Ok(Self {
+            key,
+            mutation: StateMutation::Put(value),
+        })
+    }
+
+    /// Creates a state deletion that will retain a storage revision tombstone.
+    pub fn delete(key: Vec<u8>) -> Result<Self, NodeCoreError> {
+        validate_transactional_state_key(&key)?;
+        Ok(Self {
+            key,
+            mutation: StateMutation::Delete,
+        })
+    }
+
+    /// Returns the storage key.
+    #[must_use]
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// Returns the requested mutation.
+    #[must_use]
+    pub const fn mutation(&self) -> &StateMutation {
+        &self.mutation
+    }
+}
+
+/// Candidate multi-key transition and outputs held until atomic commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransactionalNodeTransition {
+    updates: Vec<NodeStateUpdate>,
+    output: NodeOutput,
+}
+
+impl TransactionalNodeTransition {
+    /// Creates a bounded, unique, canonically key-ordered state transition.
+    pub fn new(
+        mut updates: Vec<NodeStateUpdate>,
+        output: NodeOutput,
+    ) -> Result<Self, NodeCoreError> {
+        if updates.is_empty() {
+            return Err(NodeCoreError::EmptyStateUpdates);
+        }
+        if updates.len() > MAX_ATOMIC_STATE_WRITES {
+            return Err(NodeCoreError::TooManyStateUpdates {
+                count: updates.len(),
+                maximum: MAX_ATOMIC_STATE_WRITES,
+            });
+        }
+        updates.sort_by(|left, right| left.key.cmp(&right.key));
+        if updates.windows(2).any(|pair| pair[0].key == pair[1].key) {
+            return Err(NodeCoreError::DuplicateStateUpdateKey);
+        }
+        Ok(Self { updates, output })
+    }
+
+    /// Returns state updates in deterministic raw-key order.
+    #[must_use]
+    pub fn updates(&self) -> &[NodeStateUpdate] {
+        &self.updates
+    }
+
+    /// Returns output held until every state update commits.
+    #[must_use]
+    pub const fn output(&self) -> &NodeOutput {
+        &self.output
+    }
+}
+
+/// Application transition over a declared, versioned multi-key snapshot.
+pub trait TransactionalNodeStateMachine {
+    /// Derives the bounded state keys and modes required by one validated event.
+    fn access_plan(&self, event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError>;
+
+    /// Computes one pure transition without performing I/O or retaining state.
+    fn transition(
+        &self,
+        state: &NodeStateSnapshot,
+        event: &NodeEvent,
+    ) -> Result<TransactionalNodeTransition, NodeCoreError>;
+}
+
 /// One validated candidate state replacement and its deferred outputs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeTransition {
@@ -665,6 +917,62 @@ pub trait NodeStateMachine {
     ) -> Result<NodeTransition, NodeCoreError>;
 }
 
+/// Handles one event through a declared multi-key atomic state transition.
+///
+/// The event context and access plan are validated before storage reads. Every
+/// observed revision is bound into the final write set, and output remains
+/// private until all writes commit. Conflicts are surfaced without retry.
+pub fn handle_transactional_event<R, M>(
+    runtime: &R,
+    config: &NodeConfig,
+    event: NodeEvent,
+    machine: &M,
+) -> Result<NodeOutput, NodeCoreError>
+where
+    R: Runtime,
+    R::State: TransactionalStateStore,
+    M: TransactionalNodeStateMachine,
+{
+    event.validate_context(config)?;
+    let plan = machine.access_plan(&event)?;
+    let mut values = BTreeMap::new();
+    for access in plan.accesses() {
+        let observed = runtime.state_store().get_versioned(access.key())?;
+        if let Some(value) = observed.value() {
+            validate_state(value)?;
+        }
+        values.insert(access.key.clone(), observed);
+    }
+    let snapshot = NodeStateSnapshot { values };
+
+    let transition = machine.transition(&snapshot, &event)?;
+    validate_output_context(transition.output(), &event, config)?;
+
+    let mut writes = Vec::with_capacity(transition.updates.len());
+    for update in transition.updates {
+        let Some(access) = plan.access(update.key()) else {
+            return Err(NodeCoreError::UndeclaredStateUpdate(update.key));
+        };
+        if access.mode() != NodeStateAccessMode::ReadWrite {
+            return Err(NodeCoreError::ReadOnlyStateUpdate(update.key));
+        }
+        let observed = snapshot
+            .get(update.key())
+            .ok_or_else(|| NodeCoreError::UndeclaredStateUpdate(update.key.clone()))?;
+        writes.push(StateWrite::new(
+            update.key,
+            observed.revision(),
+            update.mutation,
+        )?);
+    }
+
+    let write_set = AtomicStateWriteSet::new(writes)?;
+    match runtime.state_store().commit_atomic(write_set)? {
+        AtomicStateWriteResult::Committed => Ok(transition.output),
+        AtomicStateWriteResult::Conflict { .. } => Err(NodeCoreError::StateConflict),
+    }
+}
+
 /// Handles exactly one event and atomically persists its deterministic transition.
 ///
 /// Outputs are returned only after compare-and-swap succeeds. The caller may then
@@ -687,17 +995,7 @@ where
     }
 
     let transition = machine.transition(current.as_deref(), &event)?;
-    for response in transition.output.responses() {
-        if response.request_id() != event.request_id() {
-            return Err(NodeCoreError::ResponseRequestMismatch {
-                expected: event.request_id(),
-                actual: response.request_id(),
-            });
-        }
-    }
-    for message in transition.output.outbound_messages() {
-        message.event().validate_context(config)?;
-    }
+    validate_output_context(&transition.output, &event, config)?;
 
     let result = runtime.state_store().compare_and_swap(
         config.state_key.clone(),
@@ -708,6 +1006,25 @@ where
         return Err(NodeCoreError::StateConflict);
     }
     Ok(transition.output)
+}
+
+fn validate_output_context(
+    output: &NodeOutput,
+    event: &NodeEvent,
+    config: &NodeConfig,
+) -> Result<(), NodeCoreError> {
+    for response in output.responses() {
+        if response.request_id() != event.request_id() {
+            return Err(NodeCoreError::ResponseRequestMismatch {
+                expected: event.request_id(),
+                actual: response.request_id(),
+            });
+        }
+    }
+    for message in output.outbound_messages() {
+        message.event().validate_context(config)?;
+    }
+    Ok(())
 }
 
 fn validate_chain_id(chain_id: &ChainId) -> Result<(), NodeCoreError> {
@@ -734,10 +1051,23 @@ fn validate_state(state: &[u8]) -> Result<(), NodeCoreError> {
     Ok(())
 }
 
+fn validate_transactional_state_key(key: &[u8]) -> Result<(), NodeCoreError> {
+    if key.is_empty() {
+        return Err(NodeCoreError::EmptyStateKey);
+    }
+    if key.len() > MAX_STATE_KEY_BYTES {
+        return Err(NodeCoreError::Runtime(RuntimeError::StateKeyTooLong {
+            length: key.len(),
+            maximum: MAX_STATE_KEY_BYTES,
+        }));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runtime::{MemoryRuntime, StateStore};
+    use runtime::{MemoryRuntime, StateRevision, StateStore, TransactionalStateStore};
 
     const TEST_STATE_TYPE_ID: u16 = 0xEF01;
     const TEST_PAYLOAD_TYPE_ID: u16 = 0xEF02;
@@ -982,6 +1312,192 @@ mod tests {
         assert_eq!(
             decode_canonical_frame(&persisted).unwrap().required_u64(1),
             Ok(99)
+        );
+    }
+
+    struct MultiKeyMachine;
+
+    impl TransactionalNodeStateMachine for MultiKeyMachine {
+        fn access_plan(&self, _event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            NodeStateAccessPlan::new(vec![
+                NodeStateAccess::new(b"state/b".to_vec(), NodeStateAccessMode::ReadWrite)?,
+                NodeStateAccess::new(b"state/a".to_vec(), NodeStateAccessMode::ReadWrite)?,
+            ])
+        }
+
+        fn transition(
+            &self,
+            state: &NodeStateSnapshot,
+            _event: &NodeEvent,
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            let value = |key: &[u8]| -> Result<u64, NodeCoreError> {
+                match state.get(key).and_then(VersionedStateValue::value) {
+                    Some(bytes) => Ok(decode_canonical_frame(bytes)?.required_u64(1)?),
+                    None => Ok(0),
+                }
+            };
+            TransactionalNodeTransition::new(
+                vec![
+                    NodeStateUpdate::put(
+                        b"state/b".to_vec(),
+                        canonical(TEST_STATE_TYPE_ID, value(b"state/b")? + 2),
+                    )?,
+                    NodeStateUpdate::put(
+                        b"state/a".to_vec(),
+                        canonical(TEST_STATE_TYPE_ID, value(b"state/a")? + 1),
+                    )?,
+                ],
+                NodeOutput::default(),
+            )
+        }
+    }
+
+    #[test]
+    fn transactional_handler_commits_declared_multi_key_transition() {
+        let runtime = MemoryRuntime::new(runtime::ValidatorId::new([0x44; 32]));
+        handle_transactional_event(
+            &runtime,
+            &config("sunrise-test"),
+            event("sunrise-test", request(0x67)),
+            &MultiKeyMachine,
+        )
+        .unwrap();
+
+        let a = runtime.state_store().get(b"state/a").unwrap().unwrap();
+        let b = runtime.state_store().get(b"state/b").unwrap().unwrap();
+        assert_eq!(decode_canonical_frame(&a).unwrap().required_u64(1), Ok(1));
+        assert_eq!(decode_canonical_frame(&b).unwrap().required_u64(1), Ok(2));
+        assert_eq!(
+            runtime
+                .state_store()
+                .get_versioned(b"state/a")
+                .unwrap()
+                .revision(),
+            StateRevision::new(1)
+        );
+    }
+
+    struct InvalidAccessMachine {
+        plan_mode: NodeStateAccessMode,
+        update_key: &'static [u8],
+    }
+
+    impl TransactionalNodeStateMachine for InvalidAccessMachine {
+        fn access_plan(&self, _event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            NodeStateAccessPlan::new(vec![NodeStateAccess::new(
+                b"state/a".to_vec(),
+                self.plan_mode,
+            )?])
+        }
+
+        fn transition(
+            &self,
+            _state: &NodeStateSnapshot,
+            _event: &NodeEvent,
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            TransactionalNodeTransition::new(
+                vec![NodeStateUpdate::put(
+                    self.update_key.to_vec(),
+                    canonical(TEST_STATE_TYPE_ID, 1),
+                )?],
+                NodeOutput::default(),
+            )
+        }
+    }
+
+    #[test]
+    fn transactional_handler_rejects_undeclared_and_read_only_updates() {
+        let runtime = MemoryRuntime::new(runtime::ValidatorId::new([0x44; 32]));
+        let undeclared = handle_transactional_event(
+            &runtime,
+            &config("sunrise-test"),
+            event("sunrise-test", request(0x68)),
+            &InvalidAccessMachine {
+                plan_mode: NodeStateAccessMode::ReadWrite,
+                update_key: b"state/b",
+            },
+        );
+        assert_eq!(
+            undeclared,
+            Err(NodeCoreError::UndeclaredStateUpdate(b"state/b".to_vec()))
+        );
+
+        let read_only = handle_transactional_event(
+            &runtime,
+            &config("sunrise-test"),
+            event("sunrise-test", request(0x69)),
+            &InvalidAccessMachine {
+                plan_mode: NodeStateAccessMode::ReadOnly,
+                update_key: b"state/a",
+            },
+        );
+        assert_eq!(
+            read_only,
+            Err(NodeCoreError::ReadOnlyStateUpdate(b"state/a".to_vec()))
+        );
+        assert_eq!(runtime.state_store().get(b"state/a").unwrap(), None);
+        assert_eq!(runtime.state_store().get(b"state/b").unwrap(), None);
+    }
+
+    struct TransactionalConflictMachine<'a> {
+        runtime: &'a MemoryRuntime,
+    }
+
+    impl TransactionalNodeStateMachine for TransactionalConflictMachine<'_> {
+        fn access_plan(&self, event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            MultiKeyMachine.access_plan(event)
+        }
+
+        fn transition(
+            &self,
+            state: &NodeStateSnapshot,
+            event: &NodeEvent,
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            self.runtime
+                .state_store()
+                .put(b"state/a".to_vec(), canonical(TEST_STATE_TYPE_ID, 99))?;
+            MultiKeyMachine.transition(state, event)
+        }
+    }
+
+    #[test]
+    fn transactional_conflict_applies_none_of_the_candidate_updates() {
+        let runtime = MemoryRuntime::new(runtime::ValidatorId::new([0x44; 32]));
+        let error = handle_transactional_event(
+            &runtime,
+            &config("sunrise-test"),
+            event("sunrise-test", request(0x6A)),
+            &TransactionalConflictMachine { runtime: &runtime },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::StateConflict);
+        let a = runtime.state_store().get(b"state/a").unwrap().unwrap();
+        assert_eq!(decode_canonical_frame(&a).unwrap().required_u64(1), Ok(99));
+        assert_eq!(runtime.state_store().get(b"state/b").unwrap(), None);
+    }
+
+    #[test]
+    fn transactional_access_and_update_sets_are_bounded_and_unique() {
+        let access =
+            NodeStateAccess::new(b"state/a".to_vec(), NodeStateAccessMode::ReadWrite).unwrap();
+        assert_eq!(
+            NodeStateAccessPlan::new(vec![access.clone(), access]),
+            Err(NodeCoreError::DuplicateStateAccessKey)
+        );
+        assert_eq!(
+            NodeStateAccessPlan::new(Vec::new()),
+            Err(NodeCoreError::EmptyStateAccessPlan)
+        );
+
+        let update = NodeStateUpdate::delete(b"state/a".to_vec()).unwrap();
+        assert_eq!(
+            TransactionalNodeTransition::new(vec![update.clone(), update], NodeOutput::default(),),
+            Err(NodeCoreError::DuplicateStateUpdateKey)
+        );
+        assert_eq!(
+            TransactionalNodeTransition::new(Vec::new(), NodeOutput::default()),
+            Err(NodeCoreError::EmptyStateUpdates)
         );
     }
 

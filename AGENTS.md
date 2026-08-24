@@ -207,7 +207,7 @@ and `TODO.md` before starting because repository state may have advanced. The
 next work is closing Phase 15-17 production gaps, especially atomic durable
 state/outbox behavior, provider trust boundaries, real runtime conformance,
 capacity/fault tests, observability, and rollout/rollback rehearsal.
-The current Phase 15 sequence is transactional node-core integration, canonical
-deduplication plus outbox records in the same commit, a durable store, and crash
-recovery conformance; do not jump to provider deployment claims before that
-shared foundation is complete.
+The current Phase 15 sequence is canonical deduplication plus outbox records in
+the transactional node-core commit, adapter migration, a durable store, and
+crash recovery conformance; do not jump to provider deployment claims before
+that shared foundation is complete.
