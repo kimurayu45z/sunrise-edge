@@ -20,6 +20,12 @@ updates:
       time: "03:15"
       timezone: Asia/Singapore
     open-pull-requests-limit: 5
+    groups:
+      typescript-toolchain:
+        patterns:
+          - typescript
+          - oxlint
+          - oxlint-tsgolint
     commit-message:
       prefix: deps
 

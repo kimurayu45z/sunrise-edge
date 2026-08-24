@@ -6,18 +6,17 @@
   "scripts": {
     "types": "wrangler types --include-runtime false",
     "typecheck": "wrangler types --include-runtime false --check && tsc --noEmit",
-    "lint": "cd .. && cloudflare-workers/node_modules/.bin/eslint --config cloudflare-workers/eslint.config.js cloudflare-workers/src cloudflare-workers/test shared cloudflare-workers/vitest.config.ts",
+    "lint": "cd .. && cloudflare-workers/node_modules/.bin/oxlint --config cloudflare-workers/.oxlintrc.json --type-aware cloudflare-workers/src cloudflare-workers/test shared cloudflare-workers/vitest.config.ts",
     "test": "vitest run",
     "check": "npm run typecheck && npm run lint && npm test"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "1.0.0",
     "@cloudflare/workers-types": "5.20260823.1",
-    "@eslint/js": "10.0.1",
     "@types/node": "26.2.0",
-    "eslint": "10.9.0",
-    "typescript": "6.0.3",
-    "typescript-eslint": "8.67.0",
+    "oxlint": "1.79.0",
+    "oxlint-tsgolint": "7.0.2001",
+    "typescript": "7.0.2",
     "vitest": "4.1.11",
     "wrangler": "4.125.0"
   }

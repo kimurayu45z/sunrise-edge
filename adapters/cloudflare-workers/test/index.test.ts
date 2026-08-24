@@ -16,12 +16,13 @@ import {
 } from "../src/index";
 
 function eventRequest(body: BodyInit, headers?: HeadersInit): Request {
+  const requestHeaders = new Headers(headers);
+  if (!requestHeaders.has("content-type")) {
+    requestHeaders.set("content-type", NODE_EVENT_MEDIA_TYPE);
+  }
   return new Request(`https://edge.example${NODE_EVENT_PATH}`, {
     method: "POST",
-    headers: {
-      "content-type": NODE_EVENT_MEDIA_TYPE,
-      ...headers,
-    },
+    headers: requestHeaders,
     body,
   });
 }
