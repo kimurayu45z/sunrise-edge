@@ -1853,6 +1853,8 @@ Phase 15 prerequisites:
 - adapter-neutral canonical request/response contract (implemented As-Is)
 - bounded versioned multi-key StateStore transaction contract with an in-memory
   atomic reference implementation (implemented As-Is)
+- declared-access transactional node-core invocation over versioned snapshots
+  and atomic write sets (implemented As-Is)
 
 Phase 15 As-Is scope:
 
@@ -1870,7 +1872,11 @@ Phase 15 As-Is scope:
 - runtimeにはuniqueかつkey順へcanonicalizeされたbounded write-set、monotonic per-key
   revision、delete tombstoneによるABA防止、全revision一致時だけall-or-noneでcommitする
   TransactionalStateStoreを追加した。MemoryStateStoreはatomicity/conflict/bounds検証用の
-  As-Is referenceであり、node-coreはまだこの契約へ移行しておらずdurable実装でもない。
+  As-Is referenceでありdurable実装ではない。
+- node-coreのtransactional pathはcontext検証後かつstate read前にevent-specific access planを
+  確定し、全keyをrevision付きsnapshotとしてpure transitionへ渡す。undeclared/read-only updateを
+  rejectし、観測revisionをnode-core自身がwrite-setへbindし、全commit成功までoutputを返さない。
+  現行adapterはlegacy single-key pathのままで、dedup/outboxとdurable recoveryも未実装である。
 - native adapterはPOST /v1/events、exact canonical binary media type、bounded body、
   deterministic HTTP status mapping、GET /health/live、graceful shutdownを提供する。
 - outbound eventはCAS成功後にruntime transportへ渡すが、state commitとsendの間はまだ

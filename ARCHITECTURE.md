@@ -366,8 +366,17 @@ concurrency tokens rather than protocol object versions. A delete retains a
 tombstone revision, so delete/recreate cannot produce an ABA match. The memory
 implementation validates atomicity, deterministic conflict selection,
 resource bounds, and revision-overflow behavior; it is test infrastructure,
-not the required durable production store. Node-core integration, canonical
-deduplication records, persisted outbox entries, and crash recovery remain
+not the required durable production store.
+
+Node-core exposes this seam through `handle_transactional_event`. A state
+machine derives a bounded, unique access plan from the already context-checked
+event before any storage read. Node-core loads a revision-bearing snapshot,
+passes it into one pure transition, rejects undeclared or read-only updates,
+and binds each accepted update to the revision it observed. Responses and
+outbound messages remain withheld until the complete write set commits. The
+legacy single-key handler remains for the current adapters, so this is not yet
+a migration or production durability claim. Canonical deduplication records,
+persisted outbox entries, adapter migration, and crash recovery remain
 subsequent Phase 15 work.
 
 ## 31. Native HTTP adapter
@@ -648,3 +657,7 @@ license/SBOM policy, and protected review/merge controls.
   contract. Retain deletion tombstones to prevent ABA, reject the complete
   transaction on the first ordered conflict, and treat the in-memory
   implementation as conformance evidence rather than durable storage.
+- DR-0030: Require transactional node state machines to declare a bounded
+  event-specific access plan before reads. Supply a versioned immutable
+  snapshot, derive commit revisions inside node-core, reject undeclared and
+  read-only updates, and release no output until the whole write set commits.
