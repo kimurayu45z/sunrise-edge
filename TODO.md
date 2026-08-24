@@ -1980,7 +1980,8 @@ Phase 17 shared ingress As-Is scope:
 - liveness、unknown path、method、media parameter、content encoding、content-lengthの同一fixtureを
   5 provider consumerで実行する。これはlocal drift検出であり実gateway/runtime conformanceではない。
 - Rust 1.97.1、Node 22.20.0、Deno 2.9.4を固定したcheck script/CIがRust全featureと全adapterを
-  一括実行する。action SHA pin、provenance、SBOM、reproducibility、real provider testは未完了である。
+  一括実行する。CI actionもverified upstream tagのcommit SHAへ固定するが、provenance、SBOM、
+  reproducibility、real provider test、定期的なpin更新手順は未完了である。
 
 Phase 17 Deno As-Is scope:
 

@@ -543,9 +543,10 @@ adapter suites, and whitespace checks. GitHub Actions installs the locked npm
 dependencies and executes the same script on pull requests and main.
 
 This is an As-Is regression gate, not release provenance. Production still
-requires immutable action revisions, dependency and toolchain provenance,
-SBOMs, reproducible artifacts, protected required checks, real-provider test
-credentials and isolation, security scanning, and release-signing policy.
+requires reviewed periodic updates to the pinned action revisions, dependency
+and toolchain provenance, SBOMs, reproducible artifacts, protected required
+checks, real-provider test credentials and isolation, security scanning, and
+release-signing policy.
 
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
@@ -611,3 +612,6 @@ credentials and isolation, security scanning, and release-signing policy.
 - DR-0026: Use one pinned repository validation entrypoint locally and in CI so
   Rust and every adapter gate run together. Treat green CI as regression
   evidence only, not production provenance or real-provider certification.
+- DR-0027: Resolve CI actions from verified upstream tags and commit their full
+  immutable revisions. Keep the human-readable release tag as a comment and
+  require reviewed updates rather than following a mutable major tag.
