@@ -103,6 +103,10 @@ cross-provider ingress milestones implemented through Phase 17:
 - Canonical request/event-digest deduplication and ordered request-scoped
   outbox records committed atomically with application state, including
   response replay and conflicting request-ID reuse rejection.
+- Additive domain-aware node-core handlers that bind the complete read set and
+  commit application state, the request receipt, outbox batch, and initial
+  delivery cursor inside one explicit atomicity domain. Existing native and
+  SQLite paths are not silently redirected or migrated.
 - A one-message bounded outbox lease/ack cursor with explicit at-least-once
   redelivery after lease expiry; it does not claim transport exactly-once.
 - A native Axum/Tokio HTTP adapter with strict canonical binary media types,
@@ -150,9 +154,9 @@ independent security review.
 
 The next planned technical milestones work backward through the Phase 15
 production exit criteria in [`TODO.md`](TODO.md) and the accepted
-[persistence design](PERSISTENCE.md): assert the complete read set inside an
-explicit atomicity domain, add an indexed outbox claim contract, and implement
-the normalized PostgreSQL reference adapter. Deadline/cancellation, abrupt
+[persistence design](PERSISTENCE.md): carry the explicit domain through outbox
+delivery and native composition, add an indexed outbox claim contract, and
+implement the normalized PostgreSQL reference adapter. Deadline/cancellation, abrupt
 fault, backup/restore, capacity, and provider conformance follow on that
 foundation. Phase 16/17 provider trust, deployment, observability, and release
 rehearsal remain required.
