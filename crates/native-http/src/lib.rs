@@ -17,11 +17,15 @@ use canonical_encoding::{
     CanonicalDecodingError, CanonicalEncodingError, CanonicalStruct, decode_canonical_frame,
 };
 use core::fmt;
+use hashing::HashSuiteResolver;
 use node_core::{
     MAX_NODE_OUTPUT_ITEMS, MAX_NODE_PAYLOAD_BYTES, NodeConfig, NodeCoreError, NodeEvent,
-    NodeResponse, NodeStateMachine, RequestId, handle_event,
+    NodeResponse, OutboxLeaseId, RequestId, TransactionalNodeStateMachine,
+    acknowledge_outbox_message, claim_next_outbox_message, handle_idempotent_event,
 };
-use runtime::{Runtime, Transport};
+use runtime::{
+    Clock, PersistenceLayout, Runtime, RuntimeError, TransactionalStateStore, Transport,
+};
 use std::{error::Error, future::Future, sync::Arc};
 
 const HTTP_RESULT_TYPE_ID: u16 = 0xE101;
@@ -37,6 +41,41 @@ pub const NODE_EVENT_PATH: &str = "/v1/events";
 pub const LIVENESS_PATH: &str = "/health/live";
 /// Maximum HTTP body size. The allowance above the inner payload covers framing.
 pub const MAX_HTTP_EVENT_BODY_BYTES: usize = MAX_NODE_PAYLOAD_BYTES + 512;
+/// Bounded native delivery lease; expired work is deliberately redelivered.
+pub const NATIVE_OUTBOX_LEASE_MILLIS: u64 = 30_000;
+
+/// Supplies process-independent identities for persisted outbox leases.
+///
+/// An implementation must not reuse an identifier for the same request, even
+/// across process restarts. Reuse could allow a delayed acknowledgement from
+/// an expired attempt to acknowledge a newer delivery attempt.
+pub trait OutboxLeaseIdSource {
+    /// Returns the next unique lease identity for one request-scoped outbox.
+    fn next_lease_id(
+        &self,
+        request_id: RequestId,
+    ) -> Result<OutboxLeaseId, OutboxLeaseIdSourceError>;
+}
+
+/// Failures from the adapter-owned lease identity source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutboxLeaseIdSourceError {
+    /// The backing entropy or durable sequence is temporarily unavailable.
+    Unavailable,
+    /// The source exhausted its non-repeating identity space.
+    Exhausted,
+}
+
+impl fmt::Display for OutboxLeaseIdSourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => f.write_str("outbox lease identity source is unavailable"),
+            Self::Exhausted => f.write_str("outbox lease identity source is exhausted"),
+        }
+    }
+}
+
+impl Error for OutboxLeaseIdSourceError {}
 
 /// Errors in the canonical HTTP result contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,60 +269,85 @@ impl HttpNodeResult {
     }
 }
 
-struct NativeHttpState<R, M> {
+struct NativeHttpState<R, M, L> {
     runtime: Arc<R>,
     config: NodeConfig,
+    resolver: HashSuiteResolver,
     machine: Arc<M>,
+    lease_ids: Arc<L>,
 }
 
-/// Builds a native HTTP router around one runtime and deterministic state machine.
-pub fn router<R, M>(runtime: Arc<R>, config: NodeConfig, machine: Arc<M>) -> Router
+/// Builds the recoverable native HTTP router.
+///
+/// Application state, request deduplication, responses, and the ordered outbox
+/// commit atomically. Outbound messages are sent only through persisted
+/// lease/ack state, so a retry can recover a committed invocation.
+pub fn router<R, M, L>(
+    runtime: Arc<R>,
+    config: NodeConfig,
+    resolver: HashSuiteResolver,
+    machine: Arc<M>,
+    lease_ids: Arc<L>,
+) -> Router
 where
     R: Runtime + Send + Sync + 'static,
-    M: NodeStateMachine + Send + Sync + 'static,
+    R::State: TransactionalStateStore,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    L: OutboxLeaseIdSource + Send + Sync + 'static,
 {
     let state = Arc::new(NativeHttpState {
         runtime,
         config,
+        resolver,
         machine,
+        lease_ids,
     });
     Router::new()
         .route(LIVENESS_PATH, get(liveness))
-        .route(NODE_EVENT_PATH, post(submit_event::<R, M>))
+        .route(NODE_EVENT_PATH, post(submit_event::<R, M, L>))
         .layer(DefaultBodyLimit::max(MAX_HTTP_EVENT_BODY_BYTES))
         .with_state(state)
 }
 
 /// Serves the native router until the supplied shutdown future completes.
-pub async fn serve<R, M, F>(
+pub async fn serve<R, M, L, F>(
     listener: tokio::net::TcpListener,
     runtime: Arc<R>,
     config: NodeConfig,
+    resolver: HashSuiteResolver,
     machine: Arc<M>,
+    lease_ids: Arc<L>,
     shutdown: F,
 ) -> std::io::Result<()>
 where
     R: Runtime + Send + Sync + 'static,
-    M: NodeStateMachine + Send + Sync + 'static,
+    R::State: TransactionalStateStore,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    L: OutboxLeaseIdSource + Send + Sync + 'static,
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(listener, router(runtime, config, machine))
-        .with_graceful_shutdown(shutdown)
-        .await
+    axum::serve(
+        listener,
+        router(runtime, config, resolver, machine, lease_ids),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
 }
 
 async fn liveness() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-async fn submit_event<R, M>(
-    State(state): State<Arc<NativeHttpState<R, M>>>,
+async fn submit_event<R, M, L>(
+    State(state): State<Arc<NativeHttpState<R, M, L>>>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response
 where
     R: Runtime + Send + Sync + 'static,
-    M: NodeStateMachine + Send + Sync + 'static,
+    R::State: TransactionalStateStore,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    L: OutboxLeaseIdSource + Send + Sync + 'static,
 {
     if !has_supported_content_type(&headers) {
         return error_response(
@@ -306,9 +370,10 @@ where
         Err(error) => return node_error_response(&error),
     };
     let request_id = event.request_id();
-    let output = match handle_event(
+    let output = match handle_idempotent_event(
         state.runtime.as_ref(),
         &state.config,
+        &state.resolver,
         event,
         state.machine.as_ref(),
     ) {
@@ -316,14 +381,21 @@ where
         Err(error) => return node_error_response(&error),
     };
 
-    for outbound in output.outbound_messages() {
-        let encoded = match outbound.event().encode() {
-            Ok(encoded) => encoded,
-            Err(error) => return node_error_response(&error),
+    if let Err(error) = deliver_request_outbox(state.as_ref(), request_id) {
+        return match error {
+            OutboxDeliveryError::Node(error) => node_error_response(&error),
+            OutboxDeliveryError::Send => {
+                error_response(StatusCode::SERVICE_UNAVAILABLE, "outbound-send-failed")
+            }
+            OutboxDeliveryError::LeaseId(OutboxLeaseIdSourceError::Unavailable) => error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "lease-id-source-unavailable",
+            ),
+            OutboxDeliveryError::LeaseId(OutboxLeaseIdSourceError::Exhausted) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "lease-id-source-exhausted",
+            ),
         };
-        if state.runtime.transport().send(encoded).is_err() {
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, "outbound-send-failed");
-        }
     }
 
     let result = match HttpNodeResult::new(request_id, output.responses().to_vec())
@@ -343,6 +415,74 @@ where
         result,
     )
         .into_response()
+}
+
+enum OutboxDeliveryError {
+    Node(NodeCoreError),
+    Send,
+    LeaseId(OutboxLeaseIdSourceError),
+}
+
+impl From<NodeCoreError> for OutboxDeliveryError {
+    fn from(value: NodeCoreError) -> Self {
+        Self::Node(value)
+    }
+}
+
+impl From<RuntimeError> for OutboxDeliveryError {
+    fn from(value: RuntimeError) -> Self {
+        Self::Node(NodeCoreError::Runtime(value))
+    }
+}
+
+impl From<OutboxLeaseIdSourceError> for OutboxDeliveryError {
+    fn from(value: OutboxLeaseIdSourceError) -> Self {
+        Self::LeaseId(value)
+    }
+}
+
+fn deliver_request_outbox<R, M, L>(
+    state: &NativeHttpState<R, M, L>,
+    request_id: RequestId,
+) -> Result<(), OutboxDeliveryError>
+where
+    R: Runtime,
+    R::State: TransactionalStateStore,
+    L: OutboxLeaseIdSource,
+{
+    let layout = PersistenceLayout::new(
+        state.config.chain_id().clone(),
+        state.config.protocol_version(),
+    );
+    for _ in 0..MAX_NODE_OUTPUT_ITEMS {
+        let lease_id = state.lease_ids.next_lease_id(request_id)?;
+        let now_unix_millis = state.runtime.clock().now_unix_millis()?;
+        let Some(claim) = claim_next_outbox_message(
+            state.runtime.state_store(),
+            &layout,
+            request_id,
+            lease_id,
+            now_unix_millis,
+            NATIVE_OUTBOX_LEASE_MILLIS,
+        )?
+        else {
+            return Ok(());
+        };
+        let encoded = claim.message().event().encode()?;
+        state
+            .runtime
+            .transport()
+            .send(encoded)
+            .map_err(|_| OutboxDeliveryError::Send)?;
+        acknowledge_outbox_message(
+            state.runtime.state_store(),
+            &layout,
+            claim.request_id(),
+            claim.index(),
+            claim.lease_id(),
+        )?;
+    }
+    Ok(())
 }
 
 fn has_supported_content_type(headers: &HeaderMap) -> bool {
@@ -377,7 +517,11 @@ fn node_error_response(error: &NodeCoreError) -> Response {
         NodeCoreError::ChainMismatch { .. }
         | NodeCoreError::ProtocolVersionMismatch { .. }
         | NodeCoreError::EpochMismatch { .. }
-        | NodeCoreError::StateConflict => (StatusCode::CONFLICT, "state-or-context-conflict"),
+        | NodeCoreError::StateConflict
+        | NodeCoreError::RequestIdReuse => (StatusCode::CONFLICT, "state-or-context-conflict"),
+        NodeCoreError::OutboxLeaseActive { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, "outbox-lease-active")
+        }
         NodeCoreError::TransitionRejected(_) => {
             (StatusCode::UNPROCESSABLE_ENTITY, "transition-rejected")
         }
@@ -385,7 +529,14 @@ fn node_error_response(error: &NodeCoreError) -> Response {
         NodeCoreError::ResponseRequestMismatch { .. }
         | NodeCoreError::StateTooLarge(_)
         | NodeCoreError::TooManyOutputItems { .. }
-        | NodeCoreError::OutputTooLarge(_) => {
+        | NodeCoreError::OutputTooLarge(_)
+        | NodeCoreError::ZeroOutboxLeaseId
+        | NodeCoreError::InvalidOutboxLeaseDuration(_)
+        | NodeCoreError::PersistenceInvariant(_)
+        | NodeCoreError::OutboxNotFound
+        | NodeCoreError::OutboxLeaseMismatch
+        | NodeCoreError::OutboxIndexMismatch
+        | NodeCoreError::OutboxArithmeticOverflow => {
             (StatusCode::INTERNAL_SERVER_ERROR, "invalid-node-output")
         }
         _ => (StatusCode::BAD_REQUEST, "invalid-node-event"),
@@ -428,9 +579,19 @@ mod tests {
         http::Request,
     };
     use canonical_encoding::CanonicalStruct;
-    use node_core::{NodeOutput, NodeResponseStatus, NodeTransition, OutboundMessage};
-    use protocol_types::{ChainId, Epoch, ProtocolVersion, ValidatorId};
-    use runtime::{MemoryRuntime, StateStore};
+    use node_core::{
+        NodeOutboxDelivery, NodeOutput, NodeResponseStatus, NodeStateAccess, NodeStateAccessMode,
+        NodeStateAccessPlan, NodeStateSnapshot, NodeStateUpdate, OutboundMessage,
+        TransactionalNodeTransition,
+    };
+    use protocol_types::{
+        ChainId, Epoch, HashSuite, HashSuiteSchedule, ProtocolVersion, ValidatorId,
+    };
+    use runtime::{
+        ManualClock, MemoryBlobStore, MemoryRuntime, MemoryScheduler, MemorySigner,
+        MemoryStateStore, RuntimeError, StateStore, TransactionalStateStore,
+    };
+    use std::sync::Mutex;
     use tower::ServiceExt;
 
     const TEST_STATE_TYPE_ID: u16 = 0xEF11;
@@ -460,6 +621,18 @@ mod tests {
         .unwrap()
     }
 
+    fn resolver() -> HashSuiteResolver {
+        HashSuiteResolver::new(
+            ChainId::new("sunrise-test").unwrap(),
+            ProtocolVersion::new(3),
+            vec![HashSuiteSchedule {
+                activation_epoch: Epoch::new(0),
+                suite: HashSuite::genesis(),
+            }],
+        )
+        .unwrap()
+    }
+
     fn event(request_id: RequestId) -> NodeEvent {
         NodeEvent::new(
             ChainId::new("sunrise-test").unwrap(),
@@ -472,15 +645,35 @@ mod tests {
         .unwrap()
     }
 
-    struct IncrementMachine;
+    struct IncrementMachine {
+        state_key: Vec<u8>,
+    }
 
-    impl NodeStateMachine for IncrementMachine {
+    impl IncrementMachine {
+        fn new(state_key: &[u8]) -> Self {
+            Self {
+                state_key: state_key.to_vec(),
+            }
+        }
+    }
+
+    impl TransactionalNodeStateMachine for IncrementMachine {
+        fn access_plan(&self, _event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            NodeStateAccessPlan::new(vec![NodeStateAccess::new(
+                self.state_key.clone(),
+                NodeStateAccessMode::ReadWrite,
+            )?])
+        }
+
         fn transition(
             &self,
-            current_state: Option<&[u8]>,
+            state: &NodeStateSnapshot,
             event: &NodeEvent,
-        ) -> Result<NodeTransition, NodeCoreError> {
-            let current = current_state
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            let current = state
+                .get(&self.state_key)
+                .ok_or(NodeCoreError::TransitionRejected("test state missing"))?
+                .value()
                 .map(decode_canonical_frame)
                 .transpose()?
                 .map(|frame| frame.required_u64(1))
@@ -502,10 +695,146 @@ mod tests {
                 node_core::NodeEventKind::ReceiveVote,
                 canonical(TEST_PAYLOAD_TYPE_ID, next),
             )?;
-            NodeTransition::new(
-                canonical(TEST_STATE_TYPE_ID, next),
+            TransactionalNodeTransition::new(
+                vec![NodeStateUpdate::put(
+                    self.state_key.clone(),
+                    canonical(TEST_STATE_TYPE_ID, next),
+                )?],
                 NodeOutput::new(vec![response], vec![OutboundMessage::new(outbound)])?,
             )
+        }
+    }
+
+    #[derive(Default)]
+    struct SequenceLeaseIds {
+        next: Mutex<u64>,
+    }
+
+    impl OutboxLeaseIdSource for SequenceLeaseIds {
+        fn next_lease_id(
+            &self,
+            _request_id: RequestId,
+        ) -> Result<OutboxLeaseId, OutboxLeaseIdSourceError> {
+            let mut next = self
+                .next
+                .lock()
+                .map_err(|_| OutboxLeaseIdSourceError::Unavailable)?;
+            *next = next
+                .checked_add(1)
+                .ok_or(OutboxLeaseIdSourceError::Exhausted)?;
+            let mut bytes = [0_u8; 32];
+            bytes[..8].copy_from_slice(&next.to_le_bytes());
+            OutboxLeaseId::new(bytes).map_err(|_| OutboxLeaseIdSourceError::Exhausted)
+        }
+    }
+
+    fn app<R>(runtime: Arc<R>, config: NodeConfig) -> Router
+    where
+        R: Runtime + Send + Sync + 'static,
+        R::State: TransactionalStateStore,
+    {
+        let machine = Arc::new(IncrementMachine::new(config.state_key()));
+        router(
+            runtime,
+            config,
+            resolver(),
+            machine,
+            Arc::new(SequenceLeaseIds::default()),
+        )
+    }
+
+    struct FailOnceTransport {
+        fail_next: Mutex<bool>,
+        outbound: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl FailOnceTransport {
+        fn new() -> Self {
+            Self {
+                fail_next: Mutex::new(true),
+                outbound: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Transport for FailOnceTransport {
+        fn send(&self, message: Vec<u8>) -> Result<(), RuntimeError> {
+            let mut fail_next = self
+                .fail_next
+                .lock()
+                .map_err(|_| RuntimeError::TransportUnavailable)?;
+            if *fail_next {
+                *fail_next = false;
+                return Err(RuntimeError::TransportUnavailable);
+            }
+            self.outbound
+                .lock()
+                .map_err(|_| RuntimeError::TransportUnavailable)?
+                .push(message);
+            Ok(())
+        }
+
+        fn drain_outbound(&self) -> Result<Vec<Vec<u8>>, RuntimeError> {
+            let mut outbound = self
+                .outbound
+                .lock()
+                .map_err(|_| RuntimeError::TransportUnavailable)?;
+            Ok(std::mem::take(&mut *outbound))
+        }
+    }
+
+    struct FailOnceRuntime {
+        state_store: MemoryStateStore,
+        blob_store: MemoryBlobStore,
+        signer: MemorySigner,
+        transport: FailOnceTransport,
+        clock: ManualClock,
+        scheduler: MemoryScheduler,
+    }
+
+    impl FailOnceRuntime {
+        fn new() -> Self {
+            Self {
+                state_store: MemoryStateStore::default(),
+                blob_store: MemoryBlobStore::default(),
+                signer: MemorySigner::new(ValidatorId::new([0x44; 32])),
+                transport: FailOnceTransport::new(),
+                clock: ManualClock::new(1_000),
+                scheduler: MemoryScheduler::default(),
+            }
+        }
+    }
+
+    impl Runtime for FailOnceRuntime {
+        type State = MemoryStateStore;
+        type Blobs = MemoryBlobStore;
+        type NodeSigner = MemorySigner;
+        type Network = FailOnceTransport;
+        type Time = ManualClock;
+        type TaskScheduler = MemoryScheduler;
+
+        fn state_store(&self) -> &Self::State {
+            &self.state_store
+        }
+
+        fn blob_store(&self) -> &Self::Blobs {
+            &self.blob_store
+        }
+
+        fn signer(&self) -> &Self::NodeSigner {
+            &self.signer
+        }
+
+        fn transport(&self) -> &Self::Network {
+            &self.transport
+        }
+
+        fn clock(&self) -> &Self::Time {
+            &self.clock
+        }
+
+        fn scheduler(&self) -> &Self::TaskScheduler {
+            &self.scheduler
         }
     }
 
@@ -537,11 +866,14 @@ mod tests {
         let runtime = Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
         let config = config();
         let id = request_id(0x41);
-        let response = router(runtime.clone(), config.clone(), Arc::new(IncrementMachine))
+        let event_bytes = event(id).encode().unwrap();
+        let app = app(runtime.clone(), config.clone());
+        let response = app
+            .clone()
             .oneshot(
                 Request::post(NODE_EVENT_PATH)
                     .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                    .body(Body::from(event(id).encode().unwrap()))
+                    .body(Body::from(event_bytes.clone()))
                     .unwrap(),
             )
             .await
@@ -558,20 +890,147 @@ mod tests {
         let result = HttpNodeResult::decode(&bytes).unwrap();
         assert_eq!(result.request_id(), id);
         assert_eq!(result.responses().len(), 1);
-        assert!(
-            runtime
-                .state_store()
-                .get(config.state_key())
+
+        let state = runtime
+            .state_store()
+            .get(config.state_key())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_canonical_frame(&state)
                 .unwrap()
-                .is_some()
+                .required_u64(1)
+                .unwrap(),
+            1
         );
         assert_eq!(runtime.transport().drain_outbound().unwrap().len(), 1);
+
+        let layout = PersistenceLayout::new(config.chain_id().clone(), config.protocol_version());
+        let delivery = runtime
+            .state_store()
+            .get(&layout.outbox_delivery_key(*id.as_bytes()))
+            .unwrap()
+            .unwrap();
+        let delivery = NodeOutboxDelivery::decode(&delivery).unwrap();
+        assert_eq!(delivery.next_index(), 1);
+        assert_eq!(delivery.lease(), None);
+
+        let duplicate = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        let duplicate_bytes = to_bytes(duplicate.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(HttpNodeResult::decode(&duplicate_bytes).unwrap(), result);
+        let state = runtime
+            .state_store()
+            .get(config.state_key())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_canonical_frame(&state)
+                .unwrap()
+                .required_u64(1)
+                .unwrap(),
+            1
+        );
+        assert!(runtime.transport().drain_outbound().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_route_recovers_failed_send_after_lease_expiry_without_reapplying_state() {
+        let runtime = Arc::new(FailOnceRuntime::new());
+        let config = config();
+        let id = request_id(0x45);
+        let event_bytes = event(id).encode().unwrap();
+        let app = app(runtime.clone(), config.clone());
+
+        let failed_send = app
+            .clone()
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event_bytes.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed_send.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let state = runtime
+            .state_store()
+            .get(config.state_key())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_canonical_frame(&state)
+                .unwrap()
+                .required_u64(1)
+                .unwrap(),
+            1
+        );
+        assert!(runtime.transport().drain_outbound().unwrap().is_empty());
+
+        let active_lease = app
+            .clone()
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event_bytes.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(active_lease.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        runtime.clock.set(31_000);
+        let recovered = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.status(), StatusCode::OK);
+        assert_eq!(runtime.transport().drain_outbound().unwrap().len(), 1);
+
+        let state = runtime
+            .state_store()
+            .get(config.state_key())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_canonical_frame(&state)
+                .unwrap()
+                .required_u64(1)
+                .unwrap(),
+            1
+        );
+        let layout = PersistenceLayout::new(config.chain_id().clone(), config.protocol_version());
+        let delivery = runtime
+            .state_store()
+            .get(&layout.outbox_delivery_key(*id.as_bytes()))
+            .unwrap()
+            .unwrap();
+        let delivery = NodeOutboxDelivery::decode(&delivery).unwrap();
+        assert_eq!(delivery.attempts(), 2);
+        assert_eq!(delivery.next_index(), 1);
+        assert_eq!(delivery.lease(), None);
     }
 
     #[tokio::test]
     async fn native_route_rejects_media_type_and_malformed_event() {
         let runtime = Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
-        let app = router(runtime.clone(), config(), Arc::new(IncrementMachine));
+        let app = app(runtime.clone(), config());
 
         let wrong_type = app
             .clone()
@@ -619,7 +1078,7 @@ mod tests {
     #[tokio::test]
     async fn native_route_maps_context_conflict_and_body_limit() {
         let runtime = Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
-        let app = router(runtime, config(), Arc::new(IncrementMachine));
+        let app = app(runtime, config());
         let wrong_context = NodeEvent::new(
             ChainId::new("other-chain").unwrap(),
             ProtocolVersion::new(3),
@@ -657,7 +1116,7 @@ mod tests {
     #[tokio::test]
     async fn liveness_does_not_touch_protocol_state() {
         let runtime = Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
-        let response = router(runtime.clone(), config(), Arc::new(IncrementMachine))
+        let response = app(runtime.clone(), config())
             .oneshot(Request::get(LIVENESS_PATH).body(Body::empty()).unwrap())
             .await
             .unwrap();

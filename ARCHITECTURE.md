@@ -421,14 +421,25 @@ or storage details. `GET /health/live` returns 204 without reading protocol
 state. The server entry point requires a shutdown future so the embedding
 native process can stop accepting work cleanly.
 
-The As-Is adapter dispatches outbound events only after state CAS succeeds.
-There is still a crash window between commit and transport send, and a send
-failure can therefore return 503 after state has committed. This is explicitly
-not production delivery semantics: persisted deduplication and a transactional
-outbox with recovery must replace this window before production use. TLS,
-authentication, rate limiting, production storage, audit telemetry, and proxy
-hardening also remain deployment requirements rather than claims of this
-milestone.
+The default native route now requires a `TransactionalNodeStateMachine`, a hash
+suite resolver, a transactional store, and an injected outbox lease-ID source.
+Application updates, replayable responses, request/event deduplication, the
+ordered outbox batch, and its delivery cursor commit atomically. The request
+then claims one message at a time with a 30-second persisted lease, sends it,
+and atomically acknowledges the matching lease and index. A transport failure
+returns 503 while retaining the lease; retry after expiry deliberately
+redelivers the message, while a fully acknowledged duplicate request replays
+only its response and does not rerun the transition or resend the outbox.
+
+Lease-ID sources must prevent reuse for the same request across process
+restarts, because a delayed acknowledgement from an expired attempt must not
+match a newer lease. This closes the old native commit-before-enqueue loss
+window for request-scoped retries, but it is not the complete production
+delivery architecture. No durable store, provider scheduler that discovers
+unattended committed outboxes, poison-message policy, retention/compaction,
+trusted time policy, or crash/fault conformance exists yet. TLS,
+authentication, rate limiting, audit telemetry, and proxy hardening also remain
+deployment requirements.
 
 ## 32. Cloudflare Workers ingress adapter
 
@@ -693,3 +704,8 @@ license/SBOM policy, and protected review/merge controls.
   only expired leases, and redeliver send-without-ack after expiry. Preserve
   explicit at-least-once semantics rather than claiming transport-level
   exactly-once delivery.
+- DR-0033: Make the recoverable transactional path the native HTTP default.
+  Require an injected restart-safe lease-ID source, deliver only through the
+  persisted outbox cursor, acknowledge only after transport success, and replay
+  completed responses without rerunning or resending acknowledged work. Keep
+  unattended scheduling and durable crash recovery as explicit later gates.

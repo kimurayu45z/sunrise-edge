@@ -84,7 +84,11 @@ cross-provider ingress milestones implemented through Phase 17:
 - A one-message bounded outbox lease/ack cursor with explicit at-least-once
   redelivery after lease expiry; it does not claim transport exactly-once.
 - A native Axum/Tokio HTTP adapter with strict canonical binary media types,
-  bounded bodies, deterministic status mapping, and graceful shutdown wiring.
+  bounded bodies, deterministic status mapping, graceful shutdown wiring, and
+  recoverable transactional invocation as its default state path.
+- Native request-scoped outbox delivery through persisted 30-second leases and
+  atomic acknowledgements; lease identities come from an injected source whose
+  uniqueness must survive process restart.
 - A bounded Cloudflare Workers ingress that uses a generated private Service
   Binding, strict TypeScript, and workerd integration tests.
 - A provider-neutral Web Fetch API ingress core for keeping future edge
@@ -106,18 +110,18 @@ cross-provider ingress milestones implemented through Phase 17:
   concrete proof backends are not yet implemented.
 
 Important remaining work includes the owned-object fast path, concrete
-node-event dispatch and protocol handlers, crash-safe transactional persistence
-and outbox delivery, portable system-module execution, cryptographic slashing
-proof verification, fee-object debiting, production persistence, runtime
-adapters, networking/RPC surfaces, and independent security review.
+node-event dispatch and protocol handlers, durable transactional persistence,
+scheduled outbox recovery and fault conformance, portable system-module
+execution, cryptographic slashing proof verification, fee-object debiting,
+production persistence, runtime adapters, networking/RPC surfaces, and
+independent security review.
 
 The next planned technical milestone works backward through the Phase 15
-production exit criteria in [`TODO.md`](TODO.md): make the recoverable
-transactional path and outbox delivery cursor the adapter default, add a
-durable store, integrate provider scheduling/transport, and prove crash-
-recovery conformance. Phase 16/17 provider trust, deployment, capacity,
-observability, and release rehearsal remain required after that shared
-foundation exists.
+production exit criteria in [`TODO.md`](TODO.md): add a durable transactional
+store, integrate provider scheduling for committed outboxes that are not tied
+to an active request, and prove crash-recovery conformance. Phase 16/17
+provider trust, deployment, capacity, observability, and release rehearsal
+remain required after that shared foundation exists.
 
 ## Workspace map
 
