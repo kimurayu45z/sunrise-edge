@@ -52,8 +52,8 @@ consensus = { path = "crates/consensus" }
 node-core = { path = "crates/node-core" }
 native-http = { path = "crates/native-http" }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
-sha2 = "0.10.9"
-sha3 = "0.10.8"
+sha2 = "0.11.0"
+sha3 = "0.12.0"
 tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread"] }
 tower = { version = "0.5.3", features = ["util"] }
 wasmi = "1.1.0"
