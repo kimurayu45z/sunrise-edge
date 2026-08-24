@@ -78,6 +78,9 @@ cross-provider ingress milestones implemented through Phase 17:
 - A transactional node-core path that declares bounded state access before
   reads, transitions over an immutable versioned snapshot, and rejects
   undeclared or read-only updates before atomic commit.
+- Canonical request/event-digest deduplication and ordered request-scoped
+  outbox records committed atomically with application state, including
+  response replay and conflicting request-ID reuse rejection.
 - A native Axum/Tokio HTTP adapter with strict canonical binary media types,
   bounded bodies, deterministic status mapping, and graceful shutdown wiring.
 - A bounded Cloudflare Workers ingress that uses a generated private Service
@@ -107,9 +110,9 @@ proof verification, fee-object debiting, production persistence, runtime
 adapters, networking/RPC surfaces, and independent security review.
 
 The next planned technical milestone works backward through the Phase 15
-production exit criteria in [`TODO.md`](TODO.md): persist request deduplication
-and outbox records in the transactional node-core commit, make that path the
-adapter default, add a durable implementation, and prove crash-recovery
+production exit criteria in [`TODO.md`](TODO.md): make the recoverable
+transactional path the adapter default, implement outbox claim/send/ack and
+redelivery semantics, add a durable store, and prove crash-recovery
 conformance. Phase 16/17 provider trust, deployment, capacity, observability,
 and release rehearsal remain required after that shared foundation exists.
 

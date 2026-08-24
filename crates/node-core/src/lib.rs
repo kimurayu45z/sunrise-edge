@@ -11,17 +11,22 @@ use canonical_encoding::{
     CanonicalDecodingError, CanonicalEncodingError, CanonicalStruct, decode_canonical_frame,
 };
 use core::fmt;
-use protocol_types::{ChainId, Epoch, ProtocolVersion, TypeError};
+use hashing::{HashSuiteResolver, HashingError};
+use protocol_types::{
+    ChainId, Digest32, Epoch, HashAlgorithmId, HashPurpose, ProtocolVersion, TypeError,
+};
 use runtime::{
     AtomicStateWriteResult, AtomicStateWriteSet, MAX_ATOMIC_STATE_WRITES, MAX_STATE_KEY_BYTES,
-    Runtime, RuntimeError, StateMutation, StateStore, StateWrite, TransactionalStateStore,
-    VersionedStateValue,
+    PersistenceLayout, Runtime, RuntimeError, StateMutation, StateStore, StateWrite,
+    TransactionalStateStore, VersionedStateValue,
 };
 use std::collections::BTreeMap;
 use std::error::Error;
 
 const NODE_EVENT_TYPE_ID: u16 = 0xE001;
 const NODE_RESPONSE_TYPE_ID: u16 = 0xE002;
+const NODE_DEDUP_RECORD_TYPE_ID: u16 = 0xE003;
+const NODE_OUTBOX_BATCH_TYPE_ID: u16 = 0xE004;
 const ENCODING_VERSION: u16 = 1;
 
 /// Maximum UTF-8 byte length of a chain identifier accepted at node ingress.
@@ -42,8 +47,14 @@ pub enum NodeCoreError {
     CanonicalEncoding(CanonicalEncodingError),
     /// Canonical decoding failed.
     CanonicalDecoding(CanonicalDecodingError),
+    /// Domain-separated event hashing failed.
+    Hashing(HashingError),
     /// A decoded chain identifier was invalid.
     InvalidChainId(TypeError),
+    /// A decoded hash algorithm identifier was invalid.
+    InvalidHashAlgorithm(TypeError),
+    /// A persisted digest had the wrong byte length.
+    InvalidDigestLength(usize),
     /// A chain identifier exceeded the ingress resource bound.
     ChainIdTooLong(usize),
     /// A request identifier must not be all zeroes.
@@ -103,6 +114,8 @@ pub enum NodeCoreError {
     UndeclaredStateUpdate(Vec<u8>),
     /// A transactional transition attempted to update a read-only key.
     ReadOnlyStateUpdate(Vec<u8>),
+    /// An application access plan attempted to claim a node-core metadata key.
+    ReservedStateAccess(Vec<u8>),
     /// An event or response payload exceeded its resource bound.
     PayloadTooLarge(usize),
     /// A state value exceeded its resource bound.
@@ -125,6 +138,14 @@ pub enum NodeCoreError {
     },
     /// The persisted state changed between read and conditional write.
     StateConflict,
+    /// A request identifier was reused for different canonical event bytes.
+    RequestIdReuse,
+    /// Persisted deduplication/outbox state violated an invariant.
+    PersistenceInvariant(&'static str),
+    /// A nested canonical-record item length could not be represented.
+    NestedItemLengthOverflow(usize),
+    /// Bytes remained after a declared nested canonical-record list.
+    TrailingNestedListBytes(usize),
     /// A runtime storage operation failed.
     Runtime(RuntimeError),
     /// The application-specific state machine rejected the event.
@@ -136,7 +157,14 @@ impl fmt::Display for NodeCoreError {
         match self {
             Self::CanonicalEncoding(error) => write!(f, "canonical encoding failed: {error}"),
             Self::CanonicalDecoding(error) => write!(f, "canonical decoding failed: {error}"),
+            Self::Hashing(error) => write!(f, "node event hashing failed: {error}"),
             Self::InvalidChainId(error) => write!(f, "invalid chain id: {error}"),
+            Self::InvalidHashAlgorithm(error) => {
+                write!(f, "invalid hash algorithm: {error}")
+            }
+            Self::InvalidDigestLength(length) => {
+                write!(f, "digest is {length} bytes, expected 32")
+            }
             Self::ChainIdTooLong(length) => write!(
                 f,
                 "chain id is {length} bytes, maximum is {MAX_CHAIN_ID_BYTES}"
@@ -195,6 +223,11 @@ impl fmt::Display for NodeCoreError {
                 "transactional node transition updated a read-only {}-byte state key",
                 key.len()
             ),
+            Self::ReservedStateAccess(key) => write!(
+                f,
+                "transactional node access plan claimed a reserved {}-byte state key",
+                key.len()
+            ),
             Self::PayloadTooLarge(length) => write!(
                 f,
                 "node payload is {length} bytes, maximum is {MAX_NODE_PAYLOAD_BYTES}"
@@ -216,6 +249,21 @@ impl fmt::Display for NodeCoreError {
                 "response request id mismatch: expected {expected}, got {actual}"
             ),
             Self::StateConflict => f.write_str("node state changed before the conditional write"),
+            Self::RequestIdReuse => {
+                f.write_str("request id was already committed for a different event")
+            }
+            Self::PersistenceInvariant(reason) => {
+                write!(f, "persisted node invocation invariant failed: {reason}")
+            }
+            Self::NestedItemLengthOverflow(length) => {
+                write!(
+                    f,
+                    "nested canonical item length cannot be represented: {length}"
+                )
+            }
+            Self::TrailingNestedListBytes(length) => {
+                write!(f, "nested canonical list has {length} trailing bytes")
+            }
             Self::Runtime(error) => write!(f, "runtime operation failed: {error}"),
             Self::TransitionRejected(reason) => write!(f, "node transition rejected: {reason}"),
         }
@@ -227,7 +275,9 @@ impl Error for NodeCoreError {
         match self {
             Self::CanonicalEncoding(error) => Some(error),
             Self::CanonicalDecoding(error) => Some(error),
+            Self::Hashing(error) => Some(error),
             Self::InvalidChainId(error) => Some(error),
+            Self::InvalidHashAlgorithm(error) => Some(error),
             Self::Runtime(error) => Some(error),
             _ => None,
         }
@@ -243,6 +293,12 @@ impl From<CanonicalEncodingError> for NodeCoreError {
 impl From<CanonicalDecodingError> for NodeCoreError {
     fn from(value: CanonicalDecodingError) -> Self {
         Self::CanonicalDecoding(value)
+    }
+}
+
+impl From<HashingError> for NodeCoreError {
+    fn from(value: HashingError) -> Self {
+        Self::Hashing(value)
     }
 }
 
@@ -408,6 +464,23 @@ impl NodeEvent {
         frame.field_u16(5, self.kind.as_u16())?;
         frame.field_bytes(6, self.payload.clone())?;
         Ok(frame.finish()?)
+    }
+
+    /// Hashes the complete canonical event in its dedicated idempotency domain.
+    pub fn digest(&self, resolver: &HashSuiteResolver) -> Result<Digest32, NodeCoreError> {
+        if resolver.chain_id() != &self.chain_id {
+            return Err(NodeCoreError::ChainMismatch {
+                expected: resolver.chain_id().clone(),
+                actual: self.chain_id.clone(),
+            });
+        }
+        if resolver.protocol_version() != self.protocol_version {
+            return Err(NodeCoreError::ProtocolVersionMismatch {
+                expected: resolver.protocol_version(),
+                actual: self.protocol_version,
+            });
+        }
+        Ok(resolver.hash_for_purpose(self.epoch, HashPurpose::NodeEvent, &self.encode()?)?)
     }
 
     /// Decodes and validates exactly one canonical event frame.
@@ -630,6 +703,171 @@ impl OutboundMessage {
     #[must_use]
     pub const fn event(&self) -> &NodeEvent {
         &self.event
+    }
+}
+
+/// Canonical completed-request record used for persisted idempotency.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeDedupRecord {
+    request_id: RequestId,
+    event_digest: Digest32,
+    responses: Vec<NodeResponse>,
+}
+
+impl NodeDedupRecord {
+    /// Creates a completed request record with replayable adapter responses.
+    pub fn new(
+        request_id: RequestId,
+        event_digest: Digest32,
+        responses: Vec<NodeResponse>,
+    ) -> Result<Self, NodeCoreError> {
+        NodeOutput::new(responses.clone(), Vec::new())?;
+        for response in &responses {
+            if response.request_id() != request_id {
+                return Err(NodeCoreError::ResponseRequestMismatch {
+                    expected: request_id,
+                    actual: response.request_id(),
+                });
+            }
+        }
+        Ok(Self {
+            request_id,
+            event_digest,
+            responses,
+        })
+    }
+
+    /// Returns the stable request identifier.
+    #[must_use]
+    pub const fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    /// Returns the digest of the complete canonical input event.
+    #[must_use]
+    pub const fn event_digest(&self) -> Digest32 {
+        self.event_digest
+    }
+
+    /// Returns the responses replayed for a matching duplicate request.
+    #[must_use]
+    pub fn responses(&self) -> &[NodeResponse] {
+        &self.responses
+    }
+
+    /// Encodes the completed request record canonically.
+    pub fn encode(&self) -> Result<Vec<u8>, NodeCoreError> {
+        let response_list = encode_nested_items(
+            self.responses
+                .iter()
+                .map(NodeResponse::encode)
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        let response_count =
+            u32::try_from(self.responses.len()).map_err(|_| NodeCoreError::TooManyOutputItems {
+                collection: "dedup responses",
+                count: self.responses.len(),
+            })?;
+        let mut frame = CanonicalStruct::new(NODE_DEDUP_RECORD_TYPE_ID, ENCODING_VERSION);
+        frame.field_bytes(1, self.request_id.as_bytes().to_vec())?;
+        frame.field_u16(2, self.event_digest.algorithm().as_u16())?;
+        frame.field_bytes(3, self.event_digest.bytes())?;
+        frame.field_u32(4, response_count)?;
+        frame.field_bytes(5, response_list)?;
+        Ok(frame.finish()?)
+    }
+
+    /// Decodes and validates one completed request record.
+    pub fn decode(bytes: &[u8]) -> Result<Self, NodeCoreError> {
+        let frame = decode_canonical_frame(bytes)?;
+        frame.require_type(NODE_DEDUP_RECORD_TYPE_ID)?;
+        frame.require_version(ENCODING_VERSION)?;
+        frame.require_only_fields(&[1, 2, 3, 4, 5])?;
+
+        let request_id = decode_request_id(frame.required_field(1)?)?;
+        let event_digest = decode_digest(frame.required_u16(2)?, frame.required_field(3)?)?;
+        let count = bounded_nested_count(frame.required_u32(4)?, "dedup responses")?;
+        let responses = decode_nested_items(frame.required_field(5)?, count, NodeResponse::decode)?;
+        Self::new(request_id, event_digest, responses)
+    }
+}
+
+/// Canonical at-least-once outbound batch persisted with one request commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeOutboxBatch {
+    request_id: RequestId,
+    event_digest: Digest32,
+    messages: Vec<OutboundMessage>,
+}
+
+impl NodeOutboxBatch {
+    /// Creates the complete ordered outbound batch for one committed request.
+    pub fn new(
+        request_id: RequestId,
+        event_digest: Digest32,
+        messages: Vec<OutboundMessage>,
+    ) -> Result<Self, NodeCoreError> {
+        NodeOutput::new(Vec::new(), messages.clone())?;
+        Ok(Self {
+            request_id,
+            event_digest,
+            messages,
+        })
+    }
+
+    /// Returns the request that created this batch.
+    #[must_use]
+    pub const fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    /// Returns the digest of the input event that created this batch.
+    #[must_use]
+    pub const fn event_digest(&self) -> Digest32 {
+        self.event_digest
+    }
+
+    /// Returns outbound messages in deterministic transition order.
+    #[must_use]
+    pub fn messages(&self) -> &[OutboundMessage] {
+        &self.messages
+    }
+
+    /// Encodes the outbound batch canonically.
+    pub fn encode(&self) -> Result<Vec<u8>, NodeCoreError> {
+        let message_list = encode_nested_items(
+            self.messages
+                .iter()
+                .map(|message| message.event().encode())
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        let message_count =
+            u32::try_from(self.messages.len()).map_err(|_| NodeCoreError::TooManyOutputItems {
+                collection: "outbox messages",
+                count: self.messages.len(),
+            })?;
+        let mut frame = CanonicalStruct::new(NODE_OUTBOX_BATCH_TYPE_ID, ENCODING_VERSION);
+        frame.field_bytes(1, self.request_id.as_bytes().to_vec())?;
+        frame.field_u16(2, self.event_digest.algorithm().as_u16())?;
+        frame.field_bytes(3, self.event_digest.bytes())?;
+        frame.field_u32(4, message_count)?;
+        frame.field_bytes(5, message_list)?;
+        Ok(frame.finish()?)
+    }
+
+    /// Decodes and validates one persisted outbound batch.
+    pub fn decode(bytes: &[u8]) -> Result<Self, NodeCoreError> {
+        let frame = decode_canonical_frame(bytes)?;
+        frame.require_type(NODE_OUTBOX_BATCH_TYPE_ID)?;
+        frame.require_version(ENCODING_VERSION)?;
+        frame.require_only_fields(&[1, 2, 3, 4, 5])?;
+
+        let request_id = decode_request_id(frame.required_field(1)?)?;
+        let event_digest = decode_digest(frame.required_u16(2)?, frame.required_field(3)?)?;
+        let count = bounded_nested_count(frame.required_u32(4)?, "outbox messages")?;
+        let events = decode_nested_items(frame.required_field(5)?, count, NodeEvent::decode)?;
+        let messages = events.into_iter().map(OutboundMessage::new).collect();
+        Self::new(request_id, event_digest, messages)
     }
 }
 
@@ -973,6 +1211,131 @@ where
     }
 }
 
+/// Handles one event with atomic state, deduplication, and outbox persistence.
+///
+/// A matching committed duplicate returns its persisted responses without
+/// re-running the state machine or re-enqueuing outbound messages. Reusing a
+/// request identifier for different canonical event bytes fails closed.
+pub fn handle_idempotent_event<R, M>(
+    runtime: &R,
+    config: &NodeConfig,
+    resolver: &HashSuiteResolver,
+    event: NodeEvent,
+    machine: &M,
+) -> Result<NodeOutput, NodeCoreError>
+where
+    R: Runtime,
+    R::State: TransactionalStateStore,
+    M: TransactionalNodeStateMachine,
+{
+    event.validate_context(config)?;
+    let event_digest = event.digest(resolver)?;
+    let layout = PersistenceLayout::new(config.chain_id.clone(), config.protocol_version);
+    let request_bytes = *event.request_id.as_bytes();
+    let dedup_key = layout.request_dedup_key(request_bytes);
+    let outbox_key = layout.outbox_batch_key(request_bytes);
+
+    let plan = machine.access_plan(&event)?;
+    let maximum_application_accesses = MAX_ATOMIC_STATE_WRITES - 2;
+    if plan.accesses.len() > maximum_application_accesses {
+        return Err(NodeCoreError::TooManyStateAccesses {
+            count: plan.accesses.len(),
+            maximum: maximum_application_accesses,
+        });
+    }
+    for reserved in [&dedup_key, &outbox_key] {
+        if plan.access(reserved).is_some() {
+            return Err(NodeCoreError::ReservedStateAccess(reserved.clone()));
+        }
+    }
+
+    let dedup = runtime.state_store().get_versioned(&dedup_key)?;
+    let outbox = runtime.state_store().get_versioned(&outbox_key)?;
+
+    if let Some(bytes) = dedup.value() {
+        let record = NodeDedupRecord::decode(bytes)
+            .map_err(|_| NodeCoreError::PersistenceInvariant("invalid dedup record"))?;
+        if record.request_id() != event.request_id() || record.event_digest() != event_digest {
+            return Err(NodeCoreError::RequestIdReuse);
+        }
+        let batch_bytes = outbox.value().ok_or(NodeCoreError::PersistenceInvariant(
+            "dedup exists without outbox",
+        ))?;
+        let batch = NodeOutboxBatch::decode(batch_bytes)
+            .map_err(|_| NodeCoreError::PersistenceInvariant("invalid outbox batch"))?;
+        if batch.request_id() != event.request_id() || batch.event_digest() != event_digest {
+            return Err(NodeCoreError::PersistenceInvariant(
+                "dedup and outbox identities differ",
+            ));
+        }
+        for message in batch.messages() {
+            message.event().validate_context(config)?;
+        }
+        return NodeOutput::new(record.responses().to_vec(), Vec::new());
+    }
+    if outbox.value().is_some() {
+        return Err(NodeCoreError::PersistenceInvariant(
+            "outbox exists without dedup",
+        ));
+    }
+
+    let mut values = BTreeMap::new();
+    for access in plan.accesses() {
+        let observed = runtime.state_store().get_versioned(access.key())?;
+        if let Some(value) = observed.value() {
+            validate_state(value)?;
+        }
+        values.insert(access.key.clone(), observed);
+    }
+    let snapshot = NodeStateSnapshot { values };
+    let transition = machine.transition(&snapshot, &event)?;
+    validate_output_context(transition.output(), &event, config)?;
+    let dedup_record = NodeDedupRecord::new(
+        event.request_id(),
+        event_digest,
+        transition.output.responses.clone(),
+    )?;
+    let outbox_batch = NodeOutboxBatch::new(
+        event.request_id(),
+        event_digest,
+        transition.output.outbound_messages.clone(),
+    )?;
+
+    let mut writes = Vec::with_capacity(transition.updates.len() + 2);
+    for update in transition.updates {
+        let Some(access) = plan.access(update.key()) else {
+            return Err(NodeCoreError::UndeclaredStateUpdate(update.key));
+        };
+        if access.mode() != NodeStateAccessMode::ReadWrite {
+            return Err(NodeCoreError::ReadOnlyStateUpdate(update.key));
+        }
+        let observed = snapshot
+            .get(update.key())
+            .ok_or_else(|| NodeCoreError::UndeclaredStateUpdate(update.key.clone()))?;
+        writes.push(StateWrite::new(
+            update.key,
+            observed.revision(),
+            update.mutation,
+        )?);
+    }
+    writes.push(StateWrite::new(
+        dedup_key,
+        dedup.revision(),
+        StateMutation::Put(dedup_record.encode()?),
+    )?);
+    writes.push(StateWrite::new(
+        outbox_key,
+        outbox.revision(),
+        StateMutation::Put(outbox_batch.encode()?),
+    )?);
+
+    let write_set = AtomicStateWriteSet::new(writes)?;
+    match runtime.state_store().commit_atomic(write_set)? {
+        AtomicStateWriteResult::Committed => Ok(transition.output),
+        AtomicStateWriteResult::Conflict { .. } => Err(NodeCoreError::StateConflict),
+    }
+}
+
 /// Handles exactly one event and atomically persists its deterministic transition.
 ///
 /// Outputs are returned only after compare-and-swap succeeds. The caller may then
@@ -1064,10 +1427,104 @@ fn validate_transactional_state_key(key: &[u8]) -> Result<(), NodeCoreError> {
     Ok(())
 }
 
+fn decode_request_id(bytes: &[u8]) -> Result<RequestId, NodeCoreError> {
+    let array: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| NodeCoreError::InvalidRequestIdLength(bytes.len()))?;
+    RequestId::new(array)
+}
+
+fn decode_digest(algorithm: u16, bytes: &[u8]) -> Result<Digest32, NodeCoreError> {
+    let algorithm =
+        HashAlgorithmId::try_from(algorithm).map_err(NodeCoreError::InvalidHashAlgorithm)?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| NodeCoreError::InvalidDigestLength(bytes.len()))?;
+    Ok(Digest32::new(algorithm, bytes))
+}
+
+fn bounded_nested_count(count: u32, collection: &'static str) -> Result<usize, NodeCoreError> {
+    let count = usize::try_from(count).map_err(|_| NodeCoreError::TooManyOutputItems {
+        collection,
+        count: usize::MAX,
+    })?;
+    if count > MAX_NODE_OUTPUT_ITEMS {
+        return Err(NodeCoreError::TooManyOutputItems { collection, count });
+    }
+    Ok(count)
+}
+
+fn encode_nested_items(items: Vec<Vec<u8>>) -> Result<Vec<u8>, NodeCoreError> {
+    let capacity = items.iter().try_fold(0_usize, |total, item| {
+        total.checked_add(4)?.checked_add(item.len())
+    });
+    let capacity = capacity.ok_or(NodeCoreError::StateTooLarge(usize::MAX))?;
+    if capacity > MAX_NODE_STATE_BYTES {
+        return Err(NodeCoreError::StateTooLarge(capacity));
+    }
+
+    let mut encoded = Vec::with_capacity(capacity);
+    for item in items {
+        let length = u32::try_from(item.len())
+            .map_err(|_| NodeCoreError::NestedItemLengthOverflow(item.len()))?;
+        encoded.extend_from_slice(&length.to_le_bytes());
+        encoded.extend_from_slice(&item);
+    }
+    Ok(encoded)
+}
+
+fn decode_nested_items<T, F>(
+    bytes: &[u8],
+    count: usize,
+    mut decode: F,
+) -> Result<Vec<T>, NodeCoreError>
+where
+    F: FnMut(&[u8]) -> Result<T, NodeCoreError>,
+{
+    let mut offset = 0_usize;
+    let mut items = Vec::with_capacity(count);
+    for _ in 0..count {
+        let length_bytes = take_nested_bytes(bytes, &mut offset, 4)?;
+        let length = usize::try_from(u32::from_le_bytes([
+            length_bytes[0],
+            length_bytes[1],
+            length_bytes[2],
+            length_bytes[3],
+        ]))
+        .map_err(|_| NodeCoreError::NestedItemLengthOverflow(usize::MAX))?;
+        items.push(decode(take_nested_bytes(bytes, &mut offset, length)?)?);
+    }
+    if offset != bytes.len() {
+        return Err(NodeCoreError::TrailingNestedListBytes(bytes.len() - offset));
+    }
+    Ok(items)
+}
+
+fn take_nested_bytes<'a>(
+    bytes: &'a [u8],
+    offset: &mut usize,
+    length: usize,
+) -> Result<&'a [u8], NodeCoreError> {
+    let end = offset
+        .checked_add(length)
+        .ok_or(NodeCoreError::NestedItemLengthOverflow(usize::MAX))?;
+    let value = bytes
+        .get(*offset..end)
+        .ok_or(CanonicalDecodingError::Truncated {
+            offset: *offset,
+            needed: length,
+            remaining: bytes.len().saturating_sub(*offset),
+        })?;
+    *offset = end;
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol_types::{HashSuite, HashSuiteSchedule};
     use runtime::{MemoryRuntime, StateRevision, StateStore, TransactionalStateStore};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const TEST_STATE_TYPE_ID: u16 = 0xEF01;
     const TEST_PAYLOAD_TYPE_ID: u16 = 0xEF02;
@@ -1087,13 +1544,17 @@ mod tests {
     }
 
     fn event(chain: &str, request_id: RequestId) -> NodeEvent {
+        event_value(chain, request_id, 9)
+    }
+
+    fn event_value(chain: &str, request_id: RequestId, value: u64) -> NodeEvent {
         NodeEvent::new(
             ChainId::new(chain).unwrap(),
             ProtocolVersion::new(3),
             Epoch::new(7),
             request_id,
             NodeEventKind::SubmitTransaction,
-            canonical(TEST_PAYLOAD_TYPE_ID, 9),
+            canonical(TEST_PAYLOAD_TYPE_ID, value),
         )
         .unwrap()
     }
@@ -1104,6 +1565,18 @@ mod tests {
             ProtocolVersion::new(3),
             Epoch::new(7),
             b"node/state".to_vec(),
+        )
+        .unwrap()
+    }
+
+    fn resolver(chain: &str) -> HashSuiteResolver {
+        HashSuiteResolver::new(
+            ChainId::new(chain).unwrap(),
+            ProtocolVersion::new(3),
+            vec![HashSuiteSchedule {
+                activation_epoch: Epoch::new(0),
+                suite: HashSuite::genesis(),
+            }],
         )
         .unwrap()
     }
@@ -1149,6 +1622,60 @@ mod tests {
              1111111111111111111111110500020000000100060018000000534e524502ef0100010001000800\
              00000900000000000000"
                 .replace(' ', "")
+        );
+    }
+
+    #[test]
+    fn node_event_digest_is_stable_and_context_bound() {
+        let event = event("sunrise-test", request(0x12));
+        let digest = event.digest(&resolver("sunrise-test")).unwrap();
+
+        assert_eq!(digest.algorithm(), HashAlgorithmId::Sha2_256);
+        assert_eq!(
+            hex(&digest.bytes()),
+            "657a106559c95a487c1bf33c245d6eded71706b4d4921fd9b938552b5e1aa281"
+        );
+        assert!(matches!(
+            event.digest(&resolver("other-chain")),
+            Err(NodeCoreError::ChainMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn dedup_and_outbox_records_have_stable_canonical_vectors() {
+        let request_id = request(0x21);
+        let digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x22; 32]);
+        let response = NodeResponse::new(request_id, NodeResponseStatus::Accepted, None).unwrap();
+        let dedup = NodeDedupRecord::new(request_id, digest, vec![response]).unwrap();
+        let dedup_bytes = dedup.encode().unwrap();
+        assert_eq!(NodeDedupRecord::decode(&dedup_bytes).unwrap(), dedup);
+        assert_eq!(
+            hex(&dedup_bytes),
+            concat!(
+                "534e524503e001000500010020000000",
+                "2121212121212121212121212121212121212121212121212121212121212121",
+                "0200020000000100",
+                "0300200000002222222222222222222222222222222222222222222222222222222222222222",
+                "04000400000001000000",
+                "05003c00000038000000534e524502e001000200010020000000",
+                "2121212121212121212121212121212121212121212121212121212121212121",
+                "0200020000000100"
+            )
+        );
+
+        let outbox = NodeOutboxBatch::new(request_id, digest, Vec::new()).unwrap();
+        let outbox_bytes = outbox.encode().unwrap();
+        assert_eq!(NodeOutboxBatch::decode(&outbox_bytes).unwrap(), outbox);
+        assert_eq!(
+            hex(&outbox_bytes),
+            concat!(
+                "534e524504e001000500010020000000",
+                "2121212121212121212121212121212121212121212121212121212121212121",
+                "0200020000000100",
+                "0300200000002222222222222222222222222222222222222222222222222222222222222222",
+                "04000400000000000000",
+                "050000000000"
+            )
         );
     }
 
@@ -1374,6 +1901,164 @@ mod tests {
                 .unwrap()
                 .revision(),
             StateRevision::new(1)
+        );
+    }
+
+    struct IdempotentMachine {
+        calls: AtomicUsize,
+    }
+
+    impl TransactionalNodeStateMachine for IdempotentMachine {
+        fn access_plan(&self, _event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            NodeStateAccessPlan::new(vec![NodeStateAccess::new(
+                b"state/idempotent".to_vec(),
+                NodeStateAccessMode::ReadWrite,
+            )?])
+        }
+
+        fn transition(
+            &self,
+            state: &NodeStateSnapshot,
+            event: &NodeEvent,
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let current = match state
+                .get(b"state/idempotent")
+                .and_then(VersionedStateValue::value)
+            {
+                Some(bytes) => decode_canonical_frame(bytes)?.required_u64(1)?,
+                None => 0,
+            };
+            let next = current + 1;
+            let response = NodeResponse::new(
+                event.request_id(),
+                NodeResponseStatus::Accepted,
+                Some(canonical(TEST_PAYLOAD_TYPE_ID, next)),
+            )?;
+            let outbound = OutboundMessage::new(NodeEvent::new(
+                event.chain_id().clone(),
+                event.protocol_version(),
+                event.epoch(),
+                request(0xFE),
+                NodeEventKind::Tick,
+                canonical(TEST_PAYLOAD_TYPE_ID, next),
+            )?);
+            TransactionalNodeTransition::new(
+                vec![NodeStateUpdate::put(
+                    b"state/idempotent".to_vec(),
+                    canonical(TEST_STATE_TYPE_ID, next),
+                )?],
+                NodeOutput::new(vec![response], vec![outbound])?,
+            )
+        }
+    }
+
+    #[test]
+    fn idempotent_handler_commits_dedup_and_outbox_and_replays_response() {
+        let runtime = MemoryRuntime::new(runtime::ValidatorId::new([0x44; 32]));
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        let event = event("sunrise-test", request(0x6B));
+        let resolver = resolver("sunrise-test");
+        let first = handle_idempotent_event(
+            &runtime,
+            &config("sunrise-test"),
+            &resolver,
+            event.clone(),
+            &machine,
+        )
+        .unwrap();
+        let replay = handle_idempotent_event(
+            &runtime,
+            &config("sunrise-test"),
+            &resolver,
+            event.clone(),
+            &machine,
+        )
+        .unwrap();
+
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first.responses(), replay.responses());
+        assert_eq!(first.outbound_messages().len(), 1);
+        assert!(replay.outbound_messages().is_empty());
+        let persisted = runtime
+            .state_store()
+            .get(b"state/idempotent")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_canonical_frame(&persisted).unwrap().required_u64(1),
+            Ok(1)
+        );
+
+        let layout = PersistenceLayout::new(
+            ChainId::new("sunrise-test").unwrap(),
+            ProtocolVersion::new(3),
+        );
+        let dedup = runtime
+            .state_store()
+            .get(&layout.request_dedup_key(*event.request_id().as_bytes()))
+            .unwrap()
+            .unwrap();
+        let outbox = runtime
+            .state_store()
+            .get(&layout.outbox_batch_key(*event.request_id().as_bytes()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            NodeDedupRecord::decode(&dedup).unwrap().responses().len(),
+            1
+        );
+        assert_eq!(
+            NodeOutboxBatch::decode(&outbox).unwrap().messages().len(),
+            1
+        );
+
+        assert_eq!(
+            handle_idempotent_event(
+                &runtime,
+                &config("sunrise-test"),
+                &resolver,
+                event_value("sunrise-test", request(0x6B), 10),
+                &machine,
+            ),
+            Err(NodeCoreError::RequestIdReuse)
+        );
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn idempotent_conflict_does_not_publish_dedup_or_outbox_records() {
+        let runtime = MemoryRuntime::new(runtime::ValidatorId::new([0x44; 32]));
+        let event = event("sunrise-test", request(0x6C));
+        let error = handle_idempotent_event(
+            &runtime,
+            &config("sunrise-test"),
+            &resolver("sunrise-test"),
+            event.clone(),
+            &TransactionalConflictMachine { runtime: &runtime },
+        )
+        .unwrap_err();
+        assert_eq!(error, NodeCoreError::StateConflict);
+
+        let layout = PersistenceLayout::new(
+            ChainId::new("sunrise-test").unwrap(),
+            ProtocolVersion::new(3),
+        );
+        assert_eq!(
+            runtime
+                .state_store()
+                .get(&layout.request_dedup_key(*event.request_id().as_bytes()))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            runtime
+                .state_store()
+                .get(&layout.outbox_batch_key(*event.request_id().as_bytes()))
+                .unwrap(),
+            None
         );
     }
 

@@ -379,6 +379,18 @@ a migration or production durability claim. Canonical deduplication records,
 persisted outbox entries, adapter migration, and crash recovery remain
 subsequent Phase 15 work.
 
+The recoverable transactional path additionally hashes the complete canonical
+`NodeEvent` under dedicated hash domain `0x000D`, using the active epoch hash
+suite's certificate-hash algorithm slot. It reserves deterministic per-request
+deduplication and outbox-batch keys. Application updates, a canonical completed
+request record (`0xE003`), and a canonical ordered outbox batch (`0xE004`) enter
+the same atomic write set. A retry with the same request ID and event digest
+replays persisted responses without re-running the transition or returning the
+outbox again; the same request ID with different event bytes fails closed.
+Outbox presence makes committed messages recoverable and at-least-once, but no
+adapter uses this path yet and acknowledgement, redelivery, lease/claim policy,
+retention, compaction, and durable crash tests remain production work.
+
 ## 31. Native HTTP adapter
 
 Phase 15 adds the `native-http` crate around node-core using Axum and Tokio.
@@ -661,3 +673,8 @@ license/SBOM policy, and protected review/merge controls.
   event-specific access plan before reads. Supply a versioned immutable
   snapshot, derive commit revisions inside node-core, reject undeclared and
   read-only updates, and release no output until the whole write set commits.
+- DR-0031: Bind idempotency to both request ID and the complete canonical event
+  digest in dedicated domain `0x000D`. Commit replayable responses and one
+  ordered at-least-once outbox batch with application state, reject request-ID
+  reuse for different bytes, and do not equate persisted batches with a
+  completed delivery/acknowledgement recovery protocol.

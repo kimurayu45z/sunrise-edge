@@ -1855,6 +1855,8 @@ Phase 15 prerequisites:
   atomic reference implementation (implemented As-Is)
 - declared-access transactional node-core invocation over versioned snapshots
   and atomic write sets (implemented As-Is)
+- canonical request-id/event-digest dedup record and request-scoped outbox batch
+  in the same atomic commit (implemented As-Is)
 
 Phase 15 As-Is scope:
 
@@ -1876,7 +1878,13 @@ Phase 15 As-Is scope:
 - node-coreのtransactional pathはcontext検証後かつstate read前にevent-specific access planを
   確定し、全keyをrevision付きsnapshotとしてpure transitionへ渡す。undeclared/read-only updateを
   rejectし、観測revisionをnode-core自身がwrite-setへbindし、全commit成功までoutputを返さない。
-  現行adapterはlegacy single-key pathのままで、dedup/outboxとdurable recoveryも未実装である。
+  現行adapterはlegacy single-key pathのままである。
+- recoverable transactional pathはcomplete canonical NodeEventをdedicated hash domain 0x000Dと
+  active epoch hash suiteでdigest化する。application update、request_id/event digest/responseを持つ
+  dedup record、ordered outbound messageを持つrequest-scoped outbox batchを同一commitへ含める。
+  同一request/digestのretryはtransitionを再実行せずresponseだけを返し、別eventへのrequest ID
+  reuseはfail closedする。adapter migration、outbox claim/send/ack/redelivery、retention/compaction、
+  durable crash recoveryは未実装であり、persistしただけでproduction delivery完成とはみなさない。
 - native adapterはPOST /v1/events、exact canonical binary media type、bounded body、
   deterministic HTTP status mapping、GET /health/live、graceful shutdownを提供する。
 - outbound eventはCAS成功後にruntime transportへ渡すが、state commitとsendの間はまだ

@@ -470,6 +470,7 @@ name = "node-core"
 version = "0.1.0"
 dependencies = [
  "canonical-encoding",
+ "hashing",
  "protocol-types",
  "runtime",
 ]
