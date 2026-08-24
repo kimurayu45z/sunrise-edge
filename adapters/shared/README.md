@@ -13,3 +13,10 @@ A provider whose request-body capacity is smaller than the protocol transport
 limit may pass `maximumRequestBodyBytes`. The shared implementation accepts
 only a positive integer no larger than its default bound, so an adapter can
 narrow the capacity envelope but cannot silently raise the security limit.
+
+`authenticated-node-core.ts` provides the reusable outbound capability for Web
+providers that lack a private service binding. It requires an exact HTTPS
+endpoint, injects an ASCII Bearer secret into an allow-listed request, rejects
+redirects, and applies a bounded timeout. Provider entrypoints still own secret
+lookup and must replace this incremental public transport with the stronger
+private or mutually authenticated Phase 17 production design.
