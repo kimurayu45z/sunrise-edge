@@ -20,3 +20,8 @@ endpoint, injects an ASCII Bearer secret into an allow-listed request, rejects
 redirects, and applies a bounded timeout. Provider entrypoints still own secret
 lookup and must replace this incremental public transport with the stronger
 private or mutually authenticated Phase 17 production design.
+
+`conformance-fixtures.ts` holds provider-independent liveness and rejection
+vectors. Cloudflare, Deno, Vercel, Supabase, and AWS mapper tests all consume
+the same vectors so route, media, encoding, content-length, status, body, cache,
+and `Allow` behavior cannot drift silently between local implementations.

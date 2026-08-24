@@ -1959,6 +1959,7 @@ Phase 17 prerequisites:
 - Vercel adapter wrapper (implemented As-Is)
 - Supabase Edge adapter wrapper (implemented As-Is)
 - AWS adapter wrapper and API Gateway HTTP API v2 mapping (implemented As-Is)
+- cross-provider local ingress fixture matrix (implemented As-Is)
 
 Phase 17 shared ingress As-Is scope:
 
@@ -1975,6 +1976,8 @@ Phase 17 shared ingress As-Is scope:
   environment lookupとprovider credential lifecycleはこのmoduleへ入れない。
 - 現在のAs-Is consumerはCloudflare workerd、local Deno runtime、local Vercel/Supabase wrapper、
   AWS HTTP API v2 mapper testであり、real provider deployment conformanceはまだ完了していない。
+- liveness、unknown path、method、media parameter、content encoding、content-lengthの同一fixtureを
+  5 provider consumerで実行する。これはlocal drift検出であり実gateway/runtime conformanceではない。
 
 Phase 17 Deno As-Is scope:
 

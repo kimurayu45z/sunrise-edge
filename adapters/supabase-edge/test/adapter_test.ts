@@ -1,5 +1,9 @@
 import { deepStrictEqual, equal } from "node:assert/strict";
 import {
+  requestFromConformanceFixture,
+  WEB_INGRESS_CONFORMANCE_FIXTURES,
+} from "../../shared/conformance-fixtures.ts";
+import {
   LIVENESS_PATH,
   NODE_EVENT_MEDIA_TYPE,
   NODE_EVENT_PATH,
@@ -9,6 +13,31 @@ import { createSupabaseHandler, SUPABASE_FUNCTION_NAME } from "../src/adapter.ts
 
 const NODE_CORE_URL = "https://node.internal.example/v1/events";
 const FUNCTION_PREFIX = `/${SUPABASE_FUNCTION_NAME}`;
+
+for (const fixture of WEB_INGRESS_CONFORMANCE_FIXTURES) {
+  Deno.test(`Supabase matches shared fixture: ${fixture.name}`, async () => {
+    const handler = createSupabaseHandler({
+      nodeCoreUrl: NODE_CORE_URL,
+      bearerToken: "test-token",
+      fetch: () => Promise.reject(new Error("must not be called")),
+    });
+    const response = await handler(
+      requestFromConformanceFixture(
+        "https://project.supabase.co",
+        fixture,
+        FUNCTION_PREFIX,
+      ),
+    );
+    equal(response.status, fixture.expectedStatus);
+    equal(response.headers.get("cache-control"), "no-store");
+    equal(response.headers.get("allow"), fixture.expectedAllow);
+    if (fixture.expectedBody === null) {
+      equal(response.body, null);
+    } else {
+      equal(await response.text(), fixture.expectedBody);
+    }
+  });
+}
 
 function functionRequest(
   path: string,

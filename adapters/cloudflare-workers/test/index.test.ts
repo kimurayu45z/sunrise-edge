@@ -1,5 +1,9 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
+import {
+  requestFromConformanceFixture,
+  WEB_INGRESS_CONFORMANCE_FIXTURES,
+} from "../../shared/conformance-fixtures";
 import { handleWebRequest } from "../../shared/web-ingress";
 import {
   LIVENESS_PATH,
@@ -23,6 +27,24 @@ function eventRequest(body: BodyInit, headers?: HeadersInit): Request {
 }
 
 describe("Cloudflare ingress", () => {
+  it.each(WEB_INGRESS_CONFORMANCE_FIXTURES)(
+    "matches shared fixture: $name",
+    async (fixture) => {
+      const response = await handleRequest(
+        requestFromConformanceFixture("https://edge.example", fixture),
+        env,
+      );
+      expect(response.status).toBe(fixture.expectedStatus);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(response.headers.get("allow")).toBe(fixture.expectedAllow);
+      if (fixture.expectedBody === null) {
+        expect(response.body).toBeNull();
+      } else {
+        expect(await response.text()).toBe(fixture.expectedBody);
+      }
+    },
+  );
+
   it("answers liveness without invoking node core", async () => {
     const response = await handleRequest(
       new Request(`https://edge.example${LIVENESS_PATH}`),

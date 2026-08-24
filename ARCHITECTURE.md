@@ -521,6 +521,19 @@ custom authorization plus throttling/WAF, secret lifecycle, private node-core
 transport, reserved concurrency, observability, durable effects, and rollout
 rehearsal. Local mapper tests are not evidence of API Gateway/Lambda conformance.
 
+## 38. Cross-provider ingress fixtures
+
+One provider-neutral fixture matrix defines liveness and pre-dispatch rejection
+behavior for unknown paths, wrong methods, parameterized media types, content
+encoding, and non-canonical content length. Cloudflare workerd, Deno, Vercel,
+Supabase, and AWS HTTP API mapper tests consume those exact vectors and compare
+status, body, cache policy, and `Allow` headers.
+
+The fixture matrix prevents local wrapper drift but does not satisfy production
+conformance by itself. Each provider must run equivalent vectors through its
+real public gateway, authentication layer, runtime, private transport, and
+node-core deployment, including platform-generated rejection and timeout paths.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -579,3 +592,6 @@ rehearsal. Local mapper tests are not evidence of API Gateway/Lambda conformance
   base64 for binary events, and cap decoded request and raw buffered response at
   4 MiB to stay conservatively below Lambda's 6 MB JSON-envelope limits. Ship no
   unauthenticated production API configuration.
+- DR-0025: Define provider-neutral pre-dispatch ingress fixtures once and run
+  them through every local provider consumer. Treat this as drift detection,
+  not a substitute for real gateway and runtime conformance testing.
