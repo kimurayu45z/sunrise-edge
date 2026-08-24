@@ -162,6 +162,8 @@ pub const MAX_ATOMIC_STATE_READS: usize = 4_096;
 pub const MAX_ATOMIC_STATE_TRANSACTION_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum keys returned by one bounded state scan page.
 pub const MAX_STATE_SCAN_KEYS: usize = 1_024;
+/// Maximum lease window accepted by the indexed durable outbox contract.
+pub const MAX_DURABLE_OUTBOX_LEASE_MILLIS: u64 = 5 * 60 * 1_000;
 
 /// Monotonic deployment-generation token for one domain's authoritative writer.
 ///
@@ -263,6 +265,266 @@ pub struct DurableOperationContext {
     writer_fence: WriterFenceGeneration,
     deadline: StorageDeadline,
     correlation_id: StorageCorrelationId,
+}
+
+/// Validation errors for the provider-neutral indexed outbox contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IndexedOutboxContractError {
+    /// The projected canonical request identity must not be all zeroes.
+    ZeroRequestId,
+    /// Lease identity must not be all zeroes.
+    ZeroLeaseId,
+    /// A claimed canonical outbound payload must not be empty.
+    EmptyPayload,
+    /// A claimed outbound payload exceeded the shared value bound.
+    PayloadTooLarge {
+        /// Actual payload bytes.
+        length: usize,
+        /// Maximum accepted bytes.
+        maximum: usize,
+    },
+    /// Lease expiry was not after `now` or exceeded the shared lease bound.
+    InvalidLeaseWindow,
+}
+
+impl fmt::Display for IndexedOutboxContractError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroRequestId => f.write_str("outbox request id must not be all zeroes"),
+            Self::ZeroLeaseId => f.write_str("outbox lease id must not be all zeroes"),
+            Self::EmptyPayload => f.write_str("outbox payload must not be empty"),
+            Self::PayloadTooLarge { length, maximum } => {
+                write!(f, "outbox payload is {length} bytes, maximum is {maximum}")
+            }
+            Self::InvalidLeaseWindow => f.write_str("outbox lease window is invalid"),
+        }
+    }
+}
+
+impl Error for IndexedOutboxContractError {}
+
+/// Operational projection of the canonical request identity owning an outbox.
+///
+/// This type does not redefine request identity. Node-core must copy the exact
+/// canonical `RequestId` bytes into it; adapters must not synthesize another ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OutboxRequestId([u8; 32]);
+
+impl OutboxRequestId {
+    /// Creates a non-zero request projection.
+    pub fn new(bytes: [u8; 32]) -> Result<Self, IndexedOutboxContractError> {
+        if bytes == [0; 32] {
+            return Err(IndexedOutboxContractError::ZeroRequestId);
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the exact canonical request identity bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Non-zero, restart-safe identity for one durable outbox claim attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DurableOutboxLeaseId([u8; 32]);
+
+impl DurableOutboxLeaseId {
+    /// Creates a non-zero durable lease identity.
+    pub fn new(bytes: [u8; 32]) -> Result<Self, IndexedOutboxContractError> {
+        if bytes == [0; 32] {
+            return Err(IndexedOutboxContractError::ZeroLeaseId);
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the exact lease identity bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// One trusted-time, single-domain indexed due-work claim request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DueOutboxClaimRequest {
+    domain: AtomicityDomainId,
+    now_unix_millis: u64,
+    lease_id: DurableOutboxLeaseId,
+    lease_expires_at_unix_millis: u64,
+}
+
+impl DueOutboxClaimRequest {
+    /// Creates a bounded claim request.
+    ///
+    /// `now` comes from trusted runtime composition, never the scheduler.
+    pub fn new(
+        domain: AtomicityDomainId,
+        now_unix_millis: u64,
+        lease_id: DurableOutboxLeaseId,
+        lease_expires_at_unix_millis: u64,
+    ) -> Result<Self, IndexedOutboxContractError> {
+        let duration = lease_expires_at_unix_millis
+            .checked_sub(now_unix_millis)
+            .filter(|duration| *duration > 0)
+            .ok_or(IndexedOutboxContractError::InvalidLeaseWindow)?;
+        if duration > MAX_DURABLE_OUTBOX_LEASE_MILLIS {
+            return Err(IndexedOutboxContractError::InvalidLeaseWindow);
+        }
+        Ok(Self {
+            domain,
+            now_unix_millis,
+            lease_id,
+            lease_expires_at_unix_millis,
+        })
+    }
+
+    /// Returns the only domain that may be queried or mutated.
+    #[must_use]
+    pub const fn domain(self) -> AtomicityDomainId {
+        self.domain
+    }
+
+    /// Returns trusted time used for due-work eligibility.
+    #[must_use]
+    pub const fn now_unix_millis(self) -> u64 {
+        self.now_unix_millis
+    }
+
+    /// Returns the restart-safe lease identity.
+    #[must_use]
+    pub const fn lease_id(self) -> DurableOutboxLeaseId {
+        self.lease_id
+    }
+
+    /// Returns the bounded lease expiry installed by a successful claim.
+    #[must_use]
+    pub const fn lease_expires_at_unix_millis(self) -> u64 {
+        self.lease_expires_at_unix_millis
+    }
+}
+
+/// One canonical outbound payload leased from the indexed durable repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableOutboxClaim {
+    request_id: OutboxRequestId,
+    message_index: u32,
+    lease_id: DurableOutboxLeaseId,
+    lease_expires_at_unix_millis: u64,
+    canonical_payload: Vec<u8>,
+}
+
+impl DurableOutboxClaim {
+    /// Reconstructs and validates one durable claim returned by an adapter.
+    pub fn from_parts(
+        request_id: OutboxRequestId,
+        message_index: u32,
+        lease_id: DurableOutboxLeaseId,
+        lease_expires_at_unix_millis: u64,
+        canonical_payload: Vec<u8>,
+    ) -> Result<Self, IndexedOutboxContractError> {
+        if lease_expires_at_unix_millis == 0 {
+            return Err(IndexedOutboxContractError::InvalidLeaseWindow);
+        }
+        if canonical_payload.is_empty() {
+            return Err(IndexedOutboxContractError::EmptyPayload);
+        }
+        if canonical_payload.len() > MAX_STATE_VALUE_BYTES {
+            return Err(IndexedOutboxContractError::PayloadTooLarge {
+                length: canonical_payload.len(),
+                maximum: MAX_STATE_VALUE_BYTES,
+            });
+        }
+        Ok(Self {
+            request_id,
+            message_index,
+            lease_id,
+            lease_expires_at_unix_millis,
+            canonical_payload,
+        })
+    }
+
+    /// Returns the canonical request identity owning this work.
+    #[must_use]
+    pub const fn request_id(&self) -> OutboxRequestId {
+        self.request_id
+    }
+
+    /// Returns the ordered message index inside the immutable outbox batch.
+    #[must_use]
+    pub const fn message_index(&self) -> u32 {
+        self.message_index
+    }
+
+    /// Returns the identity required for acknowledgement.
+    #[must_use]
+    pub const fn lease_id(&self) -> DurableOutboxLeaseId {
+        self.lease_id
+    }
+
+    /// Returns the installed lease expiry.
+    #[must_use]
+    pub const fn lease_expires_at_unix_millis(&self) -> u64 {
+        self.lease_expires_at_unix_millis
+    }
+
+    /// Returns the exact canonical outbound payload to decode and transport.
+    #[must_use]
+    pub fn canonical_payload(&self) -> &[u8] {
+        &self.canonical_payload
+    }
+}
+
+/// Identity required to acknowledge exactly one leased outbox message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DurableOutboxAcknowledgement {
+    domain: AtomicityDomainId,
+    request_id: OutboxRequestId,
+    message_index: u32,
+    lease_id: DurableOutboxLeaseId,
+}
+
+impl DurableOutboxAcknowledgement {
+    /// Creates an exact acknowledgement identity.
+    #[must_use]
+    pub const fn new(
+        domain: AtomicityDomainId,
+        request_id: OutboxRequestId,
+        message_index: u32,
+        lease_id: DurableOutboxLeaseId,
+    ) -> Self {
+        Self {
+            domain,
+            request_id,
+            message_index,
+            lease_id,
+        }
+    }
+
+    /// Returns the only domain that may be mutated.
+    #[must_use]
+    pub const fn domain(self) -> AtomicityDomainId {
+        self.domain
+    }
+
+    /// Returns the canonical request identity.
+    #[must_use]
+    pub const fn request_id(self) -> OutboxRequestId {
+        self.request_id
+    }
+
+    /// Returns the exact ordered message index.
+    #[must_use]
+    pub const fn message_index(self) -> u32 {
+        self.message_index
+    }
+
+    /// Returns the lease identity that must still own the message.
+    #[must_use]
+    pub const fn lease_id(self) -> DurableOutboxLeaseId {
+        self.lease_id
+    }
 }
 
 impl DurableOperationContext {
@@ -787,6 +1049,85 @@ pub enum DurableReadError {
     SchemaMismatch,
 }
 
+/// Definite rejection of an indexed due-outbox claim.
+///
+/// Every variant proves that no new lease was installed for this request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DurableOutboxClaimRejection {
+    /// The supplied writer generation was not authoritative.
+    WriterFenced {
+        /// Generation that is currently authoritative.
+        active_generation: WriterFenceGeneration,
+    },
+    /// The storage deadline elapsed before claim commit dispatch.
+    DeadlineExceededBeforeCommit,
+    /// The backend proved its serialization transaction aborted.
+    SerializationFailure,
+    /// Delivery-attempt or lease arithmetic overflowed before claim commit.
+    ArithmeticOverflow,
+    /// Persisted batch, delivery, or index projections violated invariants.
+    InvalidPersistedState,
+    /// The durable schema identity or generation is unsupported.
+    SchemaMismatch,
+    /// The backend was unavailable before claim commit dispatch.
+    UnavailableBeforeCommit,
+    /// The lease identity was already bound to different work.
+    LeaseIdReuse,
+}
+
+/// Result of one bounded indexed due-outbox claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DurableOutboxClaimOutcome {
+    /// One due message was atomically fenced by the supplied lease.
+    Claimed(DurableOutboxClaim),
+    /// No eligible row existed at the indexed claim point.
+    NoDueWork,
+    /// The store proves that it installed no new lease.
+    Rejected(DurableOutboxClaimRejection),
+    /// The store cannot prove whether it installed the lease.
+    Indeterminate(IndeterminateCommitReason),
+}
+
+/// Definite rejection of one durable outbox acknowledgement.
+///
+/// Every variant proves that the delivery cursor did not advance for this
+/// acknowledgement attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DurableOutboxAcknowledgementRejection {
+    /// The supplied writer generation was not authoritative.
+    WriterFenced {
+        /// Generation that is currently authoritative.
+        active_generation: WriterFenceGeneration,
+    },
+    /// The storage deadline elapsed before acknowledgement commit dispatch.
+    DeadlineExceededBeforeCommit,
+    /// The backend proved its serialization transaction aborted.
+    SerializationFailure,
+    /// Delivery-cursor arithmetic overflowed before acknowledgement commit.
+    ArithmeticOverflow,
+    /// The lease does not own the requested delivery cursor.
+    LeaseMismatch,
+    /// The message index is not the cursor's next index.
+    IndexMismatch,
+    /// Persisted batch, delivery, or index projections violated invariants.
+    InvalidPersistedState,
+    /// The durable schema identity or generation is unsupported.
+    SchemaMismatch,
+    /// The backend was unavailable before acknowledgement commit dispatch.
+    UnavailableBeforeCommit,
+}
+
+/// Result of one exact durable outbox acknowledgement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DurableOutboxAcknowledgementOutcome {
+    /// The cursor advanced, or the same lease/index was already acknowledged.
+    Acknowledged,
+    /// The store proves that the cursor did not advance for this attempt.
+    Rejected(DurableOutboxAcknowledgementRejection),
+    /// The store cannot prove whether the cursor advanced.
+    Indeterminate(IndeterminateCommitReason),
+}
+
 /// Versioned multi-key state interface for production node-core transactions.
 pub trait TransactionalStateStore: StateStore {
     /// Reads a value and its ABA-safe revision token.
@@ -844,6 +1185,34 @@ pub trait DurableDomainStateStore {
         context: &DurableOperationContext,
         transaction: AtomicStateTransaction,
     ) -> DurableCommitOutcome;
+}
+
+/// Bounded indexed repository for unattended production outbox recovery.
+///
+/// Implementations must select at most one eligible row in stable
+/// `(available_at, request_id)` order through a due-work index and atomically
+/// install the requested lease. Full state-key or table scans do not conform.
+/// A scheduler supplies no cursor, domain, time, fence, or deadline authority.
+///
+/// Retrying `claim_due_outbox` with the same lease ID is also reconciliation:
+/// while that lease still owns work, the repository returns the identical
+/// claim. Reusing the ID for different work is rejected. Acknowledgement is
+/// idempotent for the same `(request, index, lease)` so callers can reconcile
+/// an indeterminate acknowledgement without skipping a message.
+pub trait IndexedOutboxRepository: DurableDomainStateStore {
+    /// Claims at most one indexed due message under the operation authority.
+    fn claim_due_outbox(
+        &self,
+        context: &DurableOperationContext,
+        request: DueOutboxClaimRequest,
+    ) -> DurableOutboxClaimOutcome;
+
+    /// Advances exactly one cursor only for the matching durable lease.
+    fn acknowledge_outbox(
+        &self,
+        context: &DurableOperationContext,
+        acknowledgement: DurableOutboxAcknowledgement,
+    ) -> DurableOutboxAcknowledgementOutcome;
 }
 
 /// The result of a compare-and-swap state operation.
@@ -1902,6 +2271,80 @@ mod tests {
                 key: key("dependency"),
                 current_revision: StateRevision::new(4),
             })
+        );
+    }
+
+    #[test]
+    fn indexed_outbox_claim_contract_bounds_identity_payload_and_lease() {
+        assert_eq!(
+            OutboxRequestId::new([0; 32]),
+            Err(IndexedOutboxContractError::ZeroRequestId)
+        );
+        assert_eq!(
+            DurableOutboxLeaseId::new([0; 32]),
+            Err(IndexedOutboxContractError::ZeroLeaseId)
+        );
+        let request_id = OutboxRequestId::new([3; 32]).unwrap();
+        let lease_id = DurableOutboxLeaseId::new([4; 32]).unwrap();
+        assert_eq!(
+            DueOutboxClaimRequest::new(domain(1), 1_000, lease_id, 1_000),
+            Err(IndexedOutboxContractError::InvalidLeaseWindow)
+        );
+        assert_eq!(
+            DueOutboxClaimRequest::new(
+                domain(1),
+                1_000,
+                lease_id,
+                1_001 + MAX_DURABLE_OUTBOX_LEASE_MILLIS,
+            ),
+            Err(IndexedOutboxContractError::InvalidLeaseWindow)
+        );
+        let request = DueOutboxClaimRequest::new(domain(1), 1_000, lease_id, 2_000).unwrap();
+        assert_eq!(request.domain(), domain(1));
+        assert_eq!(request.now_unix_millis(), 1_000);
+        assert_eq!(request.lease_id(), lease_id);
+        assert_eq!(request.lease_expires_at_unix_millis(), 2_000);
+
+        assert_eq!(
+            DurableOutboxClaim::from_parts(request_id, 2, lease_id, 2_000, Vec::new()),
+            Err(IndexedOutboxContractError::EmptyPayload)
+        );
+        let claim =
+            DurableOutboxClaim::from_parts(request_id, 2, lease_id, 2_000, vec![8, 9]).unwrap();
+        assert_eq!(claim.request_id(), request_id);
+        assert_eq!(claim.message_index(), 2);
+        assert_eq!(claim.lease_id(), lease_id);
+        assert_eq!(claim.lease_expires_at_unix_millis(), 2_000);
+        assert_eq!(claim.canonical_payload(), &[8, 9]);
+
+        let acknowledgement = DurableOutboxAcknowledgement::new(domain(1), request_id, 2, lease_id);
+        assert_eq!(acknowledgement.domain(), domain(1));
+        assert_eq!(acknowledgement.request_id(), request_id);
+        assert_eq!(acknowledgement.message_index(), 2);
+        assert_eq!(acknowledgement.lease_id(), lease_id);
+    }
+
+    #[test]
+    fn indexed_outbox_outcomes_keep_claim_and_ack_ambiguity_explicit() {
+        assert_ne!(
+            DurableOutboxClaimOutcome::Rejected(
+                DurableOutboxClaimRejection::DeadlineExceededBeforeCommit
+            ),
+            DurableOutboxClaimOutcome::Indeterminate(IndeterminateCommitReason::DeadlineExceeded)
+        );
+        assert_ne!(
+            DurableOutboxAcknowledgementOutcome::Rejected(
+                DurableOutboxAcknowledgementRejection::LeaseMismatch
+            ),
+            DurableOutboxAcknowledgementOutcome::Acknowledged
+        );
+        assert_ne!(
+            DurableOutboxAcknowledgementOutcome::Rejected(
+                DurableOutboxAcknowledgementRejection::DeadlineExceededBeforeCommit
+            ),
+            DurableOutboxAcknowledgementOutcome::Indeterminate(
+                IndeterminateCommitReason::DeadlineExceeded
+            )
         );
     }
 

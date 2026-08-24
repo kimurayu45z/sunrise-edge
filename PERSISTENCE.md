@@ -162,7 +162,8 @@ operations. Names below describe responsibilities, not yet-stable SQL names.
 | `request_receipts` | domain, request ID | Event digest, terminal outcome, canonical response, commit sequence, and retention watermark. Unique request identity rejects conflicting reuse. |
 | `outbox_batches` | domain, request ID | Immutable batch identity and event digest committed with state and receipt. |
 | `outbox_messages` | domain, request ID, message index | Immutable ordered canonical payload and payload digest. |
-| `outbox_delivery` | domain, request ID | Next index, state, availability time, lease ID, lease deadline, attempt count, and last error class. A bounded pending/due index replaces prefix scans. |
+| `outbox_delivery` | domain, request ID | Next index, state, availability time, active lease ID/deadline, attempt count, and last error class. A bounded `(domain, availability, request)` pending/due index replaces prefix scans. |
+| `outbox_delivery_attempts` | domain, lease ID | Immutable request/message binding plus lease deadline and claimed/acknowledged status. The unique lease identity and retained acknowledgement status make delayed retry after an indeterminate commit idempotent even after later messages advance. |
 | `checkpoints` | domain, checkpoint sequence | State-root commitment, covered commit sequence, blob manifest commitment, schema generation, and verification status. |
 | `migration_jobs` | domain, migration ID, range | Resumable bounded backfill cursor, source/target schema generation, checksum, and terminal status. |
 
@@ -206,12 +207,28 @@ and only while the original read assertions remain valid; otherwise it returns
 conflict or indeterminate failure according to the conformance contract.
 
 Outbox recovery uses a dedicated operation such as `claim_due_outbox(domain,
-now, limit, lease_id)`. The claim query is bounded and ordered by availability
+now, lease_id)`. The claim query returns at most one row ordered by availability
 plus stable identity, and atomically installs a fencing lease. Transport occurs
 after commit; only a matching lease and message index may acknowledge it.
 Schedulers, alarms, queues, and retries are liveness hints and remain
 untrusted. At-least-once delivery is explicit, so consumers must deduplicate by
 the stable message identity.
+
+Runtime now exposes this as the additive `IndexedOutboxRepository` contract.
+One call claims at most one row in stable `(available_at, request_id)` order;
+the caller supplies trusted runtime time and a bounded restart-safe lease, not a
+scan cursor. Repeating a claim with the same lease ID reconciles an
+indeterminate claim and returns the identical work while that lease owns it;
+binding one lease ID to different work fails closed. Acknowledgement is
+idempotent for the same `(request, message index, lease)` and therefore requires
+the normalized store to retain one uniquely bound delivery-attempt record until
+the owning batch is eligible for retention deletion. Keeping only the last
+acknowledged lease is insufficient because a delayed retry may arrive after a
+later message advances. Claim and
+acknowledgement each distinguish definite pre-commit rejection from an
+indeterminate commit. An indeterminate claim is never transported until it is
+reconciled. The contract exists As-Is, but native recovery and durable adapters
+have not implemented it yet.
 
 `StateKeyScanner` remains useful for repair, audit, bounded migration, and
 compatibility recovery. It is not a production work queue.
