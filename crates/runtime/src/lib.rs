@@ -409,6 +409,77 @@ impl DueOutboxClaimRequest {
     }
 }
 
+/// One trusted-time claim for the next message of one exact committed request.
+///
+/// Request-path delivery uses this contract so an older due row in the same
+/// domain cannot be mistaken for the invocation that just committed. The
+/// request identity is copied from node-core's canonical `RequestId`; domain,
+/// time, lease, and deadline authority remain trusted composition inputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestOutboxClaimRequest {
+    domain: AtomicityDomainId,
+    request_id: OutboxRequestId,
+    now_unix_millis: u64,
+    lease_id: DurableOutboxLeaseId,
+    lease_expires_at_unix_millis: u64,
+}
+
+impl RequestOutboxClaimRequest {
+    /// Creates one bounded exact-request claim.
+    pub fn new(
+        domain: AtomicityDomainId,
+        request_id: OutboxRequestId,
+        now_unix_millis: u64,
+        lease_id: DurableOutboxLeaseId,
+        lease_expires_at_unix_millis: u64,
+    ) -> Result<Self, IndexedOutboxContractError> {
+        let duration = lease_expires_at_unix_millis
+            .checked_sub(now_unix_millis)
+            .filter(|duration| *duration > 0)
+            .ok_or(IndexedOutboxContractError::InvalidLeaseWindow)?;
+        if duration > MAX_DURABLE_OUTBOX_LEASE_MILLIS {
+            return Err(IndexedOutboxContractError::InvalidLeaseWindow);
+        }
+        Ok(Self {
+            domain,
+            request_id,
+            now_unix_millis,
+            lease_id,
+            lease_expires_at_unix_millis,
+        })
+    }
+
+    /// Returns the manifest-resolved invocation domain.
+    #[must_use]
+    pub const fn domain(self) -> AtomicityDomainId {
+        self.domain
+    }
+
+    /// Returns the exact committed request to claim.
+    #[must_use]
+    pub const fn request_id(self) -> OutboxRequestId {
+        self.request_id
+    }
+
+    /// Returns trusted claim time.
+    #[must_use]
+    pub const fn now_unix_millis(self) -> u64 {
+        self.now_unix_millis
+    }
+
+    /// Returns the restart-safe lease identity.
+    #[must_use]
+    pub const fn lease_id(self) -> DurableOutboxLeaseId {
+        self.lease_id
+    }
+
+    /// Returns the bounded lease expiry.
+    #[must_use]
+    pub const fn lease_expires_at_unix_millis(self) -> u64 {
+        self.lease_expires_at_unix_millis
+    }
+}
+
 /// One canonical outbound payload leased from the indexed durable repository.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DurableOutboxClaim {
@@ -1662,6 +1733,13 @@ pub trait StructuredDurableDomainStateStore: DurableDomainStateStore {
 /// idempotent for the same `(request, index, lease)` so callers can reconcile
 /// an indeterminate acknowledgement without skipping a message.
 pub trait IndexedOutboxRepository: StructuredDurableDomainStateStore {
+    /// Claims the next due message for one exact committed request.
+    fn claim_request_outbox(
+        &self,
+        context: &DurableOperationContext,
+        request: RequestOutboxClaimRequest,
+    ) -> DurableOutboxClaimOutcome;
+
     /// Claims at most one indexed due message under the operation authority.
     fn claim_due_outbox(
         &self,
@@ -2479,6 +2557,149 @@ fn memory_outbox_claim_from_attempt(
 }
 
 impl IndexedOutboxRepository for MemoryDurableStateStore {
+    fn claim_request_outbox(
+        &self,
+        context: &DurableOperationContext,
+        request: RequestOutboxClaimRequest,
+    ) -> DurableOutboxClaimOutcome {
+        let mut data = self
+            .inner
+            .write()
+            .expect("durable state store lock poisoned");
+        if let Err(reason) = validate_memory_outbox_claim_authority(&data, context) {
+            return DurableOutboxClaimOutcome::Rejected(reason);
+        }
+
+        let lease_key = *request.lease_id().as_bytes();
+        if let Some(attempt) = data.delivery_attempts.get(&lease_key).cloned() {
+            if attempt.domain != request.domain() || attempt.request_id != request.request_id() {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::LeaseIdReuse,
+                );
+            }
+            if attempt.status != MemoryOutboxAttemptStatus::Claimed {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::LeaseIdReuse,
+                );
+            }
+            let claim = match memory_outbox_claim_from_attempt(&data, request.lease_id(), &attempt)
+            {
+                Ok(claim) => claim,
+                Err(reason) => return DurableOutboxClaimOutcome::Rejected(reason),
+            };
+            if attempt.lease_expires_at_unix_millis <= request.now_unix_millis() {
+                if let Some(attempt) = data.delivery_attempts.get_mut(&lease_key) {
+                    attempt.status = MemoryOutboxAttemptStatus::Expired;
+                }
+                let request_key = (*attempt.domain.as_bytes(), *attempt.request_id.as_bytes());
+                if let Some(delivery) = data.deliveries.get_mut(&request_key) {
+                    delivery.active_lease = None;
+                    delivery.available_at_unix_millis = 0;
+                }
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::LeaseIdReuse,
+                );
+            }
+            return DurableOutboxClaimOutcome::Claimed(claim);
+        }
+
+        let request_key = (
+            *request.domain().as_bytes(),
+            *request.request_id().as_bytes(),
+        );
+        let Some(mut delivery) = data.deliveries.get(&request_key).cloned() else {
+            return DurableOutboxClaimOutcome::NoDueWork;
+        };
+        if delivery.completed
+            || delivery.available_at_unix_millis > request.now_unix_millis()
+            || delivery
+                .active_lease
+                .is_some_and(|(_, expires_at)| expires_at > request.now_unix_millis())
+        {
+            return DurableOutboxClaimOutcome::NoDueWork;
+        }
+        let batch = match data.outboxes.get(&request_key) {
+            Some(batch) => batch,
+            None => {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::InvalidPersistedState,
+                );
+            }
+        };
+        let index = match usize::try_from(delivery.next_index) {
+            Ok(index) => index,
+            Err(_) => {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::ArithmeticOverflow,
+                );
+            }
+        };
+        let message = match batch.messages().get(index) {
+            Some(message) => message,
+            None => {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::InvalidPersistedState,
+                );
+            }
+        };
+        let claim = match DurableOutboxClaim::from_parts(
+            request.request_id(),
+            delivery.next_index,
+            request.lease_id(),
+            request.lease_expires_at_unix_millis(),
+            message.canonical_payload().to_vec(),
+        ) {
+            Ok(claim) => claim,
+            Err(_) => {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::InvalidPersistedState,
+                );
+            }
+        };
+        let attempt_count = match delivery.attempt_count.checked_add(1) {
+            Some(attempt_count) => attempt_count,
+            None => {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::ArithmeticOverflow,
+                );
+            }
+        };
+        if let Some((expired_lease, expires_at)) = delivery.active_lease {
+            let expired_key = *expired_lease.as_bytes();
+            let Some(expired_attempt) = data.delivery_attempts.get_mut(&expired_key) else {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::InvalidPersistedState,
+                );
+            };
+            if expires_at > request.now_unix_millis()
+                || expired_attempt.status != MemoryOutboxAttemptStatus::Claimed
+                || expired_attempt.request_id != request.request_id()
+                || expired_attempt.message_index != delivery.next_index
+            {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::InvalidPersistedState,
+                );
+            }
+            expired_attempt.status = MemoryOutboxAttemptStatus::Expired;
+        }
+
+        delivery.active_lease = Some((request.lease_id(), request.lease_expires_at_unix_millis()));
+        delivery.available_at_unix_millis = request.lease_expires_at_unix_millis();
+        delivery.attempt_count = attempt_count;
+        data.deliveries.insert(request_key, delivery);
+        data.delivery_attempts.insert(
+            lease_key,
+            MemoryOutboxDeliveryAttempt {
+                domain: request.domain(),
+                request_id: request.request_id(),
+                message_index: claim.message_index(),
+                lease_expires_at_unix_millis: request.lease_expires_at_unix_millis(),
+                status: MemoryOutboxAttemptStatus::Claimed,
+            },
+        );
+        DurableOutboxClaimOutcome::Claimed(claim)
+    }
+
     fn claim_due_outbox(
         &self,
         context: &DurableOperationContext,
@@ -3472,6 +3693,13 @@ mod tests {
         assert_eq!(request.now_unix_millis(), 1_000);
         assert_eq!(request.lease_id(), lease_id);
         assert_eq!(request.lease_expires_at_unix_millis(), 2_000);
+        let exact =
+            RequestOutboxClaimRequest::new(domain(1), request_id, 1_000, lease_id, 2_000).unwrap();
+        assert_eq!(exact.domain(), domain(1));
+        assert_eq!(exact.request_id(), request_id);
+        assert_eq!(exact.now_unix_millis(), 1_000);
+        assert_eq!(exact.lease_id(), lease_id);
+        assert_eq!(exact.lease_expires_at_unix_millis(), 2_000);
 
         assert_eq!(
             DurableOutboxClaim::from_parts(request_id, 2, lease_id, 2_000, Vec::new()),
@@ -3815,6 +4043,58 @@ mod tests {
             panic!("expected the next ordered outbox");
         };
         assert_eq!(next.request_id(), OutboxRequestId::new([0xB2; 32]).unwrap());
+    }
+
+    #[test]
+    fn memory_exact_request_claim_does_not_take_an_older_domain_row() {
+        let store = MemoryDurableStateStore::new(WriterFenceGeneration::new(3).unwrap());
+        let context = durable_context(3, 1_000, 7);
+        let selected_domain = domain(9);
+        for request_byte in [0xA3, 0xB3] {
+            assert_eq!(
+                store.commit_invocation(
+                    &context,
+                    durable_outbox_invocation(selected_domain, request_byte, &[request_byte]),
+                ),
+                DurableCommitOutcome::Committed
+            );
+        }
+
+        let exact_request_id = OutboxRequestId::new([0xB3; 32]).unwrap();
+        let exact_lease = DurableOutboxLeaseId::new([0x51; 32]).unwrap();
+        let exact_request =
+            RequestOutboxClaimRequest::new(selected_domain, exact_request_id, 0, exact_lease, 10)
+                .unwrap();
+        let exact = store.claim_request_outbox(&context, exact_request);
+        let DurableOutboxClaimOutcome::Claimed(exact) = exact else {
+            panic!("expected exact request claim");
+        };
+        assert_eq!(exact.request_id(), exact_request_id);
+        assert_eq!(exact.canonical_payload(), &[0xB3]);
+        assert_eq!(
+            store.claim_request_outbox(
+                &context,
+                RequestOutboxClaimRequest::new(
+                    selected_domain,
+                    OutboxRequestId::new([0xA3; 32]).unwrap(),
+                    0,
+                    exact_lease,
+                    10,
+                )
+                .unwrap(),
+            ),
+            DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::LeaseIdReuse)
+        );
+
+        let due_lease = DurableOutboxLeaseId::new([0x52; 32]).unwrap();
+        let due = store.claim_due_outbox(
+            &context,
+            DueOutboxClaimRequest::new(selected_domain, 0, due_lease, 10).unwrap(),
+        );
+        let DurableOutboxClaimOutcome::Claimed(due) = due else {
+            panic!("expected remaining due claim");
+        };
+        assert_eq!(due.request_id(), OutboxRequestId::new([0xA3; 32]).unwrap());
     }
 
     #[test]

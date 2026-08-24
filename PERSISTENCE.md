@@ -258,6 +258,13 @@ indexed repository contract as ephemeral conformance: initial delivery rows,
 stable due ordering, lease expiry/replacement, same-lease claim replay, retained
 attempt history, and delayed acknowledgement after later progress are covered.
 
+Request-path delivery uses a separate exact-request claim with trusted
+`(domain, request_id, now, lease_id, lease_expiry)` input. It targets only that
+request's delivery row and returns no work when the row is completed, not due,
+or actively leased. It never falls through to an older due row in the same
+domain. Lease reconciliation and acknowledgement share the retained attempt
+history used by unattended claiming.
+
 `StateKeyScanner` remains useful for repair, audit, bounded migration, and
 compatibility recovery. It is not a production work queue.
 

@@ -1948,6 +1948,10 @@ Phase 15 As-Is scope:
   read-only assertionを含むstate/receipt/outboxをこのenvelopeへ構築する。definite commitまたはexact replay以外では
   outputを返さない。single-lock memory conformance storeでatomic publication、conflict、read-only、fence、deadline、
   node-core commit/replayを検証する（runtime/node-core/memory implemented As-Is; native/durable store wiring pending）。
+- request pathのcommit直後deliveryはdomain-wide `claim_due_outbox`を流用しない。同じdomainのolder due workを
+  今回requestと誤認しないよう、trusted `(domain, request_id, now, lease, expiry)`を持つexact-request claimを使う。
+  memory conformanceはolder due rowが存在しても指定requestだけをclaimし、cross-request/domain lease reuseを拒否する
+  （contract/memory implemented As-Is; native/durable adapter wiring pending）。
 - indexed production outbox boundaryはtrusted runtime timeとbounded restart-safe leaseを受け、
   `(available_at, request_id)`のstable index順で最大1件だけclaimする。scheduler cursorやprefix scanを
   authorityにせず、同じlease IDの再claimはindeterminate claimのreconciliationとして同じworkを返し、

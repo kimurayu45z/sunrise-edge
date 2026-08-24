@@ -1094,3 +1094,9 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   active same-lease claim, expire replaced attempts, and retain every lease
   binding so a delayed acknowledgement remains idempotent after later messages
   advance. Reject cross-domain lease reuse and keep this evidence non-durable.
+- DR-0056: Give request-path outbox delivery an exact-request claim operation
+  instead of reusing domain-wide unattended claiming. Bind trusted domain and
+  canonical request identity to the lease request, return no work rather than
+  selecting another due row, and reject lease reuse across requests or domains.
+  Share retained attempt history and acknowledgement semantics with indexed
+  recovery so native composition has one delivery model.

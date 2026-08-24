@@ -1549,8 +1549,9 @@ mod tests {
         DurableCommitRejection, DurableDomainStateStore, DurableInvocationTransaction,
         DurableOutboxClaim, DurableReadError, DurableRequestId, DurableRequestReceipt,
         IndexedOutboxRepository, ManualClock, MemoryBlobStore, MemoryRuntime, MemoryScheduler,
-        MemorySigner, MemoryStateStore, MemoryTransport, OutboxRequestId, RuntimeError, StateStore,
-        StructuredDurableDomainStateStore, TransactionalStateStore, VersionedStateValue,
+        MemorySigner, MemoryStateStore, MemoryTransport, OutboxRequestId,
+        RequestOutboxClaimRequest, RuntimeError, StateStore, StructuredDurableDomainStateStore,
+        TransactionalStateStore, VersionedStateValue,
     };
     use runtime_sqlite::SqliteStateStore;
     use std::{
@@ -1886,6 +1887,18 @@ mod tests {
     }
 
     impl IndexedOutboxRepository for ScriptedIndexedStore {
+        fn claim_request_outbox(
+            &self,
+            _context: &DurableOperationContext,
+            _request: RequestOutboxClaimRequest,
+        ) -> DurableOutboxClaimOutcome {
+            self.claims
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(DurableOutboxClaimOutcome::NoDueWork)
+        }
+
         fn claim_due_outbox(
             &self,
             _context: &DurableOperationContext,
