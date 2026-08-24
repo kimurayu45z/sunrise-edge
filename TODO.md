@@ -1956,7 +1956,7 @@ Phase 17 prerequisites:
 - provider-specific lower request capacity policy (implemented As-Is)
 - shared authenticated HTTPS node-core capability (implemented As-Is)
 - Deno adapter wrapper (implemented As-Is)
-- Vercel adapter wrapper (pending)
+- Vercel adapter wrapper (implemented As-Is)
 - Supabase Edge adapter wrapper (pending)
 - AWS adapter wrapper and API Gateway mapping (pending)
 
@@ -1973,8 +1973,8 @@ Phase 17 shared ingress As-Is scope:
 - private service bindingを持たないWeb provider向けの暫定transportはexact HTTPS endpoint、
   allow-listed header、bounded ASCII Bearer secret、redirect拒否、1..30000ms timeoutを一実装にする。
   environment lookupとprovider credential lifecycleはこのmoduleへ入れない。
-- 現在のconformance consumerはCloudflare workerdとlocal Deno runtimeであり、他provider runtimeの
-  実装・検証とreal provider deploymentはまだ完了していない。
+- 現在のconformance consumerはCloudflare workerd、local Deno runtime、local Vercel wrapper testであり、
+  他provider runtimeの実装・検証とreal provider deploymentはまだ完了していない。
 
 Phase 17 Deno As-Is scope:
 
@@ -1987,6 +1987,18 @@ Phase 17 Deno As-Is scope:
 - 現実装はpublic HTTPS endpointへのBearer-authenticated relayであり、private connectivity、mTLSまたは
   signed service request、rotation/revocation、durable deduplication/outbox、real Deno Deploy rehearsalを
   production完成とみなさずTo-Beに残す。
+
+Phase 17 Vercel As-Is scope:
+
+- current Vercel Node.js FunctionのWeb fetch exportを使用し、canonical 2 pathを単一handlerへrewriteする。
+- documented 4.5 MB Function payload ceilingより小さい4 MiB request budgetをshared lower-bound policyへ
+  渡し、declared/streamed oversizeをnode-core forwarding前に413とする。
+- Sensitive Environment VariableのBearer capability、exact HTTPS endpoint、redirect拒否、bounded timeoutは
+  shared authenticated transportを再利用し、provider固有のcanonical decodeやstatus mappingを作らない。
+- 現実装はpermission-free local wrapper testまでで、Vercel preview/production deployment、rewrite後の
+  original path保持、platform 413/504、response 4.5 MB ceiling、Fluid Compute lifecycleは未検証である。
+- 4 MiBはprotocol transport上限より小さいためfull conformanceではない。全valid eventを受理できる
+  ingress architecture、private/mutual authentication、rotation、durable outbox等をTo-Beに残す。
 
 Phase 17 To-Be production exit criteria:
 

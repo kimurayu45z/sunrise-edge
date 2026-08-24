@@ -457,6 +457,27 @@ mTLS or signed service capability, rotation and revocation, durable
 deduplication and outbox delivery, provider policy and limits, real deployment
 tests, observability, incident response, and rollback rehearsal.
 
+## 35. Vercel Web ingress adapter
+
+The Vercel Phase 17 adapter is a Node.js Function with the Web `fetch` export.
+Two same-application rewrites expose the canonical event and liveness paths to
+one handler, which delegates request semantics to the portable ingress core and
+uses the shared authenticated node-core capability. The function has a
+ten-second maximum duration and a bounded downstream deadline.
+
+Vercel's documented 4.5 MB Function request/response payload ceiling is below
+the shared protocol transport bound. The As-Is adapter therefore declares a
+conservative 4 MiB request policy and fails earlier with 413 when the request is
+visible to the handler. This is not full protocol conformance: platform-level
+rejection can precede the function, and protocol-valid events above the
+provider ceiling cannot use this route.
+
+The adapter has local, permission-free conformance tests but no claimed Vercel
+deployment validation. Preview/production rewrite behavior, platform error
+mapping, response limits, lifecycle reuse, private transport, key lifecycle,
+durable effects, abuse controls, telemetry, and release rehearsal remain Phase
+17 production requirements.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -503,3 +524,7 @@ tests, observability, incident response, and rollback rehearsal.
   capability across Web providers without moving environment lookup or secret
   lifecycle into the shared layer. Keep private or mutually authenticated
   transport as a production exit requirement.
+- DR-0022: Model Vercel's smaller payload ceiling as an explicit 4 MiB adapter
+  request budget rather than pretending it accepts the full protocol envelope.
+  Reuse shared Web semantics and authenticated transport, and keep real Vercel
+  deployment behavior as an unfulfilled production gate.

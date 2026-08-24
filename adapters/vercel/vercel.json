@@ -1,0 +1,19 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "functions": {
+    "api/ingress.ts": {
+      "maxDuration": 10
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/v1/events",
+      "destination": "/api/ingress"
+    },
+    {
+      "source": "/health/live",
+      "destination": "/api/ingress"
+    }
+  ]
+}
