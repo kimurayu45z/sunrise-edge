@@ -1887,8 +1887,13 @@ Phase 15 As-Is scope:
   StateStore point-readと分離したStateKeyScannerを実装し、non-empty binary prefix、prefix内exclusive
   cursor、1,024以下のnon-zero limit、canonical order、1-row lookahead continuation、tombstone visibilityを
   強制する（implemented As-Is）。page間snapshotではないため各sweepをprefix先頭から再開する必要がある。
-  blocking local-disk storeでありproduction runtime compositionは未実装である。network filesystem、
+  blocking local-disk storeでありproduction-grade componentsを使うdeployment compositionは未実装である。network filesystem、
   kill -9/power-loss、backup/restore、capacity検証なしにprovider production persistence完成とはみなさない。
+- ComposedRuntimeはStateStore、BlobStore、Signer、Transport、Clock、Schedulerをhidden defaultなしで
+  明示的に所有・合成する。SQLiteへstate/dedup/outboxをcommit後にruntimeをdropし、同じDBを別compositionで
+  reopenしてstateを再適用せずoutboxを送ること、send failure leaseがreopen後もexpiry前は抑止されexpiry時だけ
+  attempts=2で再送されることを検証する（implemented As-Is）。これはorderly close/reopen conformanceであり、
+  kill -9、torn write、filesystem failure、power lossの証明ではない。
 - node-coreのtransactional pathはcontext検証後かつstate read前にevent-specific access planを
   確定し、全keyをrevision付きsnapshotとしてpure transitionへ渡す。undeclared/read-only updateを
   rejectし、観測revisionをnode-core自身がwrite-setへbindし、全commit成功までoutputを返さない。

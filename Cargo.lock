@@ -507,6 +507,7 @@ dependencies = [
  "node-core",
  "protocol-types",
  "runtime",
+ "runtime-sqlite",
  "tokio",
  "tower",
 ]

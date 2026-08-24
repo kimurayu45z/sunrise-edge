@@ -329,6 +329,13 @@ fault recovery. Native HTTP now places synchronous work behind bounded blocking
 admission, but production runtime composition, storage-aware deadlines,
 cancellation, and capacity evidence remain open.
 
+`ComposedRuntime` owns explicitly supplied state, blob, signer, transport,
+clock, and scheduler components and implements the same runtime trait without
+selecting defaults. It allows a native embedding to pair `SqliteStateStore`
+with independently chosen operational adapters while keeping every trust and
+durability decision visible. Composition is wiring, not certification: memory
+transport, signer, clock, and scheduler components remain test adapters.
+
 Recovery and maintenance adapters may additionally require bounded discovery
 of persisted keys. `StateKeyScanner` is deliberately separate from the
 point-read `StateStore` contract. A validated request fixes a non-empty binary
@@ -490,6 +497,14 @@ malformed record or transport failure instead of inventing a poison-message
 policy. Real provider triggers, authenticated control-plane input, durable
 SQLite reopen/process/power fault conformance, retention, scheduling backoff,
 and operational observability remain open.
+
+Native conformance now commits application state, deduplication, and an outbox
+to SQLite, drops that runtime composition, reopens the same database in a new
+composition, and recovers the outbox without rerunning the transition. A second
+case persists send-failure lease state, proves a reopened runtime skips it
+before expiry, and redelivers at expiry with the attempt counter retained.
+These are orderly connection close/reopen tests. They are evidence for durable
+state continuity, not kill -9, torn-write, filesystem, or power-loss safety.
 
 The default native route now requires a `TransactionalNodeStateMachine`, a hash
 suite resolver, a transactional store, and an injected outbox lease-ID source.
@@ -803,3 +818,8 @@ license/SBOM policy, and protected review/merge controls.
   records, recover at most one outbox, and return an exclusive continuation.
   Keep the scheduler untrusted and preserve lease-expiry redelivery after
   send-without-ack failure.
+- DR-0038: Compose native runtimes from explicit independently typed components
+  rather than embedding storage or transport defaults. Verify SQLite outbox and
+  lease continuity across orderly close/reopen into a new composition, while
+  reserving abrupt process/power-fault, filesystem, and real-provider claims
+  for separate conformance evidence.

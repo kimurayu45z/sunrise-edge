@@ -938,15 +938,58 @@ mod tests {
         ChainId, Epoch, HashSuite, HashSuiteSchedule, ProtocolVersion, ValidatorId,
     };
     use runtime::{
-        ManualClock, MemoryBlobStore, MemoryRuntime, MemoryScheduler, MemorySigner,
-        MemoryStateStore, RuntimeError, StateStore, TransactionalStateStore,
+        ComposedRuntime, ManualClock, MemoryBlobStore, MemoryRuntime, MemoryScheduler,
+        MemorySigner, MemoryStateStore, MemoryTransport, RuntimeError, StateStore,
+        TransactionalStateStore,
     };
-    use std::sync::{Condvar, Mutex};
+    use runtime_sqlite::SqliteStateStore;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{
+            Condvar, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{SystemTime, UNIX_EPOCH},
+    };
     use tokio::sync::Notify;
     use tower::ServiceExt;
 
     const TEST_STATE_TYPE_ID: u16 = 0xEF11;
     const TEST_PAYLOAD_TYPE_ID: u16 = 0xEF12;
+    static NEXT_DATABASE_PATH: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDatabase {
+        path: PathBuf,
+    }
+
+    impl TestDatabase {
+        fn new() -> Self {
+            let nonce = NEXT_DATABASE_PATH.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "sunrise-edge-native-recovery-{}-{nanos}-{nonce}.db",
+                std::process::id()
+            ));
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut path = self.path.as_os_str().to_owned();
+                path.push(suffix);
+                let path = PathBuf::from(path);
+                if path.exists() {
+                    fs::remove_file(path).unwrap();
+                }
+            }
+        }
+    }
 
     fn canonical(type_id: u16, value: u64) -> Vec<u8> {
         let mut frame = CanonicalStruct::new(type_id, 1);
@@ -982,6 +1025,28 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    fn sqlite_runtime<T>(
+        path: &std::path::Path,
+        transport: T,
+        now_unix_millis: u64,
+    ) -> ComposedRuntime<
+        SqliteStateStore,
+        MemoryBlobStore,
+        MemorySigner,
+        T,
+        ManualClock,
+        MemoryScheduler,
+    > {
+        ComposedRuntime::new(
+            SqliteStateStore::open(path).unwrap(),
+            MemoryBlobStore::default(),
+            MemorySigner::new(ValidatorId::new([0x44; 32])),
+            transport,
+            ManualClock::new(now_unix_millis),
+            MemoryScheduler::default(),
+        )
     }
 
     fn event(request_id: RequestId) -> NodeEvent {
@@ -1641,6 +1706,182 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(NativeOutboxRecoveryError::Node(_))));
+    }
+
+    #[tokio::test]
+    async fn sqlite_outbox_is_recovered_after_runtime_reopen_without_reapplying_state() {
+        let database = TestDatabase::new();
+        let config = config();
+        let id = request_id(0x81);
+        {
+            let first_runtime = Arc::new(sqlite_runtime(
+                &database.path,
+                MemoryTransport::default(),
+                1_000,
+            ));
+            handle_idempotent_event(
+                first_runtime.as_ref(),
+                &config,
+                &resolver(),
+                event(id),
+                &IncrementMachine::new(config.state_key()),
+            )
+            .unwrap();
+            assert!(
+                first_runtime
+                    .transport()
+                    .drain_outbound()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        let reopened = Arc::new(sqlite_runtime(
+            &database.path,
+            MemoryTransport::default(),
+            1_000,
+        ));
+        let recovered = recover_outboxes_once(
+            Arc::clone(&reopened),
+            config.clone(),
+            Arc::new(SequenceLeaseIds::default()),
+            NativeBlockingExecutor::new(NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap())),
+            None,
+            NonZeroUsize::new(4).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered.outcome(),
+            &NativeOutboxRecoveryOutcome::Recovered(id)
+        );
+        assert_eq!(reopened.transport().drain_outbound().unwrap().len(), 1);
+        let state = reopened
+            .state_store()
+            .get(config.state_key())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_canonical_frame(&state)
+                .unwrap()
+                .required_u64(1)
+                .unwrap(),
+            1
+        );
+        drop(reopened);
+
+        let completed = Arc::new(sqlite_runtime(
+            &database.path,
+            MemoryTransport::default(),
+            1_000,
+        ));
+        let sweep = recover_outboxes_once(
+            Arc::clone(&completed),
+            config,
+            Arc::new(SequenceLeaseIds::default()),
+            NativeBlockingExecutor::new(NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap())),
+            None,
+            NonZeroUsize::new(4).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sweep.outcome(),
+            &NativeOutboxRecoveryOutcome::NoEligibleOutbox
+        );
+        assert!(completed.transport().drain_outbound().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_send_failure_lease_survives_reopen_and_redelivers_only_after_expiry() {
+        let database = TestDatabase::new();
+        let config = config();
+        let id = request_id(0x82);
+        {
+            let failing = Arc::new(sqlite_runtime(
+                &database.path,
+                FailOnceTransport::new(),
+                1_000,
+            ));
+            handle_idempotent_event(
+                failing.as_ref(),
+                &config,
+                &resolver(),
+                event(id),
+                &IncrementMachine::new(config.state_key()),
+            )
+            .unwrap();
+            let failed = recover_outboxes_once(
+                Arc::clone(&failing),
+                config.clone(),
+                Arc::new(SequenceLeaseIds::default()),
+                NativeBlockingExecutor::new(NativeBlockingPolicy::new(
+                    NonZeroUsize::new(1).unwrap(),
+                )),
+                None,
+                NonZeroUsize::new(4).unwrap(),
+            )
+            .await;
+            assert!(matches!(failed, Err(NativeOutboxRecoveryError::Send)));
+        }
+
+        let before_expiry = Arc::new(sqlite_runtime(
+            &database.path,
+            MemoryTransport::default(),
+            30_999,
+        ));
+        let skipped = recover_outboxes_once(
+            Arc::clone(&before_expiry),
+            config.clone(),
+            Arc::new(SequenceLeaseIds::default()),
+            NativeBlockingExecutor::new(NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap())),
+            None,
+            NonZeroUsize::new(4).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            skipped.outcome(),
+            &NativeOutboxRecoveryOutcome::NoEligibleOutbox
+        );
+        assert!(
+            before_expiry
+                .transport()
+                .drain_outbound()
+                .unwrap()
+                .is_empty()
+        );
+        drop(before_expiry);
+
+        let expired = Arc::new(sqlite_runtime(
+            &database.path,
+            MemoryTransport::default(),
+            31_000,
+        ));
+        let recovered = recover_outboxes_once(
+            Arc::clone(&expired),
+            config.clone(),
+            Arc::new(SequenceLeaseIds::default()),
+            NativeBlockingExecutor::new(NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap())),
+            None,
+            NonZeroUsize::new(4).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered.outcome(),
+            &NativeOutboxRecoveryOutcome::Recovered(id)
+        );
+        assert_eq!(expired.transport().drain_outbound().unwrap().len(), 1);
+        let layout = PersistenceLayout::new(config.chain_id().clone(), config.protocol_version());
+        let delivery = expired
+            .state_store()
+            .get(&layout.outbox_delivery_key(*id.as_bytes()))
+            .unwrap()
+            .unwrap();
+        let delivery = NodeOutboxDelivery::decode(&delivery).unwrap();
+        assert_eq!(delivery.attempts(), 2);
+        assert_eq!(delivery.lease(), None);
     }
 
     #[tokio::test]
