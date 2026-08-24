@@ -1961,6 +1961,7 @@ Phase 17 prerequisites:
 - AWS adapter wrapper and API Gateway HTTP API v2 mapping (implemented As-Is)
 - cross-provider local ingress fixture matrix (implemented As-Is)
 - repository-wide pinned local/CI validation gate (implemented As-Is)
+- reviewed weekly dependency/action update proposals (implemented As-Is)
 
 Phase 17 shared ingress As-Is scope:
 
@@ -1981,7 +1982,9 @@ Phase 17 shared ingress As-Is scope:
   5 provider consumerで実行する。これはlocal drift検出であり実gateway/runtime conformanceではない。
 - Rust 1.97.1、Node 22.20.0、Deno 2.9.4を固定したcheck script/CIがRust全featureと全adapterを
   一括実行する。CI actionもverified upstream tagのcommit SHAへ固定するが、provenance、SBOM、
-  reproducibility、real provider test、定期的なpin更新手順は未完了である。
+  reproducibility、real provider testは未完了である。
+- DependabotはCargo、Cloudflare npm、GitHub Actionsを週次確認し上限付きPRを作るがauto-mergeしない。
+  changelog/互換性/repository gateを人がreviewする運用の強制、provenance検証、緊急更新SLAは未完了である。
 
 Phase 17 Deno As-Is scope:
 

@@ -170,6 +170,11 @@ Cloudflare type/lint/workerd tests, Deno/Vercel/Supabase/AWS adapter checks, and
 script before handoff. Do not omit provider checks because a change appears to
 touch only the shared Web layer.
 
+Dependabot proposes weekly Cargo, Cloudflare npm, and GitHub Actions updates.
+Never auto-merge those PRs. Review changelogs and compatibility impact, retain
+immutable workflow-action SHAs, and require the complete repository gate before
+accepting an update.
+
 Do not claim success if any required command was skipped or failed. Explain any
 environmental limitation precisely.
 
