@@ -739,6 +739,18 @@ impl PersistenceLayout {
         self.prefixed(&format!("effects/{digest_hex}"))
     }
 
+    /// Returns the persisted idempotency record key for one request.
+    #[must_use]
+    pub fn request_dedup_key(&self, request_id: [u8; 32]) -> Vec<u8> {
+        self.prefixed(&format!("requests/{}/dedup", hex32(request_id)))
+    }
+
+    /// Returns the persisted outbound batch key for one request.
+    #[must_use]
+    pub fn outbox_batch_key(&self, request_id: [u8; 32]) -> Vec<u8> {
+        self.prefixed(&format!("outbox/{}/batch", hex32(request_id)))
+    }
+
     /// Returns the system-module registry key.
     #[must_use]
     pub fn system_module_registry_key(&self) -> Vec<u8> {
@@ -1089,6 +1101,14 @@ mod tests {
         assert_ne!(
             layout.consensus_state_key(Epoch::new(7)),
             layout.consensus_state_key(Epoch::new(8))
+        );
+        assert_ne!(
+            layout.request_dedup_key([0xCC; 32]),
+            layout.outbox_batch_key([0xCC; 32])
+        );
+        assert_ne!(
+            layout.request_dedup_key([0xCC; 32]),
+            layout.request_dedup_key([0xCD; 32])
         );
         assert!(
             String::from_utf8(migration_key)

@@ -552,6 +552,9 @@ mod tests {
     fn hash_domain_vector_is_stable() {
         let bytes = encode_hash_domain(HashDomain::Transaction).unwrap();
         assert_eq!(hex(&bytes), "534e52450201010001000100020000000100");
+
+        let node_event = encode_hash_domain(HashDomain::NodeEvent).unwrap();
+        assert_eq!(hex(&node_event), "534e52450201010001000100020000000d00");
     }
 
     #[test]

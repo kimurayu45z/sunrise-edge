@@ -219,6 +219,8 @@ pub enum HashDomain {
     StateNode = 0x000B,
     /// Shared-object consensus messages.
     ConsensusMessage = 0x000C,
+    /// Canonical node ingress events used for persisted idempotency.
+    NodeEvent = 0x000D,
 }
 
 impl HashDomain {
@@ -246,6 +248,7 @@ impl TryFrom<u16> for HashDomain {
             0x000A => Ok(Self::Migration),
             0x000B => Ok(Self::StateNode),
             0x000C => Ok(Self::ConsensusMessage),
+            0x000D => Ok(Self::NodeEvent),
             other => Err(TypeError::UnknownHashDomain(other)),
         }
     }
@@ -307,6 +310,8 @@ pub enum HashPurpose {
     ValidatorSet,
     /// Shared-object consensus proposal hashing.
     ConsensusMessage,
+    /// Node ingress event hashing for persisted idempotency.
+    NodeEvent,
 }
 
 impl HashPurpose {
@@ -322,6 +327,7 @@ impl HashPurpose {
             Self::Certificate => HashDomain::Certificate,
             Self::ValidatorSet => HashDomain::ValidatorSet,
             Self::ConsensusMessage => HashDomain::ConsensusMessage,
+            Self::NodeEvent => HashDomain::NodeEvent,
         }
     }
 }
@@ -378,6 +384,7 @@ impl HashSuite {
             HashPurpose::Certificate => self.certificate_hash,
             HashPurpose::ValidatorSet => self.certificate_hash,
             HashPurpose::ConsensusMessage => self.certificate_hash,
+            HashPurpose::NodeEvent => self.certificate_hash,
         }
     }
 }
