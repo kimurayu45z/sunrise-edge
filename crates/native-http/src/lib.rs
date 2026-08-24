@@ -27,10 +27,20 @@ use node_core::{
 };
 use protocol_config::DomainPlacementManifest;
 use runtime::{
-    AtomicityDomainId, Clock, DomainTransactionalStateStore, PersistenceLayout, Runtime,
-    RuntimeError, StateKeyScan, StateKeyScanner, TransactionalStateStore, Transport,
+    AtomicityDomainId, Clock, DomainTransactionalStateStore, DueOutboxClaimRequest,
+    DurableOperationContext, DurableOutboxAcknowledgement, DurableOutboxAcknowledgementOutcome,
+    DurableOutboxAcknowledgementRejection, DurableOutboxClaimOutcome, DurableOutboxClaimRejection,
+    DurableOutboxLeaseId, IndeterminateCommitReason, IndexedOutboxContractError,
+    IndexedOutboxRepository, MAX_DURABLE_OUTBOX_LEASE_MILLIS, PersistenceLayout, Runtime,
+    RuntimeError, StateKeyScan, StateKeyScanner, StorageCorrelationId, StorageDeadline,
+    TransactionalStateStore, Transport, WriterFenceGeneration,
 };
-use std::{error::Error, future::Future, num::NonZeroUsize, sync::Arc};
+use std::{
+    error::Error,
+    future::Future,
+    num::{NonZeroU64, NonZeroUsize},
+    sync::Arc,
+};
 use tokio::sync::{Semaphore, TryAcquireError};
 
 const HTTP_RESULT_TYPE_ID: u16 = 0xE101;
@@ -48,6 +58,8 @@ pub const LIVENESS_PATH: &str = "/health/live";
 pub const MAX_HTTP_EVENT_BODY_BYTES: usize = MAX_NODE_PAYLOAD_BYTES + 512;
 /// Bounded native delivery lease; expired work is deliberately redelivered.
 pub const NATIVE_OUTBOX_LEASE_MILLIS: u64 = 30_000;
+/// Maximum storage-operation budget accepted by indexed native recovery.
+pub const MAX_INDEXED_OUTBOX_OPERATION_MILLIS: u64 = 30_000;
 
 /// Admission policy for synchronous node and runtime work.
 ///
@@ -77,8 +89,8 @@ impl NativeBlockingPolicy {
 
 /// Shared admission pool for native HTTP and scheduler-triggered recovery.
 ///
-/// Clone and pass the same executor to [`router_with_executor`] and
-/// [`recover_outboxes_once`] so recovery cannot bypass request capacity.
+/// Clone and pass the same executor to request routing and either one-shot
+/// recovery entrypoint so recovery cannot bypass request capacity.
 #[derive(Clone, Debug)]
 pub struct NativeBlockingExecutor {
     permits: Arc<Semaphore>,
@@ -130,6 +142,126 @@ impl fmt::Display for OutboxLeaseIdSourceError {
 }
 
 impl Error for OutboxLeaseIdSourceError {}
+
+/// Trusted deployment authority for one indexed outbox recovery domain.
+///
+/// The embedding host derives this from fenced physical placement. An
+/// untrusted scheduler may trigger recovery but must never construct or alter
+/// this value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexedOutboxRecoveryAuthority {
+    domain: AtomicityDomainId,
+    writer_fence: WriterFenceGeneration,
+    operation_timeout_millis: NonZeroU64,
+    lease_duration_millis: NonZeroU64,
+}
+
+impl IndexedOutboxRecoveryAuthority {
+    /// Creates bounded recovery authority for one logical domain.
+    pub fn new(
+        domain: AtomicityDomainId,
+        writer_fence: WriterFenceGeneration,
+        operation_timeout_millis: u64,
+        lease_duration_millis: u64,
+    ) -> Result<Self, IndexedOutboxRecoveryAuthorityError> {
+        let operation_timeout_millis = NonZeroU64::new(operation_timeout_millis)
+            .ok_or(IndexedOutboxRecoveryAuthorityError::InvalidOperationTimeout)?;
+        let lease_duration_millis = NonZeroU64::new(lease_duration_millis)
+            .filter(|duration| duration.get() <= MAX_DURABLE_OUTBOX_LEASE_MILLIS)
+            .ok_or(IndexedOutboxRecoveryAuthorityError::InvalidLeaseDuration)?;
+        if operation_timeout_millis.get() > MAX_INDEXED_OUTBOX_OPERATION_MILLIS
+            || operation_timeout_millis >= lease_duration_millis
+        {
+            return Err(IndexedOutboxRecoveryAuthorityError::InvalidOperationTimeout);
+        }
+        Ok(Self {
+            domain,
+            writer_fence,
+            operation_timeout_millis,
+            lease_duration_millis,
+        })
+    }
+
+    /// Returns the configured logical domain.
+    #[must_use]
+    pub const fn domain(self) -> AtomicityDomainId {
+        self.domain
+    }
+
+    /// Returns the configured authoritative writer generation.
+    #[must_use]
+    pub const fn writer_fence(self) -> WriterFenceGeneration {
+        self.writer_fence
+    }
+}
+
+/// Invalid indexed recovery authority configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexedOutboxRecoveryAuthorityError {
+    /// The operation timeout was zero, above its bound, or not below the lease.
+    InvalidOperationTimeout,
+    /// The lease duration was zero or above the shared durable bound.
+    InvalidLeaseDuration,
+}
+
+impl fmt::Display for IndexedOutboxRecoveryAuthorityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidOperationTimeout => {
+                f.write_str("indexed outbox operation timeout is invalid")
+            }
+            Self::InvalidLeaseDuration => f.write_str("indexed outbox lease duration is invalid"),
+        }
+    }
+}
+
+impl Error for IndexedOutboxRecoveryAuthorityError {}
+
+/// One pair of restart-safe operational identities for an indexed claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexedOutboxAttemptIdentity {
+    lease_id: DurableOutboxLeaseId,
+    correlation_id: StorageCorrelationId,
+}
+
+impl IndexedOutboxAttemptIdentity {
+    /// Creates one already-validated identity pair.
+    #[must_use]
+    pub const fn new(lease_id: DurableOutboxLeaseId, correlation_id: StorageCorrelationId) -> Self {
+        Self {
+            lease_id,
+            correlation_id,
+        }
+    }
+}
+
+/// Supplies restart-safe lease and correlation identities before work is known.
+pub trait IndexedOutboxIdentitySource {
+    /// Returns identities that have never been used by another claim attempt.
+    fn next_attempt_identity(
+        &self,
+    ) -> Result<IndexedOutboxAttemptIdentity, IndexedOutboxIdentitySourceError>;
+}
+
+/// Failures from the indexed recovery identity source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexedOutboxIdentitySourceError {
+    /// The backing entropy or durable sequence is temporarily unavailable.
+    Unavailable,
+    /// The source exhausted its non-repeating identity space.
+    Exhausted,
+}
+
+impl fmt::Display for IndexedOutboxIdentitySourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => f.write_str("indexed outbox identity source is unavailable"),
+            Self::Exhausted => f.write_str("indexed outbox identity source is exhausted"),
+        }
+    }
+}
+
+impl Error for IndexedOutboxIdentitySourceError {}
 
 /// Errors in the canonical HTTP result contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -562,6 +694,241 @@ impl Error for NativeOutboxRecoveryError {
             Self::Node(error) => Some(error),
             Self::LeaseId(error) => Some(error),
             _ => None,
+        }
+    }
+}
+
+/// Failures from one indexed production outbox recovery invocation.
+#[derive(Debug)]
+pub enum IndexedOutboxRecoveryError {
+    /// Request work already occupies the configured blocking capacity.
+    CapacityExhausted,
+    /// The shared admission pool was closed.
+    AdmissionClosed,
+    /// Tokio could not join the bounded blocking task.
+    BlockingTaskFailed,
+    /// Trusted clock or transport runtime failed.
+    Runtime(RuntimeError),
+    /// Deadline or lease arithmetic overflowed.
+    TimeOverflow,
+    /// Restart-safe operational identities could not be allocated.
+    Identity(IndexedOutboxIdentitySourceError),
+    /// The indexed claim request or returned claim violated shared bounds.
+    Contract(IndexedOutboxContractError),
+    /// The repository proved that no claim lease was installed.
+    ClaimRejected(DurableOutboxClaimRejection),
+    /// The claim lease may have committed but could not be reconciled.
+    ClaimIndeterminate(IndeterminateCommitReason),
+    /// The repository returned a claim that did not match the requested lease.
+    ClaimIdentityMismatch,
+    /// The claimed canonical outbound event was invalid.
+    Node(NodeCoreError),
+    /// The outbound transport rejected the claimed canonical bytes.
+    Send,
+    /// The repository proved that the sent message was not acknowledged.
+    AcknowledgementRejected(DurableOutboxAcknowledgementRejection),
+    /// The acknowledgement may have committed but could not be reconciled.
+    AcknowledgementIndeterminate(IndeterminateCommitReason),
+}
+
+impl fmt::Display for IndexedOutboxRecoveryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapacityExhausted => f.write_str("native blocking capacity is exhausted"),
+            Self::AdmissionClosed => f.write_str("native blocking admission is closed"),
+            Self::BlockingTaskFailed => f.write_str("indexed recovery blocking task failed"),
+            Self::Runtime(error) => write!(f, "indexed recovery runtime failed: {error}"),
+            Self::TimeOverflow => f.write_str("indexed recovery time arithmetic overflowed"),
+            Self::Identity(error) => write!(f, "indexed recovery identity failed: {error}"),
+            Self::Contract(error) => write!(f, "indexed recovery contract failed: {error}"),
+            Self::ClaimRejected(reason) => {
+                write!(f, "indexed outbox claim was rejected: {reason:?}")
+            }
+            Self::ClaimIndeterminate(reason) => {
+                write!(f, "indexed outbox claim is indeterminate: {reason:?}")
+            }
+            Self::ClaimIdentityMismatch => {
+                f.write_str("indexed outbox claim identity did not match request")
+            }
+            Self::Node(error) => write!(f, "indexed outbox payload is invalid: {error}"),
+            Self::Send => f.write_str("indexed outbox transport send failed"),
+            Self::AcknowledgementRejected(reason) => {
+                write!(f, "indexed outbox acknowledgement was rejected: {reason:?}")
+            }
+            Self::AcknowledgementIndeterminate(reason) => write!(
+                f,
+                "indexed outbox acknowledgement is indeterminate: {reason:?}"
+            ),
+        }
+    }
+}
+
+impl Error for IndexedOutboxRecoveryError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Runtime(error) => Some(error),
+            Self::Identity(error) => Some(error),
+            Self::Contract(error) => Some(error),
+            Self::Node(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Claims, sends, and acknowledges at most one indexed due outbox message.
+///
+/// The scheduler supplies no cursor, domain, clock, fence, or deadline. Trusted
+/// embedding composition supplies immutable authority and identity sources.
+/// Claim and acknowledgement ambiguity each receive one same-identity
+/// reconciliation attempt; an unreconciled claim is never sent.
+pub async fn recover_indexed_outbox_once<R, I>(
+    runtime: Arc<R>,
+    authority: IndexedOutboxRecoveryAuthority,
+    identities: Arc<I>,
+    blocking_executor: NativeBlockingExecutor,
+) -> Result<NativeOutboxRecoveryReport, IndexedOutboxRecoveryError>
+where
+    R: Runtime + Send + Sync + 'static,
+    R::State: IndexedOutboxRepository,
+    I: IndexedOutboxIdentitySource + Send + Sync + 'static,
+{
+    let permit = match blocking_executor.try_acquire() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => {
+            return Err(IndexedOutboxRecoveryError::CapacityExhausted);
+        }
+        Err(TryAcquireError::Closed) => {
+            return Err(IndexedOutboxRecoveryError::AdmissionClosed);
+        }
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        recover_indexed_outbox_once_blocking(runtime.as_ref(), authority, identities.as_ref())
+    })
+    .await
+    .map_err(|_| IndexedOutboxRecoveryError::BlockingTaskFailed)?
+}
+
+fn recover_indexed_outbox_once_blocking<R, I>(
+    runtime: &R,
+    authority: IndexedOutboxRecoveryAuthority,
+    identities: &I,
+) -> Result<NativeOutboxRecoveryReport, IndexedOutboxRecoveryError>
+where
+    R: Runtime,
+    R::State: IndexedOutboxRepository,
+    I: IndexedOutboxIdentitySource,
+{
+    let now_unix_millis = runtime
+        .clock()
+        .now_unix_millis()
+        .map_err(IndexedOutboxRecoveryError::Runtime)?;
+    let deadline_unix_millis = now_unix_millis
+        .checked_add(authority.operation_timeout_millis.get())
+        .ok_or(IndexedOutboxRecoveryError::TimeOverflow)?;
+    let lease_expires_at_unix_millis = now_unix_millis
+        .checked_add(authority.lease_duration_millis.get())
+        .ok_or(IndexedOutboxRecoveryError::TimeOverflow)?;
+    let identity = identities
+        .next_attempt_identity()
+        .map_err(IndexedOutboxRecoveryError::Identity)?;
+    let context = DurableOperationContext::new(
+        authority.writer_fence,
+        StorageDeadline::new(deadline_unix_millis)
+            .ok_or(IndexedOutboxRecoveryError::TimeOverflow)?,
+        identity.correlation_id,
+    );
+    let claim_request = DueOutboxClaimRequest::new(
+        authority.domain,
+        now_unix_millis,
+        identity.lease_id,
+        lease_expires_at_unix_millis,
+    )
+    .map_err(IndexedOutboxRecoveryError::Contract)?;
+
+    let claim = reconcile_indexed_claim(runtime.state_store(), &context, claim_request)?;
+    let Some(claim) = claim else {
+        return Ok(NativeOutboxRecoveryReport {
+            outcome: NativeOutboxRecoveryOutcome::NoEligibleOutbox,
+            continuation_cursor: None,
+        });
+    };
+    if claim.lease_id() != identity.lease_id
+        || claim.lease_expires_at_unix_millis() != lease_expires_at_unix_millis
+    {
+        return Err(IndexedOutboxRecoveryError::ClaimIdentityMismatch);
+    }
+    let event =
+        NodeEvent::decode(claim.canonical_payload()).map_err(IndexedOutboxRecoveryError::Node)?;
+    let canonical_payload = event.encode().map_err(IndexedOutboxRecoveryError::Node)?;
+    if canonical_payload != claim.canonical_payload() {
+        return Err(IndexedOutboxRecoveryError::Node(
+            NodeCoreError::PersistenceInvariant("indexed outbox payload is not canonical"),
+        ));
+    }
+    runtime
+        .transport()
+        .send(canonical_payload)
+        .map_err(|_| IndexedOutboxRecoveryError::Send)?;
+
+    let acknowledgement = DurableOutboxAcknowledgement::new(
+        authority.domain,
+        claim.request_id(),
+        claim.message_index(),
+        claim.lease_id(),
+    );
+    reconcile_indexed_acknowledgement(runtime.state_store(), &context, acknowledgement)?;
+    let request_id =
+        RequestId::new(*claim.request_id().as_bytes()).map_err(IndexedOutboxRecoveryError::Node)?;
+    Ok(NativeOutboxRecoveryReport {
+        outcome: NativeOutboxRecoveryOutcome::Recovered(request_id),
+        continuation_cursor: None,
+    })
+}
+
+fn reconcile_indexed_claim<S>(
+    store: &S,
+    context: &DurableOperationContext,
+    request: DueOutboxClaimRequest,
+) -> Result<Option<runtime::DurableOutboxClaim>, IndexedOutboxRecoveryError>
+where
+    S: IndexedOutboxRepository,
+{
+    match store.claim_due_outbox(context, request) {
+        DurableOutboxClaimOutcome::Claimed(claim) => Ok(Some(claim)),
+        DurableOutboxClaimOutcome::NoDueWork => Ok(None),
+        DurableOutboxClaimOutcome::Rejected(reason) => {
+            Err(IndexedOutboxRecoveryError::ClaimRejected(reason))
+        }
+        DurableOutboxClaimOutcome::Indeterminate(first_reason) => {
+            match store.claim_due_outbox(context, request) {
+                DurableOutboxClaimOutcome::Claimed(claim) => Ok(Some(claim)),
+                _ => Err(IndexedOutboxRecoveryError::ClaimIndeterminate(first_reason)),
+            }
+        }
+    }
+}
+
+fn reconcile_indexed_acknowledgement<S>(
+    store: &S,
+    context: &DurableOperationContext,
+    acknowledgement: DurableOutboxAcknowledgement,
+) -> Result<(), IndexedOutboxRecoveryError>
+where
+    S: IndexedOutboxRepository,
+{
+    match store.acknowledge_outbox(context, acknowledgement) {
+        DurableOutboxAcknowledgementOutcome::Acknowledged => Ok(()),
+        DurableOutboxAcknowledgementOutcome::Rejected(reason) => {
+            Err(IndexedOutboxRecoveryError::AcknowledgementRejected(reason))
+        }
+        DurableOutboxAcknowledgementOutcome::Indeterminate(first_reason) => {
+            match store.acknowledge_outbox(context, acknowledgement) {
+                DurableOutboxAcknowledgementOutcome::Acknowledged => Ok(()),
+                _ => Err(IndexedOutboxRecoveryError::AcknowledgementIndeterminate(
+                    first_reason,
+                )),
+            }
         }
     }
 }
@@ -1178,12 +1545,15 @@ mod tests {
         ChainId, Epoch, HashSuite, HashSuiteSchedule, ProtocolVersion, ValidatorId,
     };
     use runtime::{
-        ComposedRuntime, ManualClock, MemoryBlobStore, MemoryRuntime, MemoryScheduler,
-        MemorySigner, MemoryStateStore, MemoryTransport, RuntimeError, StateStore,
-        TransactionalStateStore,
+        AtomicStateTransaction, CompareAndSwapResult, ComposedRuntime, DurableCommitOutcome,
+        DurableCommitRejection, DurableDomainStateStore, DurableOutboxClaim, DurableReadError,
+        IndexedOutboxRepository, ManualClock, MemoryBlobStore, MemoryRuntime, MemoryScheduler,
+        MemorySigner, MemoryStateStore, MemoryTransport, OutboxRequestId, RuntimeError, StateStore,
+        TransactionalStateStore, VersionedStateValue,
     };
     use runtime_sqlite::SqliteStateStore;
     use std::{
+        collections::VecDeque,
         fs,
         path::PathBuf,
         sync::{
@@ -1423,6 +1793,139 @@ mod tests {
         }
     }
 
+    struct FixedIndexedIdentity;
+
+    impl IndexedOutboxIdentitySource for FixedIndexedIdentity {
+        fn next_attempt_identity(
+            &self,
+        ) -> Result<IndexedOutboxAttemptIdentity, IndexedOutboxIdentitySourceError> {
+            Ok(IndexedOutboxAttemptIdentity::new(
+                DurableOutboxLeaseId::new([0x71; 32]).unwrap(),
+                StorageCorrelationId::new([0x72; 16]).unwrap(),
+            ))
+        }
+    }
+
+    struct ScriptedIndexedStore {
+        claims: Mutex<VecDeque<DurableOutboxClaimOutcome>>,
+        acknowledgements: Mutex<VecDeque<DurableOutboxAcknowledgementOutcome>>,
+        claim_requests: Mutex<Vec<DueOutboxClaimRequest>>,
+        acknowledgement_requests: Mutex<Vec<DurableOutboxAcknowledgement>>,
+    }
+
+    impl ScriptedIndexedStore {
+        fn new(
+            claims: Vec<DurableOutboxClaimOutcome>,
+            acknowledgements: Vec<DurableOutboxAcknowledgementOutcome>,
+        ) -> Self {
+            Self {
+                claims: Mutex::new(claims.into()),
+                acknowledgements: Mutex::new(acknowledgements.into()),
+                claim_requests: Mutex::new(Vec::new()),
+                acknowledgement_requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl StateStore for ScriptedIndexedStore {
+        fn get(&self, _key: &[u8]) -> Result<Option<Vec<u8>>, RuntimeError> {
+            Err(RuntimeError::DurableStoreUnavailable)
+        }
+
+        fn put(&self, _key: Vec<u8>, _value: Vec<u8>) -> Result<(), RuntimeError> {
+            Err(RuntimeError::DurableStoreUnavailable)
+        }
+
+        fn compare_and_swap(
+            &self,
+            _key: Vec<u8>,
+            _expected: Option<Vec<u8>>,
+            _new_value: Vec<u8>,
+        ) -> Result<CompareAndSwapResult, RuntimeError> {
+            Err(RuntimeError::DurableStoreUnavailable)
+        }
+    }
+
+    impl DurableDomainStateStore for ScriptedIndexedStore {
+        fn get_versioned_durable(
+            &self,
+            _context: &DurableOperationContext,
+            _domain: AtomicityDomainId,
+            _key: &[u8],
+        ) -> Result<VersionedStateValue, DurableReadError> {
+            Err(DurableReadError::Unavailable)
+        }
+
+        fn commit_durable(
+            &self,
+            _context: &DurableOperationContext,
+            _transaction: AtomicStateTransaction,
+        ) -> DurableCommitOutcome {
+            DurableCommitOutcome::Rejected(DurableCommitRejection::UnavailableBeforeCommit)
+        }
+    }
+
+    impl IndexedOutboxRepository for ScriptedIndexedStore {
+        fn claim_due_outbox(
+            &self,
+            _context: &DurableOperationContext,
+            request: DueOutboxClaimRequest,
+        ) -> DurableOutboxClaimOutcome {
+            self.claim_requests.lock().unwrap().push(request);
+            self.claims
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(DurableOutboxClaimOutcome::NoDueWork)
+        }
+
+        fn acknowledge_outbox(
+            &self,
+            _context: &DurableOperationContext,
+            acknowledgement: DurableOutboxAcknowledgement,
+        ) -> DurableOutboxAcknowledgementOutcome {
+            self.acknowledgement_requests
+                .lock()
+                .unwrap()
+                .push(acknowledgement);
+            self.acknowledgements
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(DurableOutboxAcknowledgementOutcome::Acknowledged)
+        }
+    }
+
+    fn indexed_runtime(
+        store: ScriptedIndexedStore,
+    ) -> ComposedRuntime<
+        ScriptedIndexedStore,
+        MemoryBlobStore,
+        MemorySigner,
+        MemoryTransport,
+        ManualClock,
+        MemoryScheduler,
+    > {
+        ComposedRuntime::new(
+            store,
+            MemoryBlobStore::default(),
+            MemorySigner::new(ValidatorId::new([0x44; 32])),
+            MemoryTransport::default(),
+            ManualClock::new(10_000),
+            MemoryScheduler::default(),
+        )
+    }
+
+    fn indexed_authority() -> IndexedOutboxRecoveryAuthority {
+        IndexedOutboxRecoveryAuthority::new(
+            AtomicityDomainId::new([0x61; 32]).unwrap(),
+            WriterFenceGeneration::new(3).unwrap(),
+            1_000,
+            NATIVE_OUTBOX_LEASE_MILLIS,
+        )
+        .unwrap()
+    }
+
     fn app<R>(runtime: Arc<R>, config: NodeConfig) -> Router
     where
         R: Runtime + Send + Sync + 'static,
@@ -1571,6 +2074,126 @@ mod tests {
              20000000313131313131313131313131313131313131313131313131313131313131313102000200\
              00000100030018000000534e524512ef010001000100080000000400000000000000"
                 .replace(' ', "")
+        );
+    }
+
+    #[test]
+    fn indexed_recovery_authority_bounds_operation_inside_lease() {
+        let domain = AtomicityDomainId::new([0x61; 32]).unwrap();
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        assert_eq!(
+            IndexedOutboxRecoveryAuthority::new(domain, fence, 0, 30_000),
+            Err(IndexedOutboxRecoveryAuthorityError::InvalidOperationTimeout)
+        );
+        assert_eq!(
+            IndexedOutboxRecoveryAuthority::new(domain, fence, 30_000, 30_000),
+            Err(IndexedOutboxRecoveryAuthorityError::InvalidOperationTimeout)
+        );
+        assert_eq!(
+            IndexedOutboxRecoveryAuthority::new(
+                domain,
+                fence,
+                1_000,
+                MAX_DURABLE_OUTBOX_LEASE_MILLIS + 1,
+            ),
+            Err(IndexedOutboxRecoveryAuthorityError::InvalidLeaseDuration)
+        );
+        let authority = indexed_authority();
+        assert_eq!(authority.domain(), domain);
+        assert_eq!(authority.writer_fence(), fence);
+    }
+
+    #[tokio::test]
+    async fn indexed_recovery_reconciles_claim_and_ack_before_returning_success() {
+        let request_id = request_id(0x73);
+        let payload = event(request_id).encode().unwrap();
+        let lease_id = DurableOutboxLeaseId::new([0x71; 32]).unwrap();
+        let claim = DurableOutboxClaim::from_parts(
+            OutboxRequestId::new(*request_id.as_bytes()).unwrap(),
+            0,
+            lease_id,
+            40_000,
+            payload.clone(),
+        )
+        .unwrap();
+        let store = ScriptedIndexedStore::new(
+            vec![
+                DurableOutboxClaimOutcome::Indeterminate(IndeterminateCommitReason::ConnectionLost),
+                DurableOutboxClaimOutcome::Claimed(claim),
+            ],
+            vec![
+                DurableOutboxAcknowledgementOutcome::Indeterminate(
+                    IndeterminateCommitReason::ConnectionLost,
+                ),
+                DurableOutboxAcknowledgementOutcome::Acknowledged,
+            ],
+        );
+        let runtime = Arc::new(indexed_runtime(store));
+
+        let report = recover_indexed_outbox_once(
+            Arc::clone(&runtime),
+            indexed_authority(),
+            Arc::new(FixedIndexedIdentity),
+            NativeBlockingExecutor::new(NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            report.outcome(),
+            &NativeOutboxRecoveryOutcome::Recovered(request_id)
+        );
+        assert_eq!(report.continuation_cursor(), None);
+        assert_eq!(runtime.transport().drain_outbound().unwrap(), vec![payload]);
+        let claim_requests = runtime.state_store().claim_requests.lock().unwrap();
+        assert_eq!(claim_requests.len(), 2);
+        assert_eq!(claim_requests[0], claim_requests[1]);
+        drop(claim_requests);
+        let acknowledgement_requests = runtime
+            .state_store()
+            .acknowledgement_requests
+            .lock()
+            .unwrap();
+        assert_eq!(acknowledgement_requests.len(), 2);
+        assert_eq!(acknowledgement_requests[0], acknowledgement_requests[1]);
+    }
+
+    #[tokio::test]
+    async fn indexed_recovery_never_sends_an_unreconciled_claim() {
+        let store = ScriptedIndexedStore::new(
+            vec![
+                DurableOutboxClaimOutcome::Indeterminate(IndeterminateCommitReason::ConnectionLost),
+                DurableOutboxClaimOutcome::Indeterminate(
+                    IndeterminateCommitReason::DeadlineExceeded,
+                ),
+            ],
+            Vec::new(),
+        );
+        let runtime = Arc::new(indexed_runtime(store));
+
+        let error = recover_indexed_outbox_once(
+            Arc::clone(&runtime),
+            indexed_authority(),
+            Arc::new(FixedIndexedIdentity),
+            NativeBlockingExecutor::new(NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap())),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IndexedOutboxRecoveryError::ClaimIndeterminate(
+                IndeterminateCommitReason::ConnectionLost
+            )
+        ));
+        assert!(runtime.transport().drain_outbound().unwrap().is_empty());
+        assert!(
+            runtime
+                .state_store()
+                .acknowledgement_requests
+                .lock()
+                .unwrap()
+                .is_empty()
         );
     }
 

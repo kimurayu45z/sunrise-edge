@@ -220,8 +220,8 @@ before storage reads and return the domain beside output. An additive native
 router uses that result for request-scoped delivery and accepts no HTTP domain,
 but SQLite/default routing and scan recovery remain legacy. The current Phase
 15 sequence is: preserve and wire the additive fenced/deadline-aware durable
-domain boundary, connect the additive indexed outbox contract to domain-aware
-unattended recovery, implement the normalized PostgreSQL reference adapter,
+domain boundary, implement the normalized PostgreSQL reference adapter behind
+the additive indexed native recovery seam,
 run shared conformance, then deadline/cancellation, abrupt fault,
 backup/restore, capacity, and provider implementations. Do not spend further
 effort treating the opaque SQLite table or prefix scanner as the production
