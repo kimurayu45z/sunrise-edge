@@ -12,6 +12,7 @@ use canonical_encoding::{
 };
 use core::fmt;
 use hashing::{HashSuiteResolver, HashingError};
+use protocol_config::{DomainPlacementManifest, ProtocolConfigError};
 use protocol_types::{
     ChainId, Digest32, Epoch, HashAlgorithmId, HashPurpose, ProtocolVersion, TypeError,
 };
@@ -172,6 +173,8 @@ pub enum NodeCoreError {
     TrailingNestedListBytes(usize),
     /// A runtime storage operation failed.
     Runtime(RuntimeError),
+    /// Committed domain-placement configuration rejected routing.
+    ProtocolConfig(ProtocolConfigError),
     /// The application-specific state machine rejected the event.
     TransitionRejected(&'static str),
 }
@@ -307,6 +310,9 @@ impl fmt::Display for NodeCoreError {
                 write!(f, "nested canonical list has {length} trailing bytes")
             }
             Self::Runtime(error) => write!(f, "runtime operation failed: {error}"),
+            Self::ProtocolConfig(error) => {
+                write!(f, "protocol configuration rejected routing: {error}")
+            }
             Self::TransitionRejected(reason) => write!(f, "node transition rejected: {reason}"),
         }
     }
@@ -321,6 +327,7 @@ impl Error for NodeCoreError {
             Self::InvalidChainId(error) => Some(error),
             Self::InvalidHashAlgorithm(error) => Some(error),
             Self::Runtime(error) => Some(error),
+            Self::ProtocolConfig(error) => Some(error),
             _ => None,
         }
     }
@@ -347,6 +354,12 @@ impl From<HashingError> for NodeCoreError {
 impl From<RuntimeError> for NodeCoreError {
     fn from(value: RuntimeError) -> Self {
         Self::Runtime(value)
+    }
+}
+
+impl From<ProtocolConfigError> for NodeCoreError {
+    fn from(value: ProtocolConfigError) -> Self {
+        Self::ProtocolConfig(value)
     }
 }
 
@@ -1137,6 +1150,40 @@ impl NodeOutput {
     }
 }
 
+/// Persisted node output paired with the committed logical atomicity domain.
+///
+/// Adapters carry this domain into outbox claim/ack instead of accepting a
+/// domain selected by the request or independently rerunning placement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedNodeOutput {
+    domain: AtomicityDomainId,
+    output: NodeOutput,
+}
+
+impl ResolvedNodeOutput {
+    fn new(domain: AtomicityDomainId, output: NodeOutput) -> Self {
+        Self { domain, output }
+    }
+
+    /// Returns the manifest-resolved logical atomicity domain.
+    #[must_use]
+    pub const fn domain(&self) -> AtomicityDomainId {
+        self.domain
+    }
+
+    /// Returns output released after the domain transaction committed.
+    #[must_use]
+    pub const fn output(&self) -> &NodeOutput {
+        &self.output
+    }
+
+    /// Consumes the wrapper and returns the persisted output.
+    #[must_use]
+    pub fn into_output(self) -> NodeOutput {
+        self.output
+    }
+}
+
 /// Storage access granted to one deterministic transactional transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeStateAccessMode {
@@ -1454,6 +1501,46 @@ where
 {
     event.validate_context(config)?;
     let plan = machine.access_plan(&event)?;
+    handle_domain_transactional_event_with_plan(runtime, domain, config, event, machine, plan)
+}
+
+/// Resolves one event's domain from committed protocol configuration.
+///
+/// The access plan is derived exactly once before storage reads. The resolved
+/// domain is returned beside committed output for subsequent outbox delivery.
+pub fn handle_resolved_transactional_event<R, M>(
+    runtime: &R,
+    placement: &DomainPlacementManifest,
+    config: &NodeConfig,
+    event: NodeEvent,
+    machine: &M,
+) -> Result<ResolvedNodeOutput, NodeCoreError>
+where
+    R: Runtime,
+    R::State: DomainTransactionalStateStore,
+    M: TransactionalNodeStateMachine,
+{
+    event.validate_context(config)?;
+    let plan = machine.access_plan(&event)?;
+    let domain = placement.resolve_domain(event.epoch(), plan.accesses().len())?;
+    let output =
+        handle_domain_transactional_event_with_plan(runtime, domain, config, event, machine, plan)?;
+    Ok(ResolvedNodeOutput::new(domain, output))
+}
+
+fn handle_domain_transactional_event_with_plan<R, M>(
+    runtime: &R,
+    domain: AtomicityDomainId,
+    config: &NodeConfig,
+    event: NodeEvent,
+    machine: &M,
+    plan: NodeStateAccessPlan,
+) -> Result<NodeOutput, NodeCoreError>
+where
+    R: Runtime,
+    R::State: DomainTransactionalStateStore,
+    M: TransactionalNodeStateMachine,
+{
     let mut values = BTreeMap::new();
     for access in plan.accesses() {
         let observed = runtime
@@ -1670,6 +1757,53 @@ where
     M: TransactionalNodeStateMachine,
 {
     event.validate_context(config)?;
+    let plan = machine.access_plan(&event)?;
+    handle_domain_idempotent_event_with_plan(
+        runtime, domain, config, resolver, event, machine, plan,
+    )
+}
+
+/// Resolves and commits one idempotent event from protocol configuration.
+///
+/// The returned domain is the only valid domain for delivering the committed
+/// outbox. Placement is evaluated once from the non-empty bounded access plan
+/// before any storage read.
+pub fn handle_resolved_idempotent_event<R, M>(
+    runtime: &R,
+    placement: &DomainPlacementManifest,
+    config: &NodeConfig,
+    resolver: &HashSuiteResolver,
+    event: NodeEvent,
+    machine: &M,
+) -> Result<ResolvedNodeOutput, NodeCoreError>
+where
+    R: Runtime,
+    R::State: DomainTransactionalStateStore,
+    M: TransactionalNodeStateMachine,
+{
+    event.validate_context(config)?;
+    let plan = machine.access_plan(&event)?;
+    let domain = placement.resolve_domain(event.epoch(), plan.accesses().len())?;
+    let output = handle_domain_idempotent_event_with_plan(
+        runtime, domain, config, resolver, event, machine, plan,
+    )?;
+    Ok(ResolvedNodeOutput::new(domain, output))
+}
+
+fn handle_domain_idempotent_event_with_plan<R, M>(
+    runtime: &R,
+    domain: AtomicityDomainId,
+    config: &NodeConfig,
+    resolver: &HashSuiteResolver,
+    event: NodeEvent,
+    machine: &M,
+    plan: NodeStateAccessPlan,
+) -> Result<NodeOutput, NodeCoreError>
+where
+    R: Runtime,
+    R::State: DomainTransactionalStateStore,
+    M: TransactionalNodeStateMachine,
+{
     let event_digest = event.digest(resolver)?;
     let layout = PersistenceLayout::new(config.chain_id.clone(), config.protocol_version);
     let request_bytes = *event.request_id.as_bytes();
@@ -1677,7 +1811,6 @@ where
     let outbox_key = layout.outbox_batch_key(request_bytes);
     let delivery_key = layout.outbox_delivery_key(request_bytes);
 
-    let plan = machine.access_plan(&event)?;
     let maximum_application_accesses = MAX_ATOMIC_STATE_WRITES - 3;
     if plan.accesses.len() > maximum_application_accesses {
         return Err(NodeCoreError::TooManyStateAccesses {
@@ -2288,6 +2421,11 @@ mod tests {
         AtomicityDomainId::new([byte; 32]).unwrap()
     }
 
+    fn placement(byte: u8, activation_epoch: u64) -> DomainPlacementManifest {
+        DomainPlacementManifest::single_domain(1, domain(byte), Epoch::new(activation_epoch))
+            .unwrap()
+    }
+
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
@@ -2706,6 +2844,53 @@ mod tests {
         assert_eq!(runtime.state_store().get(b"state/a").unwrap(), None);
     }
 
+    struct CountingPlanMachine {
+        access_plans: AtomicUsize,
+    }
+
+    impl TransactionalNodeStateMachine for CountingPlanMachine {
+        fn access_plan(&self, event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            self.access_plans.fetch_add(1, Ordering::SeqCst);
+            MultiKeyMachine.access_plan(event)
+        }
+
+        fn transition(
+            &self,
+            state: &NodeStateSnapshot,
+            event: &NodeEvent,
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            MultiKeyMachine.transition(state, event)
+        }
+    }
+
+    #[test]
+    fn resolved_transactional_handler_derives_the_access_plan_once() {
+        let runtime = MemoryRuntime::new(runtime::ValidatorId::new([0x44; 32]));
+        let machine = CountingPlanMachine {
+            access_plans: AtomicUsize::new(0),
+        };
+        let result = handle_resolved_transactional_event(
+            &runtime,
+            &placement(0xA3, 7),
+            &config("sunrise-test"),
+            event("sunrise-test", request(0x87)),
+            &machine,
+        )
+        .unwrap();
+
+        assert_eq!(machine.access_plans.load(Ordering::SeqCst), 1);
+        assert_eq!(result.domain(), domain(0xA3));
+        assert!(result.output().responses().is_empty());
+        assert!(
+            runtime
+                .state_store()
+                .get_versioned_in_domain(result.domain(), b"state/a")
+                .unwrap()
+                .value()
+                .is_some()
+        );
+    }
+
     struct IdempotentMachine {
         calls: AtomicUsize,
     }
@@ -2903,6 +3088,105 @@ mod tests {
                 assert_eq!(runtime.state_store().get(&key).unwrap(), None);
             }
         }
+    }
+
+    #[test]
+    fn resolved_idempotent_handler_uses_committed_domain_and_returns_it() {
+        let runtime = MemoryRuntime::new(runtime::ValidatorId::new([0x44; 32]));
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        let placement = placement(0xB4, 7);
+        let event = event("sunrise-test", request(0x85));
+        let resolver = resolver("sunrise-test");
+
+        let first = handle_resolved_idempotent_event(
+            &runtime,
+            &placement,
+            &config("sunrise-test"),
+            &resolver,
+            event.clone(),
+            &machine,
+        )
+        .unwrap();
+        let replay = handle_resolved_idempotent_event(
+            &runtime,
+            &placement,
+            &config("sunrise-test"),
+            &resolver,
+            event.clone(),
+            &machine,
+        )
+        .unwrap();
+
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first.domain(), placement.domain());
+        assert_eq!(replay.domain(), placement.domain());
+        assert_eq!(first.output().responses(), replay.output().responses());
+        assert_eq!(first.output().outbound_messages().len(), 1);
+        assert!(replay.output().outbound_messages().is_empty());
+        assert_eq!(replay.clone().into_output(), replay.output);
+
+        let layout = PersistenceLayout::new(
+            ChainId::new("sunrise-test").unwrap(),
+            ProtocolVersion::new(3),
+        );
+        assert!(
+            claim_next_outbox_message_in_domain(
+                runtime.state_store(),
+                first.domain(),
+                &layout,
+                event.request_id(),
+                OutboxLeaseId::new([0x45; 32]).unwrap(),
+                100,
+                10,
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(
+            runtime
+                .state_store()
+                .get_versioned_in_domain(domain(0xB5), b"state/idempotent")
+                .unwrap()
+                .value(),
+            None
+        );
+    }
+
+    #[test]
+    fn resolved_handler_rejects_inactive_manifest_before_transition_or_read() {
+        let runtime = MemoryRuntime::new(runtime::ValidatorId::new([0x44; 32]));
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        let event = event("sunrise-test", request(0x86));
+        let error = handle_resolved_idempotent_event(
+            &runtime,
+            &placement(0xB6, 8),
+            &config("sunrise-test"),
+            &resolver("sunrise-test"),
+            event,
+            &machine,
+        )
+        .unwrap_err();
+
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            error,
+            NodeCoreError::ProtocolConfig(ProtocolConfigError::InactiveDomainPlacement {
+                activation_epoch: Epoch::new(8),
+                event_epoch: Epoch::new(7),
+            })
+        );
+        assert_eq!(
+            runtime
+                .state_store()
+                .get_versioned_in_domain(domain(0xB6), b"state/idempotent")
+                .unwrap()
+                .value(),
+            None
+        );
     }
 
     #[test]

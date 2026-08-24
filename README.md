@@ -111,7 +111,9 @@ cross-provider ingress milestones implemented through Phase 17:
   domain identity separate from PostgreSQL, Durable Object, AWS, validator, and
   deployment coordinates. The initial canonical manifest uses one closed
   `AllState` domain under an explicit ProtocolConfig v2 boundary while
-  preserving historical v1 bytes; node-core routing integration is pending.
+  preserving historical v1 bytes. Node-core resolves it once before storage
+  reads and returns the committed domain with output; native integration is
+  pending.
 - A one-message bounded outbox lease/ack cursor with explicit at-least-once
   redelivery after lease expiry; it does not claim transport exactly-once.
 - Domain-aware outbox lease/ack entrypoints that keep immutable-batch assertions
@@ -162,8 +164,8 @@ independent security review.
 
 The next planned technical milestones work backward through the Phase 15
 production exit criteria in [`TODO.md`](TODO.md) and the accepted
-[persistence design](PERSISTENCE.md): resolve the committed logical-domain
-manifest in node-core, carry that domain through native composition, add an indexed
+[persistence design](PERSISTENCE.md): carry node-core's resolved logical domain
+through native composition, add an indexed
 outbox claim contract, and
 implement the normalized PostgreSQL reference adapter. Deadline/cancellation, abrupt
 fault, backup/restore, capacity, and provider conformance follow on that
