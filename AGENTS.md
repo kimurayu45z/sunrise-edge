@@ -223,11 +223,13 @@ but SQLite/default routing and scan recovery remain legacy. The current Phase
 state/object/receipt/outbox boundary now wired through node-core, ephemeral
 memory conformance, and an explicit native request composition. Native commits
 the typed invocation and uses the same operation context to claim/ack at most
-one message for that exact request; it never sends an unresolved claim. Next,
-implement the normalized PostgreSQL adapter required by
-[`POSTGRES.md`](POSTGRES.md) behind both the structured request and indexed
-native recovery seams; then run
-shared conformance, deadline/cancellation, abrupt fault,
+one message for that exact request; it never sends an unresolved claim.
+`runtime-postgres` now applies the explicit generation-one normalized schema
+and bootstraps exact namespace/schema/fence metadata through operator-only APIs,
+with real PostgreSQL CI. It does not yet implement a durable store. Next,
+implement its bounded-pool fenced structured commit path, then the indexed
+claim/ack path required by [`POSTGRES.md`](POSTGRES.md) behind native recovery;
+then run shared conformance, deadline/cancellation, abrupt fault,
 backup/restore, capacity, and provider implementations. Do not spend further
 effort treating the opaque SQLite table or prefix scanner as the production
 schema. The adapter must not infer normalized rows from opaque key prefixes.

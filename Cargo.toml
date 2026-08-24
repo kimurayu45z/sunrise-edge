@@ -9,6 +9,7 @@ members = [
     "crates/protocol-config",
     "crates/abi",
     "crates/runtime",
+    "crates/runtime-postgres",
     "crates/runtime-sqlite",
     "crates/execution",
     "crates/fees",
@@ -40,6 +41,7 @@ objects = { path = "crates/objects" }
 abi = { path = "crates/abi" }
 protocol-config = { path = "crates/protocol-config" }
 runtime = { path = "crates/runtime" }
+runtime-postgres = { path = "crates/runtime-postgres" }
 runtime-sqlite = { path = "crates/runtime-sqlite" }
 execution = { path = "crates/execution" }
 fees = { path = "crates/fees" }
@@ -54,6 +56,7 @@ consensus = { path = "crates/consensus" }
 node-core = { path = "crates/node-core" }
 native-http = { path = "crates/native-http" }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
+postgres = "=0.19.14"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 sha2 = "0.11.0"
 sha3 = "0.12.0"

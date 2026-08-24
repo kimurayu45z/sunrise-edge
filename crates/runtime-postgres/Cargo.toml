@@ -1,0 +1,10 @@
+[package]
+name = "runtime-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+postgres.workspace = true
+protocol-types.workspace = true
+runtime.workspace = true

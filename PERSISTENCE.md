@@ -363,7 +363,9 @@ not general state reads:
 2. Add a dedicated indexed outbox repository/claim contract; retain key scans
    only for maintenance and compatibility.
 3. Apply the accepted PostgreSQL schema design, explicit migrations, and
-   adapter, then run the shared conformance suite.
+   adapter, then run the shared conformance suite. The generation-one schema,
+   operator-only namespace bootstrap, and live PostgreSQL constraint test are
+   implemented As-Is; fenced structured commit and indexed claim/ack remain.
 4. Add deadline/cancellation semantics, bounded retry, capacity tests, abrupt
    fault tests, backup/restore rehearsal, and writer-fencing failover tests.
 5. Implement Cloudflare Durable Object and AWS mappings against the same
