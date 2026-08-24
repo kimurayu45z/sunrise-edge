@@ -862,8 +862,12 @@ digest drift and cap the aggregate represented bytes. The object section is
 closed to explicit empty until concrete object dispatch exists, preventing an
 adapter from hiding unsupported object writes in generic state. Indexed outbox
 repositories now refine the structured store trait so one implementation owns
-initial commit and later delivery state. Node-core and durable adapters do not
-use this new boundary yet.
+initial commit and later delivery state. An additive node-core handler now
+resolves the manifest domain before I/O, checks the typed receipt before state
+reads, and constructs this envelope from one pure transition. Exact replay does
+not rerun the transition or republish the outbox; read-only transitions retain
+their full assertion set; rejected and indeterminate commits release no output.
+Durable adapters and native composition do not use this new boundary yet.
 
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
@@ -1068,3 +1072,9 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   digest across sections and bound aggregate bytes. Permit read-only state
   sections, keep unsupported object changes explicitly empty, and require
   indexed delivery repositories to share this structured store boundary.
+- DR-0053: Route normalized node-core persistence only through the structured
+  durable invocation boundary. Resolve placement before reads, query a typed
+  receipt before application state, bind every outbound canonical event and
+  digest into the ordered outbox, and release output only for a definite commit
+  or an exact persisted replay. Treat indeterminate commit as reconciliation
+  work, never as a safe transition retry.
