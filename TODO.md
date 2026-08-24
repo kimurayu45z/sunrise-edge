@@ -1869,7 +1869,11 @@ Phase 15 prerequisites:
   (design accepted; implementation pending)
 - complete declared read-set revision assertion in transactional and
   idempotent node-core commits, including read-only and absent keys
-  (implemented As-Is; explicit atomicity domain/read-set API pending)
+  (implemented As-Is; domain-aware node-core migration pending)
+- non-zero AtomicityDomainId、dedicated bounded/canonical read assertion set、
+  put/delete mutation set、mutation-read containment、64 MiB aggregate envelope、
+  domain-isolated memory conformanceを持つDomainTransactionalStateStore
+  (implemented As-Is; node-core/durable provider migration pending)
 
 Phase 15 As-Is scope:
 
@@ -1904,6 +1908,12 @@ Phase 15 As-Is scope:
   AWSは初期single fenced writer regionへ写像する（design accepted; implementation/certification pending）。
   D1 read replica、DynamoDB Global Tables、scheduler/queue/alarmをauthoritative atomicityやconsensus trust rootに
   してはならない。cross-domain writeは別protocol decisionなしにbest-effort dual writeで実装しない。
+- runtimeはnon-zero 32-byte AtomicityDomainId、unique/canonicalなAtomicStateReadSetと
+  AtomicStateMutationSet、それらを1 domainへ閉じ込めるAtomicStateTransactionを持つ。
+  全mutation keyはread assertionを必須とし、各set 4,096 keysおよびaggregate represented bytes 64 MiBを
+  shared safety ceilingとして検証する。MemoryStateStoreは同一keyのdomain isolation、complete-read conflict時の
+  all-or-noneを検証する（implemented As-Is）。legacy unscoped stateはprivate test domainへ隔離され、
+  node-core、runtime-sqlite、provider adapterはまだnew contractへ移行していない。
 - ComposedRuntimeはStateStore、BlobStore、Signer、Transport、Clock、Schedulerをhidden defaultなしで
   明示的に所有・合成する。SQLiteへstate/dedup/outboxをcommit後にruntimeをdropし、同じDBを別compositionで
   reopenしてstateを再適用せずoutboxを送ること、send failure leaseがreopen後もexpiry前は抑止されexpiry時だけ
@@ -1983,8 +1993,8 @@ Phase 15 To-Be production exit criteria:
 
 Phase 15 persistence implementation order（To-Beからの逆算）:
 
-1. implemented As-Isのcomplete read-set assertionを、明示的atomicity domainとdedicated read-setを持つ
-   runtime/node-core transaction contractへ発展させる。
+1. runtimeでimplemented As-Isとなったatomicity domain/dedicated read-set envelopeをnode-coreへ接続し、
+   SQLite既存dataを暗黙migrationせずdurable store contractへ実装する。
 2. indexed due-outbox repository/claim contractを追加し、StateKeyScannerはmaintenance/compatibilityへ戻す。
 3. normalized schema、explicit migration、bounded pool/deadline、typed conflictを持つPostgreSQL adapterを実装する。
 4. shared conformanceにwrite skew、absent-key race、serialization failure、lease fencing、schema/version skewを追加する。

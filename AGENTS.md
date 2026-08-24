@@ -206,9 +206,11 @@ criterion after context compaction. Re-check `main`, the open stacked PR chain,
 and `TODO.md` before starting because repository state may have advanced. The
 next work is closing Phase 15-17 production gaps using the accepted
 [`PERSISTENCE.md`](PERSISTENCE.md) design. Node-core now asserts every declared
-read revision in its atomic write set. The current Phase 15 sequence is:
-explicit atomicity domains and a dedicated read-set contract, an indexed outbox
-claim contract, the normalized PostgreSQL reference adapter, shared
+read revision in its atomic write set. Runtime now has the explicit atomicity
+domain and dedicated read/mutation envelope with memory conformance; node-core
+and durable stores have not migrated. The current Phase 15 sequence is: wire
+node-core to that contract, add an indexed outbox claim contract, implement the
+normalized PostgreSQL reference adapter, run shared
 conformance, then deadline/cancellation, abrupt fault, backup/restore, capacity,
 and provider implementations. Do not spend further effort treating the opaque
 SQLite table or prefix scanner as the production schema. SQLite remains a local

@@ -741,6 +741,23 @@ to make authoritative state writes globally atomic. Detailed schema,
 provider mappings, migration, retention, backup/restore, fencing, and
 certification requirements live in [`PERSISTENCE.md`](PERSISTENCE.md).
 
+The runtime now models that boundary explicitly with a non-zero 32-byte
+`AtomicityDomainId`, a separately validated `AtomicStateReadSet`, a put/delete
+`AtomicStateMutationSet`, and `AtomicStateTransaction`. Read and mutation sets
+are unique and canonically key-ordered; every mutation must have a matching
+read assertion. The envelope caps each set at 4,096 keys and caps aggregate
+domain, key, revision, tag, and value bytes at 64 MiB. These are shared safety
+ceilings, not measured provider capacity; provider adapters may require lower
+bounds.
+
+`DomainTransactionalStateStore` reads through an explicit domain and commits
+exactly one such envelope. `MemoryStateStore` keeps domain maps isolated and
+validates every read before calculating or applying any mutation revision. Its
+legacy `StateStore` and `TransactionalStateStore` implementations remain in a
+private test-only legacy domain so existing node-core and SQLite conformance do
+not silently change physical layout. Node-core and durable-store migration are
+therefore still pending.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -873,3 +890,8 @@ certification requirements live in [`PERSISTENCE.md`](PERSISTENCE.md).
   atomic commit. Encode untouched read-write, read-only, absent, and tombstoned
   observations as revision-only `Assert` entries so a dependency change
   rejects application state, receipt, and outbox publication together.
+- DR-0041: Represent the production transaction boundary as one explicit
+  non-zero atomicity domain, one complete canonical read-assertion set, and one
+  canonical put/delete mutation set. Require every mutation to match a read,
+  bound aggregate bytes as well as key counts, and keep the legacy unscoped
+  store contract isolated until node-core and durable adapters migrate.
