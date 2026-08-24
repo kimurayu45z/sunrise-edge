@@ -204,8 +204,8 @@ In `TODO.md`, an implemented Phase is only an As-Is milestone, never a
 production-readiness claim. Preserve and work backward from each To-Be exit
 criterion after context compaction. Re-check `main`, the open stacked PR chain,
 and `TODO.md` before starting because repository state may have advanced. The
-next work is closing Phase 15-17 production gaps, especially unattended outbox
-scheduling, storage-aware deadlines, provider trust
+next work is closing Phase 15-17 production gaps, especially connecting bounded
+state discovery to unattended outbox recovery, storage-aware deadlines, provider trust
 boundaries, real runtime conformance, capacity/fault tests, observability, and
 rollout/rollback rehearsal. The current Phase 15 sequence is unattended provider
 scheduling and transport integration, storage-aware deadline/cancellation
