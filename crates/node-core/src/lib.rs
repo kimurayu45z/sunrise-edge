@@ -1951,9 +1951,10 @@ where
 
     match store.commit_invocation(context, invocation) {
         DurableCommitOutcome::Committed => Ok(transition.output),
-        DurableCommitOutcome::Rejected(DurableCommitRejection::Conflict { .. }) => {
-            Err(NodeCoreError::StateConflict)
-        }
+        DurableCommitOutcome::Rejected(
+            DurableCommitRejection::Conflict { .. }
+            | DurableCommitRejection::RequestAlreadyCommitted,
+        ) => Err(NodeCoreError::StateConflict),
         DurableCommitOutcome::Rejected(reason) => Err(NodeCoreError::DurableCommitRejected(reason)),
         DurableCommitOutcome::Indeterminate(reason) => {
             Err(NodeCoreError::DurableCommitIndeterminate(reason))
@@ -3389,6 +3390,24 @@ mod tests {
         assert_eq!(state.reads().len(), 1);
         assert!(state.mutations().is_empty());
         assert!(commits[0].outbox().is_none());
+    }
+
+    #[test]
+    fn durable_concurrent_receipt_publication_requests_reconciliation_retry() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Rejected(
+            DurableCommitRejection::RequestAlreadyCommitted,
+        ));
+        let result = handle_resolved_durable_idempotent_event(
+            &store,
+            &durable_context(),
+            &placement(0xC2, 7),
+            &config("sunrise-test"),
+            &resolver("sunrise-test"),
+            event("sunrise-test", request(0x93)),
+            &ReadOnlyMachine,
+        );
+
+        assert_eq!(result, Err(NodeCoreError::StateConflict));
     }
 
     #[test]

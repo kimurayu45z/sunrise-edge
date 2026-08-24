@@ -1138,3 +1138,15 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   represent full-range unsigned values with checked decimal constraints, and
   verify the real schema and due index in PostgreSQL 18 CI. Do not expose DDL on
   request paths or claim schema application alone is a durable adapter.
+- DR-0059: Implement normalized PostgreSQL structured commit through an explicit
+  bounded synchronous pool. Derive acquisition and transaction-local lock/
+  statement timeouts from the absolute durable-operation deadline, lock and
+  revalidate exact schema/fence metadata, validate every canonical state read,
+  and commit checked revisions, receipt, ordered outbox messages, and initial
+  delivery state in one serializable transaction. Retry only proven
+  serialization/deadlock aborts using the unchanged envelope, explicit attempt
+  ceiling, and remaining deadline. Treat pre-dispatch failures
+  as definite only with database evidence and classify unknown commit-boundary
+  loss conservatively as indeterminate. Keep pool maintenance operational rather
+  than a protocol liveness assumption, and do not claim production certification
+  before indexed claim/ack and fault/capacity evidence exist.

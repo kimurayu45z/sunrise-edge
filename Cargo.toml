@@ -57,6 +57,7 @@ node-core = { path = "crates/node-core" }
 native-http = { path = "crates/native-http" }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
 postgres = "=0.19.14"
+r2d2_postgres = "=0.18.2"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 sha2 = "0.11.0"
 sha3 = "0.12.0"
