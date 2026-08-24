@@ -952,6 +952,18 @@ impl NodeOutboxDelivery {
         }
     }
 
+    /// Returns the request that owns this delivery cursor.
+    #[must_use]
+    pub const fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    /// Returns the event digest shared with the immutable outbox batch.
+    #[must_use]
+    pub const fn event_digest(&self) -> Digest32 {
+        self.event_digest
+    }
+
     /// Returns the next message index that requires delivery.
     #[must_use]
     pub const fn next_index(&self) -> u32 {

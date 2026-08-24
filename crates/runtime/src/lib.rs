@@ -944,6 +944,12 @@ impl PersistenceLayout {
         self.prefixed(&format!("outbox/{}/batch", hex32(request_id)))
     }
 
+    /// Returns the binary prefix shared by all request outbox records.
+    #[must_use]
+    pub fn outbox_prefix(&self) -> Vec<u8> {
+        self.prefixed("outbox/")
+    }
+
     /// Returns the mutable outbound delivery-state key for one request.
     #[must_use]
     pub fn outbox_delivery_key(&self, request_id: [u8; 32]) -> Vec<u8> {

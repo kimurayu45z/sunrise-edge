@@ -473,6 +473,24 @@ returning a timeout while a database commit may continue would create ambiguous
 client semantics. Storage-aware deadlines, cooperative cancellation before
 commit, shutdown budgets, load capacity, and circuit breaking remain required.
 
+An embedding scheduler may call `recover_outboxes_once` without an active HTTP
+request. It scans one bounded outbox-key page, validates delivery/batch identity
+and cursor bounds, skips tombstones, completed batches, and unexpired leases,
+then drains at most one eligible request through the same lease/send/ack path.
+The result carries an exclusive continuation cursor when more keys remain; a
+later sweep must restart without a cursor. Recovery and HTTP share an explicit
+`NativeBlockingExecutor`, so scheduler invocations cannot bypass host blocking
+capacity. Capacity exhaustion is retryable scheduler failure, not queued work.
+
+The API creates no timer, task, loop, or daemon. Duplicate and concurrent
+scheduler calls are safe only through persisted lease/CAS contention and
+at-least-once downstream semantics. Transport failure leaves the lease, and a
+later sweep after expiry redelivers. The current implementation stops on a
+malformed record or transport failure instead of inventing a poison-message
+policy. Real provider triggers, authenticated control-plane input, durable
+SQLite reopen/process/power fault conformance, retention, scheduling backoff,
+and operational observability remain open.
+
 The default native route now requires a `TransactionalNodeStateMachine`, a hash
 suite resolver, a transactional store, and an injected outbox lease-ID source.
 Application updates, replayable responses, request/event deduplication, the
@@ -487,10 +505,11 @@ Lease-ID sources must prevent reuse for the same request across process
 restarts, because a delayed acknowledgement from an expired attempt must not
 match a newer lease. This closes the old native commit-before-enqueue loss
 window for request-scoped retries, but it is not the complete production
-delivery architecture. A local durable SQLite store and bounded native
-blocking seam exist, but no production runtime composition or provider
-scheduler that discovers unattended committed outboxes, poison-message policy,
-retention/compaction, trusted time policy, or crash/fault conformance exists yet. TLS,
+delivery architecture. A local durable SQLite store, bounded native blocking
+seam, and scheduler-callable one-shot discovery/recovery operation exist, but
+no production runtime composition, real provider trigger, poison-message
+policy, retention/compaction, trusted time policy, or crash/fault conformance
+exists yet. TLS,
 authentication, rate limiting, audit telemetry, and proxy hardening also remain
 deployment requirements.
 
@@ -771,11 +790,16 @@ license/SBOM policy, and protected review/merge controls.
   concurrency limit. Acquire capacity before submitting one complete canonical
   decode/invoke/deliver/encode job to Tokio's blocking pool, reject excess work
   with 429, and keep liveness independent. Do not emit an invented retry delay
-  or claim cancellable deadlines
-  by timing out a started `spawn_blocking` job; design deadlines with the
-  storage operation and commit boundary instead.
+  or claim cancellable deadlines by timing out a started `spawn_blocking` job;
+  design deadlines with the storage operation and commit boundary instead.
 - DR-0036: Add optional bounded state-key discovery outside the protocol
   transition store contract. Require binary-prefix, exclusive-cursor pagination
   with a fixed page ceiling, canonical ordering, validated provider pages, and
   tombstone visibility. Treat pages as non-snapshot observations and require
   periodic prefix restarts before using the seam for unattended recovery.
+- DR-0037: Expose unattended native recovery as a scheduler-invoked, one-shot
+  bounded operation rather than a resident loop. Share HTTP blocking admission,
+  validate persisted batch/delivery identity, skip live leases and completed
+  records, recover at most one outbox, and return an exclusive continuation.
+  Keep the scheduler untrusted and preserve lease-expiry redelivery after
+  send-without-ack failure.

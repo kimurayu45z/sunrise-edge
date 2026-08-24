@@ -1905,13 +1905,17 @@ Phase 15 As-Is scope:
   revisionを同一transactionでassertする。matching lease/indexのackだけがcursorを進め、期限切れ
   claimは同じindexを再配信する。これはsend後ack前crashでmessageを失わないat-least-onceであり、
   exactly-onceではない。native HTTPは30秒leaseとinjected restart-safe lease ID sourceでtransportを
-  driveする。provider scheduler、trusted time policy、poison message、retention/compaction、durable
-  fault testはTo-Beに残る。
+  driveする。nativeはStateKeyScanner pageからcompleted/tombstone/active leaseをskipし、最大1 outboxを
+  同じlease/send/ack経路で処理してexclusive continuationを返すrecover_outboxes_onceを提供する。
+  HTTPと同じNativeBlockingExecutorを共有し、resident loopやscheduler trustを作らない
+  （implemented As-Is）。real provider trigger、trusted time policy、poison message、
+  retention/compaction、durable fault testはTo-Beに残る。
 - native adapterはPOST /v1/events、exact canonical binary media type、bounded body、
   deterministic HTTP status mapping、GET /health/live、graceful shutdownを提供する。
 - native outbound eventはatomic commit済みoutboxからlease後にruntime transportへ渡し、send成功後
   にmatching lease/indexをackする。send failureは503とactive leaseを残し、期限切れ後のretryで
-  at-least-once redeliveryする。process crash後にrequestなしで回復するschedulerは未実装である。
+  at-least-once redeliveryする。requestなしのone-shot recovery seamは実装したが、provider scheduler
+  trigger、durable SQLite runtime composition、process/power-fault conformanceは未実装である。
 - TLS、authentication、rate limiting、durable StateStoreのbounded wiring、audit telemetry、reverse
   proxy hardeningは未実装であり、このAs-Is adapterをinternet-facing production serverと扱わない。
 - 現在のRuntime traitは同期APIであるため、native adapterはcanonical decode、node-core、durable

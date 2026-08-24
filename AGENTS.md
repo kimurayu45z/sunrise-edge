@@ -204,12 +204,13 @@ In `TODO.md`, an implemented Phase is only an As-Is milestone, never a
 production-readiness claim. Preserve and work backward from each To-Be exit
 criterion after context compaction. Re-check `main`, the open stacked PR chain,
 and `TODO.md` before starting because repository state may have advanced. The
-next work is closing Phase 15-17 production gaps, especially connecting bounded
-state discovery to unattended outbox recovery, storage-aware deadlines, provider trust
-boundaries, real runtime conformance, capacity/fault tests, observability, and
-rollout/rollback rehearsal. The current Phase 15 sequence is unattended provider
-scheduling and transport integration, storage-aware deadline/cancellation
-semantics, and process/power-fault recovery conformance; do not jump to provider
+next work is closing Phase 15-17 production gaps, especially durable SQLite
+recovery conformance, real provider trigger wiring, storage-aware deadlines,
+provider trust boundaries, real runtime conformance, capacity/fault tests, observability, and
+rollout/rollback rehearsal. The current Phase 15 sequence is SQLite reopen and
+process-fault recovery conformance, provider trigger/transport integration,
+storage-aware deadline/cancellation semantics, and process/power-fault recovery
+conformance; do not jump to provider
 deployment claims before that shared foundation is complete. Native blocking
 work already has explicit admission isolation, but its configured limit is not
 a validated capacity budget and started work is not cancellable.

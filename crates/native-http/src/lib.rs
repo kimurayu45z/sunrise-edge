@@ -20,11 +20,13 @@ use core::fmt;
 use hashing::HashSuiteResolver;
 use node_core::{
     MAX_NODE_OUTPUT_ITEMS, MAX_NODE_PAYLOAD_BYTES, NodeConfig, NodeCoreError, NodeEvent,
-    NodeResponse, OutboxLeaseId, RequestId, TransactionalNodeStateMachine,
-    acknowledge_outbox_message, claim_next_outbox_message, handle_idempotent_event,
+    NodeOutboxBatch, NodeOutboxDelivery, NodeResponse, OutboxLeaseId, RequestId,
+    TransactionalNodeStateMachine, acknowledge_outbox_message, claim_next_outbox_message,
+    handle_idempotent_event,
 };
 use runtime::{
-    Clock, PersistenceLayout, Runtime, RuntimeError, TransactionalStateStore, Transport,
+    Clock, PersistenceLayout, Runtime, RuntimeError, StateKeyScan, StateKeyScanner,
+    TransactionalStateStore, Transport,
 };
 use std::{error::Error, future::Future, num::NonZeroUsize, sync::Arc};
 use tokio::sync::{Semaphore, TryAcquireError};
@@ -68,6 +70,29 @@ impl NativeBlockingPolicy {
     #[must_use]
     pub const fn max_concurrent_invocations(self) -> NonZeroUsize {
         self.max_concurrent_invocations
+    }
+}
+
+/// Shared admission pool for native HTTP and scheduler-triggered recovery.
+///
+/// Clone and pass the same executor to [`router_with_executor`] and
+/// [`recover_outboxes_once`] so recovery cannot bypass request capacity.
+#[derive(Clone, Debug)]
+pub struct NativeBlockingExecutor {
+    permits: Arc<Semaphore>,
+}
+
+impl NativeBlockingExecutor {
+    /// Creates a shared executor from an explicit host capacity policy.
+    #[must_use]
+    pub fn new(policy: NativeBlockingPolicy) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(policy.max_concurrent_invocations().get())),
+        }
+    }
+
+    fn try_acquire(&self) -> Result<tokio::sync::OwnedSemaphorePermit, TryAcquireError> {
+        Arc::clone(&self.permits).try_acquire_owned()
     }
 }
 
@@ -302,7 +327,7 @@ struct NativeHttpState<R, M, L> {
     resolver: HashSuiteResolver,
     machine: Arc<M>,
     lease_ids: Arc<L>,
-    blocking_permits: Arc<Semaphore>,
+    blocking_executor: NativeBlockingExecutor,
 }
 
 /// Builds the recoverable native HTTP router.
@@ -324,15 +349,41 @@ where
     M: TransactionalNodeStateMachine + Send + Sync + 'static,
     L: OutboxLeaseIdSource + Send + Sync + 'static,
 {
+    router_with_executor(
+        runtime,
+        config,
+        resolver,
+        machine,
+        lease_ids,
+        NativeBlockingExecutor::new(blocking_policy),
+    )
+}
+
+/// Builds the native router with a reusable blocking admission executor.
+///
+/// Native embeddings that run unattended outbox recovery should share this
+/// executor with [`recover_outboxes_once`].
+pub fn router_with_executor<R, M, L>(
+    runtime: Arc<R>,
+    config: NodeConfig,
+    resolver: HashSuiteResolver,
+    machine: Arc<M>,
+    lease_ids: Arc<L>,
+    blocking_executor: NativeBlockingExecutor,
+) -> Router
+where
+    R: Runtime + Send + Sync + 'static,
+    R::State: TransactionalStateStore,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    L: OutboxLeaseIdSource + Send + Sync + 'static,
+{
     let state = Arc::new(NativeHttpState {
         runtime,
         config,
         resolver,
         machine,
         lease_ids,
-        blocking_permits: Arc::new(Semaphore::new(
-            blocking_policy.max_concurrent_invocations().get(),
-        )),
+        blocking_executor,
     });
     Router::new()
         .route(LIVENESS_PATH, get(liveness))
@@ -356,6 +407,218 @@ where
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await
+}
+
+/// Result of one bounded scheduler-triggered recovery invocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeOutboxRecoveryOutcome {
+    /// This page contained no expired or unleased pending outbox.
+    NoEligibleOutbox,
+    /// One pending outbox was delivered through its persisted cursor.
+    Recovered(RequestId),
+    /// Another invocation won the lease or state transaction race.
+    Contended(RequestId),
+}
+
+/// Bounded progress returned to an untrusted external scheduler.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeOutboxRecoveryReport {
+    outcome: NativeOutboxRecoveryOutcome,
+    continuation_cursor: Option<Vec<u8>>,
+}
+
+impl NativeOutboxRecoveryReport {
+    /// Returns what this invocation observed or recovered.
+    #[must_use]
+    pub const fn outcome(&self) -> &NativeOutboxRecoveryOutcome {
+        &self.outcome
+    }
+
+    /// Returns the exclusive key cursor for the next page/invocation.
+    ///
+    /// `None` ends this sweep. A later scheduled sweep must start from `None`
+    /// again to discover concurrent inserts and expired leases.
+    #[must_use]
+    pub fn continuation_cursor(&self) -> Option<&[u8]> {
+        self.continuation_cursor.as_deref()
+    }
+}
+
+/// Failures from one scheduler-triggered recovery invocation.
+#[derive(Debug)]
+pub enum NativeOutboxRecoveryError {
+    /// Request work already occupies the configured blocking capacity.
+    CapacityExhausted,
+    /// The shared admission pool was closed.
+    AdmissionClosed,
+    /// Tokio could not join the blocking task.
+    BlockingTaskFailed,
+    /// Key discovery or durable state access failed.
+    Runtime(RuntimeError),
+    /// Persisted outbox state or a lease transition failed validation.
+    Node(NodeCoreError),
+    /// The outbound transport rejected a leased message.
+    Send,
+    /// A restart-safe lease identifier could not be allocated.
+    LeaseId(OutboxLeaseIdSourceError),
+}
+
+impl fmt::Display for NativeOutboxRecoveryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapacityExhausted => f.write_str("native blocking capacity is exhausted"),
+            Self::AdmissionClosed => f.write_str("native blocking admission is closed"),
+            Self::BlockingTaskFailed => f.write_str("native blocking recovery task failed"),
+            Self::Runtime(error) => write!(f, "outbox discovery failed: {error}"),
+            Self::Node(error) => write!(f, "outbox recovery failed: {error}"),
+            Self::Send => f.write_str("outbox recovery transport send failed"),
+            Self::LeaseId(error) => write!(f, "outbox recovery lease identity failed: {error}"),
+        }
+    }
+}
+
+impl Error for NativeOutboxRecoveryError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Runtime(error) => Some(error),
+            Self::Node(error) => Some(error),
+            Self::LeaseId(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Recovers at most one unattended outbox without requiring a live request.
+///
+/// The caller is an untrusted scheduler: it supplies only a bounded scan cursor
+/// and page size, and must invoke this function again while a continuation is
+/// returned. A later sweep restarts with `after = None`. This function creates
+/// no loop or background task and shares admission with HTTP when given the
+/// same [`NativeBlockingExecutor`].
+pub async fn recover_outboxes_once<R, L>(
+    runtime: Arc<R>,
+    config: NodeConfig,
+    lease_ids: Arc<L>,
+    blocking_executor: NativeBlockingExecutor,
+    after: Option<Vec<u8>>,
+    scan_limit: NonZeroUsize,
+) -> Result<NativeOutboxRecoveryReport, NativeOutboxRecoveryError>
+where
+    R: Runtime + Send + Sync + 'static,
+    R::State: TransactionalStateStore + StateKeyScanner,
+    L: OutboxLeaseIdSource + Send + Sync + 'static,
+{
+    let layout = PersistenceLayout::new(config.chain_id().clone(), config.protocol_version());
+    let scan = StateKeyScan::new(layout.outbox_prefix(), after, scan_limit)
+        .map_err(NativeOutboxRecoveryError::Runtime)?;
+    let permit = match blocking_executor.try_acquire() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => {
+            return Err(NativeOutboxRecoveryError::CapacityExhausted);
+        }
+        Err(TryAcquireError::Closed) => {
+            return Err(NativeOutboxRecoveryError::AdmissionClosed);
+        }
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        recover_outboxes_once_blocking(runtime.as_ref(), &config, lease_ids.as_ref(), &scan)
+    })
+    .await
+    .map_err(|_| NativeOutboxRecoveryError::BlockingTaskFailed)?
+}
+
+fn recover_outboxes_once_blocking<R, L>(
+    runtime: &R,
+    config: &NodeConfig,
+    lease_ids: &L,
+    scan: &StateKeyScan,
+) -> Result<NativeOutboxRecoveryReport, NativeOutboxRecoveryError>
+where
+    R: Runtime,
+    R::State: TransactionalStateStore + StateKeyScanner,
+    L: OutboxLeaseIdSource,
+{
+    let page = runtime
+        .state_store()
+        .scan_keys(scan)
+        .map_err(NativeOutboxRecoveryError::Runtime)?;
+    let layout = PersistenceLayout::new(config.chain_id().clone(), config.protocol_version());
+    let now_unix_millis = runtime
+        .clock()
+        .now_unix_millis()
+        .map_err(NativeOutboxRecoveryError::Runtime)?;
+
+    for (index, key) in page.keys().iter().enumerate() {
+        if !key.ends_with(b"/delivery") {
+            continue;
+        }
+        let delivery_value = runtime
+            .state_store()
+            .get_versioned(key)
+            .map_err(NativeOutboxRecoveryError::Runtime)?;
+        let Some(delivery_bytes) = delivery_value.value() else {
+            continue;
+        };
+        let delivery =
+            NodeOutboxDelivery::decode(delivery_bytes).map_err(NativeOutboxRecoveryError::Node)?;
+        let request_id = delivery.request_id();
+        if layout.outbox_delivery_key(*request_id.as_bytes()) != *key {
+            return Err(NativeOutboxRecoveryError::Node(
+                NodeCoreError::PersistenceInvariant("outbox delivery key does not match record"),
+            ));
+        }
+        let batch_value = runtime
+            .state_store()
+            .get_versioned(&layout.outbox_batch_key(*request_id.as_bytes()))
+            .map_err(NativeOutboxRecoveryError::Runtime)?;
+        let batch = NodeOutboxBatch::decode(batch_value.value().ok_or({
+            NativeOutboxRecoveryError::Node(NodeCoreError::PersistenceInvariant(
+                "outbox delivery exists without batch",
+            ))
+        })?)
+        .map_err(NativeOutboxRecoveryError::Node)?;
+        if batch.request_id() != request_id || batch.event_digest() != delivery.event_digest() {
+            return Err(NativeOutboxRecoveryError::Node(
+                NodeCoreError::PersistenceInvariant("outbox batch and delivery identities differ"),
+            ));
+        }
+        let next_index = usize::try_from(delivery.next_index()).map_err(|_| {
+            NativeOutboxRecoveryError::Node(NodeCoreError::OutboxArithmeticOverflow)
+        })?;
+        if next_index > batch.messages().len() {
+            return Err(NativeOutboxRecoveryError::Node(
+                NodeCoreError::PersistenceInvariant("outbox cursor exceeds batch length"),
+            ));
+        }
+        if next_index == batch.messages().len()
+            || delivery
+                .lease()
+                .is_some_and(|(_, expires_at)| expires_at > now_unix_millis)
+        {
+            continue;
+        }
+
+        let has_later_keys = index + 1 < page.keys().len() || page.continuation_cursor().is_some();
+        let continuation_cursor = has_later_keys.then(|| key.clone());
+        let outcome = match deliver_request_outbox(runtime, config, lease_ids, request_id) {
+            Ok(0) => NativeOutboxRecoveryOutcome::Contended(request_id),
+            Ok(_) => NativeOutboxRecoveryOutcome::Recovered(request_id),
+            Err(OutboxDeliveryError::Node(
+                NodeCoreError::OutboxLeaseActive { .. } | NodeCoreError::StateConflict,
+            )) => NativeOutboxRecoveryOutcome::Contended(request_id),
+            Err(error) => return Err(recovery_delivery_error(error)),
+        };
+        return Ok(NativeOutboxRecoveryReport {
+            outcome,
+            continuation_cursor,
+        });
+    }
+
+    Ok(NativeOutboxRecoveryReport {
+        outcome: NativeOutboxRecoveryOutcome::NoEligibleOutbox,
+        continuation_cursor: page.continuation_cursor().map(<[u8]>::to_vec),
+    })
 }
 
 async fn liveness() -> StatusCode {
@@ -389,7 +652,7 @@ where
         Ok(body) => body,
         Err(error) => return error_response(error.status(), "body-rejected"),
     };
-    let permit = match Arc::clone(&state.blocking_permits).try_acquire_owned() {
+    let permit = match state.blocking_executor.try_acquire() {
         Ok(permit) => permit,
         Err(TryAcquireError::NoPermits) => return overload_response(),
         Err(TryAcquireError::Closed) => {
@@ -445,7 +708,13 @@ where
         state.machine.as_ref(),
     )
     .map_err(InvocationError::Node)?;
-    deliver_request_outbox(state, request_id).map_err(InvocationError::Delivery)?;
+    let _delivered_messages = deliver_request_outbox(
+        state.runtime.as_ref(),
+        &state.config,
+        state.lease_ids.as_ref(),
+        request_id,
+    )
+    .map_err(InvocationError::Delivery)?;
     HttpNodeResult::new(request_id, output.responses().to_vec())
         .and_then(|result| result.encode())
         .map_err(|_| InvocationError::ResultEncoding)
@@ -500,24 +769,32 @@ impl From<OutboxLeaseIdSourceError> for OutboxDeliveryError {
     }
 }
 
-fn deliver_request_outbox<R, M, L>(
-    state: &NativeHttpState<R, M, L>,
+fn recovery_delivery_error(error: OutboxDeliveryError) -> NativeOutboxRecoveryError {
+    match error {
+        OutboxDeliveryError::Node(error) => NativeOutboxRecoveryError::Node(error),
+        OutboxDeliveryError::Send => NativeOutboxRecoveryError::Send,
+        OutboxDeliveryError::LeaseId(error) => NativeOutboxRecoveryError::LeaseId(error),
+    }
+}
+
+fn deliver_request_outbox<R, L>(
+    runtime: &R,
+    config: &NodeConfig,
+    lease_ids: &L,
     request_id: RequestId,
-) -> Result<(), OutboxDeliveryError>
+) -> Result<usize, OutboxDeliveryError>
 where
     R: Runtime,
     R::State: TransactionalStateStore,
     L: OutboxLeaseIdSource,
 {
-    let layout = PersistenceLayout::new(
-        state.config.chain_id().clone(),
-        state.config.protocol_version(),
-    );
+    let layout = PersistenceLayout::new(config.chain_id().clone(), config.protocol_version());
+    let mut delivered_messages = 0_usize;
     for _ in 0..MAX_NODE_OUTPUT_ITEMS {
-        let lease_id = state.lease_ids.next_lease_id(request_id)?;
-        let now_unix_millis = state.runtime.clock().now_unix_millis()?;
+        let lease_id = lease_ids.next_lease_id(request_id)?;
+        let now_unix_millis = runtime.clock().now_unix_millis()?;
         let Some(claim) = claim_next_outbox_message(
-            state.runtime.state_store(),
+            runtime.state_store(),
             &layout,
             request_id,
             lease_id,
@@ -525,23 +802,25 @@ where
             NATIVE_OUTBOX_LEASE_MILLIS,
         )?
         else {
-            return Ok(());
+            return Ok(delivered_messages);
         };
         let encoded = claim.message().event().encode()?;
-        state
-            .runtime
+        runtime
             .transport()
             .send(encoded)
             .map_err(|_| OutboxDeliveryError::Send)?;
         acknowledge_outbox_message(
-            state.runtime.state_store(),
+            runtime.state_store(),
             &layout,
             claim.request_id(),
             claim.index(),
             claim.lease_id(),
         )?;
+        delivered_messages = delivered_messages
+            .checked_add(1)
+            .ok_or(NodeCoreError::OutboxArithmeticOverflow)?;
     }
-    Ok(())
+    Ok(delivered_messages)
 }
 
 fn has_supported_content_type(headers: &HeaderMap) -> bool {
@@ -1051,6 +1330,9 @@ mod tests {
     async fn blocking_work_is_isolated_and_excess_requests_are_not_queued() {
         let runtime = Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
         let config = config();
+        let lease_ids = Arc::new(SequenceLeaseIds::default());
+        let blocking_executor =
+            NativeBlockingExecutor::new(NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap()));
         let entered = Arc::new(Notify::new());
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let machine = Arc::new(BlockingMachine {
@@ -1058,13 +1340,13 @@ mod tests {
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
         });
-        let app = router(
-            runtime,
-            config,
+        let app = router_with_executor(
+            Arc::clone(&runtime),
+            config.clone(),
             resolver(),
             machine,
-            Arc::new(SequenceLeaseIds::default()),
-            NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap()),
+            Arc::clone(&lease_ids),
+            blocking_executor.clone(),
         );
 
         let first_app = app.clone();
@@ -1095,6 +1377,15 @@ mod tests {
             )
             .await
             .unwrap();
+        let recovery = recover_outboxes_once(
+            runtime,
+            config,
+            lease_ids,
+            blocking_executor,
+            None,
+            NonZeroUsize::new(4).unwrap(),
+        )
+        .await;
 
         let (released, release_signal) = release.as_ref();
         *released.lock().unwrap() = true;
@@ -1103,9 +1394,253 @@ mod tests {
 
         assert_eq!(live.status(), StatusCode::NO_CONTENT);
         assert_eq!(overloaded.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(matches!(
+            recovery,
+            Err(NativeOutboxRecoveryError::CapacityExhausted)
+        ));
         let overload_body = to_bytes(overloaded.into_body(), 128).await.unwrap();
         assert_eq!(overload_body, "blocking-capacity-exhausted");
         assert_eq!(first.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unattended_recovery_drains_at_most_one_outbox_and_paginates() {
+        let runtime = Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
+        let config = config();
+        let machine = IncrementMachine::new(config.state_key());
+        let resolver = resolver();
+        let first_id = request_id(0x61);
+        let second_id = request_id(0x62);
+        handle_idempotent_event(
+            runtime.as_ref(),
+            &config,
+            &resolver,
+            event(first_id),
+            &machine,
+        )
+        .unwrap();
+        handle_idempotent_event(
+            runtime.as_ref(),
+            &config,
+            &resolver,
+            event(second_id),
+            &machine,
+        )
+        .unwrap();
+        assert!(runtime.transport().drain_outbound().unwrap().is_empty());
+
+        let lease_ids = Arc::new(SequenceLeaseIds::default());
+        let executor =
+            NativeBlockingExecutor::new(NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap()));
+        let first = recover_outboxes_once(
+            Arc::clone(&runtime),
+            config.clone(),
+            Arc::clone(&lease_ids),
+            executor.clone(),
+            None,
+            NonZeroUsize::new(4).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            first.outcome(),
+            &NativeOutboxRecoveryOutcome::Recovered(first_id)
+        );
+        assert!(first.continuation_cursor().is_some());
+        assert_eq!(runtime.transport().drain_outbound().unwrap().len(), 1);
+
+        let second = recover_outboxes_once(
+            Arc::clone(&runtime),
+            config.clone(),
+            Arc::clone(&lease_ids),
+            executor.clone(),
+            first.continuation_cursor().map(<[u8]>::to_vec),
+            NonZeroUsize::new(4).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second.outcome(),
+            &NativeOutboxRecoveryOutcome::Recovered(second_id)
+        );
+        assert_eq!(second.continuation_cursor(), None);
+        assert_eq!(runtime.transport().drain_outbound().unwrap().len(), 1);
+
+        let completed_sweep = recover_outboxes_once(
+            runtime,
+            config,
+            lease_ids,
+            executor,
+            None,
+            NonZeroUsize::new(4).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            completed_sweep.outcome(),
+            &NativeOutboxRecoveryOutcome::NoEligibleOutbox
+        );
+        assert_eq!(completed_sweep.continuation_cursor(), None);
+    }
+
+    #[tokio::test]
+    async fn unattended_recovery_skips_active_lease_and_retries_after_expiry() {
+        let runtime = Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
+        let config = config();
+        let id = request_id(0x63);
+        handle_idempotent_event(
+            runtime.as_ref(),
+            &config,
+            &resolver(),
+            event(id),
+            &IncrementMachine::new(config.state_key()),
+        )
+        .unwrap();
+        let layout = PersistenceLayout::new(config.chain_id().clone(), config.protocol_version());
+        claim_next_outbox_message(
+            runtime.state_store(),
+            &layout,
+            id,
+            OutboxLeaseId::new([0xAA; 32]).unwrap(),
+            0,
+            NATIVE_OUTBOX_LEASE_MILLIS,
+        )
+        .unwrap()
+        .unwrap();
+
+        let lease_ids = Arc::new(SequenceLeaseIds::default());
+        let executor =
+            NativeBlockingExecutor::new(NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap()));
+        let active = recover_outboxes_once(
+            Arc::clone(&runtime),
+            config.clone(),
+            Arc::clone(&lease_ids),
+            executor.clone(),
+            None,
+            NonZeroUsize::new(4).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            active.outcome(),
+            &NativeOutboxRecoveryOutcome::NoEligibleOutbox
+        );
+        assert!(runtime.transport().drain_outbound().unwrap().is_empty());
+
+        runtime.clock().set(NATIVE_OUTBOX_LEASE_MILLIS);
+        let expired = recover_outboxes_once(
+            Arc::clone(&runtime),
+            config,
+            lease_ids,
+            executor,
+            None,
+            NonZeroUsize::new(4).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            expired.outcome(),
+            &NativeOutboxRecoveryOutcome::Recovered(id)
+        );
+        assert_eq!(runtime.transport().drain_outbound().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unattended_recovery_redelivers_send_without_ack_after_lease_expiry() {
+        let runtime = Arc::new(FailOnceRuntime::new());
+        let config = config();
+        let id = request_id(0x64);
+        handle_idempotent_event(
+            runtime.as_ref(),
+            &config,
+            &resolver(),
+            event(id),
+            &IncrementMachine::new(config.state_key()),
+        )
+        .unwrap();
+        let lease_ids = Arc::new(SequenceLeaseIds::default());
+        let executor =
+            NativeBlockingExecutor::new(NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap()));
+
+        let failed = recover_outboxes_once(
+            Arc::clone(&runtime),
+            config.clone(),
+            Arc::clone(&lease_ids),
+            executor.clone(),
+            None,
+            NonZeroUsize::new(4).unwrap(),
+        )
+        .await;
+        assert!(matches!(failed, Err(NativeOutboxRecoveryError::Send)));
+        assert!(runtime.transport().drain_outbound().unwrap().is_empty());
+
+        runtime.clock.set(31_000);
+        let recovered = recover_outboxes_once(
+            Arc::clone(&runtime),
+            config.clone(),
+            lease_ids,
+            executor,
+            None,
+            NonZeroUsize::new(4).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered.outcome(),
+            &NativeOutboxRecoveryOutcome::Recovered(id)
+        );
+        assert_eq!(runtime.transport().drain_outbound().unwrap().len(), 1);
+        let state = runtime
+            .state_store()
+            .get(config.state_key())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_canonical_frame(&state)
+                .unwrap()
+                .required_u64(1)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn unattended_recovery_fails_closed_on_mismatched_delivery_key() {
+        let runtime = Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
+        let config = config();
+        let recorded_id = request_id(0x71);
+        handle_idempotent_event(
+            runtime.as_ref(),
+            &config,
+            &resolver(),
+            event(recorded_id),
+            &IncrementMachine::new(config.state_key()),
+        )
+        .unwrap();
+        let layout = PersistenceLayout::new(config.chain_id().clone(), config.protocol_version());
+        let delivery = runtime
+            .state_store()
+            .get(&layout.outbox_delivery_key(*recorded_id.as_bytes()))
+            .unwrap()
+            .unwrap();
+        runtime
+            .state_store()
+            .put(
+                layout.outbox_delivery_key(*request_id(0x70).as_bytes()),
+                delivery,
+            )
+            .unwrap();
+
+        let result = recover_outboxes_once(
+            runtime,
+            config,
+            Arc::new(SequenceLeaseIds::default()),
+            NativeBlockingExecutor::new(NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap())),
+            None,
+            NonZeroUsize::new(8).unwrap(),
+        )
+        .await;
+        assert!(matches!(result, Err(NativeOutboxRecoveryError::Node(_))));
     }
 
     #[tokio::test]
