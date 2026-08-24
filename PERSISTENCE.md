@@ -253,7 +253,10 @@ acknowledgement each receive one same-identity reconciliation attempt; an
 unresolved claim is never sent. The path shares native blocking admission and
 returns no scan cursor. It has only scripted in-memory conformance: no durable
 adapter implements the repository, and transport-aware cancellation/deadlines
-remain pending.
+remain pending. The shared in-memory structured store now implements the actual
+indexed repository contract as ephemeral conformance: initial delivery rows,
+stable due ordering, lease expiry/replacement, same-lease claim replay, retained
+attempt history, and delayed acknowledgement after later progress are covered.
 
 `StateKeyScanner` remains useful for repair, audit, bounded migration, and
 compatibility recovery. It is not a production work queue.

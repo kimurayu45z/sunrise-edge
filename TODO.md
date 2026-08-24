@@ -1958,7 +1958,9 @@ Phase 15 As-Is scope:
   （contract implemented As-Is）。nativeはtrusted deployment compositionからlogical domain、writer fence、
   lease未満のbounded storage timeout、restart-safe lease/correlation identityを受けるone-shot indexed recoveryを持つ。
   claim/ackのIndeterminateは同じidentityで各1回だけreconcileし、unresolved claimはsendせず、scan cursorを返さず、
-  HTTPとblocking admissionを共有する（native wiring implemented As-Is; scripted memory conformance only）。
+  HTTPとblocking admissionを共有する。single-lock memory repositoryはinitial delivery、stable due order、lease expiry、
+  same-lease reconciliation、retained attempt history、later progress後のdelayed ackを検証する
+  （native/memory implemented As-Is; restart-safe durable adapter pending）。
   durable adapter、transport-aware deadline/cancellation、real scheduler bindingは未実装である。
 - ComposedRuntimeはStateStore、BlobStore、Signer、Transport、Clock、Schedulerをhidden defaultなしで
   明示的に所有・合成する。SQLiteへstate/dedup/outboxをcommit後にruntimeをdropし、同じDBを別compositionで

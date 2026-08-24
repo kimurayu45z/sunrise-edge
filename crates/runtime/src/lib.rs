@@ -2121,6 +2121,33 @@ struct MemoryDurableStoreData {
     state_domains: MemoryDomainState,
     receipts: BTreeMap<MemoryDurableInvocationKey, DurableRequestReceipt>,
     outboxes: BTreeMap<MemoryDurableInvocationKey, DurableOutboxBatch>,
+    deliveries: BTreeMap<MemoryDurableInvocationKey, MemoryOutboxDelivery>,
+    delivery_attempts: BTreeMap<[u8; 32], MemoryOutboxDeliveryAttempt>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MemoryOutboxDelivery {
+    next_index: u32,
+    available_at_unix_millis: u64,
+    active_lease: Option<(DurableOutboxLeaseId, u64)>,
+    attempt_count: u64,
+    completed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoryOutboxAttemptStatus {
+    Claimed,
+    Acknowledged,
+    Expired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MemoryOutboxDeliveryAttempt {
+    domain: AtomicityDomainId,
+    request_id: OutboxRequestId,
+    message_index: u32,
+    lease_expires_at_unix_millis: u64,
+    status: MemoryOutboxAttemptStatus,
 }
 
 /// In-memory conformance fixture for the fenced structured durable contract.
@@ -2145,6 +2172,8 @@ impl MemoryDurableStateStore {
                 state_domains: BTreeMap::new(),
                 receipts: BTreeMap::new(),
                 outboxes: BTreeMap::new(),
+                deliveries: BTreeMap::new(),
+                delivery_attempts: BTreeMap::new(),
             })),
         }
     }
@@ -2352,6 +2381,16 @@ impl StructuredDurableDomainStateStore for MemoryDurableStateStore {
         } else {
             Vec::new()
         };
+        let delivery = transaction
+            .outbox
+            .as_ref()
+            .map(|outbox| MemoryOutboxDelivery {
+                next_index: 0,
+                available_at_unix_millis: 0,
+                active_lease: None,
+                attempt_count: 0,
+                completed: outbox.messages().is_empty(),
+            });
 
         if let Some(state_transaction) = transaction.state {
             let state = data.state_domains.entry(domain).or_default();
@@ -2367,7 +2406,333 @@ impl StructuredDurableDomainStateStore for MemoryDurableStateStore {
         if let Some(outbox) = transaction.outbox {
             data.outboxes.insert(request_key, outbox);
         }
+        if let Some(delivery) = delivery {
+            data.deliveries.insert(request_key, delivery);
+        }
         DurableCommitOutcome::Committed
+    }
+}
+
+fn validate_memory_outbox_claim_authority(
+    data: &MemoryDurableStoreData,
+    context: &DurableOperationContext,
+) -> Result<(), DurableOutboxClaimRejection> {
+    if context.writer_fence() != data.active_writer_fence {
+        return Err(DurableOutboxClaimRejection::WriterFenced {
+            active_generation: data.active_writer_fence,
+        });
+    }
+    if context.deadline().is_expired_at(data.now_unix_millis) {
+        return Err(DurableOutboxClaimRejection::DeadlineExceededBeforeCommit);
+    }
+    Ok(())
+}
+
+fn validate_memory_outbox_ack_authority(
+    data: &MemoryDurableStoreData,
+    context: &DurableOperationContext,
+) -> Result<(), DurableOutboxAcknowledgementRejection> {
+    if context.writer_fence() != data.active_writer_fence {
+        return Err(DurableOutboxAcknowledgementRejection::WriterFenced {
+            active_generation: data.active_writer_fence,
+        });
+    }
+    if context.deadline().is_expired_at(data.now_unix_millis) {
+        return Err(DurableOutboxAcknowledgementRejection::DeadlineExceededBeforeCommit);
+    }
+    Ok(())
+}
+
+fn memory_outbox_claim_from_attempt(
+    data: &MemoryDurableStoreData,
+    lease_id: DurableOutboxLeaseId,
+    attempt: &MemoryOutboxDeliveryAttempt,
+) -> Result<DurableOutboxClaim, DurableOutboxClaimRejection> {
+    let request_key = (*attempt.domain.as_bytes(), *attempt.request_id.as_bytes());
+    let delivery = data
+        .deliveries
+        .get(&request_key)
+        .ok_or(DurableOutboxClaimRejection::InvalidPersistedState)?;
+    if delivery.active_lease != Some((lease_id, attempt.lease_expires_at_unix_millis))
+        || delivery.next_index != attempt.message_index
+    {
+        return Err(DurableOutboxClaimRejection::InvalidPersistedState);
+    }
+    let batch = data
+        .outboxes
+        .get(&request_key)
+        .ok_or(DurableOutboxClaimRejection::InvalidPersistedState)?;
+    let index = usize::try_from(attempt.message_index)
+        .map_err(|_| DurableOutboxClaimRejection::ArithmeticOverflow)?;
+    let message = batch
+        .messages()
+        .get(index)
+        .ok_or(DurableOutboxClaimRejection::InvalidPersistedState)?;
+    DurableOutboxClaim::from_parts(
+        attempt.request_id,
+        attempt.message_index,
+        lease_id,
+        attempt.lease_expires_at_unix_millis,
+        message.canonical_payload().to_vec(),
+    )
+    .map_err(|_| DurableOutboxClaimRejection::InvalidPersistedState)
+}
+
+impl IndexedOutboxRepository for MemoryDurableStateStore {
+    fn claim_due_outbox(
+        &self,
+        context: &DurableOperationContext,
+        request: DueOutboxClaimRequest,
+    ) -> DurableOutboxClaimOutcome {
+        let mut data = self
+            .inner
+            .write()
+            .expect("durable state store lock poisoned");
+        if let Err(reason) = validate_memory_outbox_claim_authority(&data, context) {
+            return DurableOutboxClaimOutcome::Rejected(reason);
+        }
+
+        let lease_key = *request.lease_id().as_bytes();
+        if let Some(attempt) = data.delivery_attempts.get(&lease_key).cloned() {
+            if attempt.domain != request.domain() {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::LeaseIdReuse,
+                );
+            }
+            if attempt.status != MemoryOutboxAttemptStatus::Claimed {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::LeaseIdReuse,
+                );
+            }
+            let claim = match memory_outbox_claim_from_attempt(&data, request.lease_id(), &attempt)
+            {
+                Ok(claim) => claim,
+                Err(reason) => return DurableOutboxClaimOutcome::Rejected(reason),
+            };
+            if attempt.lease_expires_at_unix_millis <= request.now_unix_millis() {
+                if let Some(attempt) = data.delivery_attempts.get_mut(&lease_key) {
+                    attempt.status = MemoryOutboxAttemptStatus::Expired;
+                }
+                let request_key = (*attempt.domain.as_bytes(), *attempt.request_id.as_bytes());
+                if let Some(delivery) = data.deliveries.get_mut(&request_key) {
+                    delivery.active_lease = None;
+                    delivery.available_at_unix_millis = 0;
+                }
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::LeaseIdReuse,
+                );
+            }
+            return DurableOutboxClaimOutcome::Claimed(claim);
+        }
+
+        let domain = *request.domain().as_bytes();
+        let selected = data
+            .deliveries
+            .iter()
+            .filter(|((candidate_domain, _), delivery)| {
+                *candidate_domain == domain
+                    && !delivery.completed
+                    && delivery.available_at_unix_millis <= request.now_unix_millis()
+                    && delivery
+                        .active_lease
+                        .is_none_or(|(_, expires_at)| expires_at <= request.now_unix_millis())
+            })
+            .min_by_key(|((_, request_id), delivery)| {
+                (delivery.available_at_unix_millis, *request_id)
+            })
+            .map(|(key, delivery)| (*key, delivery.clone()));
+        let Some((request_key, mut delivery)) = selected else {
+            return DurableOutboxClaimOutcome::NoDueWork;
+        };
+        let request_id = match OutboxRequestId::new(request_key.1) {
+            Ok(request_id) => request_id,
+            Err(_) => {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::InvalidPersistedState,
+                );
+            }
+        };
+        let batch = match data.outboxes.get(&request_key) {
+            Some(batch) => batch,
+            None => {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::InvalidPersistedState,
+                );
+            }
+        };
+        let index = match usize::try_from(delivery.next_index) {
+            Ok(index) => index,
+            Err(_) => {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::ArithmeticOverflow,
+                );
+            }
+        };
+        let message = match batch.messages().get(index) {
+            Some(message) => message,
+            None => {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::InvalidPersistedState,
+                );
+            }
+        };
+        let claim = match DurableOutboxClaim::from_parts(
+            request_id,
+            delivery.next_index,
+            request.lease_id(),
+            request.lease_expires_at_unix_millis(),
+            message.canonical_payload().to_vec(),
+        ) {
+            Ok(claim) => claim,
+            Err(_) => {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::InvalidPersistedState,
+                );
+            }
+        };
+        let attempt_count = match delivery.attempt_count.checked_add(1) {
+            Some(attempt_count) => attempt_count,
+            None => {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::ArithmeticOverflow,
+                );
+            }
+        };
+
+        if let Some((expired_lease, expires_at)) = delivery.active_lease {
+            let expired_key = *expired_lease.as_bytes();
+            let Some(expired_attempt) = data.delivery_attempts.get_mut(&expired_key) else {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::InvalidPersistedState,
+                );
+            };
+            if expires_at > request.now_unix_millis()
+                || expired_attempt.status != MemoryOutboxAttemptStatus::Claimed
+                || expired_attempt.request_id != request_id
+                || expired_attempt.message_index != delivery.next_index
+            {
+                return DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::InvalidPersistedState,
+                );
+            }
+            expired_attempt.status = MemoryOutboxAttemptStatus::Expired;
+        }
+
+        delivery.active_lease = Some((request.lease_id(), request.lease_expires_at_unix_millis()));
+        delivery.available_at_unix_millis = request.lease_expires_at_unix_millis();
+        delivery.attempt_count = attempt_count;
+        data.deliveries.insert(request_key, delivery);
+        data.delivery_attempts.insert(
+            lease_key,
+            MemoryOutboxDeliveryAttempt {
+                domain: request.domain(),
+                request_id,
+                message_index: claim.message_index(),
+                lease_expires_at_unix_millis: request.lease_expires_at_unix_millis(),
+                status: MemoryOutboxAttemptStatus::Claimed,
+            },
+        );
+        DurableOutboxClaimOutcome::Claimed(claim)
+    }
+
+    fn acknowledge_outbox(
+        &self,
+        context: &DurableOperationContext,
+        acknowledgement: DurableOutboxAcknowledgement,
+    ) -> DurableOutboxAcknowledgementOutcome {
+        let mut data = self
+            .inner
+            .write()
+            .expect("durable state store lock poisoned");
+        if let Err(reason) = validate_memory_outbox_ack_authority(&data, context) {
+            return DurableOutboxAcknowledgementOutcome::Rejected(reason);
+        }
+        let lease_key = *acknowledgement.lease_id().as_bytes();
+        let Some(attempt) = data.delivery_attempts.get(&lease_key).cloned() else {
+            return DurableOutboxAcknowledgementOutcome::Rejected(
+                DurableOutboxAcknowledgementRejection::LeaseMismatch,
+            );
+        };
+        if attempt.domain != acknowledgement.domain()
+            || attempt.request_id != acknowledgement.request_id()
+            || attempt.message_index != acknowledgement.message_index()
+        {
+            return DurableOutboxAcknowledgementOutcome::Rejected(
+                DurableOutboxAcknowledgementRejection::LeaseMismatch,
+            );
+        }
+        match attempt.status {
+            MemoryOutboxAttemptStatus::Acknowledged => {
+                return DurableOutboxAcknowledgementOutcome::Acknowledged;
+            }
+            MemoryOutboxAttemptStatus::Expired => {
+                return DurableOutboxAcknowledgementOutcome::Rejected(
+                    DurableOutboxAcknowledgementRejection::LeaseMismatch,
+                );
+            }
+            MemoryOutboxAttemptStatus::Claimed => {}
+        }
+
+        let request_key = (
+            *acknowledgement.domain().as_bytes(),
+            *acknowledgement.request_id().as_bytes(),
+        );
+        let Some(mut delivery) = data.deliveries.get(&request_key).cloned() else {
+            return DurableOutboxAcknowledgementOutcome::Rejected(
+                DurableOutboxAcknowledgementRejection::InvalidPersistedState,
+            );
+        };
+        if delivery.next_index != acknowledgement.message_index() {
+            return DurableOutboxAcknowledgementOutcome::Rejected(
+                DurableOutboxAcknowledgementRejection::IndexMismatch,
+            );
+        }
+        if delivery.active_lease
+            != Some((
+                acknowledgement.lease_id(),
+                attempt.lease_expires_at_unix_millis,
+            ))
+        {
+            return DurableOutboxAcknowledgementOutcome::Rejected(
+                DurableOutboxAcknowledgementRejection::LeaseMismatch,
+            );
+        }
+        let Some(batch) = data.outboxes.get(&request_key) else {
+            return DurableOutboxAcknowledgementOutcome::Rejected(
+                DurableOutboxAcknowledgementRejection::InvalidPersistedState,
+            );
+        };
+        let next_index = match delivery.next_index.checked_add(1) {
+            Some(next_index) => next_index,
+            None => {
+                return DurableOutboxAcknowledgementOutcome::Rejected(
+                    DurableOutboxAcknowledgementRejection::ArithmeticOverflow,
+                );
+            }
+        };
+        let message_count = match u32::try_from(batch.messages().len()) {
+            Ok(message_count) => message_count,
+            Err(_) => {
+                return DurableOutboxAcknowledgementOutcome::Rejected(
+                    DurableOutboxAcknowledgementRejection::ArithmeticOverflow,
+                );
+            }
+        };
+        if next_index > message_count {
+            return DurableOutboxAcknowledgementOutcome::Rejected(
+                DurableOutboxAcknowledgementRejection::InvalidPersistedState,
+            );
+        }
+
+        delivery.next_index = next_index;
+        delivery.active_lease = None;
+        delivery.completed = next_index == message_count;
+        delivery.available_at_unix_millis = 0;
+        data.deliveries.insert(request_key, delivery);
+        if let Some(attempt) = data.delivery_attempts.get_mut(&lease_key) {
+            attempt.status = MemoryOutboxAttemptStatus::Acknowledged;
+        }
+        DurableOutboxAcknowledgementOutcome::Acknowledged
     }
 }
 
@@ -2909,6 +3274,42 @@ mod tests {
         .unwrap()
     }
 
+    fn durable_outbox_invocation(
+        domain: AtomicityDomainId,
+        request_byte: u8,
+        payloads: &[u8],
+    ) -> DurableInvocationTransaction {
+        let request_id = DurableRequestId::new([request_byte; 32]).unwrap();
+        let event_digest = Digest32::new(HashAlgorithmId::Sha2_256, [0xD1; 32]);
+        let receipt =
+            DurableRequestReceipt::new(request_id, event_digest, vec![request_byte]).unwrap();
+        let messages = payloads
+            .iter()
+            .map(|payload| {
+                DurableOutboxMessage::new(
+                    Digest32::new(HashAlgorithmId::Sha2_256, [*payload; 32]),
+                    vec![*payload],
+                )
+                .unwrap()
+            })
+            .collect();
+        let outbox = DurableOutboxBatch::new(request_id, event_digest, messages).unwrap();
+        let state = DurableStateTransaction::new(
+            domain,
+            AtomicStateReadSet::new(vec![read("state", StateRevision::INITIAL)]).unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+        DurableInvocationTransaction::new(
+            domain,
+            Some(state),
+            DurableObjectChanges::empty(),
+            receipt,
+            Some(outbox),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn compare_and_swap_writes_when_expected_matches() {
         let store = MemoryStateStore::default();
@@ -3350,6 +3751,152 @@ mod tests {
             ),
             DurableCommitOutcome::Rejected(DurableCommitRejection::DeadlineExceededBeforeCommit)
         );
+    }
+
+    #[test]
+    fn memory_indexed_outbox_claims_stable_order_and_reconciles_same_lease() {
+        let store = MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        let context = durable_context(1, 1_000, 5);
+        let selected_domain = domain(6);
+        assert_eq!(
+            store.commit_invocation(
+                &context,
+                durable_outbox_invocation(selected_domain, 0xB2, &[0x22]),
+            ),
+            DurableCommitOutcome::Committed
+        );
+        assert_eq!(
+            store.commit_invocation(
+                &context,
+                durable_outbox_invocation(selected_domain, 0xA2, &[0x11]),
+            ),
+            DurableCommitOutcome::Committed
+        );
+
+        let lease = DurableOutboxLeaseId::new([0x31; 32]).unwrap();
+        let request = DueOutboxClaimRequest::new(selected_domain, 0, lease, 10).unwrap();
+        let first = store.claim_due_outbox(&context, request);
+        let replay = store.claim_due_outbox(&context, request);
+        assert_eq!(first, replay);
+        assert_eq!(
+            store.claim_due_outbox(
+                &context,
+                DueOutboxClaimRequest::new(domain(8), 0, lease, 10).unwrap(),
+            ),
+            DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::LeaseIdReuse)
+        );
+        let DurableOutboxClaimOutcome::Claimed(claim) = first else {
+            panic!("expected a claimed outbox");
+        };
+        assert_eq!(
+            claim.request_id(),
+            OutboxRequestId::new([0xA2; 32]).unwrap()
+        );
+        assert_eq!(claim.canonical_payload(), &[0x11]);
+        assert_eq!(
+            store.acknowledge_outbox(
+                &context,
+                DurableOutboxAcknowledgement::new(
+                    selected_domain,
+                    claim.request_id(),
+                    claim.message_index(),
+                    lease,
+                ),
+            ),
+            DurableOutboxAcknowledgementOutcome::Acknowledged
+        );
+
+        let next_lease = DurableOutboxLeaseId::new([0x32; 32]).unwrap();
+        let next = store.claim_due_outbox(
+            &context,
+            DueOutboxClaimRequest::new(selected_domain, 0, next_lease, 10).unwrap(),
+        );
+        let DurableOutboxClaimOutcome::Claimed(next) = next else {
+            panic!("expected the next ordered outbox");
+        };
+        assert_eq!(next.request_id(), OutboxRequestId::new([0xB2; 32]).unwrap());
+    }
+
+    #[test]
+    fn memory_indexed_outbox_retains_attempt_history_for_delayed_ack() {
+        let store = MemoryDurableStateStore::new(WriterFenceGeneration::new(2).unwrap());
+        let context = durable_context(2, 1_000, 6);
+        let selected_domain = domain(7);
+        assert_eq!(
+            store.commit_invocation(
+                &context,
+                durable_outbox_invocation(selected_domain, 0xD2, &[0x41, 0x42]),
+            ),
+            DurableCommitOutcome::Committed
+        );
+        let request_id = OutboxRequestId::new([0xD2; 32]).unwrap();
+        let expired_lease = DurableOutboxLeaseId::new([0x41; 32]).unwrap();
+        assert!(matches!(
+            store.claim_due_outbox(
+                &context,
+                DueOutboxClaimRequest::new(selected_domain, 0, expired_lease, 10).unwrap(),
+            ),
+            DurableOutboxClaimOutcome::Claimed(_)
+        ));
+        assert_eq!(
+            store.claim_due_outbox(
+                &context,
+                DueOutboxClaimRequest::new(selected_domain, 10, expired_lease, 20).unwrap(),
+            ),
+            DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::LeaseIdReuse)
+        );
+
+        let first_acknowledged_lease = DurableOutboxLeaseId::new([0x42; 32]).unwrap();
+        let redelivery = store.claim_due_outbox(
+            &context,
+            DueOutboxClaimRequest::new(selected_domain, 10, first_acknowledged_lease, 20).unwrap(),
+        );
+        let DurableOutboxClaimOutcome::Claimed(redelivery) = redelivery else {
+            panic!("expected expired lease redelivery");
+        };
+        assert_eq!(redelivery.message_index(), 0);
+        let first_ack = DurableOutboxAcknowledgement::new(
+            selected_domain,
+            request_id,
+            0,
+            first_acknowledged_lease,
+        );
+        assert_eq!(
+            store.acknowledge_outbox(&context, first_ack),
+            DurableOutboxAcknowledgementOutcome::Acknowledged
+        );
+
+        let second_lease = DurableOutboxLeaseId::new([0x43; 32]).unwrap();
+        let second = store.claim_due_outbox(
+            &context,
+            DueOutboxClaimRequest::new(selected_domain, 10, second_lease, 20).unwrap(),
+        );
+        let DurableOutboxClaimOutcome::Claimed(second) = second else {
+            panic!("expected second message");
+        };
+        assert_eq!(second.message_index(), 1);
+        assert_eq!(
+            store.acknowledge_outbox(
+                &context,
+                DurableOutboxAcknowledgement::new(selected_domain, request_id, 1, second_lease),
+            ),
+            DurableOutboxAcknowledgementOutcome::Acknowledged
+        );
+
+        assert_eq!(
+            store.acknowledge_outbox(&context, first_ack),
+            DurableOutboxAcknowledgementOutcome::Acknowledged
+        );
+        assert_eq!(
+            store.claim_due_outbox(
+                &context,
+                DueOutboxClaimRequest::new(selected_domain, 10, expired_lease, 20).unwrap(),
+            ),
+            DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::LeaseIdReuse)
+        );
+        let data = store.inner.read().unwrap();
+        assert_eq!(data.delivery_attempts.len(), 3);
+        assert!(data.deliveries.values().all(|delivery| delivery.completed));
     }
 
     #[test]
