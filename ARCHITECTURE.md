@@ -760,8 +760,11 @@ transactional and idempotent handlers: both read through one explicit domain,
 bind every declared observation into the dedicated read set, and release output
 only after `commit_transaction`. The idempotent handler includes application
 mutations, request receipt, immutable outbox batch, and initial delivery cursor
-in that same domain transaction. Domain-aware outbox claim/ack, native
-composition, and durable-store migration are still pending.
+in that same domain transaction. Domain-aware outbox claim/ack reuses one
+storage-neutral validation and cursor-transition implementation: only point
+reads and the final transaction commit differ between legacy and domain stores.
+The immutable batch observation and delivery-cursor mutation remain one domain
+transaction. Native composition and durable-store migration are still pending.
 
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
@@ -904,5 +907,10 @@ composition, and durable-store migration are still pending.
   legacy store contract. Read application and reserved invocation records from
   one explicit domain, bind all observations to one transaction, and commit
   application mutations, receipt, outbox batch, and initial delivery cursor
-  together. Keep native routing and outbox delivery on the legacy path until
-  their domain identity and durable migration are explicit.
+  together. Keep native routing on the legacy path until its domain identity
+  and durable migration are explicit.
+- DR-0043: Carry the explicit atomicity domain through outbox lease and
+  acknowledgement transactions. Share identity, lease-expiry, cursor, and
+  acknowledgement validation across legacy and domain entrypoints; vary only
+  point reads and atomic commit construction. Assert the immutable batch and
+  mutate its delivery cursor in the same domain transaction.

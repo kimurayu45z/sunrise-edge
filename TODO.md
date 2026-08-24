@@ -1916,7 +1916,9 @@ Phase 15 As-Is scope:
   node-coreはadditiveなdomain-aware transactional/idempotent handlerでapplication state、dedup receipt、
   outbox batch、initial delivery cursorを1 domain transactionへ接続した（implemented As-Is）。同一keyの
   domain isolation、replay、dependency conflict時にresult/receipt/outboxを一切publishしないことを検証する。
-  native composition、outbox claim/ack、runtime-sqlite、provider adapterはまだnew contractへ移行していない。
+  outbox lease/ackにもdomain-aware entrypointを追加し、legacy/domainでidentity、lease、cursor検証を共有しつつ、
+  immutable batch assertionとdelivery mutationを1 domain transactionへ閉じ込めた（implemented As-Is）。
+  native composition、runtime-sqlite、provider adapterはまだnew contractへ移行していない。
 - ComposedRuntimeはStateStore、BlobStore、Signer、Transport、Clock、Schedulerをhidden defaultなしで
   明示的に所有・合成する。SQLiteへstate/dedup/outboxをcommit後にruntimeをdropし、同じDBを別compositionで
   reopenしてstateを再適用せずoutboxを送ること、send failure leaseがreopen後もexpiry前は抑止されexpiry時だけ
@@ -1996,7 +1998,7 @@ Phase 15 To-Be production exit criteria:
 
 Phase 15 persistence implementation order（To-Beからの逆算）:
 
-1. node-core初期commitまで接続したatomicity domain/dedicated read-set envelopeをoutbox deliveryと
+1. node-core初期commitとoutbox deliveryまで接続したatomicity domain/dedicated read-set envelopeを
    native compositionへ接続し、SQLite既存dataを暗黙migrationせずdurable store contractへ実装する。
 2. indexed due-outbox repository/claim contractを追加し、StateKeyScannerはmaintenance/compatibilityへ戻す。
 3. normalized schema、explicit migration、bounded pool/deadline、typed conflictを持つPostgreSQL adapterを実装する。

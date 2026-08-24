@@ -1780,20 +1780,51 @@ where
     }
 }
 
-/// Atomically leases the next pending message from one persisted outbox batch.
-///
-/// Expired leases may be replaced, intentionally providing at-least-once
-/// delivery. The immutable batch revision is asserted in the same transaction.
-pub fn claim_next_outbox_message<S>(
+fn commit_legacy_transaction_parts<S>(
     store: &S,
+    reads: Vec<StateReadAssertion>,
+    mutations: Vec<StateMutationEntry>,
+) -> Result<AtomicStateWriteResult, NodeCoreError>
+where
+    S: TransactionalStateStore,
+{
+    let mut mutations = mutations
+        .iter()
+        .map(|mutation| (mutation.key().to_vec(), mutation.mutation().clone()))
+        .collect::<BTreeMap<_, _>>();
+    let writes = reads
+        .iter()
+        .map(|read| {
+            StateWrite::new(
+                read.key().to_vec(),
+                read.expected_revision(),
+                mutations
+                    .remove(read.key())
+                    .unwrap_or(StateMutation::Assert),
+            )
+        })
+        .collect::<Result<Vec<_>, RuntimeError>>()?;
+    if !mutations.is_empty() {
+        return Err(RuntimeError::StateMutationWithoutRead.into());
+    }
+    Ok(store.commit_atomic(AtomicStateWriteSet::new(writes)?)?)
+}
+
+fn claim_next_outbox_message_inner<G, C>(
     layout: &PersistenceLayout,
     request_id: RequestId,
     lease_id: OutboxLeaseId,
     now_unix_millis: u64,
     lease_duration_millis: u64,
+    mut get_versioned: G,
+    commit: C,
 ) -> Result<Option<OutboxClaim>, NodeCoreError>
 where
-    S: TransactionalStateStore,
+    G: FnMut(&[u8]) -> Result<VersionedStateValue, RuntimeError>,
+    C: FnOnce(
+        Vec<StateReadAssertion>,
+        Vec<StateMutationEntry>,
+    ) -> Result<AtomicStateWriteResult, NodeCoreError>,
 {
     if lease_duration_millis == 0 || lease_duration_millis > MAX_OUTBOX_LEASE_MILLIS {
         return Err(NodeCoreError::InvalidOutboxLeaseDuration(
@@ -1803,8 +1834,8 @@ where
     let request_bytes = *request_id.as_bytes();
     let batch_key = layout.outbox_batch_key(request_bytes);
     let delivery_key = layout.outbox_delivery_key(request_bytes);
-    let batch_value = store.get_versioned(&batch_key)?;
-    let delivery_value = store.get_versioned(&delivery_key)?;
+    let batch_value = get_versioned(&batch_key)?;
+    let delivery_value = get_versioned(&delivery_key)?;
     let batch = NodeOutboxBatch::decode(batch_value.value().ok_or(NodeCoreError::OutboxNotFound)?)
         .map_err(|_| NodeCoreError::PersistenceInvariant("invalid outbox batch"))?;
     let mut delivery = NodeOutboxDelivery::decode(
@@ -1841,18 +1872,15 @@ where
         .checked_add(1)
         .ok_or(NodeCoreError::OutboxArithmeticOverflow)?;
     delivery.lease = Some((lease_id, expires_at_unix_millis));
-    let write_set = AtomicStateWriteSet::new(vec![
-        StateWrite::new(batch_key, batch_value.revision(), StateMutation::Assert)?,
-        StateWrite::new(
-            delivery_key,
-            delivery_value.revision(),
-            StateMutation::Put(delivery.encode()?),
-        )?,
-    ])?;
-    if !matches!(
-        store.commit_atomic(write_set)?,
-        AtomicStateWriteResult::Committed
-    ) {
+    let reads = vec![
+        StateReadAssertion::new(batch_key, batch_value.revision())?,
+        StateReadAssertion::new(delivery_key.clone(), delivery_value.revision())?,
+    ];
+    let mutations = vec![StateMutationEntry::new(
+        delivery_key,
+        StateMutation::Put(delivery.encode()?),
+    )?];
+    if !matches!(commit(reads, mutations)?, AtomicStateWriteResult::Committed) {
         return Err(NodeCoreError::StateConflict);
     }
 
@@ -1865,24 +1893,83 @@ where
     }))
 }
 
-/// Acknowledges one leased message and advances the durable delivery cursor.
+/// Atomically leases the next pending message from one persisted outbox batch.
 ///
-/// A send followed by a crash before this commit is deliberately redelivered.
-pub fn acknowledge_outbox_message<S>(
+/// Expired leases may be replaced, intentionally providing at-least-once
+/// delivery. The immutable batch revision is asserted in the same transaction.
+pub fn claim_next_outbox_message<S>(
     store: &S,
+    layout: &PersistenceLayout,
+    request_id: RequestId,
+    lease_id: OutboxLeaseId,
+    now_unix_millis: u64,
+    lease_duration_millis: u64,
+) -> Result<Option<OutboxClaim>, NodeCoreError>
+where
+    S: TransactionalStateStore,
+{
+    claim_next_outbox_message_inner(
+        layout,
+        request_id,
+        lease_id,
+        now_unix_millis,
+        lease_duration_millis,
+        |key| store.get_versioned(key),
+        |reads, mutations| commit_legacy_transaction_parts(store, reads, mutations),
+    )
+}
+
+/// Atomically leases one pending outbox message inside an explicit domain.
+pub fn claim_next_outbox_message_in_domain<S>(
+    store: &S,
+    domain: AtomicityDomainId,
+    layout: &PersistenceLayout,
+    request_id: RequestId,
+    lease_id: OutboxLeaseId,
+    now_unix_millis: u64,
+    lease_duration_millis: u64,
+) -> Result<Option<OutboxClaim>, NodeCoreError>
+where
+    S: DomainTransactionalStateStore,
+{
+    claim_next_outbox_message_inner(
+        layout,
+        request_id,
+        lease_id,
+        now_unix_millis,
+        lease_duration_millis,
+        |key| store.get_versioned_in_domain(domain, key),
+        |reads, mutations| {
+            let transaction = AtomicStateTransaction::new(
+                domain,
+                AtomicStateReadSet::new(reads)?,
+                AtomicStateMutationSet::new(mutations)?,
+            )?;
+            Ok(store.commit_transaction(transaction)?)
+        },
+    )
+}
+
+fn acknowledge_outbox_message_inner<G, C>(
     layout: &PersistenceLayout,
     request_id: RequestId,
     index: u32,
     lease_id: OutboxLeaseId,
+    mut get_versioned: G,
+    commit: C,
 ) -> Result<(), NodeCoreError>
 where
-    S: TransactionalStateStore,
+    G: FnMut(&[u8]) -> Result<VersionedStateValue, RuntimeError>,
+    C: FnOnce(
+        Vec<StateReadAssertion>,
+        Vec<StateMutationEntry>,
+    ) -> Result<AtomicStateWriteResult, NodeCoreError>,
 {
     let request_bytes = *request_id.as_bytes();
     let batch_key = layout.outbox_batch_key(request_bytes);
     let delivery_key = layout.outbox_delivery_key(request_bytes);
-    let batch_value = store.get_versioned(&batch_key)?;
-    let delivery_value = store.get_versioned(&delivery_key)?;
+    let batch_value = get_versioned(&batch_key)?;
+    let delivery_value = get_versioned(&delivery_key)?;
     let batch = NodeOutboxBatch::decode(batch_value.value().ok_or(NodeCoreError::OutboxNotFound)?)
         .map_err(|_| NodeCoreError::PersistenceInvariant("invalid outbox batch"))?;
     let mut delivery = NodeOutboxDelivery::decode(
@@ -1912,18 +1999,70 @@ where
     delivery.next_index = next_index;
     delivery.lease = None;
 
-    let write_set = AtomicStateWriteSet::new(vec![
-        StateWrite::new(batch_key, batch_value.revision(), StateMutation::Assert)?,
-        StateWrite::new(
-            delivery_key,
-            delivery_value.revision(),
-            StateMutation::Put(delivery.encode()?),
-        )?,
-    ])?;
-    match store.commit_atomic(write_set)? {
+    let reads = vec![
+        StateReadAssertion::new(batch_key, batch_value.revision())?,
+        StateReadAssertion::new(delivery_key.clone(), delivery_value.revision())?,
+    ];
+    let mutations = vec![StateMutationEntry::new(
+        delivery_key,
+        StateMutation::Put(delivery.encode()?),
+    )?];
+    match commit(reads, mutations)? {
         AtomicStateWriteResult::Committed => Ok(()),
         AtomicStateWriteResult::Conflict { .. } => Err(NodeCoreError::StateConflict),
     }
+}
+
+/// Acknowledges one leased message and advances the durable delivery cursor.
+///
+/// A send followed by a crash before this commit is deliberately redelivered.
+pub fn acknowledge_outbox_message<S>(
+    store: &S,
+    layout: &PersistenceLayout,
+    request_id: RequestId,
+    index: u32,
+    lease_id: OutboxLeaseId,
+) -> Result<(), NodeCoreError>
+where
+    S: TransactionalStateStore,
+{
+    acknowledge_outbox_message_inner(
+        layout,
+        request_id,
+        index,
+        lease_id,
+        |key| store.get_versioned(key),
+        |reads, mutations| commit_legacy_transaction_parts(store, reads, mutations),
+    )
+}
+
+/// Acknowledges one leased message inside an explicit atomicity domain.
+pub fn acknowledge_outbox_message_in_domain<S>(
+    store: &S,
+    domain: AtomicityDomainId,
+    layout: &PersistenceLayout,
+    request_id: RequestId,
+    index: u32,
+    lease_id: OutboxLeaseId,
+) -> Result<(), NodeCoreError>
+where
+    S: DomainTransactionalStateStore,
+{
+    acknowledge_outbox_message_inner(
+        layout,
+        request_id,
+        index,
+        lease_id,
+        |key| store.get_versioned_in_domain(domain, key),
+        |reads, mutations| {
+            let transaction = AtomicStateTransaction::new(
+                domain,
+                AtomicStateReadSet::new(reads)?,
+                AtomicStateMutationSet::new(mutations)?,
+            )?;
+            Ok(store.commit_transaction(transaction)?)
+        },
+    )
 }
 
 fn validate_outbox_identity(
@@ -2891,6 +3030,91 @@ mod tests {
         assert_eq!(delivery.next_index(), 1);
         assert_eq!(delivery.attempts(), 2);
         assert_eq!(delivery.lease(), None);
+    }
+
+    #[test]
+    fn domain_outbox_claim_and_ack_never_cross_domain_boundaries() {
+        let runtime = MemoryRuntime::new(runtime::ValidatorId::new([0x44; 32]));
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        let first_domain = domain(0xC1);
+        let second_domain = domain(0xC2);
+        let event = event("sunrise-test", request(0x84));
+        let config = config("sunrise-test");
+        let resolver = resolver("sunrise-test");
+        for active_domain in [first_domain, second_domain] {
+            handle_domain_idempotent_event(
+                &runtime,
+                active_domain,
+                &config,
+                &resolver,
+                event.clone(),
+                &machine,
+            )
+            .unwrap();
+        }
+        let layout = PersistenceLayout::new(
+            ChainId::new("sunrise-test").unwrap(),
+            ProtocolVersion::new(3),
+        );
+        let lease = OutboxLeaseId::new([0x41; 32]).unwrap();
+        let claim = claim_next_outbox_message_in_domain(
+            runtime.state_store(),
+            first_domain,
+            &layout,
+            event.request_id(),
+            lease,
+            100,
+            10,
+        )
+        .unwrap()
+        .unwrap();
+        acknowledge_outbox_message_in_domain(
+            runtime.state_store(),
+            first_domain,
+            &layout,
+            event.request_id(),
+            claim.index(),
+            lease,
+        )
+        .unwrap();
+
+        assert_eq!(
+            claim_next_outbox_message_in_domain(
+                runtime.state_store(),
+                first_domain,
+                &layout,
+                event.request_id(),
+                OutboxLeaseId::new([0x42; 32]).unwrap(),
+                111,
+                10,
+            )
+            .unwrap(),
+            None
+        );
+        let second_claim = claim_next_outbox_message_in_domain(
+            runtime.state_store(),
+            second_domain,
+            &layout,
+            event.request_id(),
+            OutboxLeaseId::new([0x43; 32]).unwrap(),
+            111,
+            10,
+        )
+        .unwrap();
+        assert!(second_claim.is_some());
+        assert_eq!(
+            claim_next_outbox_message(
+                runtime.state_store(),
+                &layout,
+                event.request_id(),
+                OutboxLeaseId::new([0x44; 32]).unwrap(),
+                111,
+                10,
+            ),
+            Err(NodeCoreError::OutboxNotFound)
+        );
     }
 
     #[test]

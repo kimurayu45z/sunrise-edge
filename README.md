@@ -109,6 +109,9 @@ cross-provider ingress milestones implemented through Phase 17:
   SQLite paths are not silently redirected or migrated.
 - A one-message bounded outbox lease/ack cursor with explicit at-least-once
   redelivery after lease expiry; it does not claim transport exactly-once.
+- Domain-aware outbox lease/ack entrypoints that keep immutable-batch assertions
+  and cursor updates in the selected atomicity domain while sharing the same
+  delivery validation with the legacy compatibility path.
 - A native Axum/Tokio HTTP adapter with strict canonical binary media types,
   bounded bodies, deterministic status mapping, graceful shutdown wiring, and
   recoverable transactional invocation as its default state path.
@@ -154,8 +157,8 @@ independent security review.
 
 The next planned technical milestones work backward through the Phase 15
 production exit criteria in [`TODO.md`](TODO.md) and the accepted
-[persistence design](PERSISTENCE.md): carry the explicit domain through outbox
-delivery and native composition, add an indexed outbox claim contract, and
+[persistence design](PERSISTENCE.md): carry the explicit domain through native
+composition, add an indexed outbox claim contract, and
 implement the normalized PostgreSQL reference adapter. Deadline/cancellation, abrupt
 fault, backup/restore, capacity, and provider conformance follow on that
 foundation. Phase 16/17 provider trust, deployment, observability, and release
