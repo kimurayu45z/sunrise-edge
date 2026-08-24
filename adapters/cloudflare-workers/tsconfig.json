@@ -16,7 +16,6 @@
     "../shared/**/*.ts",
     "src/**/*.ts",
     "test/**/*.ts",
-    "vitest.config.ts",
-    "eslint.config.js"
+    "vitest.config.ts"
   ]
 }
