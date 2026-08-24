@@ -53,7 +53,7 @@ validator-set = { path = "crates/validator-set" }
 consensus = { path = "crates/consensus" }
 node-core = { path = "crates/node-core" }
 native-http = { path = "crates/native-http" }
-rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled"] }
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 sha2 = "0.11.0"
 sha3 = "0.12.0"
