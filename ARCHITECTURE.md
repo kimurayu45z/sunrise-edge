@@ -534,6 +534,19 @@ conformance by itself. Each provider must run equivalent vectors through its
 real public gateway, authentication layer, runtime, private transport, and
 node-core deployment, including platform-generated rejection and timeout paths.
 
+## 39. Repository validation gate
+
+The repository pins Rust 1.97.1, Node.js 22.20.0 in CI, and Deno 2.9.4. One
+`scripts/check-all.sh` entrypoint runs Rust formatting, all-feature clippy and
+tests, Cloudflare type/lint/workerd validation, all four portable provider
+adapter suites, and whitespace checks. GitHub Actions installs the locked npm
+dependencies and executes the same script on pull requests and main.
+
+This is an As-Is regression gate, not release provenance. Production still
+requires immutable action revisions, dependency and toolchain provenance,
+SBOMs, reproducible artifacts, protected required checks, real-provider test
+credentials and isolation, security scanning, and release-signing policy.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -595,3 +608,6 @@ node-core deployment, including platform-generated rejection and timeout paths.
 - DR-0025: Define provider-neutral pre-dispatch ingress fixtures once and run
   them through every local provider consumer. Treat this as drift detection,
   not a substitute for real gateway and runtime conformance testing.
+- DR-0026: Use one pinned repository validation entrypoint locally and in CI so
+  Rust and every adapter gate run together. Treat green CI as regression
+  evidence only, not production provenance or real-provider certification.

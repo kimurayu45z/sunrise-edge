@@ -1960,6 +1960,7 @@ Phase 17 prerequisites:
 - Supabase Edge adapter wrapper (implemented As-Is)
 - AWS adapter wrapper and API Gateway HTTP API v2 mapping (implemented As-Is)
 - cross-provider local ingress fixture matrix (implemented As-Is)
+- repository-wide pinned local/CI validation gate (implemented As-Is)
 
 Phase 17 shared ingress As-Is scope:
 
@@ -1978,6 +1979,8 @@ Phase 17 shared ingress As-Is scope:
   AWS HTTP API v2 mapper testであり、real provider deployment conformanceはまだ完了していない。
 - liveness、unknown path、method、media parameter、content encoding、content-lengthの同一fixtureを
   5 provider consumerで実行する。これはlocal drift検出であり実gateway/runtime conformanceではない。
+- Rust 1.97.1、Node 22.20.0、Deno 2.9.4を固定したcheck script/CIがRust全featureと全adapterを
+  一括実行する。action SHA pin、provenance、SBOM、reproducibility、real provider testは未完了である。
 
 Phase 17 Deno As-Is scope:
 

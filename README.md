@@ -125,8 +125,10 @@ support belongs in adapters around these crates.
 
 ### Prerequisites
 
-- A recent stable Rust toolchain with Rust 2024 edition support.
+- Rust 1.97.1 through rustup (the repository toolchain file selects it).
 - Cargo, installed with Rust through [rustup](https://rustup.rs/).
+- Node.js 22.20.0 and npm for the Cloudflare workerd suite.
+- Deno 2.9.4 for portable adapter checks.
 
 ### Build and test
 
@@ -138,12 +140,12 @@ cargo build --workspace
 cargo test --workspace --all-targets
 ```
 
-Before submitting a change, run the full validation set:
+Install the Cloudflare test dependencies once, then run the complete repository
+gate before submitting a change:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets
+npm ci --prefix adapters/cloudflare-workers
+./scripts/check-all.sh
 ```
 
 To work on one crate while iterating:
@@ -153,9 +155,8 @@ cargo test -p consensus
 cargo test -p execution
 cargo test -p native-http
 
-cd adapters/cloudflare-workers
-npm ci
-npm run check
+npm --prefix adapters/cloudflare-workers run check
+cd adapters/deno && deno task check
 ```
 
 ## Protocol invariants

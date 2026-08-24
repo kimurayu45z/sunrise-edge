@@ -1,0 +1,40 @@
+name: repository checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repository-checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.20.0
+          cache: npm
+          cache-dependency-path: adapters/cloudflare-workers/package-lock.json
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: 2.9.4
+
+      - name: Install Cloudflare adapter dependencies
+        run: npm ci --prefix adapters/cloudflare-workers
+
+      - name: Run repository validation
+        run: ./scripts/check-all.sh
