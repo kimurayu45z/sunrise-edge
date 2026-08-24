@@ -1911,9 +1911,14 @@ Phase 15 As-Is scope:
   at-least-once redeliveryする。process crash後にrequestなしで回復するschedulerは未実装である。
 - TLS、authentication、rate limiting、durable StateStoreのbounded wiring、audit telemetry、reverse
   proxy hardeningは未実装であり、このAs-Is adapterをinternet-facing production serverと扱わない。
-- 現在のRuntime traitは同期APIであるため、遅いdurable I/OをTokio request task上で直接行う
-  production実装にしない。async runtime boundaryまたは明示的なbounded blocking isolation、
-  concurrency limit、deadlineを設計する。
+- 現在のRuntime traitは同期APIであるため、native adapterはcanonical decode、node-core、durable
+  state、outbox send/ack、result encodeを1つのspawn_blocking jobへ隔離し、embedding processが
+  non-zero concurrency limitを必ず指定する。permit枯渇時はadapter内でqueueせず429を返し、根拠の
+  ないRetry-After値は生成しない。livenessはblocking poolから独立する（implemented As-Is）。
+  開始済みspawn_blockingはTokioで
+  cancelできないため、HTTP timeoutだけ先に返してcommitを裏で継続する実装は採用しない。
+  storage-aware deadline、commit前cooperative cancellation、shutdown budget、load capacity、
+  circuit breakerはTo-Beに残る。
 
 Phase 15 To-Be production exit criteria:
 

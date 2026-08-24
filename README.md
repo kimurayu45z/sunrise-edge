@@ -92,6 +92,11 @@ cross-provider ingress milestones implemented through Phase 17:
 - Native request-scoped outbox delivery through persisted 30-second leases and
   atomic acknowledgements; lease identities come from an injected source whose
   uniqueness must survive process restart.
+- Explicit native blocking admission control: canonical decode, synchronous
+  state transition, durable store access, outbox send/ack, and result encoding
+  run outside Tokio request tasks with a host-selected non-zero concurrency
+  bound. Excess work is rejected with 429 instead of entering an unbounded
+  adapter queue.
 - A bounded Cloudflare Workers ingress that uses a generated private Service
   Binding, strict TypeScript, and workerd integration tests.
 - A provider-neutral Web Fetch API ingress core for keeping future edge
@@ -113,17 +118,17 @@ cross-provider ingress milestones implemented through Phase 17:
   concrete proof backends are not yet implemented.
 
 Important remaining work includes the owned-object fast path, concrete
-node-event dispatch and protocol handlers, bounded async isolation for durable
-I/O, scheduled outbox recovery and fault conformance, portable system-module
+node-event dispatch and protocol handlers, cancellable durable-I/O deadlines,
+scheduled outbox recovery and fault conformance, portable system-module
 execution, cryptographic slashing proof verification, fee-object debiting,
 provider persistence bindings, runtime adapters, networking/RPC surfaces, and
 independent security review.
 
 The next planned technical milestone works backward through the Phase 15
-production exit criteria in [`TODO.md`](TODO.md): place blocking durable I/O
-behind bounded async isolation, integrate provider scheduling for committed
-outboxes that are not tied to an active request, and prove process/power-fault
-recovery conformance. Phase 16/17 provider trust, deployment, capacity,
+production exit criteria in [`TODO.md`](TODO.md): integrate provider scheduling
+for committed outboxes that are not tied to an active request, define
+storage-aware deadlines/cancellation, and prove process/power-fault recovery
+conformance. Phase 16/17 provider trust, deployment, capacity,
 observability, and release rehearsal remain required after that shared
 foundation exists.
 

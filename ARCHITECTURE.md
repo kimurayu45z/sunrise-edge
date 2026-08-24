@@ -436,10 +436,24 @@ request IDs and adapter-neutral canonical `NodeResponse` framing.
 Malformed events return 400, oversized bodies return 413, unsupported media or
 content encoding returns 415, context/CAS conflicts return 409, deterministic
 application rejection returns 422, and runtime/outbound delivery failure
-returns 503. Error bodies expose stable coarse codes rather than internal state
-or storage details. `GET /health/live` returns 204 without reading protocol
-state. The server entry point requires a shutdown future so the embedding
-native process can stop accepting work cleanly.
+returns 503. The embedding process must supply a non-zero maximum number of
+concurrent synchronous invocations. Once those permits are occupied, another
+event submission returns 429; it does not wait in an adapter-owned queue. Error
+bodies expose stable coarse codes rather than internal state or storage details.
+`GET /health/live` returns 204 without reading protocol state. The server entry
+point requires a shutdown future so the embedding native process can stop
+accepting work cleanly.
+
+Canonical event decoding, node-core invocation, synchronous runtime/store
+calls, request-scoped outbox delivery, and canonical result encoding run as one
+`spawn_blocking` job while holding the admission permit. The permit is acquired
+before submitting the job, bounding both executing and Tokio-queued adapter
+jobs. Liveness remains on the async executor and is outside this admission
+pool. The adapter deliberately does not impose an HTTP timeout on started
+blocking jobs: Tokio cannot abort `spawn_blocking` work after it starts, so
+returning a timeout while a database commit may continue would create ambiguous
+client semantics. Storage-aware deadlines, cooperative cancellation before
+commit, shutdown budgets, load capacity, and circuit breaking remain required.
 
 The default native route now requires a `TransactionalNodeStateMachine`, a hash
 suite resolver, a transactional store, and an injected outbox lease-ID source.
@@ -455,9 +469,10 @@ Lease-ID sources must prevent reuse for the same request across process
 restarts, because a delayed acknowledgement from an expired attempt must not
 match a newer lease. This closes the old native commit-before-enqueue loss
 window for request-scoped retries, but it is not the complete production
-delivery architecture. No durable store, provider scheduler that discovers
-unattended committed outboxes, poison-message policy, retention/compaction,
-trusted time policy, or crash/fault conformance exists yet. TLS,
+delivery architecture. A local durable SQLite store and bounded native
+blocking seam exist, but no production runtime composition or provider
+scheduler that discovers unattended committed outboxes, poison-message policy,
+retention/compaction, trusted time policy, or crash/fault conformance exists yet. TLS,
 authentication, rate limiting, audit telemetry, and proxy hardening also remain
 deployment requirements.
 
@@ -734,3 +749,10 @@ license/SBOM policy, and protected review/merge controls.
   revision tombstones, and fail-closed application/schema identity. Keep its
   blocking local-disk boundary out of async request tasks until bounded
   isolation and fault conformance are implemented.
+- DR-0035: Require native embeddings to supply a non-zero synchronous-work
+  concurrency limit. Acquire capacity before submitting one complete canonical
+  decode/invoke/deliver/encode job to Tokio's blocking pool, reject excess work
+  with 429, and keep liveness independent. Do not emit an invented retry delay
+  or claim cancellable deadlines
+  by timing out a started `spawn_blocking` job; design deadlines with the
+  storage operation and commit boundary instead.
