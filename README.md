@@ -125,6 +125,10 @@ cross-provider ingress milestones implemented through Phase 17:
 - Native request-scoped outbox delivery through persisted 30-second leases and
   atomic acknowledgements; lease identities come from an injected source whose
   uniqueness must survive process restart.
+- An additive native router for explicit-domain stores. It resolves placement
+  in node-core, accepts no HTTP domain selector, and carries the committed
+  domain through request-scoped delivery. The SQLite/default router and scan
+  recovery remain compatibility paths, not production persistence.
 - Explicit native blocking admission control: canonical decode, synchronous
   state transition, durable store access, outbox send/ack, and result encoding
   run outside Tokio request tasks with a host-selected non-zero concurrency
@@ -164,10 +168,10 @@ independent security review.
 
 The next planned technical milestones work backward through the Phase 15
 production exit criteria in [`TODO.md`](TODO.md) and the accepted
-[persistence design](PERSISTENCE.md): carry node-core's resolved logical domain
-through native composition, add an indexed
-outbox claim contract, and
-implement the normalized PostgreSQL reference adapter. Deadline/cancellation, abrupt
+[persistence design](PERSISTENCE.md): define the fenced/deadline-aware durable
+domain adapter boundary, add an indexed outbox claim contract and domain-aware
+recovery, and implement the normalized PostgreSQL reference adapter.
+Deadline/cancellation, abrupt
 fault, backup/restore, capacity, and provider conformance follow on that
 foundation. Phase 16/17 provider trust, deployment, observability, and release
 rehearsal remain required.

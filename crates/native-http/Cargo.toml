@@ -9,6 +9,7 @@ axum.workspace = true
 canonical-encoding.workspace = true
 hashing.workspace = true
 node-core.workspace = true
+protocol-config.workspace = true
 runtime.workspace = true
 tokio.workspace = true
 

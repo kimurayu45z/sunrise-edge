@@ -759,9 +759,11 @@ later reject its absence. The manifest canonically commits its non-zero rule
 version, logical domain, closed rule tag, and activation epoch; resolution
 rejects empty plans and pre-activation events. Additive node-core resolved
 handlers now derive the access plan once, resolve before storage reads, and
-return the committed domain beside output. Native composition remains a
-separate step and must not trust caller-selected domains merely because the
-config type exists.
+return the committed domain beside output. `native-http` exposes an additive
+resolved-domain router only when the runtime store implements
+`DomainTransactionalStateStore`. It accepts no HTTP domain input and carries
+the node-core result into request-scoped outbox claim/ack. The legacy SQLite
+router and scan-based unattended recovery remain compatibility paths.
 
 The runtime now models that boundary explicitly with a non-zero 32-byte
 `AtomicityDomainId`, a separately validated `AtomicStateReadSet`, a put/delete
@@ -786,7 +788,8 @@ in that same domain transaction. Domain-aware outbox claim/ack reuses one
 storage-neutral validation and cursor-transition implementation: only point
 reads and the final transaction commit differ between legacy and domain stores.
 The immutable batch observation and delivery-cursor mutation remain one domain
-transaction. Native composition and durable-store migration are still pending.
+transaction. An additive native request path now composes these operations, but
+durable-store migration and indexed unattended recovery are still pending.
 
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
@@ -954,3 +957,9 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   outbox delivery carries the same authority instead of rerunning placement or
   accepting a request-selected domain. Keep native composition migration
   explicit and additive.
+- DR-0047: Add a native HTTP composition restricted to explicit-domain stores.
+  Resolve placement in node-core, carry that returned domain through the shared
+  request-scoped delivery loop, and never accept a domain from HTTP. Preserve
+  the legacy SQLite route and scan recovery until a durable domain store and
+  indexed due-work contract exist; do not mislabel the memory-backed route as
+  production persistence.
