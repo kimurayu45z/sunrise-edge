@@ -213,8 +213,10 @@ than hide object writes in generic state. Indexed repositories now refine this
 structured store boundary. Node-core now constructs the envelope after one
 manifest resolution and one pure transition, checks typed receipts before
 state reads, preserves read-only assertions, and withholds output for rejected
-or indeterminate commits. Memory conformance, native composition, and durable
-implementations remain pending.
+or indeterminate commits. A single-lock in-memory structured store now provides
+atomic state/receipt/outbox, deadline, fence, conflict, read-only, and node-core
+replay conformance. Native composition and durable implementations remain
+pending.
 
 The store validates the complete read set and fencing generation, then commits
 all rows or none. A pure transition is not re-run inside a storage driver. An
@@ -338,7 +340,7 @@ not general state reads:
 1. Preserve the additive fenced/deadline-aware durable boundary and add the
    structured state/receipt/outbox/object transaction envelope required by
    normalized stores without silently migrating legacy data (runtime envelope
-   implemented; node-core/store wiring pending).
+   and node-core plus memory conformance implemented; native/durable wiring pending).
 2. Add a dedicated indexed outbox repository/claim contract; retain key scans
    only for maintenance and compatibility.
 3. Apply the accepted PostgreSQL schema design, explicit migrations, and

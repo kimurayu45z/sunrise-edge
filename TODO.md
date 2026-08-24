@@ -1946,7 +1946,8 @@ Phase 15 As-Is scope:
   object dispatch未実装中のobject sectionはexplicit emptyだけを許し、generic stateへの隠蔽を禁止する
   node-core additive handlerはmanifest domainをI/O前にresolveし、typed receipt replayをstate readより先に行い、
   read-only assertionを含むstate/receipt/outboxをこのenvelopeへ構築する。definite commitまたはexact replay以外では
-  outputを返さない（runtime/node-core implemented As-Is; memory/native/durable store wiring pending）。
+  outputを返さない。single-lock memory conformance storeでatomic publication、conflict、read-only、fence、deadline、
+  node-core commit/replayを検証する（runtime/node-core/memory implemented As-Is; native/durable store wiring pending）。
 - indexed production outbox boundaryはtrusted runtime timeとbounded restart-safe leaseを受け、
   `(available_at, request_id)`のstable index順で最大1件だけclaimする。scheduler cursorやprefix scanを
   authorityにせず、同じlease IDの再claimはindeterminate claimのreconciliationとして同じworkを返し、
@@ -2045,7 +2046,7 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
 3. `POSTGRES.md`のexact namespace、unsigned SQL representation、normalized relation、attempt history、
    transaction order、migration policyを維持する。adapterがopaque PersistenceLayout key prefixをparseせずに済むよう、
    state/object/receipt/outboxを明示的sectionとして持つstructured durable transaction envelopeを先に実装する
-   （runtime/node-core envelope implemented As-Is; memory conformance/native wiring/migration/adapter pending）。その後explicit migration、bounded pool/deadline、
+   （runtime/node-core/memory conformance implemented As-Is; native wiring/migration/adapter pending）。その後explicit migration、bounded pool/deadline、
    typed conflictを持つPostgreSQL adapterを実装する。
 4. shared conformanceにwrite skew、absent-key race、serialization failure、lease fencing、schema/version skewを追加する。
 5. kill/power fault、disk full、connection exhaustion、capacity/load/soak、backup/restore、writer failoverをrehearsalする。

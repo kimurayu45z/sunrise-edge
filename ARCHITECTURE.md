@@ -867,6 +867,10 @@ resolves the manifest domain before I/O, checks the typed receipt before state
 reads, and constructs this envelope from one pure transition. Exact replay does
 not rerun the transition or republish the outbox; read-only transitions retain
 their full assertion set; rejected and indeterminate commits release no output.
+A dedicated in-memory conformance store holds state, typed receipt, and typed
+outbox under one lock, validates injected trusted time and writer generation,
+and exercises commit, conflict, read-only, replay, deadline, and fence behavior
+with the real node-core handler. It is not restart-safe production storage.
 Durable adapters and native composition do not use this new boundary yet.
 
 ## Decision record
@@ -1078,3 +1082,9 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   digest into the ordered outbox, and release output only for a definite commit
   or an exact persisted replay. Treat indeterminate commit as reconciliation
   work, never as a safe transition retry.
+- DR-0054: Establish shared structured-store semantics in memory before writing
+  a database driver. Keep state, receipt, and outbox projections under one
+  atomic lock; inject trusted time and active writer generation; prove that
+  conflicts, stale fences, and pre-dispatch deadlines publish no partial rows;
+  and use the real node-core handler for commit and replay conformance. Treat
+  this fixture as ephemeral evidence, not production persistence.
