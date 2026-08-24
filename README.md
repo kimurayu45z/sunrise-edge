@@ -182,8 +182,9 @@ independent security review.
 The next planned technical milestones work backward through the Phase 15
 production exit criteria in [`TODO.md`](TODO.md) and the accepted
 [persistence design](PERSISTENCE.md): wire the durable operation boundary
-through node-core composition and implement the normalized PostgreSQL reference
-adapter that backs indexed native recovery.
+through node-core using a structured state/receipt/outbox envelope, then
+implement the accepted [PostgreSQL reference design](POSTGRES.md) and adapter
+that back indexed native recovery.
 Deadline/cancellation, abrupt
 fault, backup/restore, capacity, and provider conformance follow on that
 foundation. Phase 16/17 provider trust, deployment, observability, and release
@@ -269,6 +270,9 @@ These rules are part of the architecture, not optional implementation details:
   decision records.
 - [`TODO.md`](TODO.md) is the original design brief, detailed requirements, and
   phase roadmap.
+- [`PERSISTENCE.md`](PERSISTENCE.md) defines provider-neutral production
+  persistence requirements; [`POSTGRES.md`](POSTGRES.md) fixes the first
+  normalized relational implementation design.
 - [`AGENTS.md`](AGENTS.md) contains repository-wide instructions for AI coding
   agents and is also a useful contributor checklist for protocol-sensitive work.
 

@@ -839,6 +839,18 @@ cursor. Scripted conformance proves unresolved claims are not sent. No durable
 repository, real scheduler binding, or transport-aware cancellation/deadline
 exists yet, so the scan path remains compatibility-only rather than deleted.
 
+[`POSTGRES.md`](POSTGRES.md) fixes the first relational implementation design:
+exact binary namespace columns, full-range unsigned numeric representation,
+writer/schema metadata, normalized state/object/receipt/outbox/checkpoint
+relations, retained lease-attempt history, serializable transaction order,
+indexed claim/ack behavior, and explicit migration/certification evidence. It
+also closes an API-design trap before SQL implementation: the existing
+`AtomicStateTransaction` exposes only opaque keys and values. A normalized
+driver must not parse `PersistenceLayout` prefixes to infer receipt, outbox, or
+object rows. Node-core must first build a structured durable envelope with
+separately typed and bounded sections. SQLite remains unchanged compatibility
+data and is never request-path migrated into that schema.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -1030,3 +1042,9 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   lease and never send it unresolved; reconcile acknowledgement with the same
   request/index/lease. Share blocking admission, expose no scan cursor, and
   retain the legacy scan path until a durable repository passes conformance.
+- DR-0051: Fix the first PostgreSQL schema and transaction design before adding
+  a database driver. Represent full-range unsigned protocol counters without
+  signed narrowing, retain per-lease attempt history, fence every transaction
+  through exact namespace metadata, and require explicit migrations. Add a
+  structured state/object/receipt/outbox envelope first; prohibit the adapter
+  from classifying opaque key prefixes into normalized relations.
