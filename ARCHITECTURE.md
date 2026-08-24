@@ -96,6 +96,14 @@ configuration, objects, effects, modules, upgrades, migrations, and Phase 13
 epoch-scoped consensus state. Stored references preserve algorithm identifiers
 in digests and never require a global rehash.
 
+That path-shaped key layout describes the current compatibility seam, not the
+production physical schema. The accepted To-Be design is specified in
+[`PERSISTENCE.md`](PERSISTENCE.md). Production records use a stable chain,
+validator, and atomicity-domain namespace; carry their own protocol/type/schema
+versions; separate immutable object versions from heads, receipts, outbox
+messages, delivery state, checkpoints, and migrations; and use explicit
+operational indexes rather than parsing text-like keys.
+
 ## 14. Validator lifecycle
 Phase 13 introduces immutable epoch-scoped `ValidatorSet` snapshots. Validator
 identity, membership, governance-assigned voting power, and bond amount remain
@@ -328,6 +336,12 @@ revision-overflow rollback, CAS behavior, and schema rejection—not kill/power
 fault recovery. Native HTTP now places synchronous work behind bounded blocking
 admission, but production runtime composition, storage-aware deadlines,
 cancellation, and capacity evidence remain open.
+
+SQLite is not the selected production database. Its single opaque
+`sunrise_state` table intentionally proves the minimal versioned key-value
+contract, but it does not provide the normalized object, receipt, outbox,
+checkpoint, migration, retention, or operational indexes required by the
+accepted production persistence architecture.
 
 `ComposedRuntime` owns explicitly supplied state, blob, signer, transport,
 clock, and scheduler components and implements the same runtime trait without
@@ -702,6 +716,30 @@ upstream integrity. Production still requires ownership and response SLAs,
 provenance and signature verification, emergency security-update procedures,
 license/SBOM policy, and protected review/merge controls.
 
+## 41. Production persistence architecture
+
+The production persistence contract is validator-local and provider-neutral.
+Each invocation targets one explicit atomicity domain, asserts revisions for
+its complete exact read set (including read-only, absent, and tombstoned keys),
+and atomically commits application mutations, the request receipt, and initial
+outbox data. Cross-domain write plans fail closed until a separate certified
+protocol supplies prepare/commit and visibility semantics.
+
+The logical schema separates small protocol records, immutable object versions,
+object heads, request receipts, immutable outbox messages, mutable indexed
+delivery state, checkpoints, and migration jobs. Large immutable values use a
+content-addressed blob store. A dedicated due-work query replaces full
+key-prefix scans for production outbox scheduling; `StateKeyScanner` remains a
+repair, migration, and compatibility seam.
+
+PostgreSQL is the first production-oriented reference backend, not a protocol
+dependency. Cloudflare maps one atomicity domain to one SQLite-backed Durable
+Object and AWS initially uses one fenced writer region. D1 read replicas,
+DynamoDB Global Tables, alarms, queues, schedulers, and relays are not assumed
+to make authoritative state writes globally atomic. Detailed schema,
+provider mappings, migration, retention, backup/restore, fencing, and
+certification requirements live in [`PERSISTENCE.md`](PERSISTENCE.md).
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -823,3 +861,10 @@ license/SBOM policy, and protected review/merge controls.
   lease continuity across orderly close/reopen into a new composition, while
   reserving abrupt process/power-fault, filesystem, and real-provider claims
   for separate conformance evidence.
+- DR-0039: Treat SQLite as a local durable reference, not the production
+  database. Define validator-local atomicity domains, assert the complete read
+  set, separate normalized object/receipt/outbox/checkpoint data, and require an
+  indexed due-outbox query. Use PostgreSQL as the first production-oriented
+  reference, map one Cloudflare Durable Object to one domain, begin AWS with one
+  fenced writer region, and prohibit cross-domain or multi-region authoritative
+  writes until their protocol and conformance evidence exist.

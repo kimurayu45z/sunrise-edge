@@ -74,8 +74,13 @@ cross-provider ingress milestones implemented through Phase 17:
 - A local durable SQLite transactional store using WAL, synchronous FULL,
   immediate write transactions, revision tombstones, and fail-closed schema
   identity/version checks. It also implements bounded, cursor-paginated binary
-  prefix key discovery for recovery adapters; it is not yet composed into a
-  production native runtime.
+  prefix key discovery for recovery adapters. It is a local reference and
+  conformance fixture, not the selected production database.
+- An accepted [production persistence architecture](PERSISTENCE.md) that makes
+  validator-local atomicity domains, complete read-set validation, normalized
+  object/receipt/outbox data, indexed recovery, writer fencing, migration, and
+  disaster recovery explicit. PostgreSQL is the first production-oriented
+  reference target; provider implementations must pass the same contract.
 - An explicit `ComposedRuntime` for assembling independently selected state,
   blob, signer, transport, clock, and scheduler components without hidden
   defaults. Native conformance tests close/reopen SQLite into a new composition,
@@ -136,14 +141,14 @@ execution, cryptographic slashing proof verification, fee-object debiting,
 provider persistence bindings, runtime adapters, networking/RPC surfaces, and
 independent security review.
 
-The next planned technical milestone works backward through the Phase 15
-production exit criteria in [`TODO.md`](TODO.md): wire authenticated provider
-triggers without trusting their delivery, add abrupt kill/power-loss recovery
-harnesses beyond orderly SQLite reopen, and define storage-aware
-deadlines/cancellation
-conformance. Phase 16/17 provider trust, deployment, capacity,
-observability, and release rehearsal remain required after that shared
-foundation exists.
+The next planned technical milestones work backward through the Phase 15
+production exit criteria in [`TODO.md`](TODO.md) and the accepted
+[persistence design](PERSISTENCE.md): assert the complete read set inside an
+explicit atomicity domain, add an indexed outbox claim contract, and implement
+the normalized PostgreSQL reference adapter. Deadline/cancellation, abrupt
+fault, backup/restore, capacity, and provider conformance follow on that
+foundation. Phase 16/17 provider trust, deployment, observability, and release
+rehearsal remain required.
 
 ## Workspace map
 

@@ -1863,6 +1863,10 @@ Phase 15 prerequisites:
   persisted outbox lease/send/ack delivery (implemented As-Is)
 - local durable SQLite TransactionalStateStore with WAL, synchronous FULL,
   BEGIN IMMEDIATE, revision tombstones, and schema identity checks (implemented As-Is)
+- production persistence architecture separating validator-local atomicity
+  domains, normalized logical data, indexed outbox recovery, provider mappings,
+  migration, retention, and disaster recovery from the SQLite reference
+  (design accepted; implementation pending)
 
 Phase 15 As-Is scope:
 
@@ -1889,6 +1893,14 @@ Phase 15 As-Is scope:
   強制する（implemented As-Is）。page間snapshotではないため各sweepをprefix先頭から再開する必要がある。
   blocking local-disk storeでありproduction-grade componentsを使うdeployment compositionは未実装である。network filesystem、
   kill -9/power-loss、backup/restore、capacity検証なしにprovider production persistence完成とはみなさない。
+- `PERSISTENCE.md`はSQLiteをlocal durable reference/conformance fixtureに限定し、production To-Beを
+  `(chain_id, validator_id, atomicity_domain)`単位のsingle-writer authority、全read-set revision assertion、
+  normalized object/request/outbox/checkpoint/migration schema、indexed due-outbox claim、writer fencing、
+  content-addressed blob、明示的migration/backup/restoreとして固定する。PostgreSQLを最初の
+  production-oriented reference targetとし、Cloudflareは1 domain = 1 SQLite-backed Durable Object、
+  AWSは初期single fenced writer regionへ写像する（design accepted; implementation/certification pending）。
+  D1 read replica、DynamoDB Global Tables、scheduler/queue/alarmをauthoritative atomicityやconsensus trust rootに
+  してはならない。cross-domain writeは別protocol decisionなしにbest-effort dual writeで実装しない。
 - ComposedRuntimeはStateStore、BlobStore、Signer、Transport、Clock、Schedulerをhidden defaultなしで
   明示的に所有・合成する。SQLiteへstate/dedup/outboxをcommit後にruntimeをdropし、同じDBを別compositionで
   reopenしてstateを再適用せずoutboxを送ること、send failure leaseがreopen後もexpiry前は抑止されexpiry時だけ
@@ -1939,14 +1951,15 @@ Phase 15 To-Be production exit criteria:
    stable/negative vectorsをprotocol specificationとして固定する。
 2. transaction、vote、certificate、consensus、governance、upgrade、validator-set、Tickの
    concrete dispatchを実装し、unknown kind/type/version/fieldと未対応機能をfail closedにする。
-3. single-key state replacementをversioned atomic write-setへ置換し、複数object、index、
-   consensus metadata、dedup recordを同一commitで更新できるproduction StateStore transaction
-   contractと少なくとも1つのdurable実装を完成させる。
+3. single-key state replacementを明示的atomicity domainと全read-set（read-only、absent、tombstoneを含む）
+   revision assertionを持つversioned transactionへ置換する。複数object、index、consensus metadata、
+   dedup record、outbox初期状態を同一commitで更新し、cross-domain writeはprotocol-level coordinationなしに
+   部分成功させないproduction contractと、normalized PostgreSQL durable実装を完成させる。
 4. request_idとevent digestをpersisted dedup recordへ統合し、duplicate、replay、reorder、
    timeout後retry、concurrent delivery、process crash後retryで同一effectsを二重適用しない。
 5. state commitとoutbound publicationのcrash windowをtransactional outboxまたは同等の
-   recovery protocolで閉じる。commit済み未送信、送信済み未ack、duplicate sendを回復でき、
-   relayをtrust rootにしない。
+   recovery protocolで閉じる。prefix full scanではなくbounded indexed due-work claimを実装し、
+   commit済み未送信、送信済み未ack、duplicate sendを回復でき、relayをtrust rootにしない。
 6. HTTP contractにmethod/path、content type、body/header limits、timeout、cancellation、
    status/error mapping、request correlation、backpressure、streaming禁止/許可範囲、
    secret-bearing response policyを明文化する。
@@ -1962,6 +1975,15 @@ Phase 15 To-Be production exit criteria:
 10. version upgrade、epoch rollover、schema compatibility、database migration、backup/restore、
     disaster recovery、key rotation、rollback非依存のsafe disable、operator runbook、SLO/alertを
     rehearsalし、independent security reviewを完了する。
+
+Phase 15 persistence implementation order（To-Beからの逆算）:
+
+1. atomicity domainとcomplete read-set assertionをruntime/node-core transaction contractへ追加する。
+2. indexed due-outbox repository/claim contractを追加し、StateKeyScannerはmaintenance/compatibilityへ戻す。
+3. normalized schema、explicit migration、bounded pool/deadline、typed conflictを持つPostgreSQL adapterを実装する。
+4. shared conformanceにwrite skew、absent-key race、serialization failure、lease fencing、schema/version skewを追加する。
+5. kill/power fault、disk full、connection exhaustion、capacity/load/soak、backup/restore、writer failoverをrehearsalする。
+6. 同じcontractをCloudflare Durable ObjectとAWS persistenceへ実装し、real providerでcertifyする。
 
 Phase 16:
 - Cloudflare Workers ingress adapter (implemented As-Is)

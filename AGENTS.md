@@ -204,13 +204,14 @@ In `TODO.md`, an implemented Phase is only an As-Is milestone, never a
 production-readiness claim. Preserve and work backward from each To-Be exit
 criterion after context compaction. Re-check `main`, the open stacked PR chain,
 and `TODO.md` before starting because repository state may have advanced. The
-next work is closing Phase 15-17 production gaps, especially abrupt SQLite
-fault conformance, real provider trigger wiring, storage-aware deadlines,
-provider trust boundaries, real runtime conformance, capacity/fault tests, observability, and
-rollout/rollback rehearsal. The current Phase 15 sequence is kill/power-fault
-recovery conformance, provider trigger/transport integration,
-storage-aware deadline/cancellation semantics, and process/power-fault recovery
-conformance; do not jump to provider
-deployment claims before that shared foundation is complete. Native blocking
-work already has explicit admission isolation, but its configured limit is not
-a validated capacity budget and started work is not cancellable.
+next work is closing Phase 15-17 production gaps using the accepted
+[`PERSISTENCE.md`](PERSISTENCE.md) design. The current Phase 15 sequence is:
+complete read-set assertions plus explicit atomicity domains, an indexed outbox
+claim contract, the normalized PostgreSQL reference adapter, shared
+conformance, then deadline/cancellation, abrupt fault, backup/restore, capacity,
+and provider implementations. Do not spend further effort treating the opaque
+SQLite table or prefix scanner as the production schema. SQLite remains a local
+durable reference. Do not jump to provider deployment claims before the shared
+contract and evidence exist. Native blocking work already has explicit
+admission isolation, but its configured limit is not a validated capacity
+budget and started work is not cancellable.
