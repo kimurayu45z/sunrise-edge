@@ -76,6 +76,45 @@ identifier and placement rule must be deterministic, versioned, committed by
 protocol configuration, and derivable from the declared access plan before
 state reads.
 
+`AtomicityDomainId` is a logical protocol identity, not a database address. A
+domain ID is assigned by genesis or an activated governance configuration,
+must be non-zero and unique for the chain, and is never reused. It is not
+derived from a PostgreSQL hostname/schema, Durable Object name, AWS region,
+validator ID, process, or deployment environment. The validator ID remains a
+separate outer namespace because each validator owns its own replica of the
+same logical domains.
+
+The first production profile commits a `DomainPlacementManifest` in protocol
+configuration with:
+
+- a monotonically increasing placement-rule version;
+- exactly one active logical domain ID;
+- the closed routing rule `AllState`;
+- an activation epoch and the protocol version that understands the rule.
+
+Node-core resolves this manifest after validating event context and after
+constructing the bounded access plan, but before any state read. Every
+application key in the plan must resolve to the same domain. Receipt, outbox,
+and delivery records inherit that resolved invocation domain; their key prefix
+is not independently routed. A caller-supplied domain ID is therefore an
+internal adapter parameter to validate against the resolved manifest, not an
+untrusted request choice. An unknown manifest version, inactive domain, empty
+plan, or multi-domain result fails before storage I/O.
+
+Future scale-out may add closed, canonical routing variants based on stable
+object/key identity. Each variant requires its own canonical encoding, test
+vectors, activation rules, and proof that all keys needed by one transition
+resolve before reads. Provider-specific callbacks, mutable lookup services,
+load-based routing, and database discovery are forbidden correctness inputs.
+
+Physical placement is deployment metadata outside protocol configuration. It
+maps `(chain_id, validator_id, logical_domain_id)` to a PostgreSQL partition or
+cluster, one Durable Object, or a regional AWS authority plus its writer-fence
+generation. Moving that binding must preserve the logical ID and use explicit
+copy, commitment verification, old-writer fencing, activation, and rollback-
+independent disable steps. It must never rewrite protocol objects merely to
+change providers.
+
 One invocation may commit only inside one domain in the first production
 profile. A provider adapter must reject a write set spanning domains before it
 performs a partial write. This maps directly to one PostgreSQL transaction, one

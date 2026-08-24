@@ -741,6 +741,16 @@ to make authoritative state writes globally atomic. Detailed schema,
 provider mappings, migration, retention, backup/restore, fencing, and
 certification requirements live in [`PERSISTENCE.md`](PERSISTENCE.md).
 
+Atomicity-domain identity is logical protocol configuration rather than
+physical placement. The initial `DomainPlacementManifest` has one non-zero,
+chain-unique, never-reused domain and a closed `AllState` rule. Node-core must
+resolve the complete bounded application access plan before reads; receipt and
+outbox records inherit that invocation domain. The adapter validates the
+resolved domain rather than accepting it from an untrusted request. Deployment
+metadata separately binds `(chain, validator, logical domain)` to PostgreSQL,
+one Durable Object, or one fenced regional authority, so provider migration
+does not change protocol identity.
+
 The runtime now models that boundary explicitly with a non-zero 32-byte
 `AtomicityDomainId`, a separately validated `AtomicStateReadSet`, a put/delete
 `AtomicStateMutationSet`, and `AtomicStateTransaction`. Read and mutation sets
@@ -914,3 +924,9 @@ transaction. Native composition and durable-store migration are still pending.
   acknowledgement validation across legacy and domain entrypoints; vary only
   point reads and atomic commit construction. Assert the immutable batch and
   mutate its delivery cursor in the same domain transaction.
+- DR-0044: Make atomicity-domain identity logical, chain-configured, and
+  independent of physical storage placement. Begin with one never-reused
+  domain and a closed `AllState` manifest rule, resolve every application key
+  before reads, and make receipt/outbox records inherit the invocation domain.
+  Bind that logical domain to provider resources only in fenced deployment
+  metadata so migration does not rewrite protocol identity.
