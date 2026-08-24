@@ -1947,7 +1947,11 @@ Phase 15 As-Is scope:
   normalized storeはleaseごとのrequest/index bindingとacknowledged statusをowning batchのretentionまで保持する。
   last acknowledged identityだけでは後続message進行後のdelayed retryを処理できない。claim/ackはどちらもdefinite pre-commit rejectionと
   Indeterminateを分離し、未reconcileのclaimをtransportしてはならない
-  （contract implemented As-Is; native recovery/durable adapter implementation pending）。
+  （contract implemented As-Is）。nativeはtrusted deployment compositionからlogical domain、writer fence、
+  lease未満のbounded storage timeout、restart-safe lease/correlation identityを受けるone-shot indexed recoveryを持つ。
+  claim/ackのIndeterminateは同じidentityで各1回だけreconcileし、unresolved claimはsendせず、scan cursorを返さず、
+  HTTPとblocking admissionを共有する（native wiring implemented As-Is; scripted memory conformance only）。
+  durable adapter、transport-aware deadline/cancellation、real scheduler bindingは未実装である。
 - ComposedRuntimeはStateStore、BlobStore、Signer、Transport、Clock、Schedulerをhidden defaultなしで
   明示的に所有・合成する。SQLiteへstate/dedup/outboxをcommit後にruntimeをdropし、同じDBを別compositionで
   reopenしてstateを再適用せずoutboxを送ること、send failure leaseがreopen後もexpiry前は抑止されexpiry時だけ
@@ -2030,7 +2034,7 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
 1. SQLite既存dataを暗黙migrationせず、writer fence、deadline、typed conflict/indeterminate failureを持つ
    durable domain adapter boundaryを定義する（implemented As-Is; composition/provider implementation pending）。
 2. indexed due-outbox repository/claim contractを追加し、domain-aware unattended recoveryを接続して
-   StateKeyScannerはmaintenance/compatibilityへ戻す（contract implemented As-Is; recovery wiring pending）。
+   StateKeyScannerはmaintenance/compatibilityへ戻す（contract/native seam implemented As-Is; durable adapter pending）。
 3. normalized schema、explicit migration、bounded pool/deadline、typed conflictを持つPostgreSQL adapterを実装する。
 4. shared conformanceにwrite skew、absent-key race、serialization failure、lease fencing、schema/version skewを追加する。
 5. kill/power fault、disk full、connection exhaustion、capacity/load/soak、backup/restore、writer failoverをrehearsalする。

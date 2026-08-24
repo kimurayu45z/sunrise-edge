@@ -807,7 +807,7 @@ are retried. Node-core, native composition, SQLite, and provider adapters have
 not migrated to this new production boundary yet.
 
 The additive `IndexedOutboxRepository` is the production discovery and lease
-boundary. A claim receives one resolved logical domain, trusted runtime time,
+boundary. A claim receives one deployment-bound logical domain, trusted runtime time,
 and a bounded restart-safe lease identity, then selects at most one eligible
 row through stable `(available_at, request_id)` index order and installs the
 lease atomically. It accepts no key-scan cursor or scheduler-selected domain.
@@ -821,9 +821,23 @@ batch's retention window rather than erasing evidence when it clears the active
 lease. Keeping only the most recent acknowledgement would fail after a later
 message advances. Both claim and acknowledgement distinguish
 definite pre-commit rejection from indeterminate commit. Callers never send an
-indeterminate claim before reconciliation. Native recovery and durable stores
-do not implement this boundary yet, so `StateKeyScanner` remains only the
-current compatibility path.
+indeterminate claim before reconciliation. Defining this contract does not
+itself provide a durable repository, so `StateKeyScanner` remains the current
+compatibility path.
+
+Native now also exposes additive `recover_indexed_outbox_once`. Trusted
+embedding composition fixes the logical domain and current physical writer
+fence, a bounded storage timeout strictly shorter than the lease, and a
+restart-safe identity source before an untrusted scheduler triggers the call.
+This authority may include explicitly draining old logical domains during a
+fenced migration; it is not re-derived from an arbitrary request or scheduler
+input. The path claims at most one message, makes one same-identity
+reconciliation attempt for an indeterminate claim, validates and sends only
+reconciled canonical event bytes, then makes one same-identity acknowledgement
+reconciliation attempt. It shares native blocking admission and returns no scan
+cursor. Scripted conformance proves unresolved claims are not sent. No durable
+repository, real scheduler binding, or transport-aware cancellation/deadline
+exists yet, so the scan path remains compatibility-only rather than deleted.
 
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
@@ -1010,3 +1024,9 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   retain uniquely bound lease-attempt history for idempotent acknowledgement retry,
   and separate indeterminate claim/ack commits from proven aborts. Keep
   scheduler cursors and caller-selected domains outside authority.
+- DR-0050: Add one-shot native indexed recovery under immutable embedding
+  authority for a logical domain, physical writer fence, storage timeout, and
+  restart-safe identities. Reconcile an indeterminate claim once with the same
+  lease and never send it unresolved; reconcile acknowledgement with the same
+  request/index/lease. Share blocking admission, expose no scan cursor, and
+  retain the legacy scan path until a durable repository passes conformance.

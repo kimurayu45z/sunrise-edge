@@ -227,8 +227,15 @@ acknowledged lease is insufficient because a delayed retry may arrive after a
 later message advances. Claim and
 acknowledgement each distinguish definite pre-commit rejection from an
 indeterminate commit. An indeterminate claim is never transported until it is
-reconciled. The contract exists As-Is, but native recovery and durable adapters
-have not implemented it yet.
+reconciled. Native now has an additive, one-shot indexed recovery path. Trusted
+embedding composition supplies one logical domain, its writer fence, a bounded
+storage-operation timeout shorter than the lease, and restart-safe lease and
+correlation identities. The scheduler supplies none of those values. Claim and
+acknowledgement each receive one same-identity reconciliation attempt; an
+unresolved claim is never sent. The path shares native blocking admission and
+returns no scan cursor. It has only scripted in-memory conformance: no durable
+adapter implements the repository, and transport-aware cancellation/deadlines
+remain pending.
 
 `StateKeyScanner` remains useful for repair, audit, bounded migration, and
 compatibility recovery. It is not a production work queue.
