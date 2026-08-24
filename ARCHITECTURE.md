@@ -20,6 +20,14 @@ Sunrise Edge is designed as a deterministic state-transition system over authent
 ## 3. Canonical serialization rules
 All protocol-critical payloads use a SCALE-based framed binary encoding with explicit protocol magic, type identifier, encoding version, field count, field identifiers, field lengths, and field bytes. Fields are emitted in sorted field-id order to avoid map and construction-order nondeterminism.
 
+The Phase 15 adapter prerequisite adds the shared inverse operation:
+`decode_canonical_frame` validates one complete frame with a 32 MiB bound,
+borrows field payloads without copying, rejects wrong magic, truncation,
+duplicate or out-of-order field IDs, length overruns, and trailing bytes, and
+provides checked integer and UTF-8 accessors. Schema decoders must additionally
+require the expected type/version and reject fields outside their explicit
+allow-list; parsing a generic frame alone does not authorize an event.
+
 ## 4. Hash architecture
 Hashing is centralized in the `hashing` crate. Callers provide a canonical payload, a hash domain, protocol version, and chain id; the crate is solely responsible for producing the canonical domain-separation frame before hashing.
 

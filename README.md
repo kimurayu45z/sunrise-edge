@@ -65,6 +65,8 @@ The workspace currently contains the foundations implemented through the
 experimental ZK commitment and execution-proof interface milestone:
 
 - Canonical framed encoding for protocol-critical values.
+- Bounded, zero-copy canonical frame decoding with strict order and length
+  validation for adapter ingress.
 - SHA-256 and SHA3-256 support with epoch-selected hash suites.
 - Self-describing digests and domain-separated hash/signature framing.
 - Versioned objects, object references, access manifests, and lazy migration.

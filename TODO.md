@@ -1845,6 +1845,12 @@ Phase 14 To-Be production exit criteria:
 Phase 15:
 - native HTTP adapter
 
+Phase 15 prerequisites:
+
+- bounded canonical frame decoder (implemented)
+- deterministic node-core event boundary (pending)
+- adapter-neutral request/response contract (pending)
+
 Phase 16:
 - Cloudflare Workers adapter
 
