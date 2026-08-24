@@ -101,9 +101,9 @@ and outbox delivery, portable system-module execution, cryptographic slashing
 proof verification, fee-object debiting, production persistence, runtime
 adapters, networking/RPC surfaces, and independent security review.
 
-The next planned technical milestone is the Phase 17 Vercel, Supabase, AWS, and
-Deno adapter family described in [`TODO.md`](TODO.md), stacked on the portable
-HTTP contract.
+The next planned technical milestone is the remaining Phase 17 Vercel,
+Supabase, and AWS adapter family described in [`TODO.md`](TODO.md), stacked on
+the portable HTTP contract and its Deno conformance consumer.
 
 ## Workspace map
 
@@ -114,7 +114,7 @@ HTTP contract.
 | Execution | `execution`, `contract-sdk`, `chain-ir`, `system-modules` | Transactions/effects, deterministic WASM, proof envelopes/verifier interfaces, contract host APIs, portable IR, and governed modules |
 | Economics and governance | `fees`, `bonds`, `governance`, `protocol-upgrades`, `protocol-config` | Stablecoin fees/bonds, admission, governance actions, upgrades, migrations, and committed configuration |
 | Runtime and consensus | `runtime`, `validator-set`, `consensus`, `node-core` | Persistence/runtime interfaces, epoch validator snapshots, event-driven shared-object ordering, and one-event conditional transitions |
-| Adapters | `native-http`, `adapters/shared`, `adapters/cloudflare-workers` | Bounded native routing, a shared Web ingress core, and Cloudflare Service-Binding ingress around the canonical HTTP contract |
+| Adapters | `native-http`, `adapters/shared`, `adapters/cloudflare-workers`, `adapters/deno` | Bounded native routing, a shared Web ingress core, Cloudflare Service-Binding ingress, and authenticated Deno ingress around the canonical HTTP contract |
 
 The repository intentionally keeps vendor-specific dependencies out of the
 protocol core. Future Cloudflare, Vercel, Supabase, AWS, Deno, and native HTTP

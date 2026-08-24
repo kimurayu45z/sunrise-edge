@@ -429,6 +429,25 @@ without weakening the shared bounds. The Cloudflare wrapper is the first
 conformance consumer and continues to pass its generated Service Binding;
 workerd tests exercise the extracted implementation unchanged.
 
+## 34. Deno Web ingress adapter
+
+The Deno Phase 17 adapter uses the current Deno 2 default `fetch` export and
+passes every public request to the portable Web ingress core. Its only runtime
+capability is an immutable node-core fetcher configured from named environment
+variables. The wrapper does not decode canonical bytes or own protocol state.
+
+The As-Is node-core transport requires an exact HTTPS `/v1/events` URL and a
+bounded Bearer token stored as a Deno Deploy secret. It reconstructs an
+allow-listed upstream request, forbids redirects to prevent cross-origin
+credential forwarding, and applies a bounded deadline. Configuration errors
+fail at startup; network and timeout failures become the shared sanitized 503.
+
+This authenticated public relay is an incremental conformance adapter, not the
+production trust boundary. Phase 17 still requires a fixed private transport,
+mTLS or signed service capability, rotation and revocation, durable
+deduplication and outbox delivery, provider policy and limits, real deployment
+tests, observability, incident response, and rollback rehearsal.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -464,3 +483,7 @@ workerd tests exercise the extracted implementation unchanged.
   and inject only a minimal node-core fetch capability. Provider wrappers may
   add authentication and deployment wiring but must not fork canonical paths,
   media types, bounds, status rules, or response sanitization.
+- DR-0019: Implement Deno ingress as a thin default-fetch wrapper over the
+  shared contract. Require an exact HTTPS node-core endpoint, inject only a
+  secret Bearer capability, reject redirects, and treat stronger private or
+  mutually authenticated transport as a production Phase 17 requirement.

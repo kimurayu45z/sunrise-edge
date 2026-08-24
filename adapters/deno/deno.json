@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "strict": true
+  },
+  "fmt": {
+    "lineWidth": 88
+  },
+  "lint": {
+    "rules": {
+      "tags": ["recommended"]
+    }
+  },
+  "tasks": {
+    "check": "deno fmt --check && deno lint && deno check src/main.ts test/adapter_test.ts && deno test --no-check test"
+  }
+}
