@@ -851,6 +851,20 @@ object rows. Node-core must first build a structured durable envelope with
 separately typed and bounded sections. SQLite remains unchanged compatibility
 data and is never request-path migrated into that schema.
 
+Runtime now implements that input boundary as `DurableInvocationTransaction`
+and `StructuredDurableDomainStateStore`. An invocation names one logical
+domain, an optional `DurableStateTransaction`, one canonical typed receipt, an
+optional typed ordered outbox batch, and an explicit object section. The state
+section keeps a complete read set but may have zero mutations, allowing a
+read-only transition to bind its observations while the receipt is written.
+Constructors reject cross-domain state and receipt/outbox request or event
+digest drift and cap the aggregate represented bytes. The object section is
+closed to explicit empty until concrete object dispatch exists, preventing an
+adapter from hiding unsupported object writes in generic state. Indexed outbox
+repositories now refine the structured store trait so one implementation owns
+initial commit and later delivery state. Node-core and durable adapters do not
+use this new boundary yet.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -1048,3 +1062,9 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   through exact namespace metadata, and require explicit migrations. Add a
   structured state/object/receipt/outbox envelope first; prohibit the adapter
   from classifying opaque key prefixes into normalized relations.
+- DR-0052: Add a structured durable invocation input before implementing SQL.
+  Separate complete state assertions/mutations, canonical request receipt,
+  ordered outbox messages, and object changes; bind domain, request, and event
+  digest across sections and bound aggregate bytes. Permit read-only state
+  sections, keep unsupported object changes explicitly empty, and require
+  indexed delivery repositories to share this structured store boundary.

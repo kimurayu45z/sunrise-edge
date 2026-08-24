@@ -1546,10 +1546,11 @@ mod tests {
     };
     use runtime::{
         AtomicStateTransaction, CompareAndSwapResult, ComposedRuntime, DurableCommitOutcome,
-        DurableCommitRejection, DurableDomainStateStore, DurableOutboxClaim, DurableReadError,
+        DurableCommitRejection, DurableDomainStateStore, DurableInvocationTransaction,
+        DurableOutboxClaim, DurableReadError, DurableRequestId, DurableRequestReceipt,
         IndexedOutboxRepository, ManualClock, MemoryBlobStore, MemoryRuntime, MemoryScheduler,
         MemorySigner, MemoryStateStore, MemoryTransport, OutboxRequestId, RuntimeError, StateStore,
-        TransactionalStateStore, VersionedStateValue,
+        StructuredDurableDomainStateStore, TransactionalStateStore, VersionedStateValue,
     };
     use runtime_sqlite::SqliteStateStore;
     use std::{
@@ -1860,6 +1861,25 @@ mod tests {
             &self,
             _context: &DurableOperationContext,
             _transaction: AtomicStateTransaction,
+        ) -> DurableCommitOutcome {
+            DurableCommitOutcome::Rejected(DurableCommitRejection::UnavailableBeforeCommit)
+        }
+    }
+
+    impl StructuredDurableDomainStateStore for ScriptedIndexedStore {
+        fn get_request_receipt(
+            &self,
+            _context: &DurableOperationContext,
+            _domain: AtomicityDomainId,
+            _request_id: DurableRequestId,
+        ) -> Result<Option<DurableRequestReceipt>, DurableReadError> {
+            Err(DurableReadError::Unavailable)
+        }
+
+        fn commit_invocation(
+            &self,
+            _context: &DurableOperationContext,
+            _transaction: DurableInvocationTransaction,
         ) -> DurableCommitOutcome {
             DurableCommitOutcome::Rejected(DurableCommitRejection::UnavailableBeforeCommit)
         }
