@@ -205,8 +205,9 @@ production-readiness claim. Preserve and work backward from each To-Be exit
 criterion after context compaction. Re-check `main`, the open stacked PR chain,
 and `TODO.md` before starting because repository state may have advanced. The
 next work is closing Phase 15-17 production gaps using the accepted
-[`PERSISTENCE.md`](PERSISTENCE.md) design. The current Phase 15 sequence is:
-complete read-set assertions plus explicit atomicity domains, an indexed outbox
+[`PERSISTENCE.md`](PERSISTENCE.md) design. Node-core now asserts every declared
+read revision in its atomic write set. The current Phase 15 sequence is:
+explicit atomicity domains and a dedicated read-set contract, an indexed outbox
 claim contract, the normalized PostgreSQL reference adapter, shared
 conformance, then deadline/cancellation, abrupt fault, backup/restore, capacity,
 and provider implementations. Do not spend further effort treating the opaque

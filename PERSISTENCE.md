@@ -55,9 +55,11 @@ A production store must provide all of the following:
     evidence before a provider implementation is certified.
 
 The existing `TransactionalStateStore` satisfies only part of this contract.
-In particular, it has no explicit atomicity domain, asserts only keys present
-in its write set, and exposes no indexed outbox claim. It remains a useful
-compatibility seam, not the final production API.
+`StateMutation::Assert` lets node-core include every declared observation in
+the atomic write set, including read-only and absent state, so the current
+handlers detect revision changes before commit. The API still has no explicit
+atomicity domain or separately typed read set and exposes no indexed outbox
+claim. It remains a useful compatibility seam, not the final production API.
 
 ## 3. Atomicity domains and scale
 
@@ -210,8 +212,8 @@ not general state reads:
 
 ## 9. Implementation order and certification
 
-1. Replace write-only optimistic validation with an atomicity-domain-aware
-   transaction contract that asserts the complete read set.
+1. Evolve the complete-read-set optimistic validation into an explicit,
+   atomicity-domain-aware transaction contract.
 2. Add a dedicated indexed outbox repository/claim contract; retain key scans
    only for maintenance and compatibility.
 3. Implement the normalized PostgreSQL schema and adapter, with migrations and

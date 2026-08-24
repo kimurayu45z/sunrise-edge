@@ -92,7 +92,9 @@ cross-provider ingress milestones implemented through Phase 17:
   revisions and an atomic in-memory conformance implementation.
 - A transactional node-core path that declares bounded state access before
   reads, transitions over an immutable versioned snapshot, and rejects
-  undeclared or read-only updates before atomic commit.
+  undeclared or read-only updates before atomic commit. Every declared
+  observation, including read-only and absent state, is revision-asserted in
+  that commit so concurrent dependency changes cannot produce write skew.
 - Canonical request/event-digest deduplication and ordered request-scoped
   outbox records committed atomically with application state, including
   response replay and conflicting request-ID reuse rejection.

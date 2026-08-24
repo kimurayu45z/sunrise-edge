@@ -1363,11 +1363,47 @@ pub trait NodeStateMachine {
     ) -> Result<NodeTransition, NodeCoreError>;
 }
 
+fn asserted_transition_writes(
+    plan: &NodeStateAccessPlan,
+    snapshot: &NodeStateSnapshot,
+    updates: Vec<NodeStateUpdate>,
+) -> Result<Vec<StateWrite>, NodeCoreError> {
+    let mut mutations = BTreeMap::new();
+    for update in updates {
+        let Some(access) = plan.access(update.key()) else {
+            return Err(NodeCoreError::UndeclaredStateUpdate(update.key));
+        };
+        if access.mode() != NodeStateAccessMode::ReadWrite {
+            return Err(NodeCoreError::ReadOnlyStateUpdate(update.key));
+        }
+        mutations.insert(update.key, update.mutation);
+    }
+
+    let mut writes = Vec::with_capacity(plan.accesses().len());
+    for access in plan.accesses() {
+        let observed = snapshot
+            .get(access.key())
+            .ok_or(NodeCoreError::PersistenceInvariant(
+                "declared access missing from snapshot",
+            ))?;
+        let mutation = mutations
+            .remove(access.key())
+            .unwrap_or(StateMutation::Assert);
+        writes.push(StateWrite::new(
+            access.key().to_vec(),
+            observed.revision(),
+            mutation,
+        )?);
+    }
+    Ok(writes)
+}
+
 /// Handles one event through a declared multi-key atomic state transition.
 ///
 /// The event context and access plan are validated before storage reads. Every
-/// observed revision is bound into the final write set, and output remains
-/// private until all writes commit. Conflicts are surfaced without retry.
+/// observed revision, including read-only and absent state, is asserted in the
+/// final transaction, and output remains private until all writes commit.
+/// Conflicts are surfaced without retry.
 pub fn handle_transactional_event<R, M>(
     runtime: &R,
     config: &NodeConfig,
@@ -1394,23 +1430,7 @@ where
     let transition = machine.transition(&snapshot, &event)?;
     validate_output_context(transition.output(), &event, config)?;
 
-    let mut writes = Vec::with_capacity(transition.updates.len());
-    for update in transition.updates {
-        let Some(access) = plan.access(update.key()) else {
-            return Err(NodeCoreError::UndeclaredStateUpdate(update.key));
-        };
-        if access.mode() != NodeStateAccessMode::ReadWrite {
-            return Err(NodeCoreError::ReadOnlyStateUpdate(update.key));
-        }
-        let observed = snapshot
-            .get(update.key())
-            .ok_or_else(|| NodeCoreError::UndeclaredStateUpdate(update.key.clone()))?;
-        writes.push(StateWrite::new(
-            update.key,
-            observed.revision(),
-            update.mutation,
-        )?);
-    }
+    let writes = asserted_transition_writes(&plan, &snapshot, transition.updates)?;
 
     let write_set = AtomicStateWriteSet::new(writes)?;
     match runtime.state_store().commit_atomic(write_set)? {
@@ -1524,23 +1544,7 @@ where
     )?;
     let outbox_delivery = NodeOutboxDelivery::pending(event.request_id(), event_digest);
 
-    let mut writes = Vec::with_capacity(transition.updates.len() + 3);
-    for update in transition.updates {
-        let Some(access) = plan.access(update.key()) else {
-            return Err(NodeCoreError::UndeclaredStateUpdate(update.key));
-        };
-        if access.mode() != NodeStateAccessMode::ReadWrite {
-            return Err(NodeCoreError::ReadOnlyStateUpdate(update.key));
-        }
-        let observed = snapshot
-            .get(update.key())
-            .ok_or_else(|| NodeCoreError::UndeclaredStateUpdate(update.key.clone()))?;
-        writes.push(StateWrite::new(
-            update.key,
-            observed.revision(),
-            update.mutation,
-        )?);
-    }
+    let mut writes = asserted_transition_writes(&plan, &snapshot, transition.updates)?;
     writes.push(StateWrite::new(
         dedup_key,
         dedup.revision(),
@@ -2711,6 +2715,93 @@ mod tests {
         let a = runtime.state_store().get(b"state/a").unwrap().unwrap();
         assert_eq!(decode_canonical_frame(&a).unwrap().required_u64(1), Ok(99));
         assert_eq!(runtime.state_store().get(b"state/b").unwrap(), None);
+    }
+
+    struct ReadDependencyConflictMachine<'a> {
+        runtime: &'a MemoryRuntime,
+    }
+
+    impl TransactionalNodeStateMachine for ReadDependencyConflictMachine<'_> {
+        fn access_plan(&self, _event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            NodeStateAccessPlan::new(vec![
+                NodeStateAccess::new(b"state/dependency".to_vec(), NodeStateAccessMode::ReadOnly)?,
+                NodeStateAccess::new(b"state/result".to_vec(), NodeStateAccessMode::ReadWrite)?,
+            ])
+        }
+
+        fn transition(
+            &self,
+            state: &NodeStateSnapshot,
+            _event: &NodeEvent,
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            assert_eq!(
+                state
+                    .get(b"state/dependency")
+                    .and_then(VersionedStateValue::value),
+                None
+            );
+            self.runtime.state_store().put(
+                b"state/dependency".to_vec(),
+                canonical(TEST_STATE_TYPE_ID, 99),
+            )?;
+            TransactionalNodeTransition::new(
+                vec![NodeStateUpdate::put(
+                    b"state/result".to_vec(),
+                    canonical(TEST_STATE_TYPE_ID, 1),
+                )?],
+                NodeOutput::default(),
+            )
+        }
+    }
+
+    #[test]
+    fn transactional_handler_asserts_read_only_absence_before_commit() {
+        let runtime = MemoryRuntime::new(runtime::ValidatorId::new([0x44; 32]));
+        let error = handle_transactional_event(
+            &runtime,
+            &config("sunrise-test"),
+            event("sunrise-test", request(0x7B)),
+            &ReadDependencyConflictMachine { runtime: &runtime },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::StateConflict);
+        assert!(
+            runtime
+                .state_store()
+                .get(b"state/dependency")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(runtime.state_store().get(b"state/result").unwrap(), None);
+    }
+
+    #[test]
+    fn idempotent_handler_asserts_read_only_absence_before_commit() {
+        let runtime = MemoryRuntime::new(runtime::ValidatorId::new([0x44; 32]));
+        let event = event("sunrise-test", request(0x7C));
+        let error = handle_idempotent_event(
+            &runtime,
+            &config("sunrise-test"),
+            &resolver("sunrise-test"),
+            event.clone(),
+            &ReadDependencyConflictMachine { runtime: &runtime },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::StateConflict);
+        assert_eq!(runtime.state_store().get(b"state/result").unwrap(), None);
+        let layout = PersistenceLayout::new(
+            ChainId::new("sunrise-test").unwrap(),
+            ProtocolVersion::new(3),
+        );
+        for key in [
+            layout.request_dedup_key(*event.request_id().as_bytes()),
+            layout.outbox_batch_key(*event.request_id().as_bytes()),
+            layout.outbox_delivery_key(*event.request_id().as_bytes()),
+        ] {
+            assert_eq!(runtime.state_store().get(&key).unwrap(), None);
+        }
     }
 
     #[test]
