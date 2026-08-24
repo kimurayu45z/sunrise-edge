@@ -1957,7 +1957,7 @@ Phase 17 prerequisites:
 - shared authenticated HTTPS node-core capability (implemented As-Is)
 - Deno adapter wrapper (implemented As-Is)
 - Vercel adapter wrapper (implemented As-Is)
-- Supabase Edge adapter wrapper (pending)
+- Supabase Edge adapter wrapper (implemented As-Is)
 - AWS adapter wrapper and API Gateway mapping (pending)
 
 Phase 17 shared ingress As-Is scope:
@@ -1973,8 +1973,8 @@ Phase 17 shared ingress As-Is scope:
 - private service bindingを持たないWeb provider向けの暫定transportはexact HTTPS endpoint、
   allow-listed header、bounded ASCII Bearer secret、redirect拒否、1..30000ms timeoutを一実装にする。
   environment lookupとprovider credential lifecycleはこのmoduleへ入れない。
-- 現在のconformance consumerはCloudflare workerd、local Deno runtime、local Vercel wrapper testであり、
-  他provider runtimeの実装・検証とreal provider deploymentはまだ完了していない。
+- 現在のconformance consumerはCloudflare workerd、local Deno runtime、local Vercel/Supabase wrapper
+  testであり、AWS実装とreal provider deploymentはまだ完了していない。
 
 Phase 17 Deno As-Is scope:
 
@@ -1999,6 +1999,19 @@ Phase 17 Vercel As-Is scope:
   original path保持、platform 413/504、response 4.5 MB ceiling、Fluid Compute lifecycleは未検証である。
 - 4 MiBはprotocol transport上限より小さいためfull conformanceではない。全valid eventを受理できる
   ingress architecture、private/mutual authentication、rotation、durable outbox等をTo-Beに残す。
+
+Phase 17 Supabase As-Is scope:
+
+- `sunrise-edge` Edge Functionのdefault fetch exportを使用し、gatewayがfunctionへ見せる
+  `/sunrise-edge/*` prefixをcanonical 2 pathにだけexact matchで除去してshared handlerへ渡す。
+- `supabase/config.toml`で`verify_jwt = true`を明示し、eventとlivenessの両方を現在はgateway JWT必須にする。
+  public healthとauthenticated submissionの分離は認証を暗黙disableせずproduction設計へ残す。
+- outboundはshared exact HTTPS/Bearer/redirect/timeout capabilityを再利用し、secret名はreserved
+  `SUPABASE_` prefixを使わない。canonical bodyのprovider decodeや独自status mappingを追加しない。
+- hosted limitsに256 MB memory、2秒CPU/request、150秒idle timeoutはあるが、同じ公式limit pageに
+  payload ceilingはないため根拠のないprovider boundを設定せずshared boundを維持する。
+- 現実装はpermission-free local wrapper testまでで、Supabase CLI/local gateway/hosted deploy、JWT
+  claims policy、gateway 401/413/504、isolate reuse、real capacityは未検証としてTo-Beに残す。
 
 Phase 17 To-Be production exit criteria:
 

@@ -478,6 +478,28 @@ mapping, response limits, lifecycle reuse, private transport, key lifecycle,
 durable effects, abuse controls, telemetry, and release rehearsal remain Phase
 17 production requirements.
 
+## 36. Supabase Edge ingress adapter
+
+The Supabase Phase 17 adapter is a Deno-compatible Edge Function named
+`sunrise-edge`. Supabase routes function-internal paths with the function name
+as a prefix, so the wrapper removes `/sunrise-edge` only when the remainder is
+one of the two exact canonical paths. The normalized request then uses the
+portable ingress handler and shared authenticated node-core capability.
+
+Gateway JWT verification remains explicitly enabled. This protects event
+submission but also means liveness is not anonymously reachable in the As-Is
+shape. Production must decide whether to split health into a separately
+controlled function or keep it authenticated; it must not disable verification
+for the combined privileged ingress by accident.
+
+The hosted limits currently document 256 MB memory, two seconds of CPU per
+request, and 150 seconds of request idle time without documenting a payload
+ceiling on that limits page. The adapter retains the shared request bound and
+does not claim hosted capacity until real gateway and deployment tests establish
+it. Authentication claims, platform error mapping, private transport, durable
+effects, lifecycle behavior, observability, abuse policy, and release rehearsal
+remain Phase 17 production gates.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -528,3 +550,7 @@ durable effects, abuse controls, telemetry, and release rehearsal remain Phase
   request budget rather than pretending it accepts the full protocol envelope.
   Reuse shared Web semantics and authenticated transport, and keep real Vercel
   deployment behavior as an unfulfilled production gate.
+- DR-0023: Normalize only the exact Supabase function-prefixed contract paths
+  and keep gateway JWT verification enabled for the combined function. Do not
+  invent an undocumented hosted payload limit or equate local wrapper tests with
+  production gateway conformance.

@@ -4,3 +4,5 @@
 /adapters/cloudflare-workers/.dev.vars
 /adapters/vercel/.vercel
 /adapters/vercel/.env*.local
+/adapters/supabase-edge/supabase/.temp
+/adapters/supabase-edge/supabase/.env*
