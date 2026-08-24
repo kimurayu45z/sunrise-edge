@@ -1953,6 +1953,7 @@ Phase 17 prerequisites:
 
 - provider-neutral Web Fetch API ingress core (implemented As-Is)
 - Cloudflare conformance consumer over the shared implementation (implemented)
+- provider-specific lower request capacity policy (implemented As-Is)
 - Deno adapter wrapper (implemented As-Is)
 - Vercel adapter wrapper (pending)
 - Supabase Edge adapter wrapper (pending)
@@ -1966,6 +1967,8 @@ Phase 17 shared ingress As-Is scope:
   mutable global request stateを持たない。
 - provider wrapperは認証/private transportを追加できるが、shared boundやfail-closed mappingを
   緩めたりprovider独自wire contractへforkしてはならない。
+- provider platform limitがshared request boundより小さい場合だけ明示的なlower boundを設定できる。
+  zero、非整数、shared上限超過はconfiguration errorとして拒否し、security boundの引上げを許さない。
 - 現在のconformance consumerはCloudflare workerdとlocal Deno runtimeであり、他provider runtimeの
   実装・検証とreal provider deploymentはまだ完了していない。
 

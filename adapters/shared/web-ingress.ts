@@ -13,6 +13,11 @@ export interface NodeCoreFetcher {
   fetch(request: Request): Promise<Response>;
 }
 
+export interface WebIngressOptions {
+  /** A provider capacity limit that may narrow, but never raise, the protocol limit. */
+  readonly maximumRequestBodyBytes?: number;
+}
+
 class IngressError extends Error {
   constructor(
     readonly status: number,
@@ -27,7 +32,11 @@ class IngressError extends Error {
 export async function handleWebRequest(
   request: Request,
   nodeCore: NodeCoreFetcher,
+  options: WebIngressOptions = {},
 ): Promise<Response> {
+  const maximumRequestBodyBytes = validateMaximumRequestBodyBytes(
+    options.maximumRequestBodyBytes ?? MAX_HTTP_EVENT_BODY_BYTES,
+  );
   const url = new URL(request.url);
 
   if (url.pathname === LIVENESS_PATH) {
@@ -47,10 +56,10 @@ export async function handleWebRequest(
   }
 
   try {
-    validateHeaders(request.headers);
+    validateHeaders(request.headers, maximumRequestBodyBytes);
     const body = await readBoundedBody(
       request.body,
-      MAX_HTTP_EVENT_BODY_BYTES,
+      maximumRequestBodyBytes,
     );
     const downstreamRequest = new Request(NODE_CORE_URL, {
       method: "POST",
@@ -141,7 +150,23 @@ export async function readBoundedBody(
   return output;
 }
 
-function validateHeaders(headers: Headers): void {
+function validateMaximumRequestBodyBytes(value: number): number {
+  if (
+    !Number.isSafeInteger(value) ||
+    value <= 0 ||
+    value > MAX_HTTP_EVENT_BODY_BYTES
+  ) {
+    throw new TypeError(
+      `maximumRequestBodyBytes must be an integer from 1 to ${MAX_HTTP_EVENT_BODY_BYTES}`,
+    );
+  }
+  return value;
+}
+
+function validateHeaders(
+  headers: Headers,
+  maximumRequestBodyBytes: number,
+): void {
   if (!hasExactMediaType(headers, NODE_EVENT_MEDIA_TYPE)) {
     throw new IngressError(415, "unsupported-content-type");
   }
@@ -157,7 +182,7 @@ function validateHeaders(headers: Headers): void {
     if (!/^(0|[1-9][0-9]*)$/.test(contentLength)) {
       throw new IngressError(400, "invalid-content-length");
     }
-    if (BigInt(contentLength) > BigInt(MAX_HTTP_EVENT_BODY_BYTES)) {
+    if (BigInt(contentLength) > BigInt(maximumRequestBodyBytes)) {
       throw new IngressError(413, "body-too-large");
     }
   }
