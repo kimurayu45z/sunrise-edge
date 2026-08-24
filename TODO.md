@@ -1958,7 +1958,7 @@ Phase 17 prerequisites:
 - Deno adapter wrapper (implemented As-Is)
 - Vercel adapter wrapper (implemented As-Is)
 - Supabase Edge adapter wrapper (implemented As-Is)
-- AWS adapter wrapper and API Gateway mapping (pending)
+- AWS adapter wrapper and API Gateway HTTP API v2 mapping (implemented As-Is)
 
 Phase 17 shared ingress As-Is scope:
 
@@ -1973,8 +1973,8 @@ Phase 17 shared ingress As-Is scope:
 - private service bindingを持たないWeb provider向けの暫定transportはexact HTTPS endpoint、
   allow-listed header、bounded ASCII Bearer secret、redirect拒否、1..30000ms timeoutを一実装にする。
   environment lookupとprovider credential lifecycleはこのmoduleへ入れない。
-- 現在のconformance consumerはCloudflare workerd、local Deno runtime、local Vercel/Supabase wrapper
-  testであり、AWS実装とreal provider deploymentはまだ完了していない。
+- 現在のAs-Is consumerはCloudflare workerd、local Deno runtime、local Vercel/Supabase wrapper、
+  AWS HTTP API v2 mapper testであり、real provider deployment conformanceはまだ完了していない。
 
 Phase 17 Deno As-Is scope:
 
@@ -2012,6 +2012,20 @@ Phase 17 Supabase As-Is scope:
   payload ceilingはないため根拠のないprovider boundを設定せずshared boundを維持する。
 - 現実装はpermission-free local wrapper testまでで、Supabase CLI/local gateway/hosted deploy、JWT
   claims policy、gateway 401/413/504、isolate reuse、real capacityは未検証としてTo-Beに残す。
+
+Phase 17 AWS As-Is scope:
+
+- API Gateway HTTP API payload format 2.0 eventだけをtyped validationし、method、rawPath、lowercase
+  headers、base64 bodyをWeb Requestへ変換してshared handlerへ渡す。1.0やmalformed eventは拒否する。
+- canonical event POSTはstrict canonical base64を必須にし、encoded lengthをdecode前に検査する。
+  shared contractが使うcontent-type/content-encoding/content-length以外のheaderを再構築しない。
+- API Gateway 10 MBに対しsynchronous Lambda request/buffered responseはJSON envelope込み6 MBのため、
+  request/responseとも保守的4 MiB budgetとし、全protocol-valid envelope対応とは主張しない。
+- Lambda proxy resultはcanonical binaryを壊さないよう常にbase64 responseとし、responseもbounded read、
+  header allow-list、oversize 502でfail closedにする。
+- control-plane SDKやunauthenticated IaCを含めない。payloadFormatVersion 2.0、JWT scope/IAM/custom
+  authorizer、VPC/private transport、Secrets Manager/KMS、reserved concurrency/throttle/WAF、real deploy、
+  platform retry/durability/observabilityはTo-Beに残す。
 
 Phase 17 To-Be production exit criteria:
 

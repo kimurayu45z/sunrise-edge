@@ -101,9 +101,10 @@ and outbox delivery, portable system-module execution, cryptographic slashing
 proof verification, fee-object debiting, production persistence, runtime
 adapters, networking/RPC surfaces, and independent security review.
 
-The next planned technical milestone is the remaining Phase 17 AWS adapter
-described in [`TODO.md`](TODO.md), stacked on the portable HTTP contract and its
-Deno, Vercel, and Supabase conformance consumers.
+The next planned technical milestone is completing the Phase 17 production
+exit criteria in [`TODO.md`](TODO.md): real provider deployment conformance,
+private trust boundaries, durable effects, capacity tests, observability, and
+release rehearsal for the implemented adapter family.
 
 ## Workspace map
 
@@ -114,7 +115,7 @@ Deno, Vercel, and Supabase conformance consumers.
 | Execution | `execution`, `contract-sdk`, `chain-ir`, `system-modules` | Transactions/effects, deterministic WASM, proof envelopes/verifier interfaces, contract host APIs, portable IR, and governed modules |
 | Economics and governance | `fees`, `bonds`, `governance`, `protocol-upgrades`, `protocol-config` | Stablecoin fees/bonds, admission, governance actions, upgrades, migrations, and committed configuration |
 | Runtime and consensus | `runtime`, `validator-set`, `consensus`, `node-core` | Persistence/runtime interfaces, epoch validator snapshots, event-driven shared-object ordering, and one-event conditional transitions |
-| Adapters | `native-http`, `adapters/shared`, `adapters/cloudflare-workers`, `adapters/deno`, `adapters/vercel`, `adapters/supabase-edge` | Bounded native routing, a shared Web ingress core, Cloudflare Service-Binding ingress, and authenticated Deno/Vercel/Supabase ingress around the canonical HTTP contract |
+| Adapters | `native-http`, `adapters/shared`, `adapters/cloudflare-workers`, `adapters/deno`, `adapters/vercel`, `adapters/supabase-edge`, `adapters/aws-lambda` | Bounded native routing, shared Web ingress, Cloudflare Service-Binding ingress, authenticated Deno/Vercel/Supabase ingress, and AWS HTTP API v2 mapping around the canonical contract |
 
 The repository intentionally keeps vendor-specific dependencies out of the
 protocol core. Future Cloudflare, Vercel, Supabase, AWS, Deno, and native HTTP

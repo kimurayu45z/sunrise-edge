@@ -500,6 +500,27 @@ it. Authentication claims, platform error mapping, private transport, durable
 effects, lifecycle behavior, observability, abuse policy, and release rehearsal
 remain Phase 17 production gates.
 
+## 37. AWS HTTP API v2 ingress adapter
+
+The AWS Phase 17 adapter maps API Gateway HTTP API payload format `2.0` events
+to the portable Web ingress contract without an AWS SDK dependency. It validates
+the event shape and version, reconstructs only contract-relevant headers, and
+requires canonical event POST bodies to use strict canonical base64. Encoded
+length is checked before allocation and decoded bytes are checked again.
+
+API Gateway allows 10 MB API payloads, but synchronous Lambda invocation
+request and buffered response payloads are limited to 6 MB including their JSON
+envelopes. The adapter uses 4 MiB for both decoded requests and raw responses,
+then base64-encodes the explicit payload-v2 result. The response stream is read
+with a bound and only cache-control, content-type, and allow can cross back to
+the gateway. This smaller envelope is an explicit conformance gap.
+
+The repository deliberately does not ship an unauthenticated deployable API.
+Production IaC must select payload format 2.0 and configure scoped JWT, IAM, or
+custom authorization plus throttling/WAF, secret lifecycle, private node-core
+transport, reserved concurrency, observability, durable effects, and rollout
+rehearsal. Local mapper tests are not evidence of API Gateway/Lambda conformance.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -554,3 +575,7 @@ remain Phase 17 production gates.
   and keep gateway JWT verification enabled for the combined function. Do not
   invent an undocumented hosted payload limit or equate local wrapper tests with
   production gateway conformance.
+- DR-0024: Map only API Gateway HTTP API payload version 2.0, require canonical
+  base64 for binary events, and cap decoded request and raw buffered response at
+  4 MiB to stay conservatively below Lambda's 6 MB JSON-envelope limits. Ship no
+  unauthenticated production API configuration.
