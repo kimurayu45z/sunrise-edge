@@ -60,10 +60,12 @@ observation in their atomic write set. The runtime now also defines the target
 shape as `AtomicityDomainId`, `AtomicStateReadSet`,
 `AtomicStateMutationSet`, `AtomicStateTransaction`, and
 `DomainTransactionalStateStore`. The memory implementation proves domain
-isolation and complete-read conflict behavior. Node-core, SQLite, and durable
-providers still use the legacy interface, and no indexed outbox claim exists
-yet, so this remains an As-Is contract milestone rather than the completed
-production API.
+isolation and complete-read conflict behavior. Node-core now has additive
+domain-aware transactional and idempotent handlers that commit application
+state, request receipt, outbox batch, and initial delivery cursor through that
+contract. Native composition, outbox claim/ack, SQLite, and durable providers
+still use the legacy interface, and no indexed outbox claim exists yet, so this
+remains an As-Is contract milestone rather than the completed production API.
 
 ## 3. Atomicity domains and scale
 
@@ -216,8 +218,9 @@ not general state reads:
 
 ## 9. Implementation order and certification
 
-1. Wire the implemented atomicity-domain/read-set envelope through node-core,
-   then implement it in durable stores without silently migrating legacy data.
+1. Finish wiring the implemented atomicity-domain/read-set envelope through
+   outbox delivery and native composition, then implement it in durable stores
+   without silently migrating legacy data.
 2. Add a dedicated indexed outbox repository/claim contract; retain key scans
    only for maintenance and compatibility.
 3. Implement the normalized PostgreSQL schema and adapter, with migrations and

@@ -1913,7 +1913,10 @@ Phase 15 As-Is scope:
   全mutation keyはread assertionを必須とし、各set 4,096 keysおよびaggregate represented bytes 64 MiBを
   shared safety ceilingとして検証する。MemoryStateStoreは同一keyのdomain isolation、complete-read conflict時の
   all-or-noneを検証する（implemented As-Is）。legacy unscoped stateはprivate test domainへ隔離され、
-  node-core、runtime-sqlite、provider adapterはまだnew contractへ移行していない。
+  node-coreはadditiveなdomain-aware transactional/idempotent handlerでapplication state、dedup receipt、
+  outbox batch、initial delivery cursorを1 domain transactionへ接続した（implemented As-Is）。同一keyの
+  domain isolation、replay、dependency conflict時にresult/receipt/outboxを一切publishしないことを検証する。
+  native composition、outbox claim/ack、runtime-sqlite、provider adapterはまだnew contractへ移行していない。
 - ComposedRuntimeはStateStore、BlobStore、Signer、Transport、Clock、Schedulerをhidden defaultなしで
   明示的に所有・合成する。SQLiteへstate/dedup/outboxをcommit後にruntimeをdropし、同じDBを別compositionで
   reopenしてstateを再適用せずoutboxを送ること、send failure leaseがreopen後もexpiry前は抑止されexpiry時だけ
@@ -1993,8 +1996,8 @@ Phase 15 To-Be production exit criteria:
 
 Phase 15 persistence implementation order（To-Beからの逆算）:
 
-1. runtimeでimplemented As-Isとなったatomicity domain/dedicated read-set envelopeをnode-coreへ接続し、
-   SQLite既存dataを暗黙migrationせずdurable store contractへ実装する。
+1. node-core初期commitまで接続したatomicity domain/dedicated read-set envelopeをoutbox deliveryと
+   native compositionへ接続し、SQLite既存dataを暗黙migrationせずdurable store contractへ実装する。
 2. indexed due-outbox repository/claim contractを追加し、StateKeyScannerはmaintenance/compatibilityへ戻す。
 3. normalized schema、explicit migration、bounded pool/deadline、typed conflictを持つPostgreSQL adapterを実装する。
 4. shared conformanceにwrite skew、absent-key race、serialization failure、lease fencing、schema/version skewを追加する。

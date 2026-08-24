@@ -16,9 +16,11 @@ use protocol_types::{
     ChainId, Digest32, Epoch, HashAlgorithmId, HashPurpose, ProtocolVersion, TypeError,
 };
 use runtime::{
-    AtomicStateWriteResult, AtomicStateWriteSet, MAX_ATOMIC_STATE_WRITES, MAX_STATE_KEY_BYTES,
-    PersistenceLayout, Runtime, RuntimeError, StateMutation, StateStore, StateWrite,
-    TransactionalStateStore, VersionedStateValue,
+    AtomicStateMutationSet, AtomicStateReadSet, AtomicStateTransaction, AtomicStateWriteResult,
+    AtomicStateWriteSet, AtomicityDomainId, DomainTransactionalStateStore, MAX_ATOMIC_STATE_WRITES,
+    MAX_STATE_KEY_BYTES, PersistenceLayout, Runtime, RuntimeError, StateMutation,
+    StateMutationEntry, StateReadAssertion, StateStore, StateWrite, TransactionalStateStore,
+    VersionedStateValue,
 };
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -1398,6 +1400,86 @@ fn asserted_transition_writes(
     Ok(writes)
 }
 
+fn domain_transition_parts(
+    plan: &NodeStateAccessPlan,
+    snapshot: &NodeStateSnapshot,
+    updates: Vec<NodeStateUpdate>,
+) -> Result<(Vec<StateReadAssertion>, Vec<StateMutationEntry>), NodeCoreError> {
+    let mut mutations = Vec::with_capacity(updates.len());
+    for update in updates {
+        let Some(access) = plan.access(update.key()) else {
+            return Err(NodeCoreError::UndeclaredStateUpdate(update.key));
+        };
+        if access.mode() != NodeStateAccessMode::ReadWrite {
+            return Err(NodeCoreError::ReadOnlyStateUpdate(update.key));
+        }
+        mutations.push(StateMutationEntry::new(update.key, update.mutation)?);
+    }
+
+    let reads = plan
+        .accesses()
+        .iter()
+        .map(|access| {
+            let observed =
+                snapshot
+                    .get(access.key())
+                    .ok_or(NodeCoreError::PersistenceInvariant(
+                        "declared access missing from snapshot",
+                    ))?;
+            Ok(StateReadAssertion::new(
+                access.key().to_vec(),
+                observed.revision(),
+            )?)
+        })
+        .collect::<Result<Vec<_>, NodeCoreError>>()?;
+    Ok((reads, mutations))
+}
+
+/// Handles one event inside one explicit atomicity domain.
+///
+/// This is the domain-aware successor to [`handle_transactional_event`]. Every
+/// declared observation enters the dedicated read set, while only returned
+/// updates enter the mutation set. Conflicts publish neither state nor output.
+pub fn handle_domain_transactional_event<R, M>(
+    runtime: &R,
+    domain: AtomicityDomainId,
+    config: &NodeConfig,
+    event: NodeEvent,
+    machine: &M,
+) -> Result<NodeOutput, NodeCoreError>
+where
+    R: Runtime,
+    R::State: DomainTransactionalStateStore,
+    M: TransactionalNodeStateMachine,
+{
+    event.validate_context(config)?;
+    let plan = machine.access_plan(&event)?;
+    let mut values = BTreeMap::new();
+    for access in plan.accesses() {
+        let observed = runtime
+            .state_store()
+            .get_versioned_in_domain(domain, access.key())?;
+        if let Some(value) = observed.value() {
+            validate_state(value)?;
+        }
+        values.insert(access.key.clone(), observed);
+    }
+    let snapshot = NodeStateSnapshot { values };
+
+    let transition = machine.transition(&snapshot, &event)?;
+    validate_output_context(transition.output(), &event, config)?;
+    let (reads, mutations) = domain_transition_parts(&plan, &snapshot, transition.updates)?;
+    let transaction = AtomicStateTransaction::new(
+        domain,
+        AtomicStateReadSet::new(reads)?,
+        AtomicStateMutationSet::new(mutations)?,
+    )?;
+    match runtime.state_store().commit_transaction(transaction)? {
+        AtomicStateWriteResult::Committed => Ok(transition.output),
+        AtomicStateWriteResult::Conflict { .. } => Err(NodeCoreError::StateConflict),
+    }
+}
+
 /// Handles one event through a declared multi-key atomic state transition.
 ///
 /// The event context and access plan are validated before storage reads. Every
@@ -1563,6 +1645,136 @@ where
 
     let write_set = AtomicStateWriteSet::new(writes)?;
     match runtime.state_store().commit_atomic(write_set)? {
+        AtomicStateWriteResult::Committed => Ok(transition.output),
+        AtomicStateWriteResult::Conflict { .. } => Err(NodeCoreError::StateConflict),
+    }
+}
+
+/// Handles one idempotent event inside one explicit atomicity domain.
+///
+/// Application state, the request receipt, the immutable outbox batch, and its
+/// initial delivery cursor share one complete read set and one atomic commit.
+/// A matching replay returns persisted responses without re-running the state
+/// machine. This additive path does not change legacy unscoped storage.
+pub fn handle_domain_idempotent_event<R, M>(
+    runtime: &R,
+    domain: AtomicityDomainId,
+    config: &NodeConfig,
+    resolver: &HashSuiteResolver,
+    event: NodeEvent,
+    machine: &M,
+) -> Result<NodeOutput, NodeCoreError>
+where
+    R: Runtime,
+    R::State: DomainTransactionalStateStore,
+    M: TransactionalNodeStateMachine,
+{
+    event.validate_context(config)?;
+    let event_digest = event.digest(resolver)?;
+    let layout = PersistenceLayout::new(config.chain_id.clone(), config.protocol_version);
+    let request_bytes = *event.request_id.as_bytes();
+    let dedup_key = layout.request_dedup_key(request_bytes);
+    let outbox_key = layout.outbox_batch_key(request_bytes);
+    let delivery_key = layout.outbox_delivery_key(request_bytes);
+
+    let plan = machine.access_plan(&event)?;
+    let maximum_application_accesses = MAX_ATOMIC_STATE_WRITES - 3;
+    if plan.accesses.len() > maximum_application_accesses {
+        return Err(NodeCoreError::TooManyStateAccesses {
+            count: plan.accesses.len(),
+            maximum: maximum_application_accesses,
+        });
+    }
+    for reserved in [&dedup_key, &outbox_key, &delivery_key] {
+        if plan.access(reserved).is_some() {
+            return Err(NodeCoreError::ReservedStateAccess(reserved.clone()));
+        }
+    }
+
+    let store = runtime.state_store();
+    let dedup = store.get_versioned_in_domain(domain, &dedup_key)?;
+    let outbox = store.get_versioned_in_domain(domain, &outbox_key)?;
+    let delivery = store.get_versioned_in_domain(domain, &delivery_key)?;
+
+    if let Some(bytes) = dedup.value() {
+        let record = NodeDedupRecord::decode(bytes)
+            .map_err(|_| NodeCoreError::PersistenceInvariant("invalid dedup record"))?;
+        if record.request_id() != event.request_id() || record.event_digest() != event_digest {
+            return Err(NodeCoreError::RequestIdReuse);
+        }
+        let batch_bytes = outbox.value().ok_or(NodeCoreError::PersistenceInvariant(
+            "dedup exists without outbox",
+        ))?;
+        let batch = NodeOutboxBatch::decode(batch_bytes)
+            .map_err(|_| NodeCoreError::PersistenceInvariant("invalid outbox batch"))?;
+        if batch.request_id() != event.request_id() || batch.event_digest() != event_digest {
+            return Err(NodeCoreError::PersistenceInvariant(
+                "dedup and outbox identities differ",
+            ));
+        }
+        for message in batch.messages() {
+            message.event().validate_context(config)?;
+        }
+        let delivery_bytes = delivery.value().ok_or(NodeCoreError::PersistenceInvariant(
+            "dedup exists without outbox delivery state",
+        ))?;
+        let delivery_record = NodeOutboxDelivery::decode(delivery_bytes)
+            .map_err(|_| NodeCoreError::PersistenceInvariant("invalid outbox delivery state"))?;
+        if delivery_record.request_id != event.request_id()
+            || delivery_record.event_digest != event_digest
+        {
+            return Err(NodeCoreError::PersistenceInvariant(
+                "dedup and outbox delivery identities differ",
+            ));
+        }
+        return NodeOutput::new(record.responses().to_vec(), Vec::new());
+    }
+    if outbox.value().is_some() || delivery.value().is_some() {
+        return Err(NodeCoreError::PersistenceInvariant(
+            "outbox state exists without dedup",
+        ));
+    }
+
+    let mut values = BTreeMap::new();
+    for access in plan.accesses() {
+        let observed = store.get_versioned_in_domain(domain, access.key())?;
+        if let Some(value) = observed.value() {
+            validate_state(value)?;
+        }
+        values.insert(access.key.clone(), observed);
+    }
+    let snapshot = NodeStateSnapshot { values };
+    let transition = machine.transition(&snapshot, &event)?;
+    validate_output_context(transition.output(), &event, config)?;
+    let dedup_record = NodeDedupRecord::new(
+        event.request_id(),
+        event_digest,
+        transition.output.responses.clone(),
+    )?;
+    let outbox_batch = NodeOutboxBatch::new(
+        event.request_id(),
+        event_digest,
+        transition.output.outbound_messages.clone(),
+    )?;
+    let outbox_delivery = NodeOutboxDelivery::pending(event.request_id(), event_digest);
+
+    let (mut reads, mut mutations) = domain_transition_parts(&plan, &snapshot, transition.updates)?;
+    reads.extend([
+        StateReadAssertion::new(dedup_key.clone(), dedup.revision())?,
+        StateReadAssertion::new(outbox_key.clone(), outbox.revision())?,
+        StateReadAssertion::new(delivery_key.clone(), delivery.revision())?,
+    ]);
+    mutations.extend([
+        StateMutationEntry::new(dedup_key, StateMutation::Put(dedup_record.encode()?))?,
+        StateMutationEntry::new(outbox_key, StateMutation::Put(outbox_batch.encode()?))?,
+        StateMutationEntry::new(delivery_key, StateMutation::Put(outbox_delivery.encode()?))?,
+    ]);
+    let transaction = AtomicStateTransaction::new(
+        domain,
+        AtomicStateReadSet::new(reads)?,
+        AtomicStateMutationSet::new(mutations)?,
+    )?;
+    match store.commit_transaction(transaction)? {
         AtomicStateWriteResult::Committed => Ok(transition.output),
         AtomicStateWriteResult::Conflict { .. } => Err(NodeCoreError::StateConflict),
     }
@@ -1931,6 +2143,10 @@ mod tests {
 
     fn request(byte: u8) -> RequestId {
         RequestId::new([byte; 32]).unwrap()
+    }
+
+    fn domain(byte: u8) -> AtomicityDomainId {
+        AtomicityDomainId::new([byte; 32]).unwrap()
     }
 
     fn hex(bytes: &[u8]) -> String {
@@ -2316,6 +2532,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn domain_transactional_handler_isolates_identical_keys() {
+        let runtime = MemoryRuntime::new(runtime::ValidatorId::new([0x44; 32]));
+        let first_domain = domain(0xA1);
+        let second_domain = domain(0xA2);
+        handle_domain_transactional_event(
+            &runtime,
+            first_domain,
+            &config("sunrise-test"),
+            event("sunrise-test", request(0x81)),
+            &MultiKeyMachine,
+        )
+        .unwrap();
+
+        let first = runtime
+            .state_store()
+            .get_versioned_in_domain(first_domain, b"state/a")
+            .unwrap();
+        let second = runtime
+            .state_store()
+            .get_versioned_in_domain(second_domain, b"state/a")
+            .unwrap();
+        assert_eq!(
+            decode_canonical_frame(first.value().unwrap())
+                .unwrap()
+                .required_u64(1),
+            Ok(1)
+        );
+        assert_eq!(
+            second,
+            VersionedStateValue::from_persisted_parts(StateRevision::INITIAL, None).unwrap()
+        );
+        assert_eq!(runtime.state_store().get(b"state/a").unwrap(), None);
+    }
+
     struct IdempotentMachine {
         calls: AtomicUsize,
     }
@@ -2447,6 +2698,72 @@ mod tests {
             Err(NodeCoreError::RequestIdReuse)
         );
         assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn domain_idempotent_handler_scopes_state_receipt_and_outbox() {
+        let runtime = MemoryRuntime::new(runtime::ValidatorId::new([0x44; 32]));
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        let first_domain = domain(0xB1);
+        let second_domain = domain(0xB2);
+        let event = event("sunrise-test", request(0x82));
+        let resolver = resolver("sunrise-test");
+
+        let first = handle_domain_idempotent_event(
+            &runtime,
+            first_domain,
+            &config("sunrise-test"),
+            &resolver,
+            event.clone(),
+            &machine,
+        )
+        .unwrap();
+        let replay = handle_domain_idempotent_event(
+            &runtime,
+            first_domain,
+            &config("sunrise-test"),
+            &resolver,
+            event.clone(),
+            &machine,
+        )
+        .unwrap();
+        handle_domain_idempotent_event(
+            &runtime,
+            second_domain,
+            &config("sunrise-test"),
+            &resolver,
+            event.clone(),
+            &machine,
+        )
+        .unwrap();
+
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(first.responses(), replay.responses());
+        assert!(replay.outbound_messages().is_empty());
+        let layout = PersistenceLayout::new(
+            ChainId::new("sunrise-test").unwrap(),
+            ProtocolVersion::new(3),
+        );
+        for active_domain in [first_domain, second_domain] {
+            for key in [
+                b"state/idempotent".to_vec(),
+                layout.request_dedup_key(*event.request_id().as_bytes()),
+                layout.outbox_batch_key(*event.request_id().as_bytes()),
+                layout.outbox_delivery_key(*event.request_id().as_bytes()),
+            ] {
+                assert!(
+                    runtime
+                        .state_store()
+                        .get_versioned_in_domain(active_domain, &key)
+                        .unwrap()
+                        .value()
+                        .is_some()
+                );
+                assert_eq!(runtime.state_store().get(&key).unwrap(), None);
+            }
+        }
     }
 
     #[test]
@@ -2801,6 +3118,103 @@ mod tests {
             layout.outbox_delivery_key(*event.request_id().as_bytes()),
         ] {
             assert_eq!(runtime.state_store().get(&key).unwrap(), None);
+        }
+    }
+
+    struct DomainReadDependencyConflictMachine<'a> {
+        runtime: &'a MemoryRuntime,
+        domain: AtomicityDomainId,
+    }
+
+    impl TransactionalNodeStateMachine for DomainReadDependencyConflictMachine<'_> {
+        fn access_plan(&self, _event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            NodeStateAccessPlan::new(vec![
+                NodeStateAccess::new(b"state/dependency".to_vec(), NodeStateAccessMode::ReadOnly)?,
+                NodeStateAccess::new(b"state/result".to_vec(), NodeStateAccessMode::ReadWrite)?,
+            ])
+        }
+
+        fn transition(
+            &self,
+            state: &NodeStateSnapshot,
+            _event: &NodeEvent,
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            let dependency =
+                state
+                    .get(b"state/dependency")
+                    .ok_or(NodeCoreError::PersistenceInvariant(
+                        "dependency missing from snapshot",
+                    ))?;
+            let competing = AtomicStateTransaction::new(
+                self.domain,
+                AtomicStateReadSet::new(vec![StateReadAssertion::new(
+                    b"state/dependency".to_vec(),
+                    dependency.revision(),
+                )?])?,
+                AtomicStateMutationSet::new(vec![StateMutationEntry::new(
+                    b"state/dependency".to_vec(),
+                    StateMutation::Put(canonical(TEST_STATE_TYPE_ID, 99)),
+                )?])?,
+            )?;
+            assert_eq!(
+                self.runtime.state_store().commit_transaction(competing)?,
+                AtomicStateWriteResult::Committed
+            );
+            TransactionalNodeTransition::new(
+                vec![NodeStateUpdate::put(
+                    b"state/result".to_vec(),
+                    canonical(TEST_STATE_TYPE_ID, 1),
+                )?],
+                NodeOutput::default(),
+            )
+        }
+    }
+
+    #[test]
+    fn domain_idempotent_conflict_publishes_neither_result_receipt_nor_outbox() {
+        let runtime = MemoryRuntime::new(runtime::ValidatorId::new([0x44; 32]));
+        let domain = domain(0xB3);
+        let event = event("sunrise-test", request(0x83));
+        let error = handle_domain_idempotent_event(
+            &runtime,
+            domain,
+            &config("sunrise-test"),
+            &resolver("sunrise-test"),
+            event.clone(),
+            &DomainReadDependencyConflictMachine {
+                runtime: &runtime,
+                domain,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::StateConflict);
+        assert!(
+            runtime
+                .state_store()
+                .get_versioned_in_domain(domain, b"state/dependency")
+                .unwrap()
+                .value()
+                .is_some()
+        );
+        let layout = PersistenceLayout::new(
+            ChainId::new("sunrise-test").unwrap(),
+            ProtocolVersion::new(3),
+        );
+        for key in [
+            b"state/result".to_vec(),
+            layout.request_dedup_key(*event.request_id().as_bytes()),
+            layout.outbox_batch_key(*event.request_id().as_bytes()),
+            layout.outbox_delivery_key(*event.request_id().as_bytes()),
+        ] {
+            assert_eq!(
+                runtime
+                    .state_store()
+                    .get_versioned_in_domain(domain, &key)
+                    .unwrap()
+                    .value(),
+                None
+            );
         }
     }
 

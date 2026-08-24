@@ -755,8 +755,13 @@ exactly one such envelope. `MemoryStateStore` keeps domain maps isolated and
 validates every read before calculating or applying any mutation revision. Its
 legacy `StateStore` and `TransactionalStateStore` implementations remain in a
 private test-only legacy domain so existing node-core and SQLite conformance do
-not silently change physical layout. Node-core and durable-store migration are
-therefore still pending.
+not silently change physical layout. Node-core exposes additive domain-aware
+transactional and idempotent handlers: both read through one explicit domain,
+bind every declared observation into the dedicated read set, and release output
+only after `commit_transaction`. The idempotent handler includes application
+mutations, request receipt, immutable outbox batch, and initial delivery cursor
+in that same domain transaction. Domain-aware outbox claim/ack, native
+composition, and durable-store migration are still pending.
 
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
@@ -895,3 +900,9 @@ therefore still pending.
   canonical put/delete mutation set. Require every mutation to match a read,
   bound aggregate bytes as well as key counts, and keep the legacy unscoped
   store contract isolated until node-core and durable adapters migrate.
+- DR-0042: Add domain-aware node-core handlers without silently redirecting the
+  legacy store contract. Read application and reserved invocation records from
+  one explicit domain, bind all observations to one transaction, and commit
+  application mutations, receipt, outbox batch, and initial delivery cursor
+  together. Keep native routing and outbox delivery on the legacy path until
+  their domain identity and durable migration are explicit.
