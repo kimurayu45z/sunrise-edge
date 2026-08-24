@@ -200,6 +200,18 @@ unless the backend supplies authoritative abort evidence. Callers reconcile
 that case through the persisted request receipt instead of rerunning effects
 blindly. No durable adapter or node-core composition uses this boundary yet.
 
+Runtime also now defines `DurableInvocationTransaction` and
+`StructuredDurableDomainStateStore`. The transaction carries one logical
+domain, an optional complete state section that may be read-only, one typed
+canonical completed-request receipt, an optional typed ordered outbox batch,
+and an explicit object section. Aggregate bytes are bounded before I/O, and
+state domain plus receipt/outbox request and event-digest identity must match.
+The object section currently permits only explicit empty because concrete
+object dispatch is not implemented; normalized adapters must fail closed rather
+than hide object writes in generic state. Indexed repositories now refine this
+structured store boundary. Node-core construction, memory conformance, and
+durable implementations remain pending.
+
 The store validates the complete read set and fencing generation, then commits
 all rows or none. A pure transition is not re-run inside a storage driver. An
 adapter may retry a serialization/transport failure only within a fixed budget
@@ -321,7 +333,8 @@ not general state reads:
 
 1. Preserve the additive fenced/deadline-aware durable boundary and add the
    structured state/receipt/outbox/object transaction envelope required by
-   normalized stores without silently migrating legacy data.
+   normalized stores without silently migrating legacy data (runtime envelope
+   implemented; node-core/store wiring pending).
 2. Add a dedicated indexed outbox repository/claim contract; retain key scans
    only for maintenance and compatibility.
 3. Apply the accepted PostgreSQL schema design, explicit migrations, and

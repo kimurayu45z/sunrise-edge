@@ -164,6 +164,10 @@ pub const MAX_ATOMIC_STATE_TRANSACTION_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_STATE_SCAN_KEYS: usize = 1_024;
 /// Maximum lease window accepted by the indexed durable outbox contract.
 pub const MAX_DURABLE_OUTBOX_LEASE_MILLIS: u64 = 5 * 60 * 1_000;
+/// Maximum ordered outbound messages in one structured durable invocation.
+pub const MAX_DURABLE_OUTBOX_MESSAGES: usize = 1_024;
+/// Maximum canonical receipt bytes in one structured durable invocation.
+pub const MAX_DURABLE_RECEIPT_BYTES: usize = 32 * 1024 * 1024;
 
 /// Monotonic deployment-generation token for one domain's authoritative writer.
 ///
@@ -527,6 +531,358 @@ impl DurableOutboxAcknowledgement {
     }
 }
 
+/// Request identity used by structured durable receipt and outbox sections.
+///
+/// This is the same exact canonical request projection used by indexed outbox
+/// operations; the alias avoids a second 32-byte identity type.
+pub type DurableRequestId = OutboxRequestId;
+
+/// Validation failures for a structured durable invocation envelope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DurableInvocationError {
+    /// Canonical completed-receipt bytes were empty.
+    EmptyReceipt,
+    /// Canonical completed-receipt bytes exceeded the shared bound.
+    ReceiptTooLarge {
+        /// Actual canonical bytes.
+        length: usize,
+        /// Maximum accepted bytes.
+        maximum: usize,
+    },
+    /// One canonical outbound message was empty.
+    EmptyOutboxMessage,
+    /// One canonical outbound message exceeded the shared value bound.
+    OutboxMessageTooLarge {
+        /// Actual canonical bytes.
+        length: usize,
+        /// Maximum accepted bytes.
+        maximum: usize,
+    },
+    /// One batch contained too many ordered messages.
+    TooManyOutboxMessages {
+        /// Actual message count.
+        count: usize,
+        /// Maximum accepted count.
+        maximum: usize,
+    },
+    /// State and invocation sections named different logical domains.
+    StateDomainMismatch,
+    /// Receipt and outbox request identities differed.
+    RequestIdentityMismatch,
+    /// Receipt and outbox event digests differed.
+    EventDigestMismatch,
+    /// Aggregate envelope accounting exceeded its shared bound.
+    EnvelopeTooLarge {
+        /// Aggregate represented bytes.
+        bytes: usize,
+        /// Maximum accepted bytes.
+        maximum: usize,
+    },
+}
+
+impl fmt::Display for DurableInvocationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyReceipt => f.write_str("durable request receipt must not be empty"),
+            Self::ReceiptTooLarge { length, maximum } => write!(
+                f,
+                "durable request receipt is {length} bytes, maximum is {maximum}"
+            ),
+            Self::EmptyOutboxMessage => f.write_str("durable outbox message must not be empty"),
+            Self::OutboxMessageTooLarge { length, maximum } => write!(
+                f,
+                "durable outbox message is {length} bytes, maximum is {maximum}"
+            ),
+            Self::TooManyOutboxMessages { count, maximum } => write!(
+                f,
+                "durable outbox has {count} messages, maximum is {maximum}"
+            ),
+            Self::StateDomainMismatch => {
+                f.write_str("durable state section belongs to another domain")
+            }
+            Self::RequestIdentityMismatch => {
+                f.write_str("durable receipt and outbox request identities differ")
+            }
+            Self::EventDigestMismatch => {
+                f.write_str("durable receipt and outbox event digests differ")
+            }
+            Self::EnvelopeTooLarge { bytes, maximum } => write!(
+                f,
+                "durable invocation represents {bytes} bytes, maximum is {maximum}"
+            ),
+        }
+    }
+}
+
+impl Error for DurableInvocationError {}
+
+/// Typed completed-request insertion for a structured durable invocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableRequestReceipt {
+    request_id: DurableRequestId,
+    event_digest: Digest32,
+    canonical_bytes: Vec<u8>,
+}
+
+impl DurableRequestReceipt {
+    /// Creates one bounded canonical completed-request record.
+    pub fn new(
+        request_id: DurableRequestId,
+        event_digest: Digest32,
+        canonical_bytes: Vec<u8>,
+    ) -> Result<Self, DurableInvocationError> {
+        if canonical_bytes.is_empty() {
+            return Err(DurableInvocationError::EmptyReceipt);
+        }
+        if canonical_bytes.len() > MAX_DURABLE_RECEIPT_BYTES {
+            return Err(DurableInvocationError::ReceiptTooLarge {
+                length: canonical_bytes.len(),
+                maximum: MAX_DURABLE_RECEIPT_BYTES,
+            });
+        }
+        Ok(Self {
+            request_id,
+            event_digest,
+            canonical_bytes,
+        })
+    }
+
+    /// Returns the canonical invocation request identity.
+    #[must_use]
+    pub const fn request_id(&self) -> DurableRequestId {
+        self.request_id
+    }
+
+    /// Returns the digest of the complete canonical input event.
+    #[must_use]
+    pub const fn event_digest(&self) -> Digest32 {
+        self.event_digest
+    }
+
+    /// Returns the exact canonical completed-request bytes.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+}
+
+/// One typed canonical outbound message projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableOutboxMessage {
+    payload_digest: Digest32,
+    canonical_payload: Vec<u8>,
+}
+
+impl DurableOutboxMessage {
+    /// Creates one bounded canonical message and its verified-by-node digest.
+    pub fn new(
+        payload_digest: Digest32,
+        canonical_payload: Vec<u8>,
+    ) -> Result<Self, DurableInvocationError> {
+        if canonical_payload.is_empty() {
+            return Err(DurableInvocationError::EmptyOutboxMessage);
+        }
+        if canonical_payload.len() > MAX_STATE_VALUE_BYTES {
+            return Err(DurableInvocationError::OutboxMessageTooLarge {
+                length: canonical_payload.len(),
+                maximum: MAX_STATE_VALUE_BYTES,
+            });
+        }
+        Ok(Self {
+            payload_digest,
+            canonical_payload,
+        })
+    }
+
+    /// Returns the self-describing canonical payload digest.
+    #[must_use]
+    pub const fn payload_digest(&self) -> Digest32 {
+        self.payload_digest
+    }
+
+    /// Returns exact canonical outbound event bytes.
+    #[must_use]
+    pub fn canonical_payload(&self) -> &[u8] {
+        &self.canonical_payload
+    }
+}
+
+/// Typed immutable outbox insertion for one structured invocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableOutboxBatch {
+    request_id: DurableRequestId,
+    event_digest: Digest32,
+    messages: Vec<DurableOutboxMessage>,
+}
+
+impl DurableOutboxBatch {
+    /// Creates one bounded ordered message batch. Empty batches are explicit.
+    pub fn new(
+        request_id: DurableRequestId,
+        event_digest: Digest32,
+        messages: Vec<DurableOutboxMessage>,
+    ) -> Result<Self, DurableInvocationError> {
+        if messages.len() > MAX_DURABLE_OUTBOX_MESSAGES {
+            return Err(DurableInvocationError::TooManyOutboxMessages {
+                count: messages.len(),
+                maximum: MAX_DURABLE_OUTBOX_MESSAGES,
+            });
+        }
+        Ok(Self {
+            request_id,
+            event_digest,
+            messages,
+        })
+    }
+
+    /// Returns the owning canonical request identity.
+    #[must_use]
+    pub const fn request_id(&self) -> DurableRequestId {
+        self.request_id
+    }
+
+    /// Returns the input event digest shared with the receipt.
+    #[must_use]
+    pub const fn event_digest(&self) -> Digest32 {
+        self.event_digest
+    }
+
+    /// Returns messages in deterministic transition order.
+    #[must_use]
+    pub fn messages(&self) -> &[DurableOutboxMessage] {
+        &self.messages
+    }
+}
+
+/// Explicit object section while concrete object dispatch remains unsupported.
+///
+/// This closed empty value prevents a normalized adapter from silently storing
+/// object data as generic state. Concrete object assertions/version/head writes
+/// require a later reviewed expansion of this operational API.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DurableObjectChanges;
+
+impl DurableObjectChanges {
+    /// Creates the only currently supported empty object section.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self
+    }
+
+    /// Returns true until concrete typed object changes are implemented.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        true
+    }
+}
+
+/// Structured, bounded input consumed directly by normalized durable stores.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableInvocationTransaction {
+    domain: AtomicityDomainId,
+    state: Option<DurableStateTransaction>,
+    objects: DurableObjectChanges,
+    receipt: DurableRequestReceipt,
+    outbox: Option<DurableOutboxBatch>,
+    represented_bytes: usize,
+}
+
+impl DurableInvocationTransaction {
+    /// Validates one typed all-or-none invocation envelope.
+    pub fn new(
+        domain: AtomicityDomainId,
+        state: Option<DurableStateTransaction>,
+        objects: DurableObjectChanges,
+        receipt: DurableRequestReceipt,
+        outbox: Option<DurableOutboxBatch>,
+    ) -> Result<Self, DurableInvocationError> {
+        if state.as_ref().is_some_and(|state| state.domain() != domain) {
+            return Err(DurableInvocationError::StateDomainMismatch);
+        }
+        if let Some(outbox) = &outbox {
+            if outbox.request_id() != receipt.request_id() {
+                return Err(DurableInvocationError::RequestIdentityMismatch);
+            }
+            if outbox.event_digest() != receipt.event_digest() {
+                return Err(DurableInvocationError::EventDigestMismatch);
+            }
+        }
+
+        let mut represented_bytes = domain
+            .as_bytes()
+            .len()
+            .saturating_add(receipt.request_id().as_bytes().len())
+            .saturating_add(2 * (size_of::<u16>() + 32))
+            .saturating_add(size_of::<u32>())
+            .saturating_add(receipt.canonical_bytes().len());
+        if let Some(state) = &state {
+            represented_bytes = represented_bytes.saturating_add(state.represented_bytes());
+        }
+        if let Some(outbox) = &outbox {
+            represented_bytes = represented_bytes
+                .saturating_add(outbox.request_id().as_bytes().len())
+                .saturating_add(size_of::<u32>());
+            for message in outbox.messages() {
+                represented_bytes = represented_bytes
+                    .saturating_add(size_of::<u32>())
+                    .saturating_add(size_of::<u16>() + 32)
+                    .saturating_add(size_of::<u64>())
+                    .saturating_add(message.canonical_payload().len());
+            }
+        }
+        if represented_bytes > MAX_ATOMIC_STATE_TRANSACTION_BYTES {
+            return Err(DurableInvocationError::EnvelopeTooLarge {
+                bytes: represented_bytes,
+                maximum: MAX_ATOMIC_STATE_TRANSACTION_BYTES,
+            });
+        }
+        Ok(Self {
+            domain,
+            state,
+            objects,
+            receipt,
+            outbox,
+            represented_bytes,
+        })
+    }
+
+    /// Returns the only domain this invocation may read or mutate.
+    #[must_use]
+    pub const fn domain(&self) -> AtomicityDomainId {
+        self.domain
+    }
+
+    /// Returns the optional exact state section.
+    #[must_use]
+    pub const fn state(&self) -> Option<&DurableStateTransaction> {
+        self.state.as_ref()
+    }
+
+    /// Returns the explicit object section.
+    #[must_use]
+    pub const fn objects(&self) -> DurableObjectChanges {
+        self.objects
+    }
+
+    /// Returns the typed completed-request insertion.
+    #[must_use]
+    pub const fn receipt(&self) -> &DurableRequestReceipt {
+        &self.receipt
+    }
+
+    /// Returns the optional typed immutable outbox insertion.
+    #[must_use]
+    pub const fn outbox(&self) -> Option<&DurableOutboxBatch> {
+        self.outbox.as_ref()
+    }
+
+    /// Returns aggregate bytes covered by shared envelope accounting.
+    #[must_use]
+    pub const fn represented_bytes(&self) -> usize {
+        self.represented_bytes
+    }
+}
+
 impl DurableOperationContext {
     /// Creates the bounded operational context for one durable invocation.
     #[must_use]
@@ -819,10 +1175,14 @@ pub struct AtomicStateMutationSet {
 
 impl AtomicStateMutationSet {
     /// Validates and canonicalizes put/delete mutations.
-    pub fn new(mut mutations: Vec<StateMutationEntry>) -> Result<Self, RuntimeError> {
+    pub fn new(mutations: Vec<StateMutationEntry>) -> Result<Self, RuntimeError> {
         if mutations.is_empty() {
             return Err(RuntimeError::EmptyWriteSet);
         }
+        Self::new_allow_empty(mutations)
+    }
+
+    fn new_allow_empty(mut mutations: Vec<StateMutationEntry>) -> Result<Self, RuntimeError> {
         if mutations.len() > MAX_ATOMIC_STATE_WRITES {
             return Err(RuntimeError::TooManyStateWrites {
                 count: mutations.len(),
@@ -909,6 +1269,87 @@ impl AtomicStateTransaction {
     #[must_use]
     pub const fn represented_bytes(&self) -> usize {
         self.represented_bytes
+    }
+}
+
+/// Complete state section of a structured durable invocation.
+///
+/// Unlike the compatibility [`AtomicStateTransaction`], this section may be
+/// read-only. The enclosing receipt/outbox transaction still performs the
+/// durable write while every observation remains revision-asserted. An
+/// invocation with no state observations omits this section entirely.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableStateTransaction {
+    domain: AtomicityDomainId,
+    reads: AtomicStateReadSet,
+    mutations: AtomicStateMutationSet,
+    represented_bytes: usize,
+}
+
+impl DurableStateTransaction {
+    /// Creates a bounded state section with zero or more contained mutations.
+    pub fn new(
+        domain: AtomicityDomainId,
+        reads: AtomicStateReadSet,
+        mutations: Vec<StateMutationEntry>,
+    ) -> Result<Self, RuntimeError> {
+        let mutations = AtomicStateMutationSet::new_allow_empty(mutations)?;
+        if mutations.mutations().iter().any(|mutation| {
+            reads
+                .reads()
+                .binary_search_by(|read| read.key.as_slice().cmp(mutation.key()))
+                .is_err()
+        }) {
+            return Err(RuntimeError::StateMutationWithoutRead);
+        }
+        let represented_bytes = represented_transaction_bytes(domain, &reads, &mutations);
+        if represented_bytes > MAX_ATOMIC_STATE_TRANSACTION_BYTES {
+            return Err(RuntimeError::StateTransactionTooLarge {
+                bytes: represented_bytes,
+                maximum: MAX_ATOMIC_STATE_TRANSACTION_BYTES,
+            });
+        }
+        Ok(Self {
+            domain,
+            reads,
+            mutations,
+            represented_bytes,
+        })
+    }
+
+    /// Returns the only logical domain this state section may access.
+    #[must_use]
+    pub const fn domain(&self) -> AtomicityDomainId {
+        self.domain
+    }
+
+    /// Returns every exact state observation in canonical key order.
+    #[must_use]
+    pub fn reads(&self) -> &[StateReadAssertion] {
+        self.reads.reads()
+    }
+
+    /// Returns state mutations in canonical key order.
+    #[must_use]
+    pub fn mutations(&self) -> &[StateMutationEntry] {
+        self.mutations.mutations()
+    }
+
+    /// Returns bytes covered by shared state-section accounting.
+    #[must_use]
+    pub const fn represented_bytes(&self) -> usize {
+        self.represented_bytes
+    }
+}
+
+impl From<AtomicStateTransaction> for DurableStateTransaction {
+    fn from(transaction: AtomicStateTransaction) -> Self {
+        Self {
+            domain: transaction.domain,
+            reads: transaction.reads,
+            mutations: transaction.mutations,
+            represented_bytes: transaction.represented_bytes,
+        }
     }
 }
 
@@ -1187,6 +1628,27 @@ pub trait DurableDomainStateStore {
     ) -> DurableCommitOutcome;
 }
 
+/// Structured invocation boundary for normalized production durable stores.
+///
+/// Implementations consume typed receipt/outbox sections directly. They must
+/// not inspect generic state-key prefixes to infer relational record kinds.
+pub trait StructuredDurableDomainStateStore: DurableDomainStateStore {
+    /// Reads and validates one typed completed-request receipt projection.
+    fn get_request_receipt(
+        &self,
+        context: &DurableOperationContext,
+        domain: AtomicityDomainId,
+        request_id: DurableRequestId,
+    ) -> Result<Option<DurableRequestReceipt>, DurableReadError>;
+
+    /// Commits every typed invocation section atomically or reports ambiguity.
+    fn commit_invocation(
+        &self,
+        context: &DurableOperationContext,
+        transaction: DurableInvocationTransaction,
+    ) -> DurableCommitOutcome;
+}
+
 /// Bounded indexed repository for unattended production outbox recovery.
 ///
 /// Implementations must select at most one eligible row in stable
@@ -1199,7 +1661,7 @@ pub trait DurableDomainStateStore {
 /// claim. Reusing the ID for different work is rejected. Acknowledgement is
 /// idempotent for the same `(request, index, lease)` so callers can reconcile
 /// an indeterminate acknowledgement without skipping a message.
-pub trait IndexedOutboxRepository: DurableDomainStateStore {
+pub trait IndexedOutboxRepository: StructuredDurableDomainStateStore {
     /// Claims at most one indexed due message under the operation authority.
     fn claim_due_outbox(
         &self,
@@ -2345,6 +2807,121 @@ mod tests {
             DurableOutboxAcknowledgementOutcome::Indeterminate(
                 IndeterminateCommitReason::DeadlineExceeded
             )
+        );
+    }
+
+    #[test]
+    fn structured_durable_state_section_supports_read_only_assertions() {
+        let state = DurableStateTransaction::new(
+            domain(1),
+            AtomicStateReadSet::new(vec![read("dependency", StateRevision::new(7))]).unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(state.domain(), domain(1));
+        assert_eq!(state.reads().len(), 1);
+        assert!(state.mutations().is_empty());
+        assert!(state.represented_bytes() > 0);
+        assert_eq!(
+            DurableStateTransaction::new(
+                domain(1),
+                AtomicStateReadSet::new(vec![read("dependency", StateRevision::new(7))]).unwrap(),
+                vec![mutation("other", StateMutation::Delete)],
+            ),
+            Err(RuntimeError::StateMutationWithoutRead)
+        );
+    }
+
+    #[test]
+    fn structured_durable_invocation_keeps_receipt_and_outbox_typed() {
+        let request_id = DurableRequestId::new([0x81; 32]).unwrap();
+        let event_digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x82; 32]);
+        let message_digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x83; 32]);
+        let receipt =
+            DurableRequestReceipt::new(request_id, event_digest, vec![0x84, 0x85]).unwrap();
+        let message = DurableOutboxMessage::new(message_digest, vec![0x86, 0x87]).unwrap();
+        let outbox =
+            DurableOutboxBatch::new(request_id, event_digest, vec![message.clone()]).unwrap();
+        let state = DurableStateTransaction::new(
+            domain(1),
+            AtomicStateReadSet::new(vec![read("state", StateRevision::INITIAL)]).unwrap(),
+            vec![mutation("state", StateMutation::Put(vec![1]))],
+        )
+        .unwrap();
+        let invocation = DurableInvocationTransaction::new(
+            domain(1),
+            Some(state),
+            DurableObjectChanges::empty(),
+            receipt.clone(),
+            Some(outbox.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(invocation.domain(), domain(1));
+        assert_eq!(invocation.state().unwrap().mutations().len(), 1);
+        assert!(invocation.objects().is_empty());
+        assert_eq!(invocation.receipt(), &receipt);
+        assert_eq!(invocation.outbox(), Some(&outbox));
+        assert!(invocation.represented_bytes() > receipt.canonical_bytes().len());
+        assert_eq!(outbox.messages()[0], message);
+        assert_eq!(outbox.messages()[0].payload_digest(), message_digest);
+    }
+
+    #[test]
+    fn structured_durable_invocation_rejects_cross_section_identity_drift() {
+        let request_id = DurableRequestId::new([0x91; 32]).unwrap();
+        let other_request_id = DurableRequestId::new([0x92; 32]).unwrap();
+        let event_digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x93; 32]);
+        let other_digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x94; 32]);
+        assert_eq!(
+            DurableRequestReceipt::new(request_id, event_digest, Vec::new()),
+            Err(DurableInvocationError::EmptyReceipt)
+        );
+        assert_eq!(
+            DurableOutboxMessage::new(event_digest, Vec::new()),
+            Err(DurableInvocationError::EmptyOutboxMessage)
+        );
+        let receipt = DurableRequestReceipt::new(request_id, event_digest, vec![1]).unwrap();
+        let message = DurableOutboxMessage::new(event_digest, vec![2]).unwrap();
+        let wrong_request =
+            DurableOutboxBatch::new(other_request_id, event_digest, vec![message.clone()]).unwrap();
+        assert_eq!(
+            DurableInvocationTransaction::new(
+                domain(1),
+                None,
+                DurableObjectChanges::empty(),
+                receipt.clone(),
+                Some(wrong_request),
+            ),
+            Err(DurableInvocationError::RequestIdentityMismatch)
+        );
+        let wrong_digest =
+            DurableOutboxBatch::new(request_id, other_digest, vec![message]).unwrap();
+        assert_eq!(
+            DurableInvocationTransaction::new(
+                domain(1),
+                None,
+                DurableObjectChanges::empty(),
+                receipt.clone(),
+                Some(wrong_digest),
+            ),
+            Err(DurableInvocationError::EventDigestMismatch)
+        );
+        let state = DurableStateTransaction::new(
+            domain(2),
+            AtomicStateReadSet::new(vec![read("state", StateRevision::INITIAL)]).unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            DurableInvocationTransaction::new(
+                domain(1),
+                Some(state),
+                DurableObjectChanges::empty(),
+                receipt,
+                None,
+            ),
+            Err(DurableInvocationError::StateDomainMismatch)
         );
     }
 

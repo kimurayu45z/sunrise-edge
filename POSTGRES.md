@@ -1,7 +1,8 @@
 # PostgreSQL Reference Design
 
-Status: accepted implementation design; schema migration, Rust adapter, and
-production certification are not implemented.
+Status: accepted implementation design. The runtime structured envelope exists
+As-Is; node-core wiring, schema migration, Rust adapter, and production
+certification are not implemented.
 
 This document refines [`PERSISTENCE.md`](PERSISTENCE.md) for the first
 production-oriented PostgreSQL backend. It deliberately does not map the
@@ -14,8 +15,8 @@ adapter. It carries only binary state keys and values. A PostgreSQL driver must
 not inspect text-like key prefixes to guess that a value is a request receipt,
 outbox batch, delivery cursor, object head, or consensus record.
 
-Before the adapter is implemented, runtime and node-core must add a structured
-durable transaction envelope with explicit bounded sections:
+Runtime now has a structured durable transaction envelope with explicit bounded
+sections:
 
 - exact state-record read assertions and mutations;
 - object-version creation and object-head assertions/mutations;
@@ -24,14 +25,19 @@ durable transaction envelope with explicit bounded sections:
 - one initial outbox-delivery row when a batch is present;
 - the logical domain plus `DurableOperationContext`.
 
-The envelope must reject duplicate logical identities across sections, require
+The implemented runtime envelope rejects cross-domain and receipt/outbox
+request/event-digest drift, permits read-only state assertions, and bounds
+aggregate bytes. Node-core has not migrated to construct it, and the concrete
+object section intentionally supports only explicit empty. Before the adapter,
+the envelope must additionally reject duplicate logical identities across
+future object sections, require
 every mutable head/state record to have a read assertion, and account for all
 represented bytes before storage I/O. Receipt and outbox identities must match
 the invocation request and event digest. The PostgreSQL adapter consumes those
 sections directly. It never parses a `PersistenceLayout` path as correctness
 input.
 
-The first implementation may leave object-specific sections empty while the
+The first implementation leaves object-specific sections explicitly empty while the
 node event dispatcher is incomplete, but their absence must be explicit. It
 must not encode objects into a generic state row and call the schema normalized.
 

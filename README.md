@@ -100,6 +100,12 @@ cross-provider ingress milestones implemented through Phase 17:
   and typed commit outcomes. Proven conflicts, fencing, serialization aborts,
   and pre-commit deadline/unavailability remain distinct from an indeterminate
   commit that must be reconciled by persisted request identity.
+- A structured durable invocation envelope with an optional read-only-capable
+  application state section, a typed canonical request receipt, a typed ordered
+  outbox batch, and an explicit currently-empty object section. It bounds total
+  represented bytes and rejects domain/request/event-digest drift, so a
+  normalized adapter never needs to classify opaque key prefixes. Node-core
+  and durable stores have not yet migrated to this envelope.
 - An additive indexed durable-outbox repository contract that claims at most
   one due message in stable availability/request order, installs a bounded
   restart-safe lease atomically, and makes same-lease claim and acknowledgement
@@ -182,7 +188,8 @@ independent security review.
 The next planned technical milestones work backward through the Phase 15
 production exit criteria in [`TODO.md`](TODO.md) and the accepted
 [persistence design](PERSISTENCE.md): wire the durable operation boundary
-through node-core using a structured state/receipt/outbox envelope, then
+through node-core using the implemented structured state/receipt/outbox
+envelope, then
 implement the accepted [PostgreSQL reference design](POSTGRES.md) and adapter
 that back indexed native recovery.
 Deadline/cancellation, abrupt
