@@ -27,6 +27,7 @@ const NODE_EVENT_TYPE_ID: u16 = 0xE001;
 const NODE_RESPONSE_TYPE_ID: u16 = 0xE002;
 const NODE_DEDUP_RECORD_TYPE_ID: u16 = 0xE003;
 const NODE_OUTBOX_BATCH_TYPE_ID: u16 = 0xE004;
+const NODE_OUTBOX_DELIVERY_TYPE_ID: u16 = 0xE005;
 const ENCODING_VERSION: u16 = 1;
 
 /// Maximum UTF-8 byte length of a chain identifier accepted at node ingress.
@@ -39,6 +40,8 @@ pub const MAX_NODE_STATE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_NODE_OUTPUT_ITEMS: usize = 1_024;
 /// Maximum aggregate payload bytes returned by one invocation.
 pub const MAX_NODE_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum lease duration for one outbound delivery attempt.
+pub const MAX_OUTBOX_LEASE_MILLIS: u64 = 5 * 60 * 1_000;
 
 /// Errors returned by node-core validation, transition, and persistence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,8 +62,14 @@ pub enum NodeCoreError {
     ChainIdTooLong(usize),
     /// A request identifier must not be all zeroes.
     ZeroRequestId,
+    /// An outbox lease identifier must not be all zeroes.
+    ZeroOutboxLeaseId,
+    /// An outbox lease duration was zero or exceeded its bound.
+    InvalidOutboxLeaseDuration(u64),
     /// A request identifier had the wrong encoded length.
     InvalidRequestIdLength(usize),
+    /// An outbox lease identifier had the wrong encoded length.
+    InvalidOutboxLeaseIdLength(usize),
     /// An event kind identifier is unknown.
     UnknownEventKind(u16),
     /// A response status identifier is unknown.
@@ -142,6 +151,19 @@ pub enum NodeCoreError {
     RequestIdReuse,
     /// Persisted deduplication/outbox state violated an invariant.
     PersistenceInvariant(&'static str),
+    /// No persisted outbox exists for the requested invocation.
+    OutboxNotFound,
+    /// Another delivery attempt owns an unexpired lease.
+    OutboxLeaseActive {
+        /// Unix-millisecond lease deadline.
+        expires_at_unix_millis: u64,
+    },
+    /// An acknowledgement did not match the active lease.
+    OutboxLeaseMismatch,
+    /// An acknowledgement did not match the next pending message index.
+    OutboxIndexMismatch,
+    /// Lease deadline or delivery-attempt arithmetic overflowed.
+    OutboxArithmeticOverflow,
     /// A nested canonical-record item length could not be represented.
     NestedItemLengthOverflow(usize),
     /// Bytes remained after a declared nested canonical-record list.
@@ -170,8 +192,16 @@ impl fmt::Display for NodeCoreError {
                 "chain id is {length} bytes, maximum is {MAX_CHAIN_ID_BYTES}"
             ),
             Self::ZeroRequestId => f.write_str("request id must not be all zeroes"),
+            Self::ZeroOutboxLeaseId => f.write_str("outbox lease id must not be all zeroes"),
+            Self::InvalidOutboxLeaseDuration(duration) => write!(
+                f,
+                "outbox lease duration is {duration}ms, maximum is {MAX_OUTBOX_LEASE_MILLIS}ms"
+            ),
             Self::InvalidRequestIdLength(length) => {
                 write!(f, "request id is {length} bytes, expected 32")
+            }
+            Self::InvalidOutboxLeaseIdLength(length) => {
+                write!(f, "outbox lease id is {length} bytes, expected 32")
             }
             Self::UnknownEventKind(kind) => write!(f, "unknown node event kind: {kind:#06x}"),
             Self::UnknownResponseStatus(status) => {
@@ -255,6 +285,16 @@ impl fmt::Display for NodeCoreError {
             Self::PersistenceInvariant(reason) => {
                 write!(f, "persisted node invocation invariant failed: {reason}")
             }
+            Self::OutboxNotFound => f.write_str("outbox batch was not found"),
+            Self::OutboxLeaseActive {
+                expires_at_unix_millis,
+            } => write!(
+                f,
+                "outbox message is leased until unix millisecond {expires_at_unix_millis}"
+            ),
+            Self::OutboxLeaseMismatch => f.write_str("outbox acknowledgement lease does not match"),
+            Self::OutboxIndexMismatch => f.write_str("outbox acknowledgement index does not match"),
+            Self::OutboxArithmeticOverflow => f.write_str("outbox delivery arithmetic overflow"),
             Self::NestedItemLengthOverflow(length) => {
                 write!(
                     f,
@@ -871,6 +911,162 @@ impl NodeOutboxBatch {
     }
 }
 
+/// Non-zero caller-generated identity for one bounded outbox lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OutboxLeaseId([u8; 32]);
+
+impl OutboxLeaseId {
+    /// Creates a non-zero lease identifier.
+    pub fn new(bytes: [u8; 32]) -> Result<Self, NodeCoreError> {
+        if bytes == [0; 32] {
+            return Err(NodeCoreError::ZeroOutboxLeaseId);
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the lease identifier bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Mutable delivery cursor committed beside an immutable outbox batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeOutboxDelivery {
+    request_id: RequestId,
+    event_digest: Digest32,
+    next_index: u32,
+    attempts: u32,
+    lease: Option<(OutboxLeaseId, u64)>,
+}
+
+impl NodeOutboxDelivery {
+    fn pending(request_id: RequestId, event_digest: Digest32) -> Self {
+        Self {
+            request_id,
+            event_digest,
+            next_index: 0,
+            attempts: 0,
+            lease: None,
+        }
+    }
+
+    /// Returns the next message index that requires delivery.
+    #[must_use]
+    pub const fn next_index(&self) -> u32 {
+        self.next_index
+    }
+
+    /// Returns the number of leases granted for this batch.
+    #[must_use]
+    pub const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    /// Returns the active lease and deadline, if present.
+    #[must_use]
+    pub const fn lease(&self) -> Option<(OutboxLeaseId, u64)> {
+        self.lease
+    }
+
+    /// Encodes the delivery cursor canonically.
+    pub fn encode(&self) -> Result<Vec<u8>, NodeCoreError> {
+        let mut frame = CanonicalStruct::new(NODE_OUTBOX_DELIVERY_TYPE_ID, ENCODING_VERSION);
+        frame.field_bytes(1, self.request_id.as_bytes().to_vec())?;
+        frame.field_u16(2, self.event_digest.algorithm().as_u16())?;
+        frame.field_bytes(3, self.event_digest.bytes())?;
+        frame.field_u32(4, self.next_index)?;
+        frame.field_u32(5, self.attempts)?;
+        if let Some((lease_id, expires_at)) = self.lease {
+            frame.field_bytes(6, lease_id.as_bytes().to_vec())?;
+            frame.field_u64(7, expires_at)?;
+        }
+        Ok(frame.finish()?)
+    }
+
+    /// Decodes and validates one delivery cursor.
+    pub fn decode(bytes: &[u8]) -> Result<Self, NodeCoreError> {
+        let frame = decode_canonical_frame(bytes)?;
+        frame.require_type(NODE_OUTBOX_DELIVERY_TYPE_ID)?;
+        frame.require_version(ENCODING_VERSION)?;
+        frame.require_only_fields(&[1, 2, 3, 4, 5, 6, 7])?;
+        let request_id = decode_request_id(frame.required_field(1)?)?;
+        let event_digest = decode_digest(frame.required_u16(2)?, frame.required_field(3)?)?;
+        let lease = match (frame.field(6), frame.field(7)) {
+            (None, None) => None,
+            (Some(id), Some(expires)) => {
+                let id: [u8; 32] = id
+                    .try_into()
+                    .map_err(|_| NodeCoreError::InvalidOutboxLeaseIdLength(id.len()))?;
+                let expires: [u8; 8] =
+                    expires
+                        .try_into()
+                        .map_err(|_| CanonicalDecodingError::InvalidFieldLength {
+                            field_id: 7,
+                            expected: 8,
+                            actual: expires.len(),
+                        })?;
+                Some((OutboxLeaseId::new(id)?, u64::from_le_bytes(expires)))
+            }
+            _ => {
+                return Err(NodeCoreError::PersistenceInvariant(
+                    "outbox lease id and deadline must appear together",
+                ));
+            }
+        };
+        Ok(Self {
+            request_id,
+            event_digest,
+            next_index: frame.required_u32(4)?,
+            attempts: frame.required_u32(5)?,
+            lease,
+        })
+    }
+}
+
+/// One leased outbound message. Delivery is at-least-once until acknowledged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboxClaim {
+    request_id: RequestId,
+    index: u32,
+    lease_id: OutboxLeaseId,
+    expires_at_unix_millis: u64,
+    message: OutboundMessage,
+}
+
+impl OutboxClaim {
+    /// Returns the originating request.
+    #[must_use]
+    pub const fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    /// Returns the ordered message index.
+    #[must_use]
+    pub const fn index(&self) -> u32 {
+        self.index
+    }
+
+    /// Returns the lease identity required for acknowledgement.
+    #[must_use]
+    pub const fn lease_id(&self) -> OutboxLeaseId {
+        self.lease_id
+    }
+
+    /// Returns the lease deadline.
+    #[must_use]
+    pub const fn expires_at_unix_millis(&self) -> u64 {
+        self.expires_at_unix_millis
+    }
+
+    /// Returns the message to send through an untrusted relay.
+    #[must_use]
+    pub const fn message(&self) -> &OutboundMessage {
+        &self.message
+    }
+}
+
 /// Bounded side effects returned only after state persistence succeeds.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NodeOutput {
@@ -1234,16 +1430,17 @@ where
     let request_bytes = *event.request_id.as_bytes();
     let dedup_key = layout.request_dedup_key(request_bytes);
     let outbox_key = layout.outbox_batch_key(request_bytes);
+    let delivery_key = layout.outbox_delivery_key(request_bytes);
 
     let plan = machine.access_plan(&event)?;
-    let maximum_application_accesses = MAX_ATOMIC_STATE_WRITES - 2;
+    let maximum_application_accesses = MAX_ATOMIC_STATE_WRITES - 3;
     if plan.accesses.len() > maximum_application_accesses {
         return Err(NodeCoreError::TooManyStateAccesses {
             count: plan.accesses.len(),
             maximum: maximum_application_accesses,
         });
     }
-    for reserved in [&dedup_key, &outbox_key] {
+    for reserved in [&dedup_key, &outbox_key, &delivery_key] {
         if plan.access(reserved).is_some() {
             return Err(NodeCoreError::ReservedStateAccess(reserved.clone()));
         }
@@ -1251,6 +1448,7 @@ where
 
     let dedup = runtime.state_store().get_versioned(&dedup_key)?;
     let outbox = runtime.state_store().get_versioned(&outbox_key)?;
+    let delivery = runtime.state_store().get_versioned(&delivery_key)?;
 
     if let Some(bytes) = dedup.value() {
         let record = NodeDedupRecord::decode(bytes)
@@ -1271,11 +1469,23 @@ where
         for message in batch.messages() {
             message.event().validate_context(config)?;
         }
+        let delivery_bytes = delivery.value().ok_or(NodeCoreError::PersistenceInvariant(
+            "dedup exists without outbox delivery state",
+        ))?;
+        let delivery_record = NodeOutboxDelivery::decode(delivery_bytes)
+            .map_err(|_| NodeCoreError::PersistenceInvariant("invalid outbox delivery state"))?;
+        if delivery_record.request_id != event.request_id()
+            || delivery_record.event_digest != event_digest
+        {
+            return Err(NodeCoreError::PersistenceInvariant(
+                "dedup and outbox delivery identities differ",
+            ));
+        }
         return NodeOutput::new(record.responses().to_vec(), Vec::new());
     }
-    if outbox.value().is_some() {
+    if outbox.value().is_some() || delivery.value().is_some() {
         return Err(NodeCoreError::PersistenceInvariant(
-            "outbox exists without dedup",
+            "outbox state exists without dedup",
         ));
     }
 
@@ -1300,8 +1510,9 @@ where
         event_digest,
         transition.output.outbound_messages.clone(),
     )?;
+    let outbox_delivery = NodeOutboxDelivery::pending(event.request_id(), event_digest);
 
-    let mut writes = Vec::with_capacity(transition.updates.len() + 2);
+    let mut writes = Vec::with_capacity(transition.updates.len() + 3);
     for update in transition.updates {
         let Some(access) = plan.access(update.key()) else {
             return Err(NodeCoreError::UndeclaredStateUpdate(update.key));
@@ -1328,12 +1539,179 @@ where
         outbox.revision(),
         StateMutation::Put(outbox_batch.encode()?),
     )?);
+    writes.push(StateWrite::new(
+        delivery_key,
+        delivery.revision(),
+        StateMutation::Put(outbox_delivery.encode()?),
+    )?);
 
     let write_set = AtomicStateWriteSet::new(writes)?;
     match runtime.state_store().commit_atomic(write_set)? {
         AtomicStateWriteResult::Committed => Ok(transition.output),
         AtomicStateWriteResult::Conflict { .. } => Err(NodeCoreError::StateConflict),
     }
+}
+
+/// Atomically leases the next pending message from one persisted outbox batch.
+///
+/// Expired leases may be replaced, intentionally providing at-least-once
+/// delivery. The immutable batch revision is asserted in the same transaction.
+pub fn claim_next_outbox_message<S>(
+    store: &S,
+    layout: &PersistenceLayout,
+    request_id: RequestId,
+    lease_id: OutboxLeaseId,
+    now_unix_millis: u64,
+    lease_duration_millis: u64,
+) -> Result<Option<OutboxClaim>, NodeCoreError>
+where
+    S: TransactionalStateStore,
+{
+    if lease_duration_millis == 0 || lease_duration_millis > MAX_OUTBOX_LEASE_MILLIS {
+        return Err(NodeCoreError::InvalidOutboxLeaseDuration(
+            lease_duration_millis,
+        ));
+    }
+    let request_bytes = *request_id.as_bytes();
+    let batch_key = layout.outbox_batch_key(request_bytes);
+    let delivery_key = layout.outbox_delivery_key(request_bytes);
+    let batch_value = store.get_versioned(&batch_key)?;
+    let delivery_value = store.get_versioned(&delivery_key)?;
+    let batch = NodeOutboxBatch::decode(batch_value.value().ok_or(NodeCoreError::OutboxNotFound)?)
+        .map_err(|_| NodeCoreError::PersistenceInvariant("invalid outbox batch"))?;
+    let mut delivery = NodeOutboxDelivery::decode(
+        delivery_value
+            .value()
+            .ok_or(NodeCoreError::OutboxNotFound)?,
+    )
+    .map_err(|_| NodeCoreError::PersistenceInvariant("invalid outbox delivery state"))?;
+    validate_outbox_identity(request_id, &batch, &delivery)?;
+
+    let index = usize::try_from(delivery.next_index)
+        .map_err(|_| NodeCoreError::OutboxArithmeticOverflow)?;
+    if index > batch.messages.len() {
+        return Err(NodeCoreError::PersistenceInvariant(
+            "outbox cursor exceeds batch length",
+        ));
+    }
+    if index == batch.messages.len() {
+        return Ok(None);
+    }
+    if let Some((_, expires_at)) = delivery.lease
+        && expires_at > now_unix_millis
+    {
+        return Err(NodeCoreError::OutboxLeaseActive {
+            expires_at_unix_millis: expires_at,
+        });
+    }
+
+    let expires_at_unix_millis = now_unix_millis
+        .checked_add(lease_duration_millis)
+        .ok_or(NodeCoreError::OutboxArithmeticOverflow)?;
+    delivery.attempts = delivery
+        .attempts
+        .checked_add(1)
+        .ok_or(NodeCoreError::OutboxArithmeticOverflow)?;
+    delivery.lease = Some((lease_id, expires_at_unix_millis));
+    let write_set = AtomicStateWriteSet::new(vec![
+        StateWrite::new(batch_key, batch_value.revision(), StateMutation::Assert)?,
+        StateWrite::new(
+            delivery_key,
+            delivery_value.revision(),
+            StateMutation::Put(delivery.encode()?),
+        )?,
+    ])?;
+    if !matches!(
+        store.commit_atomic(write_set)?,
+        AtomicStateWriteResult::Committed
+    ) {
+        return Err(NodeCoreError::StateConflict);
+    }
+
+    Ok(Some(OutboxClaim {
+        request_id,
+        index: delivery.next_index,
+        lease_id,
+        expires_at_unix_millis,
+        message: batch.messages[index].clone(),
+    }))
+}
+
+/// Acknowledges one leased message and advances the durable delivery cursor.
+///
+/// A send followed by a crash before this commit is deliberately redelivered.
+pub fn acknowledge_outbox_message<S>(
+    store: &S,
+    layout: &PersistenceLayout,
+    request_id: RequestId,
+    index: u32,
+    lease_id: OutboxLeaseId,
+) -> Result<(), NodeCoreError>
+where
+    S: TransactionalStateStore,
+{
+    let request_bytes = *request_id.as_bytes();
+    let batch_key = layout.outbox_batch_key(request_bytes);
+    let delivery_key = layout.outbox_delivery_key(request_bytes);
+    let batch_value = store.get_versioned(&batch_key)?;
+    let delivery_value = store.get_versioned(&delivery_key)?;
+    let batch = NodeOutboxBatch::decode(batch_value.value().ok_or(NodeCoreError::OutboxNotFound)?)
+        .map_err(|_| NodeCoreError::PersistenceInvariant("invalid outbox batch"))?;
+    let mut delivery = NodeOutboxDelivery::decode(
+        delivery_value
+            .value()
+            .ok_or(NodeCoreError::OutboxNotFound)?,
+    )
+    .map_err(|_| NodeCoreError::PersistenceInvariant("invalid outbox delivery state"))?;
+    validate_outbox_identity(request_id, &batch, &delivery)?;
+
+    if delivery.next_index != index {
+        return Err(NodeCoreError::OutboxIndexMismatch);
+    }
+    if delivery.lease.map(|(active, _)| active) != Some(lease_id) {
+        return Err(NodeCoreError::OutboxLeaseMismatch);
+    }
+    let next_index = index
+        .checked_add(1)
+        .ok_or(NodeCoreError::OutboxArithmeticOverflow)?;
+    let next_index_usize =
+        usize::try_from(next_index).map_err(|_| NodeCoreError::OutboxArithmeticOverflow)?;
+    if next_index_usize > batch.messages.len() {
+        return Err(NodeCoreError::PersistenceInvariant(
+            "outbox acknowledgement exceeds batch length",
+        ));
+    }
+    delivery.next_index = next_index;
+    delivery.lease = None;
+
+    let write_set = AtomicStateWriteSet::new(vec![
+        StateWrite::new(batch_key, batch_value.revision(), StateMutation::Assert)?,
+        StateWrite::new(
+            delivery_key,
+            delivery_value.revision(),
+            StateMutation::Put(delivery.encode()?),
+        )?,
+    ])?;
+    match store.commit_atomic(write_set)? {
+        AtomicStateWriteResult::Committed => Ok(()),
+        AtomicStateWriteResult::Conflict { .. } => Err(NodeCoreError::StateConflict),
+    }
+}
+
+fn validate_outbox_identity(
+    request_id: RequestId,
+    batch: &NodeOutboxBatch,
+    delivery: &NodeOutboxDelivery,
+) -> Result<(), NodeCoreError> {
+    if batch.request_id != request_id
+        || delivery.request_id != request_id
+        || batch.event_digest != delivery.event_digest
+    {
+        return Err(NodeCoreError::PersistenceInvariant(
+            "outbox batch and delivery identities differ",
+        ));
+    }
+    Ok(())
 }
 
 /// Handles exactly one event and atomically persists its deterministic transition.
@@ -1677,6 +2055,24 @@ mod tests {
                 "050000000000"
             )
         );
+
+        let delivery = NodeOutboxDelivery::pending(request_id, digest);
+        let delivery_bytes = delivery.encode().unwrap();
+        assert_eq!(
+            NodeOutboxDelivery::decode(&delivery_bytes).unwrap(),
+            delivery
+        );
+        assert_eq!(
+            hex(&delivery_bytes),
+            concat!(
+                "534e524505e001000500010020000000",
+                "2121212121212121212121212121212121212121212121212121212121212121",
+                "0200020000000100",
+                "0300200000002222222222222222222222222222222222222222222222222222222222222222",
+                "04000400000000000000",
+                "05000400000000000000"
+            )
+        );
     }
 
     #[test]
@@ -2006,6 +2402,11 @@ mod tests {
             .get(&layout.outbox_batch_key(*event.request_id().as_bytes()))
             .unwrap()
             .unwrap();
+        let delivery = runtime
+            .state_store()
+            .get(&layout.outbox_delivery_key(*event.request_id().as_bytes()))
+            .unwrap()
+            .unwrap();
         assert_eq!(
             NodeDedupRecord::decode(&dedup).unwrap().responses().len(),
             1
@@ -2013,6 +2414,10 @@ mod tests {
         assert_eq!(
             NodeOutboxBatch::decode(&outbox).unwrap().messages().len(),
             1
+        );
+        assert_eq!(
+            NodeOutboxDelivery::decode(&delivery).unwrap().next_index(),
+            0
         );
 
         assert_eq!(
@@ -2026,6 +2431,133 @@ mod tests {
             Err(NodeCoreError::RequestIdReuse)
         );
         assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn outbox_lease_expiry_redelivers_and_matching_ack_advances_cursor() {
+        let runtime = MemoryRuntime::new(runtime::ValidatorId::new([0x44; 32]));
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        let event = event("sunrise-test", request(0x6D));
+        handle_idempotent_event(
+            &runtime,
+            &config("sunrise-test"),
+            &resolver("sunrise-test"),
+            event.clone(),
+            &machine,
+        )
+        .unwrap();
+        let layout = PersistenceLayout::new(
+            ChainId::new("sunrise-test").unwrap(),
+            ProtocolVersion::new(3),
+        );
+        let first_lease = OutboxLeaseId::new([0x31; 32]).unwrap();
+        let second_lease = OutboxLeaseId::new([0x32; 32]).unwrap();
+        assert_eq!(
+            OutboxLeaseId::new([0; 32]),
+            Err(NodeCoreError::ZeroOutboxLeaseId)
+        );
+        assert_eq!(
+            claim_next_outbox_message(
+                runtime.state_store(),
+                &layout,
+                event.request_id(),
+                first_lease,
+                100,
+                0,
+            ),
+            Err(NodeCoreError::InvalidOutboxLeaseDuration(0))
+        );
+
+        let first = claim_next_outbox_message(
+            runtime.state_store(),
+            &layout,
+            event.request_id(),
+            first_lease,
+            100,
+            10,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.index(), 0);
+        assert_eq!(first.expires_at_unix_millis(), 110);
+        assert_eq!(
+            claim_next_outbox_message(
+                runtime.state_store(),
+                &layout,
+                event.request_id(),
+                second_lease,
+                109,
+                10,
+            ),
+            Err(NodeCoreError::OutboxLeaseActive {
+                expires_at_unix_millis: 110,
+            })
+        );
+
+        let redelivered = claim_next_outbox_message(
+            runtime.state_store(),
+            &layout,
+            event.request_id(),
+            second_lease,
+            110,
+            10,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(redelivered.index(), first.index());
+        assert_eq!(redelivered.message(), first.message());
+        assert_eq!(
+            acknowledge_outbox_message(
+                runtime.state_store(),
+                &layout,
+                event.request_id(),
+                1,
+                second_lease,
+            ),
+            Err(NodeCoreError::OutboxIndexMismatch)
+        );
+        assert_eq!(
+            acknowledge_outbox_message(
+                runtime.state_store(),
+                &layout,
+                event.request_id(),
+                0,
+                first_lease,
+            ),
+            Err(NodeCoreError::OutboxLeaseMismatch)
+        );
+        acknowledge_outbox_message(
+            runtime.state_store(),
+            &layout,
+            event.request_id(),
+            0,
+            second_lease,
+        )
+        .unwrap();
+        assert_eq!(
+            claim_next_outbox_message(
+                runtime.state_store(),
+                &layout,
+                event.request_id(),
+                OutboxLeaseId::new([0x33; 32]).unwrap(),
+                121,
+                10,
+            )
+            .unwrap(),
+            None
+        );
+
+        let delivery = runtime
+            .state_store()
+            .get(&layout.outbox_delivery_key(*event.request_id().as_bytes()))
+            .unwrap()
+            .unwrap();
+        let delivery = NodeOutboxDelivery::decode(&delivery).unwrap();
+        assert_eq!(delivery.next_index(), 1);
+        assert_eq!(delivery.attempts(), 2);
+        assert_eq!(delivery.lease(), None);
     }
 
     #[test]
@@ -2057,6 +2589,13 @@ mod tests {
             runtime
                 .state_store()
                 .get(&layout.outbox_batch_key(*event.request_id().as_bytes()))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            runtime
+                .state_store()
+                .get(&layout.outbox_delivery_key(*event.request_id().as_bytes()))
                 .unwrap(),
             None
         );

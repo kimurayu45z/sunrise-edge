@@ -81,6 +81,8 @@ cross-provider ingress milestones implemented through Phase 17:
 - Canonical request/event-digest deduplication and ordered request-scoped
   outbox records committed atomically with application state, including
   response replay and conflicting request-ID reuse rejection.
+- A one-message bounded outbox lease/ack cursor with explicit at-least-once
+  redelivery after lease expiry; it does not claim transport exactly-once.
 - A native Axum/Tokio HTTP adapter with strict canonical binary media types,
   bounded bodies, deterministic status mapping, and graceful shutdown wiring.
 - A bounded Cloudflare Workers ingress that uses a generated private Service
@@ -111,10 +113,11 @@ adapters, networking/RPC surfaces, and independent security review.
 
 The next planned technical milestone works backward through the Phase 15
 production exit criteria in [`TODO.md`](TODO.md): make the recoverable
-transactional path the adapter default, implement outbox claim/send/ack and
-redelivery semantics, add a durable store, and prove crash-recovery
-conformance. Phase 16/17 provider trust, deployment, capacity, observability,
-and release rehearsal remain required after that shared foundation exists.
+transactional path and outbox delivery cursor the adapter default, add a
+durable store, integrate provider scheduling/transport, and prove crash-
+recovery conformance. Phase 16/17 provider trust, deployment, capacity,
+observability, and release rehearsal remain required after that shared
+foundation exists.
 
 ## Workspace map
 
