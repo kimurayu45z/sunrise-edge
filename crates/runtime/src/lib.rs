@@ -49,6 +49,8 @@ pub enum RuntimeError {
     ClockBeforeUnixEpoch,
     /// The system clock value exceeds supported range.
     ClockOverflow,
+    /// The configured outbound transport is temporarily unavailable.
+    TransportUnavailable,
 }
 
 impl fmt::Display for RuntimeError {
@@ -73,6 +75,7 @@ impl fmt::Display for RuntimeError {
             Self::StateRevisionOverflow => write!(f, "state revision overflow"),
             Self::ClockBeforeUnixEpoch => write!(f, "clock is before unix epoch"),
             Self::ClockOverflow => write!(f, "clock value exceeds u64 milliseconds range"),
+            Self::TransportUnavailable => write!(f, "outbound transport is unavailable"),
         }
     }
 }

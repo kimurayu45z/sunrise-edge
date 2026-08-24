@@ -1859,6 +1859,8 @@ Phase 15 prerequisites:
   in the same atomic commit (implemented As-Is)
 - ordered one-message outbox claim/lease/ack cursor with explicit at-least-once
   redelivery semantics (implemented As-Is)
+- native HTTP default path using atomic deduplication and request-scoped
+  persisted outbox lease/send/ack delivery (implemented As-Is)
 
 Phase 15 As-Is scope:
 
@@ -1880,24 +1882,26 @@ Phase 15 As-Is scope:
 - node-coreのtransactional pathはcontext検証後かつstate read前にevent-specific access planを
   確定し、全keyをrevision付きsnapshotとしてpure transitionへ渡す。undeclared/read-only updateを
   rejectし、観測revisionをnode-core自身がwrite-setへbindし、全commit成功までoutputを返さない。
-  現行adapterはlegacy single-key pathのままである。
+  native HTTP adapterはこのrecoverable transactional pathをdefaultにした。edge adapterの
+  downstream service実装とdurable provider storeは別途必要である。
 - recoverable transactional pathはcomplete canonical NodeEventをdedicated hash domain 0x000Dと
   active epoch hash suiteでdigest化する。application update、request_id/event digest/responseを持つ
   dedup record、ordered outbound messageを持つrequest-scoped outbox batchを同一commitへ含める。
   同一request/digestのretryはtransitionを再実行せずresponseだけを返し、別eventへのrequest ID
-  reuseはfail closedする。adapter migration、transport send/scheduling integration、
-  retention/compaction、durable crash recoveryは未実装であり、persistしただけでproduction
-  delivery完成とはみなさない。
+  reuseはfail closedする。native HTTPはrequest-scoped transport sendまで統合したが、providerが
+  unattended outboxを発見するscheduling、retention/compaction、durable crash recoveryは未実装であり、
+  request retryで回復できるだけでproduction delivery完成とはみなさない。
 - outbox delivery cursorは1 messageずつnon-zero lease IDと5分以下のdeadlineでclaimし、batch
   revisionを同一transactionでassertする。matching lease/indexのackだけがcursorを進め、期限切れ
   claimは同じindexを再配信する。これはsend後ack前crashでmessageを失わないat-least-onceであり、
-  exactly-onceではない。provider scheduler、time policy、transport integration、poison message、
-  retention/compaction、durable fault testはTo-Beに残る。
+  exactly-onceではない。native HTTPは30秒leaseとinjected restart-safe lease ID sourceでtransportを
+  driveする。provider scheduler、trusted time policy、poison message、retention/compaction、durable
+  fault testはTo-Beに残る。
 - native adapterはPOST /v1/events、exact canonical binary media type、bounded body、
   deterministic HTTP status mapping、GET /health/live、graceful shutdownを提供する。
-- outbound eventはCAS成功後にruntime transportへ渡すが、state commitとsendの間はまだ
-  atomicではない。send failureが503を返してもstateがcommit済みの場合があるため、
-  productionではpersisted deduplicationとtransactional outboxが必須。
+- native outbound eventはatomic commit済みoutboxからlease後にruntime transportへ渡し、send成功後
+  にmatching lease/indexをackする。send failureは503とactive leaseを残し、期限切れ後のretryで
+  at-least-once redeliveryする。process crash後にrequestなしで回復するschedulerは未実装である。
 - TLS、authentication、rate limiting、durable StateStore、audit telemetry、reverse proxy
   hardeningは未実装であり、このAs-Is adapterをinternet-facing production serverと扱わない。
 - 現在のRuntime traitは同期APIであるため、遅いdurable I/OをTokio request task上で直接行う
