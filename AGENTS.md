@@ -40,6 +40,10 @@ aspirational example.
   process lifetime as a correctness requirement.
 - Treat clients, relays, transports, schedulers, Tick senders, and cloud
   providers as untrusted.
+- Treat atomicity-domain IDs as logical protocol configuration. Never derive
+  them from provider/database coordinates or accept an untrusted request's
+  domain as authoritative; physical placement is separate fenced deployment
+  metadata.
 - Keep validator identity, membership, voting power, bond, and economics
   separate. Bond amount must not silently determine voting power.
 - Route owned/non-conflicting transactions toward the fast path and shared or
@@ -206,11 +210,14 @@ criterion after context compaction. Re-check `main`, the open stacked PR chain,
 and `TODO.md` before starting because repository state may have advanced. The
 next work is closing Phase 15-17 production gaps using the accepted
 [`PERSISTENCE.md`](PERSISTENCE.md) design. Node-core now asserts every declared
-read revision in its atomic write set. Runtime now has the explicit atomicity
-domain and dedicated read/mutation envelope with memory conformance; node-core
-and durable stores have not migrated. The current Phase 15 sequence is: wire
-node-core to that contract, add an indexed outbox claim contract, implement the
-normalized PostgreSQL reference adapter, run shared
+read revision in its atomic write set. Runtime has the explicit atomicity
+domain and dedicated read/mutation envelope with memory conformance; additive
+node-core transaction and outbox delivery entrypoints now use it, while native
+composition and durable stores have not migrated. The accepted logical-domain
+manifest must be implemented in canonical protocol configuration before native
+routing trusts a domain. The current Phase 15 sequence is: implement and resolve
+that manifest, wire native composition, add an indexed outbox claim contract,
+implement the normalized PostgreSQL reference adapter, run shared
 conformance, then deadline/cancellation, abrupt fault, backup/restore, capacity,
 and provider implementations. Do not spend further effort treating the opaque
 SQLite table or prefix scanner as the production schema. SQLite remains a local

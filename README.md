@@ -107,6 +107,10 @@ cross-provider ingress milestones implemented through Phase 17:
   commit application state, the request receipt, outbox batch, and initial
   delivery cursor inside one explicit atomicity domain. Existing native and
   SQLite paths are not silently redirected or migrated.
+- An accepted domain-placement design that keeps logical, chain-configured
+  domain identity separate from PostgreSQL, Durable Object, AWS, validator, and
+  deployment coordinates. The initial manifest uses one closed `AllState`
+  domain; canonical protocol-config implementation is still pending.
 - A one-message bounded outbox lease/ack cursor with explicit at-least-once
   redelivery after lease expiry; it does not claim transport exactly-once.
 - Domain-aware outbox lease/ack entrypoints that keep immutable-batch assertions
@@ -157,8 +161,9 @@ independent security review.
 
 The next planned technical milestones work backward through the Phase 15
 production exit criteria in [`TODO.md`](TODO.md) and the accepted
-[persistence design](PERSISTENCE.md): carry the explicit domain through native
-composition, add an indexed outbox claim contract, and
+[persistence design](PERSISTENCE.md): implement the accepted logical-domain
+manifest, carry its resolved domain through native composition, add an indexed
+outbox claim contract, and
 implement the normalized PostgreSQL reference adapter. Deadline/cancellation, abrupt
 fault, backup/restore, capacity, and provider conformance follow on that
 foundation. Phase 16/17 provider trust, deployment, observability, and release
