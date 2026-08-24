@@ -198,7 +198,8 @@ and failures proved to occur before commit dispatch are definite rejections.
 Deadline, connection loss, or cancellation after dispatch is indeterminate
 unless the backend supplies authoritative abort evidence. Callers reconcile
 that case through the persisted request receipt instead of rerunning effects
-blindly. No durable adapter or node-core composition uses this boundary yet.
+blindly. Node-core uses this boundary through an additive structured handler;
+native composition and durable adapters remain pending.
 
 Runtime also now defines `DurableInvocationTransaction` and
 `StructuredDurableDomainStateStore`. The transaction carries one logical
@@ -209,8 +210,11 @@ state domain plus receipt/outbox request and event-digest identity must match.
 The object section currently permits only explicit empty because concrete
 object dispatch is not implemented; normalized adapters must fail closed rather
 than hide object writes in generic state. Indexed repositories now refine this
-structured store boundary. Node-core construction, memory conformance, and
-durable implementations remain pending.
+structured store boundary. Node-core now constructs the envelope after one
+manifest resolution and one pure transition, checks typed receipts before
+state reads, preserves read-only assertions, and withholds output for rejected
+or indeterminate commits. Memory conformance, native composition, and durable
+implementations remain pending.
 
 The store validates the complete read set and fencing generation, then commits
 all rows or none. A pure transition is not re-run inside a storage driver. An

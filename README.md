@@ -104,8 +104,11 @@ cross-provider ingress milestones implemented through Phase 17:
   application state section, a typed canonical request receipt, a typed ordered
   outbox batch, and an explicit currently-empty object section. It bounds total
   represented bytes and rejects domain/request/event-digest drift, so a
-  normalized adapter never needs to classify opaque key prefixes. Node-core
-  and durable stores have not yet migrated to this envelope.
+  normalized adapter never needs to classify opaque key prefixes. An additive
+  node-core handler constructs this envelope, replays typed receipts before
+  state reads, supports read-only state assertions, and withholds output for
+  rejected or indeterminate commits. Durable stores and native composition
+  have not yet migrated to it.
 - An additive indexed durable-outbox repository contract that claims at most
   one due message in stable availability/request order, installs a bounded
   restart-safe lease atomically, and makes same-lease claim and acknowledgement

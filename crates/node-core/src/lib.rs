@@ -18,10 +18,13 @@ use protocol_types::{
 };
 use runtime::{
     AtomicStateMutationSet, AtomicStateReadSet, AtomicStateTransaction, AtomicStateWriteResult,
-    AtomicStateWriteSet, AtomicityDomainId, DomainTransactionalStateStore, MAX_ATOMIC_STATE_WRITES,
-    MAX_STATE_KEY_BYTES, PersistenceLayout, Runtime, RuntimeError, StateMutation,
-    StateMutationEntry, StateReadAssertion, StateStore, StateWrite, TransactionalStateStore,
-    VersionedStateValue,
+    AtomicStateWriteSet, AtomicityDomainId, DomainTransactionalStateStore, DurableCommitOutcome,
+    DurableCommitRejection, DurableInvocationError, DurableInvocationTransaction,
+    DurableObjectChanges, DurableOperationContext, DurableOutboxBatch, DurableOutboxMessage,
+    DurableReadError, DurableRequestId, DurableRequestReceipt, DurableStateTransaction,
+    IndeterminateCommitReason, MAX_ATOMIC_STATE_WRITES, MAX_STATE_KEY_BYTES, PersistenceLayout,
+    Runtime, RuntimeError, StateMutation, StateMutationEntry, StateReadAssertion, StateStore,
+    StateWrite, StructuredDurableDomainStateStore, TransactionalStateStore, VersionedStateValue,
 };
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -173,6 +176,14 @@ pub enum NodeCoreError {
     TrailingNestedListBytes(usize),
     /// A runtime storage operation failed.
     Runtime(RuntimeError),
+    /// A durable storage read failed before a transition could commit.
+    DurableRead(DurableReadError),
+    /// A structured durable invocation failed validation before storage I/O.
+    DurableInvocation(DurableInvocationError),
+    /// Durable storage proved that the invocation did not commit.
+    DurableCommitRejected(DurableCommitRejection),
+    /// Durable storage could not prove whether the invocation committed.
+    DurableCommitIndeterminate(IndeterminateCommitReason),
     /// Committed domain-placement configuration rejected routing.
     ProtocolConfig(ProtocolConfigError),
     /// The application-specific state machine rejected the event.
@@ -310,6 +321,16 @@ impl fmt::Display for NodeCoreError {
                 write!(f, "nested canonical list has {length} trailing bytes")
             }
             Self::Runtime(error) => write!(f, "runtime operation failed: {error}"),
+            Self::DurableRead(error) => write!(f, "durable read failed: {error:?}"),
+            Self::DurableInvocation(error) => {
+                write!(f, "durable invocation validation failed: {error}")
+            }
+            Self::DurableCommitRejected(error) => {
+                write!(f, "durable commit was rejected: {error:?}")
+            }
+            Self::DurableCommitIndeterminate(reason) => {
+                write!(f, "durable commit outcome is indeterminate: {reason:?}")
+            }
             Self::ProtocolConfig(error) => {
                 write!(f, "protocol configuration rejected routing: {error}")
             }
@@ -354,6 +375,18 @@ impl From<HashingError> for NodeCoreError {
 impl From<RuntimeError> for NodeCoreError {
     fn from(value: RuntimeError) -> Self {
         Self::Runtime(value)
+    }
+}
+
+impl From<DurableReadError> for NodeCoreError {
+    fn from(value: DurableReadError) -> Self {
+        Self::DurableRead(value)
+    }
+}
+
+impl From<DurableInvocationError> for NodeCoreError {
+    fn from(value: DurableInvocationError) -> Self {
+        Self::DurableInvocation(value)
     }
 }
 
@@ -1349,6 +1382,20 @@ impl TransactionalNodeTransition {
         Ok(Self { updates, output })
     }
 
+    /// Creates a transition that publishes only a receipt after asserting reads.
+    ///
+    /// This is accepted by the structured durable handler, whose receipt write
+    /// makes the overall invocation non-empty. Compatibility transaction
+    /// handlers may reject it because their storage envelopes require a state
+    /// mutation.
+    #[must_use]
+    pub const fn read_only(output: NodeOutput) -> Self {
+        Self {
+            updates: Vec::new(),
+            output,
+        }
+    }
+
     /// Returns state updates in deterministic raw-key order.
     #[must_use]
     pub fn updates(&self) -> &[NodeStateUpdate] {
@@ -1788,6 +1835,130 @@ where
         runtime, domain, config, resolver, event, machine, plan,
     )?;
     Ok(ResolvedNodeOutput::new(domain, output))
+}
+
+/// Resolves and commits one idempotent event through the normalized durable boundary.
+///
+/// The access plan and logical domain are resolved before storage I/O. A typed
+/// completed-request receipt is checked before application state is loaded, so
+/// an exact replay returns only its persisted responses without rerunning the
+/// transition. New application state, the receipt, and any ordered outbox are
+/// then submitted as one structured invocation. Output is never released for a
+/// rejected or indeterminate commit.
+pub fn handle_resolved_durable_idempotent_event<S, M>(
+    store: &S,
+    context: &DurableOperationContext,
+    placement: &DomainPlacementManifest,
+    config: &NodeConfig,
+    resolver: &HashSuiteResolver,
+    event: NodeEvent,
+    machine: &M,
+) -> Result<ResolvedNodeOutput, NodeCoreError>
+where
+    S: StructuredDurableDomainStateStore,
+    M: TransactionalNodeStateMachine,
+{
+    event.validate_context(config)?;
+    let plan = machine.access_plan(&event)?;
+    let domain = placement.resolve_domain(event.epoch(), plan.accesses().len())?;
+    let output = handle_durable_idempotent_event_with_plan(
+        store, context, domain, resolver, event, machine, plan,
+    )?;
+    Ok(ResolvedNodeOutput::new(domain, output))
+}
+
+fn handle_durable_idempotent_event_with_plan<S, M>(
+    store: &S,
+    context: &DurableOperationContext,
+    domain: AtomicityDomainId,
+    resolver: &HashSuiteResolver,
+    event: NodeEvent,
+    machine: &M,
+    plan: NodeStateAccessPlan,
+) -> Result<NodeOutput, NodeCoreError>
+where
+    S: StructuredDurableDomainStateStore,
+    M: TransactionalNodeStateMachine,
+{
+    let event_digest = event.digest(resolver)?;
+    let request_id = DurableRequestId::new(*event.request_id().as_bytes()).map_err(|_| {
+        NodeCoreError::PersistenceInvariant("validated request id failed durable projection")
+    })?;
+
+    if let Some(receipt) = store.get_request_receipt(context, domain, request_id)? {
+        if receipt.request_id() != request_id {
+            return Err(NodeCoreError::PersistenceInvariant(
+                "durable receipt lookup returned another request",
+            ));
+        }
+        if receipt.event_digest() != event_digest {
+            return Err(NodeCoreError::RequestIdReuse);
+        }
+        let record = NodeDedupRecord::decode(receipt.canonical_bytes())
+            .map_err(|_| NodeCoreError::PersistenceInvariant("invalid durable receipt"))?;
+        if record.request_id() != event.request_id() || record.event_digest() != event_digest {
+            return Err(NodeCoreError::PersistenceInvariant(
+                "durable receipt projection and canonical record differ",
+            ));
+        }
+        return NodeOutput::new(record.responses().to_vec(), Vec::new());
+    }
+
+    let mut values = BTreeMap::new();
+    for access in plan.accesses() {
+        let observed = store.get_versioned_durable(context, domain, access.key())?;
+        if let Some(value) = observed.value() {
+            validate_state(value)?;
+        }
+        values.insert(access.key.clone(), observed);
+    }
+    let snapshot = NodeStateSnapshot { values };
+    let transition = machine.transition(&snapshot, &event)?;
+    validate_output_event_context(transition.output(), &event)?;
+
+    let dedup_record = NodeDedupRecord::new(
+        event.request_id(),
+        event_digest,
+        transition.output.responses.clone(),
+    )?;
+    let receipt = DurableRequestReceipt::new(request_id, event_digest, dedup_record.encode()?)?;
+    let outbox = if transition.output.outbound_messages.is_empty() {
+        None
+    } else {
+        let messages = transition
+            .output
+            .outbound_messages
+            .iter()
+            .map(|message| {
+                let payload_digest = message.event().digest(resolver)?;
+                Ok(DurableOutboxMessage::new(
+                    payload_digest,
+                    message.event().encode()?,
+                )?)
+            })
+            .collect::<Result<Vec<_>, NodeCoreError>>()?;
+        Some(DurableOutboxBatch::new(request_id, event_digest, messages)?)
+    };
+    let (reads, mutations) = domain_transition_parts(&plan, &snapshot, transition.updates)?;
+    let state = DurableStateTransaction::new(domain, AtomicStateReadSet::new(reads)?, mutations)?;
+    let invocation = DurableInvocationTransaction::new(
+        domain,
+        Some(state),
+        DurableObjectChanges::empty(),
+        receipt,
+        outbox,
+    )?;
+
+    match store.commit_invocation(context, invocation) {
+        DurableCommitOutcome::Committed => Ok(transition.output),
+        DurableCommitOutcome::Rejected(DurableCommitRejection::Conflict { .. }) => {
+            Err(NodeCoreError::StateConflict)
+        }
+        DurableCommitOutcome::Rejected(reason) => Err(NodeCoreError::DurableCommitRejected(reason)),
+        DurableCommitOutcome::Indeterminate(reason) => {
+            Err(NodeCoreError::DurableCommitIndeterminate(reason))
+        }
+    }
 }
 
 fn handle_domain_idempotent_event_with_plan<R, M>(
@@ -2254,6 +2425,17 @@ fn validate_output_context(
     event: &NodeEvent,
     config: &NodeConfig,
 ) -> Result<(), NodeCoreError> {
+    validate_output_event_context(output, event)?;
+    for message in output.outbound_messages() {
+        message.event().validate_context(config)?;
+    }
+    Ok(())
+}
+
+fn validate_output_event_context(
+    output: &NodeOutput,
+    event: &NodeEvent,
+) -> Result<(), NodeCoreError> {
     for response in output.responses() {
         if response.request_id() != event.request_id() {
             return Err(NodeCoreError::ResponseRequestMismatch {
@@ -2263,7 +2445,25 @@ fn validate_output_context(
         }
     }
     for message in output.outbound_messages() {
-        message.event().validate_context(config)?;
+        let outbound = message.event();
+        if outbound.chain_id() != event.chain_id() {
+            return Err(NodeCoreError::ChainMismatch {
+                expected: event.chain_id().clone(),
+                actual: outbound.chain_id().clone(),
+            });
+        }
+        if outbound.protocol_version() != event.protocol_version() {
+            return Err(NodeCoreError::ProtocolVersionMismatch {
+                expected: event.protocol_version(),
+                actual: outbound.protocol_version(),
+            });
+        }
+        if outbound.epoch() != event.epoch() {
+            return Err(NodeCoreError::EpochMismatch {
+                expected: event.epoch(),
+                actual: outbound.epoch(),
+            });
+        }
     }
     Ok(())
 }
@@ -2401,8 +2601,14 @@ fn take_nested_bytes<'a>(
 mod tests {
     use super::*;
     use protocol_types::{HashSuite, HashSuiteSchedule};
-    use runtime::{MemoryRuntime, StateRevision, StateStore, TransactionalStateStore};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use runtime::{
+        DurableDomainStateStore, MemoryRuntime, StateRevision, StateStore, StorageCorrelationId,
+        StorageDeadline, TransactionalStateStore, WriterFenceGeneration,
+    };
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     const TEST_STATE_TYPE_ID: u16 = 0xEF01;
     const TEST_PAYLOAD_TYPE_ID: u16 = 0xEF02;
@@ -2424,6 +2630,14 @@ mod tests {
     fn placement(byte: u8, activation_epoch: u64) -> DomainPlacementManifest {
         DomainPlacementManifest::single_domain(1, domain(byte), Epoch::new(activation_epoch))
             .unwrap()
+    }
+
+    fn durable_context() -> DurableOperationContext {
+        DurableOperationContext::new(
+            WriterFenceGeneration::new(1).unwrap(),
+            StorageDeadline::new(10_000).unwrap(),
+            StorageCorrelationId::new([0xA5; 16]).unwrap(),
+        )
     }
 
     fn hex(bytes: &[u8]) -> String {
@@ -2938,6 +3152,198 @@ mod tests {
                 NodeOutput::new(vec![response], vec![outbound])?,
             )
         }
+    }
+
+    struct ScriptedDurableStore {
+        receipt: Mutex<Option<DurableRequestReceipt>>,
+        commits: Mutex<Vec<DurableInvocationTransaction>>,
+        state_reads: AtomicUsize,
+        commit_outcome: DurableCommitOutcome,
+    }
+
+    impl ScriptedDurableStore {
+        fn new(commit_outcome: DurableCommitOutcome) -> Self {
+            Self {
+                receipt: Mutex::new(None),
+                commits: Mutex::new(Vec::new()),
+                state_reads: AtomicUsize::new(0),
+                commit_outcome,
+            }
+        }
+    }
+
+    impl DurableDomainStateStore for ScriptedDurableStore {
+        fn get_versioned_durable(
+            &self,
+            _context: &DurableOperationContext,
+            _domain: AtomicityDomainId,
+            _key: &[u8],
+        ) -> Result<VersionedStateValue, DurableReadError> {
+            self.state_reads.fetch_add(1, Ordering::SeqCst);
+            VersionedStateValue::from_persisted_parts(StateRevision::INITIAL, None)
+                .map_err(DurableReadError::InvalidRequest)
+        }
+
+        fn commit_durable(
+            &self,
+            _context: &DurableOperationContext,
+            _transaction: AtomicStateTransaction,
+        ) -> DurableCommitOutcome {
+            DurableCommitOutcome::Rejected(DurableCommitRejection::InvalidPersistedState)
+        }
+    }
+
+    impl StructuredDurableDomainStateStore for ScriptedDurableStore {
+        fn get_request_receipt(
+            &self,
+            _context: &DurableOperationContext,
+            _domain: AtomicityDomainId,
+            _request_id: DurableRequestId,
+        ) -> Result<Option<DurableRequestReceipt>, DurableReadError> {
+            Ok(self.receipt.lock().unwrap().clone())
+        }
+
+        fn commit_invocation(
+            &self,
+            _context: &DurableOperationContext,
+            transaction: DurableInvocationTransaction,
+        ) -> DurableCommitOutcome {
+            self.commits.lock().unwrap().push(transaction);
+            self.commit_outcome.clone()
+        }
+    }
+
+    #[test]
+    fn durable_idempotent_handler_builds_typed_sections_and_replays_receipt() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        let input = event("sunrise-test", request(0x91));
+        let resolver = resolver("sunrise-test");
+        let first = handle_resolved_durable_idempotent_event(
+            &store,
+            &durable_context(),
+            &placement(0xC1, 7),
+            &config("sunrise-test"),
+            &resolver,
+            input.clone(),
+            &machine,
+        )
+        .unwrap();
+
+        assert_eq!(first.domain(), domain(0xC1));
+        assert_eq!(first.output().outbound_messages().len(), 1);
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        let commits = store.commits.lock().unwrap();
+        assert_eq!(commits.len(), 1);
+        let invocation = &commits[0];
+        let state = invocation.state().unwrap();
+        assert_eq!(state.domain(), domain(0xC1));
+        assert_eq!(state.reads().len(), 1);
+        assert_eq!(state.mutations().len(), 1);
+        assert!(invocation.objects().is_empty());
+        let receipt = invocation.receipt().clone();
+        assert_eq!(
+            NodeDedupRecord::decode(receipt.canonical_bytes())
+                .unwrap()
+                .responses()
+                .len(),
+            1
+        );
+        let outbox = invocation.outbox().unwrap();
+        assert_eq!(outbox.messages().len(), 1);
+        let outbound_event = NodeEvent::decode(outbox.messages()[0].canonical_payload()).unwrap();
+        assert_eq!(
+            outbox.messages()[0].payload_digest(),
+            outbound_event.digest(&resolver).unwrap()
+        );
+        drop(commits);
+
+        store.receipt.lock().unwrap().replace(receipt);
+        let replay = handle_resolved_durable_idempotent_event(
+            &store,
+            &durable_context(),
+            &placement(0xC1, 7),
+            &config("sunrise-test"),
+            &resolver,
+            input.clone(),
+            &machine,
+        )
+        .unwrap();
+        assert_eq!(replay.output().responses(), first.output().responses());
+        assert!(replay.output().outbound_messages().is_empty());
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(store.state_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(store.commits.lock().unwrap().len(), 1);
+
+        assert_eq!(
+            handle_resolved_durable_idempotent_event(
+                &store,
+                &durable_context(),
+                &placement(0xC1, 7),
+                &config("sunrise-test"),
+                &resolver,
+                event_value("sunrise-test", request(0x91), 10),
+                &machine,
+            ),
+            Err(NodeCoreError::RequestIdReuse)
+        );
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct ReadOnlyMachine;
+
+    impl TransactionalNodeStateMachine for ReadOnlyMachine {
+        fn access_plan(&self, _event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            NodeStateAccessPlan::new(vec![NodeStateAccess::new(
+                b"state/read-only".to_vec(),
+                NodeStateAccessMode::ReadOnly,
+            )?])
+        }
+
+        fn transition(
+            &self,
+            _state: &NodeStateSnapshot,
+            event: &NodeEvent,
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            Ok(TransactionalNodeTransition::read_only(NodeOutput::new(
+                vec![NodeResponse::new(
+                    event.request_id(),
+                    NodeResponseStatus::Accepted,
+                    None,
+                )?],
+                Vec::new(),
+            )?))
+        }
+    }
+
+    #[test]
+    fn durable_idempotent_handler_asserts_read_only_state_and_hides_ambiguity() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Indeterminate(
+            IndeterminateCommitReason::ConnectionLost,
+        ));
+        let result = handle_resolved_durable_idempotent_event(
+            &store,
+            &durable_context(),
+            &placement(0xC2, 7),
+            &config("sunrise-test"),
+            &resolver("sunrise-test"),
+            event("sunrise-test", request(0x92)),
+            &ReadOnlyMachine,
+        );
+
+        assert_eq!(
+            result,
+            Err(NodeCoreError::DurableCommitIndeterminate(
+                IndeterminateCommitReason::ConnectionLost
+            ))
+        );
+        let commits = store.commits.lock().unwrap();
+        let state = commits[0].state().unwrap();
+        assert_eq!(state.reads().len(), 1);
+        assert!(state.mutations().is_empty());
+        assert!(commits[0].outbox().is_none());
     }
 
     #[test]
