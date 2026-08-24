@@ -871,7 +871,17 @@ A dedicated in-memory conformance store holds state, typed receipt, and typed
 outbox under one lock, validates injected trusted time and writer generation,
 and exercises commit, conflict, read-only, replay, deadline, and fence behavior
 with the real node-core handler. It is not restart-safe production storage.
-Durable adapters and native composition do not use this new boundary yet.
+An additive native router now owns explicit normalized store, transport, clock,
+and restart-safe identity components without requiring the store to implement
+the legacy opaque `StateStore`/`Runtime` surface. Trusted embedding authority
+fixes writer fence and time budgets; node-core resolves the manifest domain and
+commits the typed invocation before native claims at most one message for that
+exact request. Commit, claim, and acknowledgement reuse one bounded operation
+context. Claim and acknowledgement ambiguity receive one same-identity
+reconciliation attempt, and an unresolved claim is never sent. The in-memory
+tests prove an older due row in the same domain is not mistaken for the current
+request. No restart-safe durable adapter uses this boundary yet, and started
+transport/storage work is not cancellable.
 
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
@@ -1100,3 +1110,11 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   selecting another due row, and reject lease reuse across requests or domains.
   Share retained attempt history and acknowledgement semantics with indexed
   recovery so native composition has one delivery model.
+- DR-0057: Compose normalized native requests from explicit structured store,
+  transport, clock, and restart-safe identity components instead of forcing the
+  store through the legacy `Runtime` boundary. Resolve the protocol manifest in
+  node-core, reuse one trusted fenced/deadline context across commit and the
+  exact-request claim/ack attempt, reconcile each ambiguous outbox operation
+  once with the same identity, and never send an unresolved claim. Bound the
+  synchronous path with existing native admission and keep durable adapters,
+  cancellation, and production capacity evidence as separate exit work.

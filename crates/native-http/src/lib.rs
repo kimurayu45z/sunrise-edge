@@ -23,7 +23,8 @@ use node_core::{
     NodeOutboxBatch, NodeOutboxDelivery, NodeResponse, OutboxClaim, OutboxLeaseId, RequestId,
     TransactionalNodeStateMachine, acknowledge_outbox_message,
     acknowledge_outbox_message_in_domain, claim_next_outbox_message,
-    claim_next_outbox_message_in_domain, handle_idempotent_event, handle_resolved_idempotent_event,
+    claim_next_outbox_message_in_domain, handle_idempotent_event,
+    handle_resolved_durable_idempotent_event, handle_resolved_idempotent_event,
 };
 use protocol_config::DomainPlacementManifest;
 use runtime::{
@@ -31,9 +32,10 @@ use runtime::{
     DurableOperationContext, DurableOutboxAcknowledgement, DurableOutboxAcknowledgementOutcome,
     DurableOutboxAcknowledgementRejection, DurableOutboxClaimOutcome, DurableOutboxClaimRejection,
     DurableOutboxLeaseId, IndeterminateCommitReason, IndexedOutboxContractError,
-    IndexedOutboxRepository, MAX_DURABLE_OUTBOX_LEASE_MILLIS, PersistenceLayout, Runtime,
-    RuntimeError, StateKeyScan, StateKeyScanner, StorageCorrelationId, StorageDeadline,
-    TransactionalStateStore, Transport, WriterFenceGeneration,
+    IndexedOutboxRepository, MAX_DURABLE_OUTBOX_LEASE_MILLIS, OutboxRequestId, PersistenceLayout,
+    RequestOutboxClaimRequest, Runtime, RuntimeError, StateKeyScan, StateKeyScanner,
+    StorageCorrelationId, StorageDeadline, TransactionalStateStore, Transport,
+    WriterFenceGeneration,
 };
 use std::{
     error::Error,
@@ -60,6 +62,74 @@ pub const MAX_HTTP_EVENT_BODY_BYTES: usize = MAX_NODE_PAYLOAD_BYTES + 512;
 pub const NATIVE_OUTBOX_LEASE_MILLIS: u64 = 30_000;
 /// Maximum storage-operation budget accepted by indexed native recovery.
 pub const MAX_INDEXED_OUTBOX_OPERATION_MILLIS: u64 = 30_000;
+
+/// Trusted storage authority for one normalized native request.
+///
+/// The embedding host fixes writer fencing and time budgets. The HTTP request
+/// supplies none of these values, and node-core still resolves the logical
+/// domain from the protocol manifest before any storage read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StructuredDurableRequestAuthority {
+    writer_fence: WriterFenceGeneration,
+    operation_timeout_millis: NonZeroU64,
+    lease_duration_millis: NonZeroU64,
+}
+
+impl StructuredDurableRequestAuthority {
+    /// Creates bounded request authority whose storage budget is below a lease.
+    pub fn new(
+        writer_fence: WriterFenceGeneration,
+        operation_timeout_millis: u64,
+        lease_duration_millis: u64,
+    ) -> Result<Self, IndexedOutboxRecoveryAuthorityError> {
+        let operation_timeout_millis = NonZeroU64::new(operation_timeout_millis)
+            .ok_or(IndexedOutboxRecoveryAuthorityError::InvalidOperationTimeout)?;
+        let lease_duration_millis = NonZeroU64::new(lease_duration_millis)
+            .filter(|duration| duration.get() <= MAX_DURABLE_OUTBOX_LEASE_MILLIS)
+            .ok_or(IndexedOutboxRecoveryAuthorityError::InvalidLeaseDuration)?;
+        if operation_timeout_millis.get() > MAX_INDEXED_OUTBOX_OPERATION_MILLIS
+            || operation_timeout_millis >= lease_duration_millis
+        {
+            return Err(IndexedOutboxRecoveryAuthorityError::InvalidOperationTimeout);
+        }
+        Ok(Self {
+            writer_fence,
+            operation_timeout_millis,
+            lease_duration_millis,
+        })
+    }
+
+    /// Returns the configured authoritative writer generation.
+    #[must_use]
+    pub const fn writer_fence(self) -> WriterFenceGeneration {
+        self.writer_fence
+    }
+}
+
+/// Explicit components used by the normalized durable native request path.
+///
+/// Keeping these components separate from [`Runtime`] lets normalized stores
+/// avoid implementing the legacy opaque [`runtime::StateStore`] interface.
+#[derive(Debug)]
+pub struct StructuredDurableNativeComponents<S, T, C, I> {
+    store: Arc<S>,
+    transport: Arc<T>,
+    clock: Arc<C>,
+    identities: Arc<I>,
+}
+
+impl<S, T, C, I> StructuredDurableNativeComponents<S, T, C, I> {
+    /// Creates a composition without hidden defaults or request authority.
+    #[must_use]
+    pub const fn new(store: Arc<S>, transport: Arc<T>, clock: Arc<C>, identities: Arc<I>) -> Self {
+        Self {
+            store,
+            transport,
+            clock,
+            identities,
+        }
+    }
+}
 
 /// Admission policy for synchronous node and runtime work.
 ///
@@ -474,6 +544,19 @@ struct ResolvedDomainNativeHttpState<R, M, L> {
     blocking_executor: NativeBlockingExecutor,
 }
 
+struct StructuredDurableNativeHttpState<S, M, T, C, I> {
+    components: StructuredDurableNativeComponents<S, T, C, I>,
+    placement: DomainPlacementManifest,
+    authority: StructuredDurableRequestAuthority,
+    config: NodeConfig,
+    resolver: HashSuiteResolver,
+    machine: Arc<M>,
+    blocking_executor: NativeBlockingExecutor,
+}
+
+type SharedStructuredDurableNativeHttpState<S, M, T, C, I> =
+    Arc<StructuredDurableNativeHttpState<S, M, T, C, I>>;
+
 /// Builds the recoverable native HTTP router.
 ///
 /// Application state, request deduplication, responses, and the ordered outbox
@@ -602,10 +685,80 @@ where
         .with_state(state)
 }
 
+/// Builds the normalized durable native router.
+///
+/// This is the production-oriented composition seam: node-core commits typed
+/// state, receipt, and outbox sections through one fenced transaction, then
+/// native delivery claims only that committed request through the indexed
+/// repository. Storage authority and operational identities come solely from
+/// the embedding host.
+pub fn structured_durable_router<S, M, T, C, I>(
+    components: StructuredDurableNativeComponents<S, T, C, I>,
+    placement: DomainPlacementManifest,
+    authority: StructuredDurableRequestAuthority,
+    config: NodeConfig,
+    resolver: HashSuiteResolver,
+    machine: Arc<M>,
+    blocking_policy: NativeBlockingPolicy,
+) -> Router
+where
+    S: IndexedOutboxRepository + Send + Sync + 'static,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    T: Transport + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+    I: IndexedOutboxIdentitySource + Send + Sync + 'static,
+{
+    structured_durable_router_with_executor(
+        components,
+        placement,
+        authority,
+        config,
+        resolver,
+        machine,
+        NativeBlockingExecutor::new(blocking_policy),
+    )
+}
+
+/// Builds the normalized durable router with shared blocking admission.
+pub fn structured_durable_router_with_executor<S, M, T, C, I>(
+    components: StructuredDurableNativeComponents<S, T, C, I>,
+    placement: DomainPlacementManifest,
+    authority: StructuredDurableRequestAuthority,
+    config: NodeConfig,
+    resolver: HashSuiteResolver,
+    machine: Arc<M>,
+    blocking_executor: NativeBlockingExecutor,
+) -> Router
+where
+    S: IndexedOutboxRepository + Send + Sync + 'static,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    T: Transport + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+    I: IndexedOutboxIdentitySource + Send + Sync + 'static,
+{
+    let state = Arc::new(StructuredDurableNativeHttpState {
+        components,
+        placement,
+        authority,
+        config,
+        resolver,
+        machine,
+        blocking_executor,
+    });
+    Router::new()
+        .route(LIVENESS_PATH, get(liveness))
+        .route(
+            NODE_EVENT_PATH,
+            post(submit_structured_durable_event::<S, M, T, C, I>),
+        )
+        .layer(DefaultBodyLimit::max(MAX_HTTP_EVENT_BODY_BYTES))
+        .with_state(state)
+}
+
 /// Serves a configured native router until the shutdown future completes.
 ///
-/// Build `app` with [`router`] so the blocking admission policy is explicit at
-/// the composition boundary.
+/// Build `app` with [`router`] or [`structured_durable_router`] so the blocking
+/// admission policy is explicit at the composition boundary.
 pub async fn serve<F>(
     listener: tokio::net::TcpListener,
     app: Router,
@@ -1184,9 +1337,68 @@ where
         .into_response()
 }
 
+async fn submit_structured_durable_event<S, M, T, C, I>(
+    State(state): State<SharedStructuredDurableNativeHttpState<S, M, T, C, I>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response
+where
+    S: IndexedOutboxRepository + Send + Sync + 'static,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    T: Transport + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+    I: IndexedOutboxIdentitySource + Send + Sync + 'static,
+{
+    if !has_supported_content_type(&headers) {
+        return error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported-content-type",
+        );
+    }
+    if has_unsupported_content_encoding(&headers) {
+        return error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported-content-encoding",
+        );
+    }
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => return error_response(error.status(), "body-rejected"),
+    };
+    let permit = match state.blocking_executor.try_acquire() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => return overload_response(),
+        Err(TryAcquireError::Closed) => {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "blocking-admission-closed");
+        }
+    };
+    let blocking_state = Arc::clone(&state);
+    let work = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        invoke_structured_durable_event(blocking_state.as_ref(), &body)
+    });
+    let result = match work.await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => return invocation_error_response(&error),
+        Err(_) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "blocking-task-failed");
+        }
+    };
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, NODE_RESULT_MEDIA_TYPE),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        result,
+    )
+        .into_response()
+}
+
 enum InvocationError {
     Node(NodeCoreError),
     Delivery(OutboxDeliveryError),
+    Indexed(IndexedOutboxRecoveryError),
     ResultEncoding,
 }
 
@@ -1256,6 +1468,164 @@ where
         .map_err(|_| InvocationError::ResultEncoding)
 }
 
+fn invoke_structured_durable_event<S, M, T, C, I>(
+    state: &StructuredDurableNativeHttpState<S, M, T, C, I>,
+    body: &[u8],
+) -> Result<Vec<u8>, InvocationError>
+where
+    S: IndexedOutboxRepository,
+    M: TransactionalNodeStateMachine,
+    T: Transport,
+    C: Clock,
+    I: IndexedOutboxIdentitySource,
+{
+    let event = NodeEvent::decode(body).map_err(InvocationError::Node)?;
+    validate_native_event_context(&event, &state.config).map_err(InvocationError::Node)?;
+    let request_id = event.request_id();
+    let identity = state
+        .components
+        .identities
+        .next_attempt_identity()
+        .map_err(|error| InvocationError::Indexed(IndexedOutboxRecoveryError::Identity(error)))?;
+    let now_unix_millis =
+        state.components.clock.now_unix_millis().map_err(|error| {
+            InvocationError::Indexed(IndexedOutboxRecoveryError::Runtime(error))
+        })?;
+    let deadline_unix_millis = now_unix_millis
+        .checked_add(state.authority.operation_timeout_millis.get())
+        .ok_or(InvocationError::Indexed(
+            IndexedOutboxRecoveryError::TimeOverflow,
+        ))?;
+    let lease_expires_at_unix_millis = now_unix_millis
+        .checked_add(state.authority.lease_duration_millis.get())
+        .ok_or(InvocationError::Indexed(
+            IndexedOutboxRecoveryError::TimeOverflow,
+        ))?;
+    let deadline = StorageDeadline::new(deadline_unix_millis).ok_or(InvocationError::Indexed(
+        IndexedOutboxRecoveryError::TimeOverflow,
+    ))?;
+    let context = DurableOperationContext::new(
+        state.authority.writer_fence,
+        deadline,
+        identity.correlation_id,
+    );
+    let resolved = handle_resolved_durable_idempotent_event(
+        state.components.store.as_ref(),
+        &context,
+        &state.placement,
+        &state.config,
+        &state.resolver,
+        event,
+        state.machine.as_ref(),
+    )
+    .map_err(InvocationError::Node)?;
+
+    let outbox_request_id = OutboxRequestId::new(*request_id.as_bytes())
+        .map_err(|error| InvocationError::Indexed(IndexedOutboxRecoveryError::Contract(error)))?;
+    let claim_request = RequestOutboxClaimRequest::new(
+        resolved.domain(),
+        outbox_request_id,
+        now_unix_millis,
+        identity.lease_id,
+        lease_expires_at_unix_millis,
+    )
+    .map_err(|error| InvocationError::Indexed(IndexedOutboxRecoveryError::Contract(error)))?;
+    let claim =
+        reconcile_request_outbox_claim(state.components.store.as_ref(), &context, claim_request)
+            .map_err(InvocationError::Indexed)?;
+    if let Some(claim) = claim {
+        if claim.request_id() != outbox_request_id
+            || claim.lease_id() != identity.lease_id
+            || claim.lease_expires_at_unix_millis() != lease_expires_at_unix_millis
+        {
+            return Err(InvocationError::Indexed(
+                IndexedOutboxRecoveryError::ClaimIdentityMismatch,
+            ));
+        }
+        let outbound = NodeEvent::decode(claim.canonical_payload())
+            .map_err(|error| InvocationError::Indexed(IndexedOutboxRecoveryError::Node(error)))?;
+        validate_native_event_context(&outbound, &state.config)
+            .map_err(|error| InvocationError::Indexed(IndexedOutboxRecoveryError::Node(error)))?;
+        let canonical_payload = outbound
+            .encode()
+            .map_err(|error| InvocationError::Indexed(IndexedOutboxRecoveryError::Node(error)))?;
+        if canonical_payload != claim.canonical_payload() {
+            return Err(InvocationError::Indexed(IndexedOutboxRecoveryError::Node(
+                NodeCoreError::PersistenceInvariant("request outbox payload is not canonical"),
+            )));
+        }
+        state
+            .components
+            .transport
+            .send(canonical_payload)
+            .map_err(|_| InvocationError::Indexed(IndexedOutboxRecoveryError::Send))?;
+        let acknowledgement = DurableOutboxAcknowledgement::new(
+            resolved.domain(),
+            claim.request_id(),
+            claim.message_index(),
+            claim.lease_id(),
+        );
+        reconcile_indexed_acknowledgement(
+            state.components.store.as_ref(),
+            &context,
+            acknowledgement,
+        )
+        .map_err(InvocationError::Indexed)?;
+    }
+
+    HttpNodeResult::new(request_id, resolved.output().responses().to_vec())
+        .and_then(|result| result.encode())
+        .map_err(|_| InvocationError::ResultEncoding)
+}
+
+fn validate_native_event_context(
+    event: &NodeEvent,
+    config: &NodeConfig,
+) -> Result<(), NodeCoreError> {
+    if event.chain_id() != config.chain_id() {
+        return Err(NodeCoreError::ChainMismatch {
+            expected: config.chain_id().clone(),
+            actual: event.chain_id().clone(),
+        });
+    }
+    if event.protocol_version() != config.protocol_version() {
+        return Err(NodeCoreError::ProtocolVersionMismatch {
+            expected: config.protocol_version(),
+            actual: event.protocol_version(),
+        });
+    }
+    if event.epoch() != config.epoch() {
+        return Err(NodeCoreError::EpochMismatch {
+            expected: config.epoch(),
+            actual: event.epoch(),
+        });
+    }
+    Ok(())
+}
+
+fn reconcile_request_outbox_claim<S>(
+    store: &S,
+    context: &DurableOperationContext,
+    request: RequestOutboxClaimRequest,
+) -> Result<Option<runtime::DurableOutboxClaim>, IndexedOutboxRecoveryError>
+where
+    S: IndexedOutboxRepository,
+{
+    match store.claim_request_outbox(context, request) {
+        DurableOutboxClaimOutcome::Claimed(claim) => Ok(Some(claim)),
+        DurableOutboxClaimOutcome::NoDueWork => Ok(None),
+        DurableOutboxClaimOutcome::Rejected(reason) => {
+            Err(IndexedOutboxRecoveryError::ClaimRejected(reason))
+        }
+        DurableOutboxClaimOutcome::Indeterminate(first_reason) => {
+            match store.claim_request_outbox(context, request) {
+                DurableOutboxClaimOutcome::Claimed(claim) => Ok(Some(claim)),
+                _ => Err(IndexedOutboxRecoveryError::ClaimIndeterminate(first_reason)),
+            }
+        }
+    }
+}
+
 fn invocation_error_response(error: &InvocationError) -> Response {
     match error {
         InvocationError::Node(error) => node_error_response(error),
@@ -1275,9 +1645,70 @@ fn invocation_error_response(error: &InvocationError) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
             "lease-id-source-exhausted",
         ),
+        InvocationError::Indexed(error) => indexed_invocation_error_response(error),
         InvocationError::ResultEncoding => {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "result-encoding-failed")
         }
+    }
+}
+
+fn indexed_invocation_error_response(error: &IndexedOutboxRecoveryError) -> Response {
+    match error {
+        IndexedOutboxRecoveryError::Runtime(_) => {
+            error_response(StatusCode::SERVICE_UNAVAILABLE, "runtime-unavailable")
+        }
+        IndexedOutboxRecoveryError::Identity(IndexedOutboxIdentitySourceError::Unavailable) => {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "indexed-identity-source-unavailable",
+            )
+        }
+        IndexedOutboxRecoveryError::Identity(IndexedOutboxIdentitySourceError::Exhausted) => {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "indexed-identity-source-exhausted",
+            )
+        }
+        IndexedOutboxRecoveryError::ClaimRejected(
+            DurableOutboxClaimRejection::WriterFenced { .. }
+            | DurableOutboxClaimRejection::DeadlineExceededBeforeCommit
+            | DurableOutboxClaimRejection::SerializationFailure
+            | DurableOutboxClaimRejection::UnavailableBeforeCommit,
+        ) => error_response(StatusCode::SERVICE_UNAVAILABLE, "outbox-claim-unavailable"),
+        IndexedOutboxRecoveryError::ClaimIndeterminate(_) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "outbox-claim-indeterminate",
+        ),
+        IndexedOutboxRecoveryError::Send => {
+            error_response(StatusCode::SERVICE_UNAVAILABLE, "outbound-send-failed")
+        }
+        IndexedOutboxRecoveryError::AcknowledgementRejected(
+            DurableOutboxAcknowledgementRejection::WriterFenced { .. }
+            | DurableOutboxAcknowledgementRejection::DeadlineExceededBeforeCommit
+            | DurableOutboxAcknowledgementRejection::SerializationFailure
+            | DurableOutboxAcknowledgementRejection::UnavailableBeforeCommit,
+        ) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "outbox-acknowledgement-unavailable",
+        ),
+        IndexedOutboxRecoveryError::AcknowledgementIndeterminate(_) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "outbox-acknowledgement-indeterminate",
+        ),
+        IndexedOutboxRecoveryError::Node(error) => node_error_response(error),
+        IndexedOutboxRecoveryError::TimeOverflow
+        | IndexedOutboxRecoveryError::Contract(_)
+        | IndexedOutboxRecoveryError::ClaimIdentityMismatch
+        | IndexedOutboxRecoveryError::ClaimRejected(_)
+        | IndexedOutboxRecoveryError::AcknowledgementRejected(_) => {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "invalid-durable-outbox")
+        }
+        IndexedOutboxRecoveryError::CapacityExhausted
+        | IndexedOutboxRecoveryError::AdmissionClosed
+        | IndexedOutboxRecoveryError::BlockingTaskFailed => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid-indexed-invocation-state",
+        ),
     }
 }
 
@@ -1459,7 +1890,10 @@ fn node_error_response(error: &NodeCoreError) -> Response {
         | NodeCoreError::ProtocolVersionMismatch { .. }
         | NodeCoreError::EpochMismatch { .. }
         | NodeCoreError::StateConflict
-        | NodeCoreError::RequestIdReuse => (StatusCode::CONFLICT, "state-or-context-conflict"),
+        | NodeCoreError::RequestIdReuse
+        | NodeCoreError::DurableCommitRejected(runtime::DurableCommitRejection::Conflict {
+            ..
+        }) => (StatusCode::CONFLICT, "state-or-context-conflict"),
         NodeCoreError::OutboxLeaseActive { .. } => {
             (StatusCode::SERVICE_UNAVAILABLE, "outbox-lease-active")
         }
@@ -1467,6 +1901,21 @@ fn node_error_response(error: &NodeCoreError) -> Response {
             (StatusCode::UNPROCESSABLE_ENTITY, "transition-rejected")
         }
         NodeCoreError::Runtime(_) => (StatusCode::SERVICE_UNAVAILABLE, "runtime-unavailable"),
+        NodeCoreError::DurableRead(
+            runtime::DurableReadError::WriterFenced { .. }
+            | runtime::DurableReadError::DeadlineExceeded
+            | runtime::DurableReadError::Unavailable,
+        )
+        | NodeCoreError::DurableCommitRejected(
+            runtime::DurableCommitRejection::WriterFenced { .. }
+            | runtime::DurableCommitRejection::DeadlineExceededBeforeCommit
+            | runtime::DurableCommitRejection::SerializationFailure
+            | runtime::DurableCommitRejection::UnavailableBeforeCommit,
+        )
+        | NodeCoreError::DurableCommitIndeterminate(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "durable-storage-unavailable",
+        ),
         NodeCoreError::ProtocolConfig(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "protocol-config-unavailable",
@@ -1481,7 +1930,10 @@ fn node_error_response(error: &NodeCoreError) -> Response {
         | NodeCoreError::OutboxNotFound
         | NodeCoreError::OutboxLeaseMismatch
         | NodeCoreError::OutboxIndexMismatch
-        | NodeCoreError::OutboxArithmeticOverflow => {
+        | NodeCoreError::OutboxArithmeticOverflow
+        | NodeCoreError::DurableRead(_)
+        | NodeCoreError::DurableInvocation(_)
+        | NodeCoreError::DurableCommitRejected(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "invalid-node-output")
         }
         _ => (StatusCode::BAD_REQUEST, "invalid-node-event"),
@@ -1548,10 +2000,10 @@ mod tests {
         AtomicStateTransaction, CompareAndSwapResult, ComposedRuntime, DurableCommitOutcome,
         DurableCommitRejection, DurableDomainStateStore, DurableInvocationTransaction,
         DurableOutboxClaim, DurableReadError, DurableRequestId, DurableRequestReceipt,
-        IndexedOutboxRepository, ManualClock, MemoryBlobStore, MemoryRuntime, MemoryScheduler,
-        MemorySigner, MemoryStateStore, MemoryTransport, OutboxRequestId,
-        RequestOutboxClaimRequest, RuntimeError, StateStore, StructuredDurableDomainStateStore,
-        TransactionalStateStore, VersionedStateValue,
+        IndexedOutboxRepository, ManualClock, MemoryBlobStore, MemoryDurableStateStore,
+        MemoryRuntime, MemoryScheduler, MemorySigner, MemoryStateStore, MemoryTransport,
+        OutboxRequestId, RequestOutboxClaimRequest, RuntimeError, StateStore,
+        StructuredDurableDomainStateStore, TransactionalStateStore, VersionedStateValue,
     };
     use runtime_sqlite::SqliteStateStore;
     use std::{
@@ -1808,6 +2260,35 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct SequenceIndexedIdentities {
+        next: Mutex<u64>,
+    }
+
+    impl IndexedOutboxIdentitySource for SequenceIndexedIdentities {
+        fn next_attempt_identity(
+            &self,
+        ) -> Result<IndexedOutboxAttemptIdentity, IndexedOutboxIdentitySourceError> {
+            let mut next = self
+                .next
+                .lock()
+                .map_err(|_| IndexedOutboxIdentitySourceError::Unavailable)?;
+            *next = next
+                .checked_add(1)
+                .ok_or(IndexedOutboxIdentitySourceError::Exhausted)?;
+            let mut lease = [0_u8; 32];
+            lease[..8].copy_from_slice(&next.to_le_bytes());
+            let mut correlation = [0_u8; 16];
+            correlation[..8].copy_from_slice(&next.to_le_bytes());
+            Ok(IndexedOutboxAttemptIdentity::new(
+                DurableOutboxLeaseId::new(lease)
+                    .map_err(|_| IndexedOutboxIdentitySourceError::Exhausted)?,
+                StorageCorrelationId::new(correlation)
+                    .ok_or(IndexedOutboxIdentitySourceError::Exhausted)?,
+            ))
+        }
+    }
+
     struct ScriptedIndexedStore {
         claims: Mutex<VecDeque<DurableOutboxClaimOutcome>>,
         acknowledgements: Mutex<VecDeque<DurableOutboxAcknowledgementOutcome>>,
@@ -1929,6 +2410,91 @@ mod tests {
         }
     }
 
+    struct IndeterminateRequestClaimStore {
+        inner: MemoryDurableStateStore,
+        commit_contexts: Mutex<Vec<DurableOperationContext>>,
+        claim_contexts: Mutex<Vec<DurableOperationContext>>,
+        claim_requests: Mutex<Vec<RequestOutboxClaimRequest>>,
+    }
+
+    impl IndeterminateRequestClaimStore {
+        fn new(inner: MemoryDurableStateStore) -> Self {
+            Self {
+                inner,
+                commit_contexts: Mutex::new(Vec::new()),
+                claim_contexts: Mutex::new(Vec::new()),
+                claim_requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl DurableDomainStateStore for IndeterminateRequestClaimStore {
+        fn get_versioned_durable(
+            &self,
+            context: &DurableOperationContext,
+            domain: AtomicityDomainId,
+            key: &[u8],
+        ) -> Result<VersionedStateValue, DurableReadError> {
+            self.inner.get_versioned_durable(context, domain, key)
+        }
+
+        fn commit_durable(
+            &self,
+            context: &DurableOperationContext,
+            transaction: AtomicStateTransaction,
+        ) -> DurableCommitOutcome {
+            self.inner.commit_durable(context, transaction)
+        }
+    }
+
+    impl StructuredDurableDomainStateStore for IndeterminateRequestClaimStore {
+        fn get_request_receipt(
+            &self,
+            context: &DurableOperationContext,
+            domain: AtomicityDomainId,
+            request_id: DurableRequestId,
+        ) -> Result<Option<DurableRequestReceipt>, DurableReadError> {
+            self.inner.get_request_receipt(context, domain, request_id)
+        }
+
+        fn commit_invocation(
+            &self,
+            context: &DurableOperationContext,
+            transaction: DurableInvocationTransaction,
+        ) -> DurableCommitOutcome {
+            self.commit_contexts.lock().unwrap().push(*context);
+            self.inner.commit_invocation(context, transaction)
+        }
+    }
+
+    impl IndexedOutboxRepository for IndeterminateRequestClaimStore {
+        fn claim_request_outbox(
+            &self,
+            context: &DurableOperationContext,
+            request: RequestOutboxClaimRequest,
+        ) -> DurableOutboxClaimOutcome {
+            self.claim_contexts.lock().unwrap().push(*context);
+            self.claim_requests.lock().unwrap().push(request);
+            DurableOutboxClaimOutcome::Indeterminate(IndeterminateCommitReason::ConnectionLost)
+        }
+
+        fn claim_due_outbox(
+            &self,
+            context: &DurableOperationContext,
+            request: DueOutboxClaimRequest,
+        ) -> DurableOutboxClaimOutcome {
+            self.inner.claim_due_outbox(context, request)
+        }
+
+        fn acknowledge_outbox(
+            &self,
+            context: &DurableOperationContext,
+            acknowledgement: DurableOutboxAcknowledgement,
+        ) -> DurableOutboxAcknowledgementOutcome {
+            self.inner.acknowledge_outbox(context, acknowledgement)
+        }
+    }
+
     fn indexed_runtime(
         store: ScriptedIndexedStore,
     ) -> ComposedRuntime<
@@ -1988,6 +2554,42 @@ mod tests {
             resolver(),
             machine,
             Arc::new(SequenceLeaseIds::default()),
+            NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+        )
+    }
+
+    fn structured_request_authority() -> StructuredDurableRequestAuthority {
+        StructuredDurableRequestAuthority::new(
+            WriterFenceGeneration::new(3).unwrap(),
+            1_000,
+            NATIVE_OUTBOX_LEASE_MILLIS,
+        )
+        .unwrap()
+    }
+
+    fn structured_app<S>(
+        store: Arc<S>,
+        transport: Arc<MemoryTransport>,
+        clock: Arc<ManualClock>,
+        placement: DomainPlacementManifest,
+        config: NodeConfig,
+    ) -> Router
+    where
+        S: IndexedOutboxRepository + Send + Sync + 'static,
+    {
+        let machine = Arc::new(IncrementMachine::new(config.state_key()));
+        structured_durable_router(
+            StructuredDurableNativeComponents::new(
+                store,
+                transport,
+                clock,
+                Arc::new(SequenceIndexedIdentities::default()),
+            ),
+            placement,
+            structured_request_authority(),
+            config,
+            resolver(),
+            machine,
             NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
         )
     }
@@ -2134,6 +2736,11 @@ mod tests {
         let authority = indexed_authority();
         assert_eq!(authority.domain(), domain);
         assert_eq!(authority.writer_fence(), fence);
+        assert_eq!(
+            StructuredDurableRequestAuthority::new(fence, 30_000, 30_000),
+            Err(IndexedOutboxRecoveryAuthorityError::InvalidOperationTimeout)
+        );
+        assert_eq!(structured_request_authority().writer_fence(), fence);
     }
 
     #[tokio::test]
@@ -2228,6 +2835,180 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn structured_route_commits_and_claims_only_the_exact_request() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let clock = Arc::new(ManualClock::new(10_000));
+        let config = config();
+        let placement = placement(0x81, 7);
+        let domain = placement.domain();
+        let machine = IncrementMachine::new(config.state_key());
+        let older_request_id = request_id(0x21);
+        let older_context = DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(11_000).unwrap(),
+            StorageCorrelationId::new([0x31; 16]).unwrap(),
+        );
+        handle_resolved_durable_idempotent_event(
+            store.as_ref(),
+            &older_context,
+            &placement,
+            &config,
+            &resolver(),
+            event(older_request_id),
+            &machine,
+        )
+        .unwrap();
+
+        let current_request_id = request_id(0x22);
+        let app = structured_app(
+            Arc::clone(&store),
+            Arc::clone(&transport),
+            Arc::clone(&clock),
+            placement,
+            config.clone(),
+        );
+        let response = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event(current_request_id).encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let outbound = transport.drain_outbound().unwrap();
+        assert_eq!(outbound.len(), 1);
+        let delivered = NodeEvent::decode(&outbound[0]).unwrap();
+        assert_eq!(
+            decode_canonical_frame(delivered.payload())
+                .unwrap()
+                .required_u64(1),
+            Ok(2)
+        );
+
+        let due_request = DueOutboxClaimRequest::new(
+            domain,
+            10_000,
+            DurableOutboxLeaseId::new([0x91; 32]).unwrap(),
+            40_000,
+        )
+        .unwrap();
+        let due_context = DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(11_000).unwrap(),
+            StorageCorrelationId::new([0x32; 16]).unwrap(),
+        );
+        let current_claim_request = RequestOutboxClaimRequest::new(
+            domain,
+            OutboxRequestId::new(*current_request_id.as_bytes()).unwrap(),
+            10_000,
+            DurableOutboxLeaseId::new([0x92; 32]).unwrap(),
+            40_000,
+        )
+        .unwrap();
+        assert_eq!(
+            store.claim_request_outbox(&due_context, current_claim_request),
+            DurableOutboxClaimOutcome::NoDueWork
+        );
+        let DurableOutboxClaimOutcome::Claimed(older_claim) =
+            store.claim_due_outbox(&due_context, due_request)
+        else {
+            panic!("older request should remain due after exact-request delivery");
+        };
+        assert_eq!(
+            older_claim.request_id().as_bytes(),
+            older_request_id.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_route_never_sends_an_unreconciled_request_claim() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let inner = MemoryDurableStateStore::new(fence);
+        inner.set_time(10_000);
+        let store = Arc::new(IndeterminateRequestClaimStore::new(inner));
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let placement = placement(0x82, 7);
+        let domain = placement.domain();
+        let id = request_id(0x23);
+        let app = structured_app(
+            Arc::clone(&store),
+            Arc::clone(&transport),
+            Arc::new(ManualClock::new(10_000)),
+            placement,
+            config,
+        );
+
+        let response = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event(id).encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "outbox-claim-indeterminate"
+        );
+        assert!(transport.drain_outbound().unwrap().is_empty());
+        let commit_contexts = store.commit_contexts.lock().unwrap();
+        let claim_contexts = store.claim_contexts.lock().unwrap();
+        let claim_requests = store.claim_requests.lock().unwrap();
+        assert_eq!(commit_contexts.len(), 1);
+        assert_eq!(claim_contexts.len(), 2);
+        assert_eq!(claim_requests.len(), 2);
+        assert_eq!(commit_contexts[0], claim_contexts[0]);
+        assert_eq!(claim_contexts[0], claim_contexts[1]);
+        assert_eq!(claim_requests[0], claim_requests[1]);
+        assert_eq!(claim_requests[0].domain(), domain);
+        assert_eq!(claim_requests[0].request_id().as_bytes(), id.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn structured_route_maps_writer_fencing_without_publishing_output() {
+        let store = Arc::new(MemoryDurableStateStore::new(
+            WriterFenceGeneration::new(4).unwrap(),
+        ));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let app = structured_app(
+            store,
+            Arc::clone(&transport),
+            Arc::new(ManualClock::new(10_000)),
+            placement(0x83, 7),
+            config,
+        );
+
+        let response = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event(request_id(0x24)).encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "durable-storage-unavailable"
+        );
+        assert!(transport.drain_outbound().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -199,7 +199,8 @@ Deadline, connection loss, or cancellation after dispatch is indeterminate
 unless the backend supplies authoritative abort evidence. Callers reconcile
 that case through the persisted request receipt instead of rerunning effects
 blindly. Node-core uses this boundary through an additive structured handler;
-native composition and durable adapters remain pending.
+an additive native composition supplies the trusted context, while restart-safe
+durable adapters remain pending.
 
 Runtime also now defines `DurableInvocationTransaction` and
 `StructuredDurableDomainStateStore`. The transaction carries one logical
@@ -215,8 +216,8 @@ manifest resolution and one pure transition, checks typed receipts before
 state reads, preserves read-only assertions, and withholds output for rejected
 or indeterminate commits. A single-lock in-memory structured store now provides
 atomic state/receipt/outbox, deadline, fence, conflict, read-only, and node-core
-replay conformance. Native composition and durable implementations remain
-pending.
+replay conformance. An additive native composition now consumes this boundary;
+restart-safe durable implementations remain pending.
 
 The store validates the complete read set and fencing generation, then commits
 all rows or none. A pure transition is not re-run inside a storage driver. An
@@ -263,7 +264,14 @@ Request-path delivery uses a separate exact-request claim with trusted
 request's delivery row and returns no work when the row is completed, not due,
 or actively leased. It never falls through to an older due row in the same
 domain. Lease reconciliation and acknowledgement share the retained attempt
-history used by unattended claiming.
+history used by unattended claiming. The additive structured native router
+derives no storage authority from HTTP: trusted composition supplies writer
+fence, clock, deadline budget, restart-safe lease/correlation identity,
+transport, and store. It resolves the manifest through node-core, commits the
+typed invocation, then claims at most one message for that exact request using
+the same operation context. One same-identity reconciliation is attempted for
+an indeterminate claim or acknowledgement; unresolved claims are never sent.
+This is an in-memory As-Is seam, not durable production evidence.
 
 `StateKeyScanner` remains useful for repair, audit, bounded migration, and
 compatibility recovery. It is not a production work queue.
@@ -350,7 +358,8 @@ not general state reads:
 1. Preserve the additive fenced/deadline-aware durable boundary and add the
    structured state/receipt/outbox/object transaction envelope required by
    normalized stores without silently migrating legacy data (runtime envelope
-   and node-core plus memory conformance implemented; native/durable wiring pending).
+   and node-core plus memory conformance and native composition implemented;
+   restart-safe durable wiring pending).
 2. Add a dedicated indexed outbox repository/claim contract; retain key scans
    only for maintenance and compatibility.
 3. Apply the accepted PostgreSQL schema design, explicit migrations, and
