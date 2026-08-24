@@ -1913,7 +1913,11 @@ Phase 15 As-Is scope:
   never-reused domain、closed `AllState` rule、activation epochを持つ。node-coreはbounded access plan確定後かつ
   state read前に全application keyをresolveし、receipt/outbox/deliveryはそのinvocation domainを継承する。
   `(chain, validator, logical domain)`からPostgreSQL/DO/AWS authorityへのbindingはwriter-fenced deployment
-  metadataでありprotocol identityへ混ぜない（design accepted; canonical config implementation pending）。
+  metadataでありprotocol identityへ混ぜない。AtomicityDomainIdはprotocol-typesへ置き、zeroをrejectする。
+  DomainPlacementManifestはnon-zero rule version、domain、closed AllState tag、activation epochをcanonicalizeし、
+  historical ProtocolConfig encoding v1を維持したままprotocol version 2+のfield 14/encoding v2としてcommitする。
+  v1+manifest、v2+-manifest、empty access、pre-activation resolveはfail closedする（implemented As-Is;
+  node-core/native routing integration pending）。
 - runtimeはnon-zero 32-byte AtomicityDomainId、unique/canonicalなAtomicStateReadSetと
   AtomicStateMutationSet、それらを1 domainへ閉じ込めるAtomicStateTransactionを持つ。
   全mutation keyはread assertionを必須とし、各set 4,096 keysおよびaggregate represented bytes 64 MiBを
@@ -2004,9 +2008,9 @@ Phase 15 To-Be production exit criteria:
 
 Phase 15 persistence implementation order（To-Beからの逆算）:
 
-1. accepted `DomainPlacementManifest`をcanonical protocol configへ実装し、node-core初期commitとoutbox
-   deliveryまで接続したatomicity domain/dedicated read-set envelopeをresolved domainでnative compositionへ
-   接続する。SQLite既存dataを暗黙migrationせずdurable store contractへ実装する。
+1. canonical ProtocolConfigへ実装した`DomainPlacementManifest`をnode-core access planからresolveし、初期commitと
+   outbox deliveryまで接続したatomicity domain/dedicated read-set envelopeをそのresolved domainでnative
+   compositionへ接続する。SQLite既存dataを暗黙migrationせずdurable store contractへ実装する。
 2. indexed due-outbox repository/claim contractを追加し、StateKeyScannerはmaintenance/compatibilityへ戻す。
 3. normalized schema、explicit migration、bounded pool/deadline、typed conflictを持つPostgreSQL adapterを実装する。
 4. shared conformanceにwrite skew、absent-key race、serialization failure、lease fencing、schema/version skewを追加する。

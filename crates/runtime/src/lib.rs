@@ -3,7 +3,7 @@
 //! Runtime abstraction and in-memory adapters for serverless-safe node execution.
 
 use core::{fmt, mem::size_of};
-pub use protocol_types::ValidatorId;
+pub use protocol_types::{AtomicityDomainId, ValidatorId};
 use protocol_types::{ChainId, Digest32, Epoch, ProtocolVersion};
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
@@ -15,8 +15,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Errors produced by runtime adapters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
-    /// Atomicity-domain identifiers must not be all zeroes.
-    ZeroAtomicityDomainId,
     /// State keys must not be empty.
     EmptyKey,
     /// Scheduled payloads must not be empty.
@@ -96,9 +94,6 @@ pub enum RuntimeError {
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ZeroAtomicityDomainId => {
-                write!(f, "atomicity domain id must not be all zeroes")
-            }
             Self::EmptyKey => write!(f, "state keys must not be empty"),
             Self::EmptyScheduledPayload => write!(f, "scheduled payloads must not be empty"),
             Self::EmptyWriteSet => write!(f, "atomic state write set must not be empty"),
@@ -167,30 +162,6 @@ pub const MAX_ATOMIC_STATE_READS: usize = 4_096;
 pub const MAX_ATOMIC_STATE_TRANSACTION_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum keys returned by one bounded state scan page.
 pub const MAX_STATE_SCAN_KEYS: usize = 1_024;
-
-/// Stable, non-zero identity for one independently writable state authority.
-///
-/// Placement and routing are external to this dependency-light runtime type.
-/// Production protocol configuration must commit the selected derivation and
-/// placement rule before the domain controls transaction validity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AtomicityDomainId([u8; 32]);
-
-impl AtomicityDomainId {
-    /// Creates a non-zero atomicity-domain identifier.
-    pub fn new(bytes: [u8; 32]) -> Result<Self, RuntimeError> {
-        if bytes == [0; 32] {
-            return Err(RuntimeError::ZeroAtomicityDomainId);
-        }
-        Ok(Self(bytes))
-    }
-
-    /// Returns the exact identifier bytes.
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
 
 /// Monotonic optimistic-concurrency token for one state key.
 ///
@@ -839,14 +810,14 @@ pub trait Runtime {
 }
 
 /// In-memory `StateStore` implementation for tests and local execution.
-type MemoryDomainState = BTreeMap<AtomicityDomainId, BTreeMap<Vec<u8>, StoredStateValue>>;
+type MemoryDomainState = BTreeMap<[u8; 32], BTreeMap<Vec<u8>, StoredStateValue>>;
 
 #[derive(Clone, Debug, Default)]
 pub struct MemoryStateStore {
     inner: Arc<RwLock<MemoryDomainState>>,
 }
 
-const LEGACY_MEMORY_DOMAIN: AtomicityDomainId = AtomicityDomainId([0; 32]);
+const LEGACY_MEMORY_DOMAIN: [u8; 32] = [0; 32];
 
 #[derive(Clone, Debug)]
 struct StoredStateValue {
@@ -995,7 +966,7 @@ impl DomainTransactionalStateStore for MemoryStateStore {
     ) -> Result<VersionedStateValue, RuntimeError> {
         validate_state_key(key)?;
         let domains = self.inner.read().expect("state store lock poisoned");
-        Ok(read_memory_versioned(domains.get(&domain), key))
+        Ok(read_memory_versioned(domains.get(domain.as_bytes()), key))
     }
 
     fn commit_transaction(
@@ -1003,7 +974,7 @@ impl DomainTransactionalStateStore for MemoryStateStore {
         transaction: AtomicStateTransaction,
     ) -> Result<AtomicStateWriteResult, RuntimeError> {
         let mut domains = self.inner.write().expect("state store lock poisoned");
-        let state = domains.entry(transaction.domain).or_default();
+        let state = domains.entry(*transaction.domain.as_bytes()).or_default();
 
         for read in transaction.reads() {
             let current = current_revision(state, read.key());
@@ -1573,7 +1544,7 @@ mod tests {
     fn domain_transaction_envelope_is_bounded_ordered_and_complete() {
         assert_eq!(
             AtomicityDomainId::new([0; 32]),
-            Err(RuntimeError::ZeroAtomicityDomainId)
+            Err(protocol_types::TypeError::ZeroAtomicityDomainId)
         );
         assert_eq!(
             StateMutationEntry::new(key("a"), StateMutation::Assert),

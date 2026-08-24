@@ -14,7 +14,7 @@ use fees::{
     FeeAssetRegistry, FeeError, GasSchedule, encode_fee_asset_registry, encode_gas_schedule,
 };
 use governance::{GovernanceConfig, GovernanceError, encode_governance_config};
-use protocol_types::{HashSuiteId, ProtocolVersion};
+use protocol_types::{AtomicityDomainId, Epoch, HashSuiteId, ProtocolVersion};
 use protocol_upgrades::{
     FeatureFlags, HashSuiteScheduleConfig, ProtocolUpgradeError, ProtocolUpgradeSchedule,
     encode_feature_flags, encode_hash_suite_schedule, encode_protocol_upgrade_schedule,
@@ -23,7 +23,10 @@ use std::error::Error;
 use system_modules::{SystemModuleError, SystemModuleRegistry, encode_system_module_registry};
 
 const PROTOCOL_CONFIG_TYPE_ID: u16 = 0x5001;
+const DOMAIN_PLACEMENT_RULE_TYPE_ID: u16 = 0x500A;
+const DOMAIN_PLACEMENT_MANIFEST_TYPE_ID: u16 = 0x500B;
 const ENCODING_VERSION: u16 = 1;
+const DOMAIN_PLACEMENT_CONFIG_ENCODING_VERSION: u16 = 2;
 
 /// Errors returned by protocol configuration helpers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +35,21 @@ pub enum ProtocolConfigError {
     ZeroProtocolVersion,
     /// Hash-suite identifiers must be explicitly non-zero.
     ZeroHashSuiteId,
+    /// Domain placement rule versions must be explicitly non-zero.
+    ZeroDomainPlacementRuleVersion,
+    /// Protocol version 1 must retain the historical configuration encoding.
+    DomainPlacementRequiresProtocolVersion2,
+    /// Protocol version 2 and later require committed domain placement.
+    MissingDomainPlacement,
+    /// Domain routing requires a declared application access plan.
+    EmptyDomainAccessPlan,
+    /// A domain-placement manifest was used before its activation epoch.
+    InactiveDomainPlacement {
+        /// First epoch where the manifest is active.
+        activation_epoch: Epoch,
+        /// Event epoch presented for routing.
+        event_epoch: Epoch,
+    },
     /// The active hash-suite id must have a committed schedule definition.
     ActiveHashSuiteNotScheduled(HashSuiteId),
     /// The first pending upgrade must start from the active protocol version.
@@ -64,6 +82,28 @@ impl fmt::Display for ProtocolConfigError {
         match self {
             Self::ZeroProtocolVersion => write!(f, "protocol version must be non-zero"),
             Self::ZeroHashSuiteId => write!(f, "hash-suite id must be non-zero"),
+            Self::ZeroDomainPlacementRuleVersion => {
+                write!(f, "domain placement rule version must be non-zero")
+            }
+            Self::DomainPlacementRequiresProtocolVersion2 => {
+                write!(f, "domain placement requires protocol version 2 or later")
+            }
+            Self::MissingDomainPlacement => write!(
+                f,
+                "protocol version 2 or later requires a domain placement manifest"
+            ),
+            Self::EmptyDomainAccessPlan => {
+                write!(f, "domain placement cannot resolve an empty access plan")
+            }
+            Self::InactiveDomainPlacement {
+                activation_epoch,
+                event_epoch,
+            } => write!(
+                f,
+                "domain placement activates at epoch {}, event epoch is {}",
+                activation_epoch.get(),
+                event_epoch.get()
+            ),
             Self::ActiveHashSuiteNotScheduled(id) => {
                 write!(f, "active hash-suite id {} is not scheduled", id.get())
             }
@@ -138,6 +178,120 @@ impl From<ConsensusError> for ProtocolConfigError {
     }
 }
 
+/// Closed routing rules committed by a domain-placement manifest.
+///
+/// New variants require a new canonical tag and explicit activation semantics.
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DomainPlacementRule {
+    /// Every application key resolves to the manifest's sole logical domain.
+    AllState = 0x0001,
+}
+
+impl DomainPlacementRule {
+    /// Returns the stable canonical routing-rule tag.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        self as u16
+    }
+}
+
+/// Canonical first-profile mapping from application state to a logical domain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DomainPlacementManifest {
+    rule_version: u32,
+    domain: AtomicityDomainId,
+    rule: DomainPlacementRule,
+    activation_epoch: Epoch,
+}
+
+impl DomainPlacementManifest {
+    /// Creates the first production profile with exactly one `AllState` domain.
+    pub fn single_domain(
+        rule_version: u32,
+        domain: AtomicityDomainId,
+        activation_epoch: Epoch,
+    ) -> Result<Self, ProtocolConfigError> {
+        if rule_version == 0 {
+            return Err(ProtocolConfigError::ZeroDomainPlacementRuleVersion);
+        }
+        Ok(Self {
+            rule_version,
+            domain,
+            rule: DomainPlacementRule::AllState,
+            activation_epoch,
+        })
+    }
+
+    /// Returns the monotonically increasing routing-rule version.
+    #[must_use]
+    pub const fn rule_version(&self) -> u32 {
+        self.rule_version
+    }
+
+    /// Returns the sole active logical atomicity domain.
+    #[must_use]
+    pub const fn domain(&self) -> AtomicityDomainId {
+        self.domain
+    }
+
+    /// Returns the closed routing rule.
+    #[must_use]
+    pub const fn rule(&self) -> DomainPlacementRule {
+        self.rule
+    }
+
+    /// Returns the first epoch where this manifest is active.
+    #[must_use]
+    pub const fn activation_epoch(&self) -> Epoch {
+        self.activation_epoch
+    }
+
+    /// Resolves a non-empty bounded application plan at an active event epoch.
+    pub fn resolve_domain(
+        &self,
+        event_epoch: Epoch,
+        application_key_count: usize,
+    ) -> Result<AtomicityDomainId, ProtocolConfigError> {
+        if application_key_count == 0 {
+            return Err(ProtocolConfigError::EmptyDomainAccessPlan);
+        }
+        if event_epoch < self.activation_epoch {
+            return Err(ProtocolConfigError::InactiveDomainPlacement {
+                activation_epoch: self.activation_epoch,
+                event_epoch,
+            });
+        }
+        match self.rule {
+            DomainPlacementRule::AllState => Ok(self.domain),
+        }
+    }
+}
+
+/// Encodes a closed domain-placement routing rule.
+pub fn encode_domain_placement_rule(
+    rule: DomainPlacementRule,
+) -> Result<Vec<u8>, ProtocolConfigError> {
+    let mut canonical = CanonicalStruct::new(DOMAIN_PLACEMENT_RULE_TYPE_ID, ENCODING_VERSION);
+    canonical.field_u16(1, rule.as_u16())?;
+    Ok(canonical.finish()?)
+}
+
+/// Encodes one logical domain-placement manifest deterministically.
+pub fn encode_domain_placement_manifest(
+    manifest: &DomainPlacementManifest,
+) -> Result<Vec<u8>, ProtocolConfigError> {
+    if manifest.rule_version == 0 {
+        return Err(ProtocolConfigError::ZeroDomainPlacementRuleVersion);
+    }
+    let mut canonical = CanonicalStruct::new(DOMAIN_PLACEMENT_MANIFEST_TYPE_ID, ENCODING_VERSION);
+    canonical.field_u32(1, manifest.rule_version)?;
+    canonical.field_bytes(2, *manifest.domain.as_bytes())?;
+    canonical.field_bytes(3, encode_domain_placement_rule(manifest.rule)?)?;
+    canonical.field_u64(4, manifest.activation_epoch.get())?;
+    Ok(canonical.finish()?)
+}
+
 /// Protocol configuration fields that affect cryptographic commitments today.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtocolConfig {
@@ -167,6 +321,8 @@ pub struct ProtocolConfig {
     pub protocol_upgrades: ProtocolUpgradeSchedule,
     /// Shared-object consensus protocol and resource limits.
     pub consensus_parameters: ConsensusParameters,
+    /// Logical state-domain routing, required from protocol version 2.
+    pub domain_placement: Option<DomainPlacementManifest>,
 }
 
 impl ProtocolConfig {
@@ -187,6 +343,7 @@ impl ProtocolConfig {
             hash_suite_schedule: HashSuiteScheduleConfig::genesis(),
             protocol_upgrades: ProtocolUpgradeSchedule::new(),
             consensus_parameters: ConsensusParameters::genesis(),
+            domain_placement: None,
         }
     }
 
@@ -216,6 +373,16 @@ impl ProtocolConfig {
         }
         self.protocol_upgrades.validate()?;
         self.consensus_parameters.validate()?;
+        match (self.protocol_version.get(), &self.domain_placement) {
+            (0 | 1, Some(_)) => {
+                return Err(ProtocolConfigError::DomainPlacementRequiresProtocolVersion2);
+            }
+            (2.., None) => return Err(ProtocolConfigError::MissingDomainPlacement),
+            (_, Some(manifest)) if manifest.rule_version == 0 => {
+                return Err(ProtocolConfigError::ZeroDomainPlacementRuleVersion);
+            }
+            _ => {}
+        }
         if let Some(first) = self.protocol_upgrades.upgrades().first()
             && first.from_version != self.protocol_version
         {
@@ -237,7 +404,12 @@ impl ProtocolConfig {
 pub fn encode_protocol_config(config: &ProtocolConfig) -> Result<Vec<u8>, ProtocolConfigError> {
     config.validate()?;
 
-    let mut canonical = CanonicalStruct::new(PROTOCOL_CONFIG_TYPE_ID, ENCODING_VERSION);
+    let encoding_version = if config.domain_placement.is_some() {
+        DOMAIN_PLACEMENT_CONFIG_ENCODING_VERSION
+    } else {
+        ENCODING_VERSION
+    };
+    let mut canonical = CanonicalStruct::new(PROTOCOL_CONFIG_TYPE_ID, encoding_version);
     canonical.field_u32(1, config.protocol_version.get())?;
     canonical.field_u16(2, config.hash_suite_id.get())?;
     canonical.field_bytes(3, encode_commitment_scheme_id(config.commitment_scheme_id)?)?;
@@ -260,6 +432,9 @@ pub fn encode_protocol_config(config: &ProtocolConfig) -> Result<Vec<u8>, Protoc
         13,
         encode_consensus_parameters(config.consensus_parameters)?,
     )?;
+    if let Some(manifest) = &config.domain_placement {
+        canonical.field_bytes(14, encode_domain_placement_manifest(manifest)?)?;
+    }
     Ok(canonical.finish()?)
 }
 
@@ -277,6 +452,15 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn domain_manifest(byte: u8, activation_epoch: u64) -> DomainPlacementManifest {
+        DomainPlacementManifest::single_domain(
+            1,
+            AtomicityDomainId::new([byte; 32]).unwrap(),
+            Epoch::new(activation_epoch),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -359,11 +543,15 @@ mod tests {
         let mut config = ProtocolConfig::genesis();
         let v1 = encode_protocol_config(&config).unwrap();
         config.protocol_version = ProtocolVersion::new(2);
+        config.domain_placement = Some(domain_manifest(0x11, 7));
         let v2 = encode_protocol_config(&config).unwrap();
 
         assert_ne!(v1, v2);
-        assert!(hex(&v1).contains("01000000"));
-        assert!(hex(&v2).contains("02000000"));
+        assert_eq!(&v1[6..8], &ENCODING_VERSION.to_le_bytes());
+        assert_eq!(
+            &v2[6..8],
+            &DOMAIN_PLACEMENT_CONFIG_ENCODING_VERSION.to_le_bytes()
+        );
     }
 
     #[test]
@@ -382,6 +570,7 @@ mod tests {
             hash_suite_schedule: HashSuiteScheduleConfig::genesis(),
             protocol_upgrades: ProtocolUpgradeSchedule::new(),
             consensus_parameters: ConsensusParameters::genesis(),
+            domain_placement: None,
         })
         .unwrap_err();
 
@@ -404,10 +593,79 @@ mod tests {
             hash_suite_schedule: HashSuiteScheduleConfig::genesis(),
             protocol_upgrades: ProtocolUpgradeSchedule::new(),
             consensus_parameters: ConsensusParameters::genesis(),
+            domain_placement: None,
         })
         .unwrap_err();
 
         assert_eq!(err, ProtocolConfigError::ZeroHashSuiteId);
+    }
+
+    #[test]
+    fn domain_placement_manifest_has_a_stable_canonical_vector() {
+        let manifest = domain_manifest(0x11, 7);
+        assert_eq!(manifest.rule_version(), 1);
+        assert_eq!(manifest.rule(), DomainPlacementRule::AllState);
+        assert_eq!(manifest.activation_epoch(), Epoch::new(7));
+        assert_eq!(
+            manifest.resolve_domain(Epoch::new(7), 1),
+            Ok(manifest.domain())
+        );
+        assert_eq!(
+            manifest.resolve_domain(Epoch::new(7), 0),
+            Err(ProtocolConfigError::EmptyDomainAccessPlan)
+        );
+        assert_eq!(
+            manifest.resolve_domain(Epoch::new(6), 1),
+            Err(ProtocolConfigError::InactiveDomainPlacement {
+                activation_epoch: Epoch::new(7),
+                event_epoch: Epoch::new(6),
+            })
+        );
+        assert_eq!(
+            hex(&encode_domain_placement_manifest(&manifest).unwrap()),
+            concat!(
+                "534e52450b5001000400",
+                "01000400000001000000",
+                "020020000000",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                "030012000000",
+                "534e52450a50010001000100020000000100",
+                "0400080000000700000000000000"
+            )
+        );
+    }
+
+    #[test]
+    fn domain_placement_has_an_explicit_protocol_config_version_boundary() {
+        assert_eq!(
+            DomainPlacementManifest::single_domain(
+                0,
+                AtomicityDomainId::new([0x22; 32]).unwrap(),
+                Epoch::new(7),
+            ),
+            Err(ProtocolConfigError::ZeroDomainPlacementRuleVersion)
+        );
+
+        let mut legacy = ProtocolConfig::genesis();
+        legacy.domain_placement = Some(domain_manifest(0x22, 7));
+        assert_eq!(
+            legacy.validate(),
+            Err(ProtocolConfigError::DomainPlacementRequiresProtocolVersion2)
+        );
+
+        let mut missing = ProtocolConfig::genesis();
+        missing.protocol_version = ProtocolVersion::new(2);
+        assert_eq!(
+            missing.validate(),
+            Err(ProtocolConfigError::MissingDomainPlacement)
+        );
+
+        missing.domain_placement = Some(domain_manifest(0x22, 7));
+        assert!(missing.validate().is_ok());
+        assert_ne!(
+            encode_protocol_config(&missing).unwrap(),
+            encode_protocol_config(&ProtocolConfig::genesis()).unwrap()
+        );
     }
 
     #[test]
