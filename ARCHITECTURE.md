@@ -492,8 +492,11 @@ jobs. Liveness remains on the async executor and is outside this admission
 pool. The adapter deliberately does not impose an HTTP timeout on started
 blocking jobs: Tokio cannot abort `spawn_blocking` work after it starts, so
 returning a timeout while a database commit may continue would create ambiguous
-client semantics. Storage-aware deadlines, cooperative cancellation before
-commit, shutdown budgets, load capacity, and circuit breaking remain required.
+client semantics. The structured durable route supplies a storage-aware deadline
+and checks an explicit cooperative cancellation signal before blocking dispatch,
+at blocking-job entry, and immediately before its first storage call. Legacy
+routes, client-disconnect wiring, shutdown budgets, cancellation of started
+transport/storage work, load capacity, and circuit breaking remain required.
 
 An embedding scheduler may call `recover_outboxes_once` without an active HTTP
 request. It scans one bounded outbox-key page, validates delivery/batch identity
@@ -922,6 +925,18 @@ abrupt failure, backup/restore, capacity, and real failover remain
 backend-specific evidence. Passing this suite is As-Is contract evidence, not
 production certification.
 
+A cancellation-enabled normalized native composition accepts and owns an
+explicit trusted `InvocationCancellation` signal. It checks that signal in the
+async request handler, again when the bounded blocking job begins, and
+immediately before the first structured storage call. Cancellation at any of
+those checkpoints returns 503 without state, receipt, outbox, send, or
+acknowledgement effects. Once the first storage call starts, the job never
+consults the signal again and completes commit/delivery reconciliation normally.
+This deliberately does not cancel started synchronous PostgreSQL work or
+manufacture `IndeterminateCommitReason::CancellationRequested`;
+client-disconnect wiring, shutdown budgets, and in-flight cancellation remain
+separate work.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -1200,3 +1215,15 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   the work. Keep induced database aborts and schema skew as adapter capabilities,
   and keep commit-loss, abrupt-fault, backup/restore, capacity, and real failover
   outside this As-Is contract evidence.
+- DR-0062: Add cooperative native cancellation only before a structured
+  request's first durable storage dispatch. A cancellation-enabled composition
+  supplies an explicit signal checked before blocking dispatch, at blocking-job
+  entry, and immediately before the first storage call; after that call begins,
+  ignore later cancellation and finish commit, claim, send, and acknowledgement
+  reconciliation. Keep the signal out of `DurableOperationContext` and
+  durable-store traits so adapters do not claim they can stop started synchronous
+  work. Extend shared conformance
+  with the exact expired-deadline boundary and PostgreSQL evidence with pool and
+  row-lock deadline exhaustion plus conservative commit-boundary classification.
+  Keep client disconnect, shutdown budgets, in-flight database cancellation,
+  commit loss, and capacity/fault certification deferred.

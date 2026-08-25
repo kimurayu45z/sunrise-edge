@@ -75,7 +75,10 @@ pub trait DurableStoreFixture {
     /// Returns the fixture's initial authoritative writer generation.
     fn initial_writer_fence(&self) -> WriterFenceGeneration;
 
-    /// Creates a live operation context using the fixture's trusted clock.
+    /// Creates an operation context using the fixture's trusted clock.
+    ///
+    /// A zero budget must set the deadline to the current trusted time so the
+    /// shared suite can exercise the exact expired-boundary rule.
     fn live_context(
         &self,
         writer_fence: WriterFenceGeneration,
@@ -267,6 +270,184 @@ fn commit_concurrently<S: StructuredDurableDomainStateStore + Send + Sync + 'sta
         .join()
         .map_err(|_| ConformanceFailure::new(case, "second commit thread panicked"))?;
     Ok([first, second])
+}
+
+fn deadline_conformance<F: DurableStoreFixture>(fixture: &F) -> ConformanceResult {
+    const CASE: &str = "deadline-before-dispatch";
+    let store: Arc<F::Store> = fixture.store();
+    let domain: AtomicityDomainId = fixture.domain();
+    let fence: WriterFenceGeneration = fixture.initial_writer_fence();
+    let expired_context: DurableOperationContext =
+        fixture.live_context(fence, 0x06, std::time::Duration::ZERO)?;
+    let key: Vec<u8> = b"conformance/deadline".to_vec();
+
+    let read: Result<VersionedStateValue, DurableReadError> =
+        store.get_versioned_durable(&expired_context, domain, &key);
+    if read != Err(DurableReadError::DeadlineExceeded) {
+        return Err(mismatch(
+            CASE,
+            "a context at its exact deadline boundary must reject the state read",
+            &read,
+        ));
+    }
+    let receipt_read: Result<Option<DurableRequestReceipt>, DurableReadError> =
+        store.get_request_receipt(&expired_context, domain, request_id(CASE, 0x71)?);
+    if receipt_read != Err(DurableReadError::DeadlineExceeded) {
+        return Err(mismatch(
+            CASE,
+            "an expired context must reject the receipt read",
+            &receipt_read,
+        ));
+    }
+
+    let atomic: AtomicStateTransaction = AtomicStateTransaction::new(
+        domain,
+        AtomicStateReadSet::new(vec![
+            StateReadAssertion::new(key.clone(), StateRevision::INITIAL)
+                .map_err(|error| ConformanceFailure::new(CASE, error.to_string()))?,
+        ])
+        .map_err(|error| ConformanceFailure::new(CASE, error.to_string()))?,
+        AtomicStateMutationSet::new(vec![
+            StateMutationEntry::new(key.clone(), StateMutation::Put(vec![0x71]))
+                .map_err(|error| ConformanceFailure::new(CASE, error.to_string()))?,
+        ])
+        .map_err(|error| ConformanceFailure::new(CASE, error.to_string()))?,
+    )
+    .map_err(|error| ConformanceFailure::new(CASE, error.to_string()))?;
+    let atomic_outcome: DurableCommitOutcome = store.commit_durable(&expired_context, atomic);
+    if atomic_outcome
+        != DurableCommitOutcome::Rejected(DurableCommitRejection::DeadlineExceededBeforeCommit)
+    {
+        return Err(mismatch(
+            CASE,
+            "an expired atomic commit must be a definite pre-dispatch rejection",
+            &atomic_outcome,
+        ));
+    }
+
+    let request_byte: u8 = 0x72;
+    let invocation_outcome: DurableCommitOutcome = store.commit_invocation(
+        &expired_context,
+        invocation(
+            CASE,
+            domain,
+            request_byte,
+            vec![(key.clone(), StateRevision::INITIAL)],
+            vec![(key.clone(), StateMutation::Put(vec![request_byte]))],
+            vec![vec![request_byte]],
+        )?,
+    );
+    if invocation_outcome
+        != DurableCommitOutcome::Rejected(DurableCommitRejection::DeadlineExceededBeforeCommit)
+    {
+        return Err(mismatch(
+            CASE,
+            "an expired structured commit must be a definite pre-dispatch rejection",
+            &invocation_outcome,
+        ));
+    }
+
+    let outbox_request: OutboxRequestId = outbox_request_id(CASE, request_byte)?;
+    let exact_claim: DurableOutboxClaimOutcome = store.claim_request_outbox(
+        &expired_context,
+        RequestOutboxClaimRequest::new(
+            domain,
+            outbox_request,
+            OUTBOX_NOW,
+            lease_id(CASE, 0x73)?,
+            OUTBOX_NOW + OUTBOX_LEASE_MILLIS,
+        )
+        .map_err(|error| ConformanceFailure::new(CASE, error.to_string()))?,
+    );
+    if exact_claim
+        != DurableOutboxClaimOutcome::Rejected(
+            DurableOutboxClaimRejection::DeadlineExceededBeforeCommit,
+        )
+    {
+        return Err(mismatch(
+            CASE,
+            "an expired exact claim must be a definite pre-dispatch rejection",
+            &exact_claim,
+        ));
+    }
+    let due_claim: DurableOutboxClaimOutcome = store.claim_due_outbox(
+        &expired_context,
+        DueOutboxClaimRequest::new(
+            domain,
+            OUTBOX_NOW,
+            lease_id(CASE, 0x74)?,
+            OUTBOX_NOW + OUTBOX_LEASE_MILLIS,
+        )
+        .map_err(|error| ConformanceFailure::new(CASE, error.to_string()))?,
+    );
+    if due_claim
+        != DurableOutboxClaimOutcome::Rejected(
+            DurableOutboxClaimRejection::DeadlineExceededBeforeCommit,
+        )
+    {
+        return Err(mismatch(
+            CASE,
+            "an expired due claim must be a definite pre-dispatch rejection",
+            &due_claim,
+        ));
+    }
+    let acknowledgement: DurableOutboxAcknowledgementOutcome = store.acknowledge_outbox(
+        &expired_context,
+        DurableOutboxAcknowledgement::new(domain, outbox_request, 0, lease_id(CASE, 0x75)?),
+    );
+    if acknowledgement
+        != DurableOutboxAcknowledgementOutcome::Rejected(
+            DurableOutboxAcknowledgementRejection::DeadlineExceededBeforeCommit,
+        )
+    {
+        return Err(mismatch(
+            CASE,
+            "an expired acknowledgement must be a definite pre-dispatch rejection",
+            &acknowledgement,
+        ));
+    }
+
+    let live_context: DurableOperationContext = build_context(fixture, fence, 0x07)?;
+    let unchanged: VersionedStateValue =
+        store
+            .get_versioned_durable(&live_context, domain, &key)
+            .map_err(|error| mismatch(CASE, "post-deadline state read must succeed", &error))?;
+    if unchanged.revision() != StateRevision::INITIAL || unchanged.value().is_some() {
+        return Err(mismatch(
+            CASE,
+            "deadline rejection must publish no state mutation",
+            &unchanged,
+        ));
+    }
+    let receipt: Option<DurableRequestReceipt> = store
+        .get_request_receipt(&live_context, domain, request_id(CASE, request_byte)?)
+        .map_err(|error| mismatch(CASE, "post-deadline receipt read must succeed", &error))?;
+    if receipt.is_some() {
+        return Err(mismatch(
+            CASE,
+            "deadline rejection must publish no receipt",
+            &receipt,
+        ));
+    }
+    let live_claim: DurableOutboxClaimOutcome = store.claim_request_outbox(
+        &live_context,
+        RequestOutboxClaimRequest::new(
+            domain,
+            outbox_request,
+            OUTBOX_NOW,
+            lease_id(CASE, 0x76)?,
+            OUTBOX_NOW + OUTBOX_LEASE_MILLIS,
+        )
+        .map_err(|error| ConformanceFailure::new(CASE, error.to_string()))?,
+    );
+    if live_claim != DurableOutboxClaimOutcome::NoDueWork {
+        return Err(mismatch(
+            CASE,
+            "deadline rejection must publish no outbox work",
+            &live_claim,
+        ));
+    }
+    Ok(())
 }
 
 fn complete_read_and_serialization_conformance<F: DurableStoreFixture>(
@@ -850,6 +1031,7 @@ fn writer_fence_conformance<F: DurableStoreFixture>(
 /// The fixture is consumed logically: it must not be reused for another run.
 pub fn run_durable_store_conformance<F: DurableStoreFixture>(fixture: &F) -> ConformanceResult {
     let initial_fence: WriterFenceGeneration = fixture.initial_writer_fence();
+    deadline_conformance(fixture)?;
     let complete_read_context: DurableOperationContext =
         build_context(fixture, initial_fence, 0x01)?;
     complete_read_and_serialization_conformance(fixture, complete_read_context)?;

@@ -1768,21 +1768,25 @@ fn classify_outbox_acknowledgement_commit_error(
 fn finalize_commit(transaction: postgres::Transaction<'_>) -> DurableCommitOutcome {
     match transaction.commit() {
         Ok(()) => DurableCommitOutcome::Committed,
-        Err(error) => match error.code().map(postgres::error::SqlState::code) {
-            Some("40001" | "40P01") => {
-                DurableCommitOutcome::Rejected(DurableCommitRejection::SerializationFailure)
-            }
-            Some("3F000" | "42P01" | "42703" | "42883") => {
-                DurableCommitOutcome::Rejected(DurableCommitRejection::SchemaMismatch)
-            }
-            Some(code) if code.starts_with("22") || code.starts_with("23") => {
-                DurableCommitOutcome::Rejected(DurableCommitRejection::InvalidPersistedState)
-            }
-            Some("57014") => {
-                DurableCommitOutcome::Indeterminate(IndeterminateCommitReason::DeadlineExceeded)
-            }
-            _ => DurableCommitOutcome::Indeterminate(IndeterminateCommitReason::ConnectionLost),
-        },
+        Err(error) => classify_commit_error(error.code().map(postgres::error::SqlState::code)),
+    }
+}
+
+fn classify_commit_error(sqlstate: Option<&str>) -> DurableCommitOutcome {
+    match sqlstate {
+        Some("40001" | "40P01") => {
+            DurableCommitOutcome::Rejected(DurableCommitRejection::SerializationFailure)
+        }
+        Some("3F000" | "42P01" | "42703" | "42883") => {
+            DurableCommitOutcome::Rejected(DurableCommitRejection::SchemaMismatch)
+        }
+        Some(code) if code.starts_with("22") || code.starts_with("23") => {
+            DurableCommitOutcome::Rejected(DurableCommitRejection::InvalidPersistedState)
+        }
+        Some("57014") => {
+            DurableCommitOutcome::Indeterminate(IndeterminateCommitReason::DeadlineExceeded)
+        }
+        _ => DurableCommitOutcome::Indeterminate(IndeterminateCommitReason::ConnectionLost),
     }
 }
 
@@ -2677,7 +2681,21 @@ mod tests {
     }
 
     #[test]
-    fn unknown_outbox_commit_results_remain_indeterminate() {
+    fn commit_boundary_errors_preserve_deadline_ambiguity() {
+        assert_eq!(
+            classify_commit_error(Some("57014")),
+            DurableCommitOutcome::Indeterminate(IndeterminateCommitReason::DeadlineExceeded)
+        );
+        assert_eq!(
+            classify_outbox_claim_commit_error(Some("57014")),
+            DurableOutboxClaimOutcome::Indeterminate(IndeterminateCommitReason::DeadlineExceeded)
+        );
+        assert_eq!(
+            classify_outbox_acknowledgement_commit_error(Some("57014")),
+            DurableOutboxAcknowledgementOutcome::Indeterminate(
+                IndeterminateCommitReason::DeadlineExceeded
+            )
+        );
         assert_eq!(
             classify_outbox_claim_commit_error(None),
             DurableOutboxClaimOutcome::Indeterminate(IndeterminateCommitReason::ConnectionLost)
@@ -2695,6 +2713,10 @@ mod tests {
         assert_eq!(
             classify_outbox_claim_commit_error(Some("40001")),
             DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::SerializationFailure)
+        );
+        assert_eq!(
+            classify_commit_error(None),
+            DurableCommitOutcome::Indeterminate(IndeterminateCommitReason::ConnectionLost)
         );
     }
 }

@@ -92,11 +92,12 @@ cross-provider ingress milestones implemented through Phase 17:
   only within an explicit attempt ceiling and remaining deadline. Indexed
   exact-request/due claim and acknowledgement now use retained attempt history.
   One feature-gated shared suite exercises complete-read write skew,
-  absent/tombstone races, definite contention classification, and lease/writer
-  fencing against memory and PostgreSQL; the live PostgreSQL fixture additionally
-  injects retry exhaustion and schema skew when its required test URL is set.
-  Broader fault, operations, and production certification remain pending, so
-  this is still As-Is evidence.
+  absent/tombstone races, exact-boundary pre-dispatch deadlines, definite
+  contention classification, and lease/writer fencing against memory and
+  PostgreSQL; the live PostgreSQL fixture additionally injects pool/row-lock
+  deadline exhaustion, retry exhaustion, and schema skew when its required test
+  URL is set. Broader fault, operations, and production certification remain
+  pending, so this is still As-Is evidence.
 - An explicit `ComposedRuntime` for assembling independently selected state,
   blob, signer, transport, clock, and scheduler components without hidden
   defaults. Native conformance tests close/reopen SQLite into a new composition,
@@ -208,7 +209,7 @@ cross-provider ingress milestones implemented through Phase 17:
   concrete proof backends are not yet implemented.
 
 Important remaining work includes the owned-object fast path, concrete
-node-event dispatch and protocol handlers, cancellable durable-I/O deadlines,
+node-event dispatch and protocol handlers, in-flight durable-I/O cancellation,
 real provider trigger wiring, abrupt process/power-fault recovery conformance,
 portable system-module
 execution, cryptographic slashing proof verification, fee-object debiting,
@@ -220,10 +221,11 @@ production exit criteria in [`TODO.md`](TODO.md) and the accepted
 [persistence design](PERSISTENCE.md): implement the accepted
 [PostgreSQL reference design](POSTGRES.md): extend the now-implemented fenced
 structured commit, indexed outbox adapter, and shared memory/PostgreSQL
-conformance with deadline/cancellation and capacity evidence. Abrupt fault,
-backup/restore, real writer failover, and provider conformance follow on that
-foundation. Phase 16/17 provider trust, deployment, observability, and release
-rehearsal remain required.
+conformance with capacity evidence. Native structured requests now honor an
+explicit cooperative cancellation signal only before first storage dispatch;
+client-disconnect cancellation, abrupt fault, backup/restore, real writer
+failover, and provider conformance follow on that foundation. Phase 16/17
+provider trust, deployment, observability, and release rehearsal remain required.
 
 ## Workspace map
 

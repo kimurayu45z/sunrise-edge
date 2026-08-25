@@ -212,6 +212,13 @@ The pure node transition is not rerun inside the driver. Any serialization
 retry reuses the same structured envelope and read assertions. Once its deadline
 or retry budget ends, policy returns to composition.
 
+Live PostgreSQL conformance holds the only pool connection past a short
+operation deadline and separately holds the fenced metadata row past its local
+lock timeout. Pool acquisition returns a definite read deadline; row-lock expiry
+returns a definite pre-commit deadline and publishes no state. SQLSTATE `57014`
+at the commit boundary remains indeterminate for structured commit, claim, and
+acknowledgement because PostgreSQL does not prove whether dispatch completed.
+
 ## 6. Indexed claim and acknowledgement
 
 Claim first checks the lease-attempt identity. A matching active attempt returns
@@ -294,10 +301,12 @@ Passing unit tests, applying the first migration, or implementing Rust traits is
 As-Is progress only, not a production-readiness claim.
 
 The feature-gated shared runtime suite now covers complete-read write skew,
-absent/tombstone races, concurrent definite outcome classification, retained
-lease replacement, and writer-fence handoff against both memory and PostgreSQL.
+the exact expired-deadline boundary, absent/tombstone races, concurrent definite
+outcome classification, retained lease replacement, and writer-fence handoff
+against both memory and PostgreSQL.
 When `SUNRISE_EDGE_TEST_POSTGRES_URL` is configured (as it is in CI), the live
-PostgreSQL fixture additionally covers bounded retry exhaustion, non-active
+PostgreSQL fixture additionally covers pool/row-lock deadline exhaustion,
+commit-boundary deadline ambiguity, bounded retry exhaustion, non-active
 migration-phase rejection, and exact schema-generation/window mismatch across
 read, commit, claim, and acknowledgement. Duplicate request races,
 commit-boundary connection loss,

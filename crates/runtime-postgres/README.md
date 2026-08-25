@@ -31,5 +31,7 @@ SUNRISE_EDGE_TEST_POSTGRES_URL=postgresql://postgres:test@127.0.0.1:5432/sunrise
 
 The test refuses to reset any database with a different name. It runs the same
 feature-gated durable conformance cases as the in-memory fixture and adds live
-serialization-exhaustion plus schema-skew injection. CI supplies a digest-pinned
-PostgreSQL 18 service and runs this test through the normal workspace gate.
+pool/row-lock deadline exhaustion, commit-boundary deadline classification,
+serialization exhaustion, and schema-skew injection. CI supplies a
+digest-pinned PostgreSQL 18 service and runs this test through the normal
+workspace gate.

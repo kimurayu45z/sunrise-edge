@@ -702,6 +702,29 @@ fn postgres_schema_and_durable_store_conformance() {
     assert_eq!(lock_timeout, "0");
     drop(pooled);
 
+    let held_pool_connection = pool.get().unwrap();
+    let pool_wait_now: u64 = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let pool_wait_context: DurableOperationContext = DurableOperationContext::new(
+        initial_fence,
+        StorageDeadline::new(pool_wait_now.checked_add(100).unwrap()).unwrap(),
+        StorageCorrelationId::new([0x64; 16]).unwrap(),
+    );
+    assert_eq!(
+        store.get_versioned_durable(
+            &pool_wait_context,
+            namespace.domain(),
+            b"pool-wait-deadline",
+        ),
+        Err(DurableReadError::DeadlineExceeded)
+    );
+    drop(held_pool_connection);
+
     let mut locker = Client::connect(&url.to_string_lossy(), NoTls).unwrap();
     let mut locker_transaction = locker.transaction().unwrap();
     locker_transaction
@@ -717,6 +740,39 @@ fn postgres_schema_and_durable_store_conformance() {
             ],
         )
         .unwrap();
+    let lock_deadline_key: Vec<u8> = b"lock-wait-deadline".to_vec();
+    let lock_wait_now: u64 = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let lock_wait_context: DurableOperationContext = DurableOperationContext::new(
+        initial_fence,
+        StorageDeadline::new(lock_wait_now.checked_add(100).unwrap()).unwrap(),
+        StorageCorrelationId::new([0x65; 16]).unwrap(),
+    );
+    let lock_wait_transaction: AtomicStateTransaction = AtomicStateTransaction::new(
+        namespace.domain(),
+        AtomicStateReadSet::new(vec![
+            StateReadAssertion::new(lock_deadline_key.clone(), StateRevision::INITIAL).unwrap(),
+        ])
+        .unwrap(),
+        AtomicStateMutationSet::new(vec![
+            StateMutationEntry::new(
+                lock_deadline_key.clone(),
+                StateMutation::Put(b"must-not-commit".to_vec()),
+            )
+            .unwrap(),
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        store.commit_durable(&lock_wait_context, lock_wait_transaction),
+        DurableCommitOutcome::Rejected(DurableCommitRejection::DeadlineExceededBeforeCommit)
+    );
     let retry_key = b"serialization-retry".to_vec();
     let retry_transaction = AtomicStateTransaction::new(
         namespace.domain(),
@@ -768,6 +824,12 @@ fn postgres_schema_and_durable_store_conformance() {
             .unwrap()
             .value(),
         Some(b"retried".as_slice())
+    );
+    assert_eq!(
+        store
+            .get_versioned_durable(&context, namespace.domain(), &lock_deadline_key)
+            .unwrap(),
+        runtime::VersionedStateValue::from_persisted_parts(StateRevision::INITIAL, None).unwrap()
     );
 
     let commit_outbox = |request_byte: u8, payloads: &[&[u8]]| -> DurableRequestId {

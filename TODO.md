@@ -1969,8 +1969,9 @@ Phase 15 As-Is scope:
   （native/memory/PostgreSQL implemented As-Is）。
   PostgreSQL以外のdurable adapter、transport-aware deadline/cancellation、real scheduler bindingは未実装である。
 - runtimeのnon-default `durable-conformance` test supportは同じblack-box caseをmemoryとPostgreSQLで実行し、
-  complete-read write skew、concurrent absent-key create、tombstone ABA、definite contention outcome、retained
-  outbox lease、writer-fence handoffを検証する。PostgreSQL live testはさらにretry ceiling到達時の
+  deadline exact boundaryのread/commit/claim/ack definite rejection、complete-read write skew、concurrent
+  absent-key create、tombstone ABA、definite contention outcome、retained outbox lease、writer-fence handoffを
+  検証する。PostgreSQL live testはさらにpool acquisition/metadata lock待ちdeadline、retry ceiling到達時の
   serialization rejectionとunsupported schema generationのread/commit/claim/ack fail-closedを検証する
   （implemented As-Is）。commit-loss、kill/power fault、disk full、connection exhaustion、backup/restore、
   capacity/load/soak、real writer failover、provider certificationは未実装である。
@@ -2016,8 +2017,10 @@ Phase 15 As-Is scope:
   ないRetry-After値は生成しない。livenessはblocking poolから独立する（implemented As-Is）。
   開始済みspawn_blockingはTokioで
   cancelできないため、HTTP timeoutだけ先に返してcommitを裏で継続する実装は採用しない。
-  storage-aware deadline、commit前cooperative cancellation、shutdown budget、load capacity、
-  circuit breakerはTo-Beに残る。
+  structured durable pathはexplicit trusted cancellation signalをasync handler、blocking job開始、最初のstorage
+  dispatch直前でのみ検査し、cancel済みなら503かつstate/receipt/outbox/send/ackなしで終了する。storage dispatch
+  開始後はsignalを再検査せずcommit/send/ack reconciliationを完遂する（implemented As-Is）。client disconnect、
+  started I/O cancellation、shutdown budget、load capacity、circuit breakerはTo-Beに残る。
 
 Phase 15 To-Be production exit criteria:
 
@@ -2065,10 +2068,12 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
    implemented As-Is; bounded pool、fenced state/receipt read、serializable structured state/receipt/outbox commit、
    statementごとの残deadline timeout、bounded unchanged-envelope serialization retry、typed conflict/indeterminate分類も
    PostgreSQLでimplemented As-Is; indexed exact-request/due claim、same-lease reconciliation、retained attempt history、
-   idempotent ackもPostgreSQLでimplemented As-Is; cancellation/fault/capacity certification pending）。
+   idempotent ack、pool/row-lock deadline exhaustionとcommit-boundary deadline classificationもPostgreSQLで
+   implemented As-Is; in-flight cancellation/fault/capacity certification pending）。
    explicit migrationとshared contract evidenceはimplemented As-Is; broader fault/capacity evidenceは未実装である。
-4. shared conformanceにwrite skew、absent-key race、definite contention classification、lease fencingを追加し、
-   PostgreSQL capability testにserialization failureとschema/version skewを追加する
+4. shared conformanceにexact deadline boundary、write skew、absent-key race、definite contention classification、
+   lease fencingを追加し、PostgreSQL capability testにpool/row-lock deadline、serialization failure、
+   schema/version skewを追加する
    （memory/PostgreSQL implemented As-Is; provider adapters、commit-loss、fault/capacity certification pending）。
 5. kill/power fault、disk full、connection exhaustion、capacity/load/soak、backup/restore、writer failoverをrehearsalする。
 6. 同じcontractをCloudflare Durable ObjectとAWS persistenceへ実装し、real providerでcertifyする。
