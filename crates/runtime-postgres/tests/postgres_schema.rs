@@ -1,12 +1,16 @@
 use postgres::{Client, Config, NoTls, error::SqlState};
 use protocol_types::{AtomicityDomainId, ChainId, Digest32, HashAlgorithmId, ValidatorId};
 use runtime::{
-    AtomicStateMutationSet, AtomicStateReadSet, AtomicStateTransaction, DurableCommitOutcome,
-    DurableCommitRejection, DurableDomainStateStore, DurableInvocationTransaction,
-    DurableObjectChanges, DurableOperationContext, DurableOutboxBatch, DurableOutboxMessage,
-    DurableReadError, DurableRequestId, DurableRequestReceipt, DurableStateTransaction,
-    StateMutation, StateMutationEntry, StateReadAssertion, StateRevision, StorageCorrelationId,
-    StorageDeadline, StructuredDurableDomainStateStore, WriterFenceGeneration,
+    AtomicStateMutationSet, AtomicStateReadSet, AtomicStateTransaction, DueOutboxClaimRequest,
+    DurableCommitOutcome, DurableCommitRejection, DurableDomainStateStore,
+    DurableInvocationTransaction, DurableObjectChanges, DurableOperationContext,
+    DurableOutboxAcknowledgement, DurableOutboxAcknowledgementOutcome,
+    DurableOutboxAcknowledgementRejection, DurableOutboxBatch, DurableOutboxClaimOutcome,
+    DurableOutboxClaimRejection, DurableOutboxLeaseId, DurableOutboxMessage, DurableReadError,
+    DurableRequestId, DurableRequestReceipt, DurableStateTransaction, IndexedOutboxRepository,
+    RequestOutboxClaimRequest, StateMutation, StateMutationEntry, StateReadAssertion,
+    StateRevision, StorageCorrelationId, StorageDeadline, StructuredDurableDomainStateStore,
+    WriterFenceGeneration,
 };
 use runtime_postgres::{
     POSTGRES_SCHEMA_GENERATION, PostgresDurableStore, PostgresNamespace, PostgresPoolConfig,
@@ -582,6 +586,674 @@ fn normalized_schema_bootstrap_and_constraints_hold_in_postgres() {
             .value(),
         Some(b"retried".as_slice())
     );
+
+    let commit_outbox = |request_byte: u8, payloads: &[&[u8]]| -> DurableRequestId {
+        let request_id = DurableRequestId::new([request_byte; 32]).unwrap();
+        let event_digest = Digest32::new(
+            HashAlgorithmId::Sha2_256,
+            [request_byte.wrapping_add(1); 32],
+        );
+        let messages: Vec<DurableOutboxMessage> = payloads
+            .iter()
+            .enumerate()
+            .map(|(index, payload)| {
+                let index_byte = u8::try_from(index).unwrap();
+                DurableOutboxMessage::new(
+                    Digest32::new(
+                        HashAlgorithmId::Sha3_256,
+                        [request_byte.wrapping_add(index_byte).wrapping_add(2); 32],
+                    ),
+                    payload.to_vec(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let invocation = DurableInvocationTransaction::new(
+            namespace.domain(),
+            None,
+            DurableObjectChanges::empty(),
+            DurableRequestReceipt::new(request_id, event_digest, vec![request_byte]).unwrap(),
+            Some(DurableOutboxBatch::new(request_id, event_digest, messages).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            store.commit_invocation(&context, invocation),
+            DurableCommitOutcome::Committed
+        );
+        request_id
+    };
+    let lease =
+        |byte: u8| -> DurableOutboxLeaseId { DurableOutboxLeaseId::new([byte; 32]).unwrap() };
+
+    let preexisting_lease = lease(0x8f);
+    assert!(matches!(
+        store.claim_request_outbox(
+            &context,
+            RequestOutboxClaimRequest::new(
+                namespace.domain(),
+                durable_request_id,
+                1_000,
+                preexisting_lease,
+                2_000,
+            )
+            .unwrap(),
+        ),
+        DurableOutboxClaimOutcome::Claimed(_)
+    ));
+    assert_eq!(
+        store.acknowledge_outbox(
+            &context,
+            DurableOutboxAcknowledgement::new(
+                namespace.domain(),
+                durable_request_id,
+                0,
+                preexisting_lease,
+            ),
+        ),
+        DurableOutboxAcknowledgementOutcome::Acknowledged
+    );
+
+    let older_request = commit_outbox(0x80, &[b"older-due"]);
+    let exact_request = commit_outbox(0x81, &[b"exact-request"]);
+    let exact_lease = lease(0x90);
+    let exact_claim_request = RequestOutboxClaimRequest::new(
+        namespace.domain(),
+        exact_request,
+        1_000,
+        exact_lease,
+        2_000,
+    )
+    .unwrap();
+    let exact_claim = match store.claim_request_outbox(&context, exact_claim_request) {
+        DurableOutboxClaimOutcome::Claimed(claim) => claim,
+        outcome => panic!("exact request claim failed: {outcome:?}"),
+    };
+    assert_eq!(exact_claim.request_id(), exact_request);
+    assert_eq!(exact_claim.message_index(), 0);
+    assert_eq!(exact_claim.canonical_payload(), b"exact-request");
+    let reconciled_claim = store.claim_request_outbox(
+        &context,
+        RequestOutboxClaimRequest::new(
+            namespace.domain(),
+            exact_request,
+            1_001,
+            exact_lease,
+            3_000,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        reconciled_claim,
+        DurableOutboxClaimOutcome::Claimed(exact_claim.clone())
+    );
+    assert_eq!(
+        store.claim_request_outbox(
+            &context,
+            RequestOutboxClaimRequest::new(
+                namespace.domain(),
+                older_request,
+                1_001,
+                exact_lease,
+                3_000,
+            )
+            .unwrap(),
+        ),
+        DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::LeaseIdReuse)
+    );
+    let other_domain = AtomicityDomainId::new([0x23; 32]).unwrap();
+    assert_eq!(
+        store.claim_request_outbox(
+            &context,
+            RequestOutboxClaimRequest::new(other_domain, exact_request, 1_001, exact_lease, 3_000,)
+                .unwrap(),
+        ),
+        DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::LeaseIdReuse)
+    );
+    assert_eq!(
+        store.acknowledge_outbox(
+            &context,
+            DurableOutboxAcknowledgement::new(namespace.domain(), exact_request, 0, exact_lease,),
+        ),
+        DurableOutboxAcknowledgementOutcome::Acknowledged
+    );
+
+    let older_lease = lease(0x91);
+    assert!(matches!(
+        store.claim_request_outbox(
+            &context,
+            RequestOutboxClaimRequest::new(
+                namespace.domain(),
+                older_request,
+                1_000,
+                older_lease,
+                2_000,
+            )
+            .unwrap(),
+        ),
+        DurableOutboxClaimOutcome::Claimed(_)
+    ));
+    assert_eq!(
+        store.acknowledge_outbox(
+            &context,
+            DurableOutboxAcknowledgement::new(namespace.domain(), older_request, 0, older_lease,),
+        ),
+        DurableOutboxAcknowledgementOutcome::Acknowledged
+    );
+
+    let later_ordered_request = commit_outbox(0x84, &[b"later-ordered"]);
+    let first_ordered_request = commit_outbox(0x83, &[b"first-ordered"]);
+    let first_ordered_lease = lease(0x92);
+    let first_ordered_claim = match store.claim_due_outbox(
+        &context,
+        DueOutboxClaimRequest::new(namespace.domain(), 1_000, first_ordered_lease, 2_000).unwrap(),
+    ) {
+        DurableOutboxClaimOutcome::Claimed(claim) => claim,
+        outcome => panic!("stable due claim failed: {outcome:?}"),
+    };
+    assert_eq!(first_ordered_claim.request_id(), first_ordered_request);
+    assert_eq!(
+        store.acknowledge_outbox(
+            &context,
+            DurableOutboxAcknowledgement::new(
+                namespace.domain(),
+                first_ordered_request,
+                0,
+                first_ordered_lease,
+            ),
+        ),
+        DurableOutboxAcknowledgementOutcome::Acknowledged
+    );
+    let later_ordered_lease = lease(0x93);
+    let later_ordered_claim = match store.claim_due_outbox(
+        &context,
+        DueOutboxClaimRequest::new(namespace.domain(), 1_000, later_ordered_lease, 2_000).unwrap(),
+    ) {
+        DurableOutboxClaimOutcome::Claimed(claim) => claim,
+        outcome => panic!("second stable due claim failed: {outcome:?}"),
+    };
+    assert_eq!(later_ordered_claim.request_id(), later_ordered_request);
+    assert_eq!(
+        store.acknowledge_outbox(
+            &context,
+            DurableOutboxAcknowledgement::new(
+                namespace.domain(),
+                later_ordered_request,
+                0,
+                later_ordered_lease,
+            ),
+        ),
+        DurableOutboxAcknowledgementOutcome::Acknowledged
+    );
+
+    let multi_request = commit_outbox(0x85, &[b"multi-0", b"multi-1"]);
+    let first_multi_lease = lease(0x94);
+    let first_multi_claim = match store.claim_request_outbox(
+        &context,
+        RequestOutboxClaimRequest::new(
+            namespace.domain(),
+            multi_request,
+            1_000,
+            first_multi_lease,
+            2_000,
+        )
+        .unwrap(),
+    ) {
+        DurableOutboxClaimOutcome::Claimed(claim) => claim,
+        outcome => panic!("first multi-message claim failed: {outcome:?}"),
+    };
+    assert_eq!(first_multi_claim.message_index(), 0);
+    let first_multi_acknowledgement =
+        DurableOutboxAcknowledgement::new(namespace.domain(), multi_request, 0, first_multi_lease);
+    assert_eq!(
+        store.acknowledge_outbox(&context, first_multi_acknowledgement),
+        DurableOutboxAcknowledgementOutcome::Acknowledged
+    );
+    let second_multi_lease = lease(0x95);
+    let second_multi_claim = match store.claim_request_outbox(
+        &context,
+        RequestOutboxClaimRequest::new(
+            namespace.domain(),
+            multi_request,
+            1_000,
+            second_multi_lease,
+            2_000,
+        )
+        .unwrap(),
+    ) {
+        DurableOutboxClaimOutcome::Claimed(claim) => claim,
+        outcome => panic!("second multi-message claim failed: {outcome:?}"),
+    };
+    assert_eq!(second_multi_claim.message_index(), 1);
+    assert_eq!(
+        store.acknowledge_outbox(
+            &context,
+            DurableOutboxAcknowledgement::new(
+                namespace.domain(),
+                multi_request,
+                1,
+                second_multi_lease,
+            ),
+        ),
+        DurableOutboxAcknowledgementOutcome::Acknowledged
+    );
+    assert_eq!(
+        store.acknowledge_outbox(&context, first_multi_acknowledgement),
+        DurableOutboxAcknowledgementOutcome::Acknowledged
+    );
+    let completed_row = client
+        .query_one(
+            "SELECT next_message_index, state_id
+             FROM sunrise_edge.outbox_delivery
+             WHERE chain_id_bytes = $1 AND validator_id = $2
+               AND atomicity_domain_id = $3 AND request_id = $4",
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&multi_request.as_bytes()[..],
+            ],
+        )
+        .unwrap();
+    assert_eq!(completed_row.get::<_, i32>(0), 2);
+    assert_eq!(completed_row.get::<_, i16>(1), 2);
+    assert_eq!(
+        store.claim_request_outbox(
+            &context,
+            RequestOutboxClaimRequest::new(
+                namespace.domain(),
+                multi_request,
+                1_000,
+                lease(0x96),
+                2_000,
+            )
+            .unwrap(),
+        ),
+        DurableOutboxClaimOutcome::NoDueWork
+    );
+
+    let expiry_request = commit_outbox(0x86, &[b"expiry"]);
+    let expired_lease = lease(0x97);
+    assert!(matches!(
+        store.claim_request_outbox(
+            &context,
+            RequestOutboxClaimRequest::new(
+                namespace.domain(),
+                expiry_request,
+                1_000,
+                expired_lease,
+                2_000,
+            )
+            .unwrap(),
+        ),
+        DurableOutboxClaimOutcome::Claimed(_)
+    ));
+    let replacement_lease = lease(0x98);
+    assert!(matches!(
+        store.claim_request_outbox(
+            &context,
+            RequestOutboxClaimRequest::new(
+                namespace.domain(),
+                expiry_request,
+                2_000,
+                replacement_lease,
+                3_000,
+            )
+            .unwrap(),
+        ),
+        DurableOutboxClaimOutcome::Claimed(_)
+    ));
+    let expired_attempt_state: i16 = client
+        .query_one(
+            "SELECT state_id FROM sunrise_edge.outbox_delivery_attempts
+             WHERE chain_id_bytes = $1 AND validator_id = $2
+               AND atomicity_domain_id = $3 AND lease_id = $4",
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&expired_lease.as_bytes()[..],
+            ],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(expired_attempt_state, 3);
+    assert_eq!(
+        store.acknowledge_outbox(
+            &context,
+            DurableOutboxAcknowledgement::new(
+                namespace.domain(),
+                expiry_request,
+                0,
+                replacement_lease,
+            ),
+        ),
+        DurableOutboxAcknowledgementOutcome::Acknowledged
+    );
+
+    let serialization_request = commit_outbox(0x8b, &[b"claim-serialization-retry"]);
+    let mut outbox_locker = Client::connect(&url.to_string_lossy(), NoTls).unwrap();
+    let mut outbox_locker_transaction = outbox_locker.transaction().unwrap();
+    outbox_locker_transaction
+        .execute(
+            "UPDATE sunrise_edge.outbox_delivery
+             SET last_error_class_id = last_error_class_id
+             WHERE chain_id_bytes = $1 AND validator_id = $2
+               AND atomicity_domain_id = $3 AND request_id = $4",
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&serialization_request.as_bytes()[..],
+            ],
+        )
+        .unwrap();
+    let serialization_store = Arc::clone(&store);
+    let serialization_context = context;
+    let serialization_domain = namespace.domain();
+    let serialization_lease = lease(0x9f);
+    let serialization_handle = thread::spawn(move || {
+        serialization_store.claim_request_outbox(
+            &serialization_context,
+            RequestOutboxClaimRequest::new(
+                serialization_domain,
+                serialization_request,
+                1_000,
+                serialization_lease,
+                2_000,
+            )
+            .unwrap(),
+        )
+    });
+    let mut observed_outbox_lock_wait = false;
+    for _ in 0..2_000 {
+        observed_outbox_lock_wait = client
+            .query_one(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                     WHERE application_name = 'sunrise-edge-pr72-test'
+                       AND wait_event_type = 'Lock'
+                 )",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        if observed_outbox_lock_wait {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        observed_outbox_lock_wait,
+        "adapter never reached the outbox delivery lock"
+    );
+    outbox_locker_transaction.commit().unwrap();
+    assert!(matches!(
+        serialization_handle.join().unwrap(),
+        DurableOutboxClaimOutcome::Claimed(_)
+    ));
+    assert_eq!(
+        store.acknowledge_outbox(
+            &context,
+            DurableOutboxAcknowledgement::new(
+                namespace.domain(),
+                serialization_request,
+                0,
+                serialization_lease,
+            ),
+        ),
+        DurableOutboxAcknowledgementOutcome::Acknowledged
+    );
+
+    let authority_request = commit_outbox(0x87, &[b"authority"]);
+    assert!(matches!(
+        store.claim_request_outbox(
+            &stale_context,
+            RequestOutboxClaimRequest::new(
+                namespace.domain(),
+                authority_request,
+                1_000,
+                lease(0x99),
+                2_000,
+            )
+            .unwrap(),
+        ),
+        DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::WriterFenced {
+            active_generation
+        }) if active_generation == initial_fence
+    ));
+    assert_eq!(
+        store.claim_request_outbox(
+            &expired_context,
+            RequestOutboxClaimRequest::new(
+                namespace.domain(),
+                authority_request,
+                1_000,
+                lease(0x9a),
+                2_000,
+            )
+            .unwrap(),
+        ),
+        DurableOutboxClaimOutcome::Rejected(
+            DurableOutboxClaimRejection::DeadlineExceededBeforeCommit
+        )
+    );
+    let authority_row = client
+        .query_one(
+            "SELECT active_lease_id, attempt_count::TEXT, revision::TEXT
+             FROM sunrise_edge.outbox_delivery
+             WHERE chain_id_bytes = $1 AND validator_id = $2
+               AND atomicity_domain_id = $3 AND request_id = $4",
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&authority_request.as_bytes()[..],
+            ],
+        )
+        .unwrap();
+    assert_eq!(authority_row.get::<_, Option<Vec<u8>>>(0), None);
+    assert_eq!(authority_row.get::<_, String>(1), "0");
+    assert_eq!(authority_row.get::<_, String>(2), "1");
+    let authority_lease = lease(0x9b);
+    assert!(matches!(
+        store.claim_request_outbox(
+            &context,
+            RequestOutboxClaimRequest::new(
+                namespace.domain(),
+                authority_request,
+                1_000,
+                authority_lease,
+                2_000,
+            )
+            .unwrap(),
+        ),
+        DurableOutboxClaimOutcome::Claimed(_)
+    ));
+    let authority_ack = DurableOutboxAcknowledgement::new(
+        namespace.domain(),
+        authority_request,
+        0,
+        authority_lease,
+    );
+    assert!(matches!(
+        store.acknowledge_outbox(&stale_context, authority_ack),
+        DurableOutboxAcknowledgementOutcome::Rejected(
+            DurableOutboxAcknowledgementRejection::WriterFenced { active_generation }
+        ) if active_generation == initial_fence
+    ));
+    assert_eq!(
+        store.acknowledge_outbox(&expired_context, authority_ack),
+        DurableOutboxAcknowledgementOutcome::Rejected(
+            DurableOutboxAcknowledgementRejection::DeadlineExceededBeforeCommit
+        )
+    );
+    assert_eq!(
+        store.acknowledge_outbox(&context, authority_ack),
+        DurableOutboxAcknowledgementOutcome::Acknowledged
+    );
+
+    let attempt_overflow_request = commit_outbox(0x88, &[b"attempt-overflow"]);
+    client
+        .execute(
+            "UPDATE sunrise_edge.outbox_delivery
+             SET attempt_count = 18446744073709551615
+             WHERE chain_id_bytes = $1 AND validator_id = $2
+               AND atomicity_domain_id = $3 AND request_id = $4",
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&attempt_overflow_request.as_bytes()[..],
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        store.claim_request_outbox(
+            &context,
+            RequestOutboxClaimRequest::new(
+                namespace.domain(),
+                attempt_overflow_request,
+                1_000,
+                lease(0x9c),
+                2_000,
+            )
+            .unwrap(),
+        ),
+        DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::ArithmeticOverflow)
+    );
+    let overflow_attempt_count: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM sunrise_edge.outbox_delivery_attempts
+             WHERE chain_id_bytes = $1 AND validator_id = $2
+               AND atomicity_domain_id = $3 AND request_id = $4",
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&attempt_overflow_request.as_bytes()[..],
+            ],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(overflow_attempt_count, 0);
+
+    let revision_overflow_request = commit_outbox(0x89, &[b"revision-overflow"]);
+    client
+        .execute(
+            "UPDATE sunrise_edge.outbox_delivery
+             SET revision = 18446744073709551615
+             WHERE chain_id_bytes = $1 AND validator_id = $2
+               AND atomicity_domain_id = $3 AND request_id = $4",
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&revision_overflow_request.as_bytes()[..],
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        store.claim_request_outbox(
+            &context,
+            RequestOutboxClaimRequest::new(
+                namespace.domain(),
+                revision_overflow_request,
+                1_000,
+                lease(0x9d),
+                2_000,
+            )
+            .unwrap(),
+        ),
+        DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::ArithmeticOverflow)
+    );
+    let overflow_revision_attempt_count: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM sunrise_edge.outbox_delivery_attempts
+             WHERE chain_id_bytes = $1 AND validator_id = $2
+               AND atomicity_domain_id = $3 AND request_id = $4",
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&revision_overflow_request.as_bytes()[..],
+            ],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(overflow_revision_attempt_count, 0);
+
+    let acknowledgement_overflow_request = commit_outbox(0x8a, &[b"ack-overflow"]);
+    let acknowledgement_overflow_lease = lease(0x9e);
+    assert!(matches!(
+        store.claim_request_outbox(
+            &context,
+            RequestOutboxClaimRequest::new(
+                namespace.domain(),
+                acknowledgement_overflow_request,
+                1_000,
+                acknowledgement_overflow_lease,
+                2_000,
+            )
+            .unwrap(),
+        ),
+        DurableOutboxClaimOutcome::Claimed(_)
+    ));
+    client
+        .execute(
+            "UPDATE sunrise_edge.outbox_delivery
+             SET revision = 18446744073709551615
+             WHERE chain_id_bytes = $1 AND validator_id = $2
+               AND atomicity_domain_id = $3 AND request_id = $4",
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&acknowledgement_overflow_request.as_bytes()[..],
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        store.acknowledge_outbox(
+            &context,
+            DurableOutboxAcknowledgement::new(
+                namespace.domain(),
+                acknowledgement_overflow_request,
+                0,
+                acknowledgement_overflow_lease,
+            ),
+        ),
+        DurableOutboxAcknowledgementOutcome::Rejected(
+            DurableOutboxAcknowledgementRejection::ArithmeticOverflow
+        )
+    );
+    let overflow_ack_attempt_state: i16 = client
+        .query_one(
+            "SELECT state_id FROM sunrise_edge.outbox_delivery_attempts
+             WHERE chain_id_bytes = $1 AND validator_id = $2
+               AND atomicity_domain_id = $3 AND lease_id = $4",
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&acknowledgement_overflow_lease.as_bytes()[..],
+            ],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(overflow_ack_attempt_state, 1);
+
+    let mut pooled_after_outbox = pool.get().unwrap();
+    let statement_timeout_after_outbox: String = pooled_after_outbox
+        .query_one("SHOW statement_timeout", &[])
+        .unwrap()
+        .get(0);
+    let lock_timeout_after_outbox: String = pooled_after_outbox
+        .query_one("SHOW lock_timeout", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(statement_timeout_after_outbox, "0");
+    assert_eq!(lock_timeout_after_outbox, "0");
+    drop(pooled_after_outbox);
 
     client
         .execute(

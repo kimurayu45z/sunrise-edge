@@ -129,9 +129,10 @@ cross-provider ingress milestones implemented through Phase 17:
   one-shot recovery path consumes trusted deployment domain/fence authority,
   sends no unreconciled claim, and shares blocking admission. The in-memory
   conformance repository now validates stable due order, expiry replacement,
-  same-lease reconciliation, and retained delayed acknowledgement. No
-  restart-safe adapter uses this contract yet; prefix scanning remains
-  compatibility-only recovery.
+  same-lease reconciliation, and retained delayed acknowledgement. The
+  normalized PostgreSQL adapter implements the same indexed claim and
+  acknowledgement boundary with retained attempt history; prefix scanning
+  remains compatibility-only recovery.
 - An exact-request durable outbox claim beside the unattended due-work claim.
   The additive structured native request path targets only the request that
   just committed, even when older work is due in the same domain. Commit,
@@ -212,8 +213,9 @@ independent security review.
 The next planned technical milestones work backward through the Phase 15
 production exit criteria in [`TODO.md`](TODO.md) and the accepted
 [persistence design](PERSISTENCE.md): implement the accepted
-[PostgreSQL reference design](POSTGRES.md): implement the indexed claim/ack
-recovery boundary over the accepted schema and fenced structured commit adapter.
+[PostgreSQL reference design](POSTGRES.md): extend the now-implemented fenced
+structured commit and indexed outbox adapter with shared fault, cancellation,
+and capacity evidence.
 Deadline/cancellation, abrupt
 fault, backup/restore, capacity, and provider conformance follow on that
 foundation. Phase 16/17 provider trust, deployment, observability, and release
@@ -227,7 +229,7 @@ rehearsal remain required.
 | State and access | `objects`, `abi` | Versioned objects, ownership, object references, access modes, and transaction access manifests |
 | Execution | `execution`, `contract-sdk`, `chain-ir`, `system-modules` | Transactions/effects, deterministic WASM, proof envelopes/verifier interfaces, contract host APIs, portable IR, and governed modules |
 | Economics and governance | `fees`, `bonds`, `governance`, `protocol-upgrades`, `protocol-config` | Stablecoin fees/bonds, admission, governance actions, upgrades, migrations, and committed configuration |
-| Runtime and consensus | `runtime`, `runtime-sqlite`, `runtime-postgres`, `validator-set`, `consensus`, `node-core` | Persistence/runtime interfaces, local durable SQLite state, normalized PostgreSQL schema lifecycle, epoch validator snapshots, event-driven shared-object ordering, and one-event conditional transitions |
+| Runtime and consensus | `runtime`, `runtime-sqlite`, `runtime-postgres`, `validator-set`, `consensus`, `node-core` | Persistence/runtime interfaces, local durable SQLite state, normalized PostgreSQL structured commit and indexed outbox adapter, epoch validator snapshots, event-driven shared-object ordering, and one-event conditional transitions |
 | Adapters | `native-http`, `adapters/shared`, `adapters/cloudflare-workers`, `adapters/deno`, `adapters/vercel`, `adapters/supabase-edge`, `adapters/aws-lambda` | Bounded native routing, shared Web ingress, Cloudflare Service-Binding ingress, authenticated Deno/Vercel/Supabase ingress, and AWS HTTP API v2 mapping around the canonical contract |
 
 The repository intentionally keeps vendor-specific dependencies out of the

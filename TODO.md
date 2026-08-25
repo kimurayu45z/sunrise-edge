@@ -1966,8 +1966,8 @@ Phase 15 As-Is scope:
   claim/ackのIndeterminateは同じidentityで各1回だけreconcileし、unresolved claimはsendせず、scan cursorを返さず、
   HTTPとblocking admissionを共有する。single-lock memory repositoryはinitial delivery、stable due order、lease expiry、
   same-lease reconciliation、retained attempt history、later progress後のdelayed ackを検証する
-  （native/memory implemented As-Is; restart-safe durable adapter pending）。
-  durable adapter、transport-aware deadline/cancellation、real scheduler bindingは未実装である。
+  （native/memory/PostgreSQL implemented As-Is）。
+  PostgreSQL以外のdurable adapter、transport-aware deadline/cancellation、real scheduler bindingは未実装である。
 - ComposedRuntimeはStateStore、BlobStore、Signer、Transport、Clock、Schedulerをhidden defaultなしで
   明示的に所有・合成する。SQLiteへstate/dedup/outboxをcommit後にruntimeをdropし、同じDBを別compositionで
   reopenしてstateを再適用せずoutboxを送ること、send failure leaseがreopen後もexpiry前は抑止されexpiry時だけ
@@ -2050,15 +2050,17 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
 1. SQLite既存dataを暗黙migrationせず、writer fence、deadline、typed conflict/indeterminate failureを持つ
    durable domain adapter boundaryを定義する（implemented As-Is; composition/provider implementation pending）。
 2. indexed due-outbox repository/claim contractを追加し、domain-aware unattended recoveryを接続して
-   StateKeyScannerはmaintenance/compatibilityへ戻す（contract/native seam implemented As-Is; durable adapter pending）。
+   StateKeyScannerはmaintenance/compatibilityへ戻す（contract/native/PostgreSQL implemented As-Is;
+   provider durable adapters pending）。
 3. `POSTGRES.md`のexact namespace、unsigned SQL representation、normalized relation、attempt history、
    transaction order、migration policyを維持する。adapterがopaque PersistenceLayout key prefixをparseせずに済むよう、
    state/object/receipt/outboxを明示的sectionとして持つstructured durable transaction envelopeを先に実装する
    （runtime/node-core/memory/native compositionとgeneration-one normalized schema migration/operator bootstrapは
    implemented As-Is; bounded pool、fenced state/receipt read、serializable structured state/receipt/outbox commit、
    statementごとの残deadline timeout、bounded unchanged-envelope serialization retry、typed conflict/indeterminate分類も
-   PostgreSQLでimplemented As-Is; indexed claim/ack、
-   cancellation/fault/capacity certification pending）。その後explicit migrationとindexed PostgreSQL recoveryを実装する。
+   PostgreSQLでimplemented As-Is; indexed exact-request/due claim、same-lease reconciliation、retained attempt history、
+   idempotent ackもPostgreSQLでimplemented As-Is; cancellation/fault/capacity certification pending）。
+   その後explicit migrationとshared fault/capacity evidenceを実装する。
 4. shared conformanceにwrite skew、absent-key race、serialization failure、lease fencing、schema/version skewを追加する。
 5. kill/power fault、disk full、connection exhaustion、capacity/load/soak、backup/restore、writer failoverをrehearsalする。
 6. 同じcontractをCloudflare Durable ObjectとAWS persistenceへ実装し、real providerでcertifyする。
