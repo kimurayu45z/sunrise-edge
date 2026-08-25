@@ -350,6 +350,20 @@ pub enum PostgresSchemaError {
     SchemaMismatch,
     /// Existing namespace metadata differs from the requested bootstrap authority.
     NamespaceMetadataMismatch,
+    /// The expected writer fence was no longer active when an operator tried to advance it.
+    WriterFenceMismatch {
+        /// Generation the operator expected to replace.
+        expected: WriterFenceGeneration,
+        /// Generation locked from authoritative metadata.
+        actual: WriterFenceGeneration,
+    },
+    /// A requested writer generation did not strictly advance the active generation.
+    WriterFenceNotAdvanced {
+        /// Current generation supplied by the operator.
+        current: WriterFenceGeneration,
+        /// Requested replacement generation.
+        requested: WriterFenceGeneration,
+    },
     /// A stored full-range unsigned value was malformed or outside `u64`.
     InvalidUnsignedValue {
         /// Column whose value failed validation.
@@ -376,6 +390,18 @@ impl fmt::Display for PostgresSchemaError {
             Self::NamespaceMetadataMismatch => {
                 f.write_str("PostgreSQL namespace already has different authority metadata")
             }
+            Self::WriterFenceMismatch { expected, actual } => write!(
+                f,
+                "PostgreSQL writer fence changed: expected {}, found {}",
+                expected.get(),
+                actual.get()
+            ),
+            Self::WriterFenceNotAdvanced { current, requested } => write!(
+                f,
+                "PostgreSQL writer fence must advance: current {}, requested {}",
+                current.get(),
+                requested.get()
+            ),
             Self::InvalidUnsignedValue { field, value } => {
                 write!(f, "PostgreSQL {field} is not a canonical u64: {value}")
             }
@@ -521,6 +547,74 @@ pub fn bootstrap_namespace(
     Ok(metadata)
 }
 
+/// Atomically advances one namespace's physical writer generation.
+///
+/// This is an operator-only failover seam. Request handling must never expose
+/// it to transport input. The exact metadata row is locked, its schema identity
+/// and current generation are revalidated, and only a strictly greater writer
+/// generation may replace the expected value.
+pub fn advance_writer_fence(
+    client: &mut Client,
+    namespace: &PostgresNamespace,
+    expected: WriterFenceGeneration,
+    next: WriterFenceGeneration,
+) -> Result<PostgresSchemaMetadata, PostgresSchemaError> {
+    if next.get() <= expected.get() {
+        return Err(PostgresSchemaError::WriterFenceNotAdvanced {
+            current: expected,
+            requested: next,
+        });
+    }
+    let mut transaction = client.transaction()?;
+    verify_initial_schema(&mut transaction)?;
+    let row = transaction.query_opt(
+        "SELECT writer_fence_generation::TEXT
+         FROM sunrise_edge.storage_metadata
+         WHERE chain_id_bytes = $1
+           AND validator_id = $2
+           AND atomicity_domain_id = $3
+         FOR UPDATE",
+        &[
+            &namespace.chain_id_bytes(),
+            &&namespace.validator_id().as_bytes()[..],
+            &&namespace.domain().as_bytes()[..],
+        ],
+    )?;
+    let Some(row) = row else {
+        return Err(PostgresSchemaError::NamespaceMetadataMismatch);
+    };
+    inspect_namespace(&mut transaction, namespace)?
+        .ok_or(PostgresSchemaError::NamespaceMetadataMismatch)?;
+    let actual_value: u64 = parse_u64("writer_fence_generation", row.get(0))?;
+    let actual: WriterFenceGeneration =
+        WriterFenceGeneration::new(actual_value).ok_or(PostgresSchemaError::ZeroWriterFence)?;
+    if actual != expected {
+        return Err(PostgresSchemaError::WriterFenceMismatch { expected, actual });
+    }
+    let updated: u64 = transaction.execute(
+        "UPDATE sunrise_edge.storage_metadata
+         SET writer_fence_generation = CAST(CAST($1 AS TEXT) AS NUMERIC)
+         WHERE chain_id_bytes = $2
+           AND validator_id = $3
+           AND atomicity_domain_id = $4
+           AND writer_fence_generation = CAST(CAST($5 AS TEXT) AS NUMERIC)",
+        &[
+            &next.get().to_string(),
+            &namespace.chain_id_bytes(),
+            &&namespace.validator_id().as_bytes()[..],
+            &&namespace.domain().as_bytes()[..],
+            &expected.get().to_string(),
+        ],
+    )?;
+    if updated != 1 {
+        return Err(PostgresSchemaError::NamespaceMetadataMismatch);
+    }
+    let metadata: PostgresSchemaMetadata = inspect_namespace(&mut transaction, namespace)?
+        .ok_or(PostgresSchemaError::NamespaceMetadataMismatch)?;
+    transaction.commit()?;
+    Ok(metadata)
+}
+
 /// Reads and validates one exact namespace metadata row.
 pub fn inspect_namespace(
     client: &mut impl GenericClient,
@@ -532,6 +626,7 @@ pub fn inspect_namespace(
              schema_generation::TEXT,
              compatibility_min_generation::TEXT,
              compatibility_max_generation::TEXT,
+             migration_phase_id,
              writer_fence_generation::TEXT,
              commit_sequence::TEXT
          FROM sunrise_edge.storage_metadata
@@ -551,17 +646,19 @@ pub fn inspect_namespace(
     let generation = parse_u64("schema_generation", row.get(1))?;
     let minimum = parse_u64("compatibility_min_generation", row.get(2))?;
     let maximum = parse_u64("compatibility_max_generation", row.get(3))?;
+    let migration_phase: i16 = row.get(4);
     if identity.as_slice() != POSTGRES_SCHEMA_IDENTITY
         || generation != POSTGRES_SCHEMA_GENERATION.get()
         || minimum != generation
         || maximum != generation
+        || migration_phase != MIGRATION_PHASE_ACTIVE
     {
         return Err(PostgresSchemaError::SchemaMismatch);
     }
-    let writer_fence_value = parse_u64("writer_fence_generation", row.get(4))?;
+    let writer_fence_value = parse_u64("writer_fence_generation", row.get(5))?;
     let writer_fence = WriterFenceGeneration::new(writer_fence_value)
         .ok_or(PostgresSchemaError::ZeroWriterFence)?;
-    let commit_sequence = parse_u64("commit_sequence", row.get(5))?;
+    let commit_sequence = parse_u64("commit_sequence", row.get(6))?;
     Ok(Some(PostgresSchemaMetadata {
         schema_generation: POSTGRES_SCHEMA_GENERATION,
         writer_fence,
@@ -712,6 +809,7 @@ fn load_namespace_metadata(
              schema_generation::TEXT,
              compatibility_min_generation::TEXT,
              compatibility_max_generation::TEXT,
+             migration_phase_id,
              writer_fence_generation::TEXT,
              commit_sequence::TEXT
          FROM sunrise_edge.storage_metadata
@@ -736,19 +834,23 @@ fn load_namespace_metadata(
     let generation = parse_database_u64(&row, 1)?;
     let minimum = parse_database_u64(&row, 2)?;
     let maximum = parse_database_u64(&row, 3)?;
+    let migration_phase: i16 = row
+        .try_get(4)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
     if identity.as_slice() != POSTGRES_SCHEMA_IDENTITY
         || generation != POSTGRES_SCHEMA_GENERATION.get()
         || minimum != generation
         || maximum != generation
+        || migration_phase != MIGRATION_PHASE_ACTIVE
     {
         return Err(PreCommitFailure::SchemaMismatch);
     }
-    let writer_fence = WriterFenceGeneration::new(parse_database_u64(&row, 4)?)
+    let writer_fence = WriterFenceGeneration::new(parse_database_u64(&row, 5)?)
         .ok_or(PreCommitFailure::InvalidPersistedState)?;
     Ok(PostgresSchemaMetadata {
         schema_generation: POSTGRES_SCHEMA_GENERATION,
         writer_fence,
-        commit_sequence: parse_database_u64(&row, 5)?,
+        commit_sequence: parse_database_u64(&row, 6)?,
     })
 }
 

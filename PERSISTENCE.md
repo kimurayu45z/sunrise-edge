@@ -223,7 +223,8 @@ The store validates the complete read set and fencing generation, then commits
 all rows or none. A pure transition is not re-run inside a storage driver. An
 adapter may retry a serialization/transport failure only within a fixed budget
 and only while the original read assertions remain valid; otherwise it returns
-conflict or indeterminate failure according to the conformance contract.
+conflict, a definite serialization failure, or an indeterminate result according
+to the evidence available at the commit boundary.
 
 Outbox recovery uses a dedicated operation such as `claim_due_outbox(domain,
 now, lease_id)`. The claim query returns at most one row ordered by availability
@@ -243,7 +244,11 @@ idempotent for the same `(request, message index, lease)` and therefore requires
 the normalized store to retain one uniquely bound delivery-attempt record until
 the owning batch is eligible for retention deletion. Keeping only the last
 acknowledged lease is insufficient because a delayed retry may arrive after a
-later message advances. Claim and
+later message advances. Advancing the namespace writer fence rejects all later
+operations from the old writer but does not revoke an already committed,
+unexpired delivery lease. The replacement writer may reclaim that work only at
+trusted lease expiry; the runtime-wide five-minute maximum therefore bounds this
+failover delivery delay. Claim and
 acknowledgement each distinguish definite pre-commit rejection from an
 indeterminate commit. An indeterminate claim is never transported until it is
 reconciled. Native now has an additive, one-shot indexed recovery path. Trusted
@@ -364,10 +369,12 @@ not general state reads:
    only for maintenance and compatibility.
 3. Apply the accepted PostgreSQL schema design, explicit migrations, and
    adapter, then run the shared conformance suite. The generation-one schema,
-   operator-only namespace bootstrap, and live PostgreSQL constraint test are
-   implemented As-Is; fenced structured commit and indexed claim/ack remain.
-4. Add deadline/cancellation semantics, bounded retry, capacity tests, abrupt
-   fault tests, backup/restore rehearsal, and writer-fencing failover tests.
+   operator-only namespace bootstrap/fence advance, fenced structured commit,
+   indexed claim/ack, and shared memory/PostgreSQL contract suite are implemented
+   As-Is.
+4. Extend that evidence with deadline/cancellation semantics, commit-loss,
+   capacity tests, abrupt fault tests, backup/restore rehearsal, and real
+   writer-fencing failover tests.
 5. Implement Cloudflare Durable Object and AWS mappings against the same
    contract and pass real-provider conformance before claiming support.
 

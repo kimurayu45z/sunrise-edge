@@ -1968,6 +1968,12 @@ Phase 15 As-Is scope:
   same-lease reconciliation、retained attempt history、later progress後のdelayed ackを検証する
   （native/memory/PostgreSQL implemented As-Is）。
   PostgreSQL以外のdurable adapter、transport-aware deadline/cancellation、real scheduler bindingは未実装である。
+- runtimeのnon-default `durable-conformance` test supportは同じblack-box caseをmemoryとPostgreSQLで実行し、
+  complete-read write skew、concurrent absent-key create、tombstone ABA、definite contention outcome、retained
+  outbox lease、writer-fence handoffを検証する。PostgreSQL live testはさらにretry ceiling到達時の
+  serialization rejectionとunsupported schema generationのread/commit/claim/ack fail-closedを検証する
+  （implemented As-Is）。commit-loss、kill/power fault、disk full、connection exhaustion、backup/restore、
+  capacity/load/soak、real writer failover、provider certificationは未実装である。
 - ComposedRuntimeはStateStore、BlobStore、Signer、Transport、Clock、Schedulerをhidden defaultなしで
   明示的に所有・合成する。SQLiteへstate/dedup/outboxをcommit後にruntimeをdropし、同じDBを別compositionで
   reopenしてstateを再適用せずoutboxを送ること、send failure leaseがreopen後もexpiry前は抑止されexpiry時だけ
@@ -2060,8 +2066,10 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
    statementごとの残deadline timeout、bounded unchanged-envelope serialization retry、typed conflict/indeterminate分類も
    PostgreSQLでimplemented As-Is; indexed exact-request/due claim、same-lease reconciliation、retained attempt history、
    idempotent ackもPostgreSQLでimplemented As-Is; cancellation/fault/capacity certification pending）。
-   その後explicit migrationとshared fault/capacity evidenceを実装する。
-4. shared conformanceにwrite skew、absent-key race、serialization failure、lease fencing、schema/version skewを追加する。
+   explicit migrationとshared contract evidenceはimplemented As-Is; broader fault/capacity evidenceは未実装である。
+4. shared conformanceにwrite skew、absent-key race、definite contention classification、lease fencingを追加し、
+   PostgreSQL capability testにserialization failureとschema/version skewを追加する
+   （memory/PostgreSQL implemented As-Is; provider adapters、commit-loss、fault/capacity certification pending）。
 5. kill/power fault、disk full、connection exhaustion、capacity/load/soak、backup/restore、writer failoverをrehearsalする。
 6. 同じcontractをCloudflare Durable ObjectとAWS persistenceへ実装し、real providerでcertifyする。
 

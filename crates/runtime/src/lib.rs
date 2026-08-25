@@ -2,6 +2,9 @@
 
 //! Runtime abstraction and in-memory adapters for serverless-safe node execution.
 
+#[cfg(any(test, feature = "durable-conformance"))]
+pub mod conformance;
+
 use core::{fmt, mem::size_of};
 pub use protocol_types::{AtomicityDomainId, ValidatorId};
 use protocol_types::{ChainId, Digest32, Epoch, ProtocolVersion};

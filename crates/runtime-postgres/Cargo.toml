@@ -9,3 +9,6 @@ postgres.workspace = true
 protocol-types.workspace = true
 r2d2_postgres.workspace = true
 runtime.workspace = true
+
+[dev-dependencies]
+runtime = { workspace = true, features = ["durable-conformance"] }
