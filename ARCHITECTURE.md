@@ -908,6 +908,20 @@ abrupt-fault, commit-loss, capacity, backup/restore, failover, and production
 certification evidence remain open, so this is As-Is adapter evidence rather
 than production readiness.
 
+Runtime exposes the vendor-neutral durable-store conformance cases only to its
+own tests or adapters that opt into the non-default `durable-conformance`
+feature. One fixture supplies the backend's trusted deadline clock, exact
+logical domain, and operator-only writer-fence advance while the suite drives
+only `StructuredDurableDomainStateStore` and `IndexedOutboxRepository` methods.
+Memory and PostgreSQL run the same complete-read write-skew, concurrent absent
+and tombstone, definite contention-outcome, retained outbox-lease, and
+writer-fence cases. PostgreSQL additionally injects unsupported schema metadata
+and a real serialization abort at an exhausted retry ceiling when the live-test
+URL is configured; CI supplies it. SQL constraints, commit-loss fault injection,
+abrupt failure, backup/restore, capacity, and real failover remain
+backend-specific evidence. Passing this suite is As-Is contract evidence, not
+production certification.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -1174,3 +1188,15 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   commit results as indeterminate. Treat PostgreSQL 18 tests as As-Is evidence;
   cancellation, abrupt faults, capacity, recovery, and provider certification
   remain separate exit work.
+- DR-0061: Define durable-store behavioral conformance once in runtime behind a
+  non-default test-support feature and run it against memory plus every durable
+  adapter. Let each fixture supply trusted deadline and operator fence authority;
+  do not weaken the production traits with test controls or manufacture schema
+  evidence for stores without persisted schema identity. Require complete-read
+  write-skew and absent/tombstone races, bounded concurrent outcome
+  classification, retained lease fencing, and writer-fence handoff. A fence
+  advance revokes the old writer but not an already committed unexpired delivery
+  lease; the replacement writer waits for trusted lease expiry before reclaiming
+  the work. Keep induced database aborts and schema skew as adapter capabilities,
+  and keep commit-loss, abrupt-fault, backup/restore, capacity, and real failover
+  outside this As-Is contract evidence.

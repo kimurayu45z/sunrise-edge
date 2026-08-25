@@ -222,6 +222,10 @@ updates active lease, deadline, availability, and attempt count atomically.
 
 On lease replacement after expiry, the previous attempt becomes `expired` in
 the same transaction. Send occurs only after a reconciled claim commit.
+Writer-fence advance does not erase or revoke an already committed unexpired
+lease. The replacement writer observes no due work until trusted lease expiry,
+then atomically expires and replaces the old attempt. The runtime-wide
+five-minute maximum lease bounds this failover delivery delay.
 
 Acknowledgement locks the attempt and delivery rows, validates exact
 request/index/lease binding, and atomically marks the attempt acknowledged,
@@ -264,6 +268,8 @@ rows. Legacy SQLite data remains a separate compatibility source and requires
 an explicit, checksummed import tool if migration is later approved.
 
 Activation advances schema generation and writer fence after verification.
+Request operations, schema inspection, and writer-fence advance all fail closed
+unless the namespace row is in the active migration phase.
 Rollback means forward repair or safe disable; it never decrements generation,
 reuses a fence, drops newly authoritative data, or rewrites protocol bytes.
 
@@ -286,3 +292,14 @@ The adapter is not production-certified until automated evidence covers:
 
 Passing unit tests, applying the first migration, or implementing Rust traits is
 As-Is progress only, not a production-readiness claim.
+
+The feature-gated shared runtime suite now covers complete-read write skew,
+absent/tombstone races, concurrent definite outcome classification, retained
+lease replacement, and writer-fence handoff against both memory and PostgreSQL.
+When `SUNRISE_EDGE_TEST_POSTGRES_URL` is configured (as it is in CI), the live
+PostgreSQL fixture additionally covers bounded retry exhaustion, non-active
+migration-phase rejection, and exact schema-generation/window mismatch across
+read, commit, claim, and acknowledgement. Duplicate request races,
+commit-boundary connection loss,
+abrupt/process faults, backup/restore, migration compatibility across real old
+and new binaries, capacity, and operational certification remain open.

@@ -90,8 +90,13 @@ cross-provider ingress milestones implemented through Phase 17:
   outbox commits with complete read assertions and conservative commit-result
   classification. Serialization/deadlock aborts retry the unchanged envelope
   only within an explicit attempt ceiling and remaining deadline. Indexed
-  claim/ack, shared fault conformance, operations, and
-  production certification remain pending, so this is still As-Is evidence.
+  exact-request/due claim and acknowledgement now use retained attempt history.
+  One feature-gated shared suite exercises complete-read write skew,
+  absent/tombstone races, definite contention classification, and lease/writer
+  fencing against memory and PostgreSQL; the live PostgreSQL fixture additionally
+  injects retry exhaustion and schema skew when its required test URL is set.
+  Broader fault, operations, and production certification remain pending, so
+  this is still As-Is evidence.
 - An explicit `ComposedRuntime` for assembling independently selected state,
   blob, signer, transport, clock, and scheduler components without hidden
   defaults. Native conformance tests close/reopen SQLite into a new composition,
@@ -214,10 +219,9 @@ The next planned technical milestones work backward through the Phase 15
 production exit criteria in [`TODO.md`](TODO.md) and the accepted
 [persistence design](PERSISTENCE.md): implement the accepted
 [PostgreSQL reference design](POSTGRES.md): extend the now-implemented fenced
-structured commit and indexed outbox adapter with shared fault, cancellation,
-and capacity evidence.
-Deadline/cancellation, abrupt
-fault, backup/restore, capacity, and provider conformance follow on that
+structured commit, indexed outbox adapter, and shared memory/PostgreSQL
+conformance with deadline/cancellation and capacity evidence. Abrupt fault,
+backup/restore, real writer failover, and provider conformance follow on that
 foundation. Phase 16/17 provider trust, deployment, observability, and release
 rehearsal remain required.
 

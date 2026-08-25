@@ -4,5 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+durable-conformance = []
+
 [dependencies]
 protocol-types.workspace = true

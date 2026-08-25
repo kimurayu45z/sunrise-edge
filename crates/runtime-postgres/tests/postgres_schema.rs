@@ -1,5 +1,6 @@
 use postgres::{Client, Config, NoTls, error::SqlState};
 use protocol_types::{AtomicityDomainId, ChainId, Digest32, HashAlgorithmId, ValidatorId};
+use r2d2_postgres::{PostgresConnectionManager, r2d2::Pool};
 use runtime::{
     AtomicStateMutationSet, AtomicStateReadSet, AtomicStateTransaction, DueOutboxClaimRequest,
     DurableCommitOutcome, DurableCommitRejection, DurableDomainStateStore,
@@ -11,24 +12,206 @@ use runtime::{
     RequestOutboxClaimRequest, StateMutation, StateMutationEntry, StateReadAssertion,
     StateRevision, StorageCorrelationId, StorageDeadline, StructuredDurableDomainStateStore,
     WriterFenceGeneration,
+    conformance::{
+        ConformanceFailure, ConformanceResult, DurableStoreFixture, SchemaSkewFixture,
+        run_durable_store_conformance, run_schema_skew_conformance,
+    },
 };
 use runtime_postgres::{
     POSTGRES_SCHEMA_GENERATION, PostgresDurableStore, PostgresNamespace, PostgresPoolConfig,
-    PostgresSchemaError, PostgresTransactionPolicy, apply_initial_schema, bootstrap_namespace,
-    build_postgres_pool, inspect_namespace, verify_initial_schema,
+    PostgresSchemaError, PostgresTransactionPolicy,
+    advance_writer_fence as advance_postgres_writer_fence, apply_initial_schema,
+    bootstrap_namespace, build_postgres_pool, inspect_namespace, verify_initial_schema,
 };
 use std::{
     num::NonZeroU32,
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const TEST_DATABASE: &str = "sunrise_edge_test";
 
+type TestPostgresManager = PostgresConnectionManager<NoTls>;
+
+struct PostgresConformanceFixture {
+    store: Arc<PostgresDurableStore<TestPostgresManager>>,
+    namespace: PostgresNamespace,
+    operator: Mutex<Client>,
+    initial_fence: WriterFenceGeneration,
+}
+
+impl DurableStoreFixture for PostgresConformanceFixture {
+    type Store = PostgresDurableStore<TestPostgresManager>;
+
+    fn store(&self) -> Arc<Self::Store> {
+        Arc::clone(&self.store)
+    }
+
+    fn domain(&self) -> AtomicityDomainId {
+        self.namespace.domain()
+    }
+
+    fn initial_writer_fence(&self) -> WriterFenceGeneration {
+        self.initial_fence
+    }
+
+    fn live_context(
+        &self,
+        writer_fence: WriterFenceGeneration,
+        correlation_byte: u8,
+        budget: Duration,
+    ) -> ConformanceResult<DurableOperationContext> {
+        let now_millis: u64 = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| ConformanceFailure::new("postgres-fixture", error.to_string()))?
+                .as_millis(),
+        )
+        .map_err(|_| ConformanceFailure::new("postgres-fixture", "clock exceeds u64"))?;
+        let budget_millis: u64 = u64::try_from(budget.as_millis())
+            .map_err(|_| ConformanceFailure::new("postgres-fixture", "budget exceeds u64"))?;
+        let deadline: u64 = now_millis
+            .checked_add(budget_millis)
+            .ok_or_else(|| ConformanceFailure::new("postgres-fixture", "deadline exceeds u64"))?;
+        Ok(DurableOperationContext::new(
+            writer_fence,
+            StorageDeadline::new(deadline).ok_or_else(|| {
+                ConformanceFailure::new("postgres-fixture", "deadline must be non-zero")
+            })?,
+            StorageCorrelationId::new([correlation_byte; 16]).ok_or_else(|| {
+                ConformanceFailure::new("postgres-fixture", "correlation ID must be non-zero")
+            })?,
+        ))
+    }
+
+    fn advance_writer_fence(
+        &self,
+        expected: WriterFenceGeneration,
+        next: WriterFenceGeneration,
+    ) -> ConformanceResult<()> {
+        let mut operator = self.operator.lock().map_err(|_| {
+            ConformanceFailure::new("postgres-fixture", "operator client lock poisoned")
+        })?;
+        let metadata =
+            advance_postgres_writer_fence(&mut operator, &self.namespace, expected, next)
+                .map_err(|error| ConformanceFailure::new("postgres-fixture", error.to_string()))?;
+        if metadata.writer_fence() != next {
+            return Err(ConformanceFailure::new(
+                "postgres-fixture",
+                "operator fence advance returned the wrong generation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl SchemaSkewFixture for PostgresConformanceFixture {
+    fn install_unsupported_schema(&self) -> ConformanceResult<()> {
+        let unsupported_generation: u64 = POSTGRES_SCHEMA_GENERATION
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| {
+                ConformanceFailure::new("postgres-fixture", "schema generation overflow")
+            })?;
+        self.set_schema_generation(unsupported_generation)
+    }
+
+    fn restore_supported_schema(&self) -> ConformanceResult<()> {
+        self.set_schema_generation(POSTGRES_SCHEMA_GENERATION.get())
+    }
+}
+
+impl PostgresConformanceFixture {
+    fn set_schema_generation(&self, generation: u64) -> ConformanceResult<()> {
+        let mut operator = self.operator.lock().map_err(|_| {
+            ConformanceFailure::new("postgres-fixture", "operator client lock poisoned")
+        })?;
+        let updated: u64 = operator
+            .execute(
+                "UPDATE sunrise_edge.storage_metadata
+                 SET schema_generation = CAST(CAST($1 AS TEXT) AS NUMERIC),
+                     compatibility_min_generation = CAST(CAST($1 AS TEXT) AS NUMERIC),
+                     compatibility_max_generation = CAST(CAST($1 AS TEXT) AS NUMERIC)
+                 WHERE chain_id_bytes = $2
+                   AND validator_id = $3
+                   AND atomicity_domain_id = $4",
+                &[
+                    &generation.to_string(),
+                    &self.namespace.chain_id_bytes(),
+                    &&self.namespace.validator_id().as_bytes()[..],
+                    &&self.namespace.domain().as_bytes()[..],
+                ],
+            )
+            .map_err(|error| ConformanceFailure::new("postgres-fixture", error.to_string()))?;
+        if updated != 1 {
+            return Err(ConformanceFailure::new(
+                "postgres-fixture",
+                "schema generation update did not affect exactly one namespace",
+            ));
+        }
+        Ok(())
+    }
+
+    fn set_migration_phase(&self, phase: i16) -> ConformanceResult<()> {
+        let mut operator = self.operator.lock().map_err(|_| {
+            ConformanceFailure::new("postgres-fixture", "operator client lock poisoned")
+        })?;
+        let updated: u64 = operator
+            .execute(
+                "UPDATE sunrise_edge.storage_metadata
+                 SET migration_phase_id = $1
+                 WHERE chain_id_bytes = $2
+                   AND validator_id = $3
+                   AND atomicity_domain_id = $4",
+                &[
+                    &phase,
+                    &self.namespace.chain_id_bytes(),
+                    &&self.namespace.validator_id().as_bytes()[..],
+                    &&self.namespace.domain().as_bytes()[..],
+                ],
+            )
+            .map_err(|error| ConformanceFailure::new("postgres-fixture", error.to_string()))?;
+        if updated != 1 {
+            return Err(ConformanceFailure::new(
+                "postgres-fixture",
+                "migration phase update did not affect exactly one namespace",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn postgres_conformance_fixture(
+    database_url: &str,
+    pool: Pool<TestPostgresManager>,
+    namespace: PostgresNamespace,
+    initial_fence: WriterFenceGeneration,
+) -> PostgresConformanceFixture {
+    let mut operator = Client::connect(database_url, NoTls).unwrap();
+    bootstrap_namespace(
+        &mut operator,
+        &namespace,
+        POSTGRES_SCHEMA_GENERATION,
+        initial_fence,
+    )
+    .unwrap();
+    PostgresConformanceFixture {
+        store: Arc::new(PostgresDurableStore::new(
+            pool,
+            namespace.clone(),
+            PostgresTransactionPolicy::new(NonZeroU32::new(3).unwrap()).unwrap(),
+        )),
+        namespace,
+        operator: Mutex::new(operator),
+        initial_fence,
+    }
+}
+
 #[test]
-fn normalized_schema_bootstrap_and_constraints_hold_in_postgres() {
+fn postgres_schema_and_durable_store_conformance() {
     let Some(url) = std::env::var_os("SUNRISE_EDGE_TEST_POSTGRES_URL") else {
+        eprintln!("skipping live PostgreSQL conformance: SUNRISE_EDGE_TEST_POSTGRES_URL is unset");
         return;
     };
     let mut client = Client::connect(&url.to_string_lossy(), NoTls).unwrap();
@@ -1288,5 +1471,239 @@ fn normalized_schema_bootstrap_and_constraints_hold_in_postgres() {
     assert_eq!(
         store.commit_durable(&context, overflow_transaction),
         DurableCommitOutcome::Rejected(DurableCommitRejection::CommitSequenceOverflow)
+    );
+
+    let database_url: String = url.to_string_lossy().into_owned();
+    let mut conformance_config: Config = database_url.parse().unwrap();
+    conformance_config.application_name("sunrise-edge-pr74-conformance");
+    let conformance_pool: Pool<TestPostgresManager> = build_postgres_pool(
+        conformance_config,
+        NoTls,
+        PostgresPoolConfig::new(
+            NonZeroU32::new(4).unwrap(),
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let conformance_namespace = PostgresNamespace::new(
+        &ChainId::new("postgres-shared-conformance").unwrap(),
+        ValidatorId::new([0xA1; 32]),
+        AtomicityDomainId::new([0xA2; 32]).unwrap(),
+    )
+    .unwrap();
+    let conformance_fence = WriterFenceGeneration::new(31).unwrap();
+    let missing_namespace = PostgresNamespace::new(
+        &ChainId::new("postgres-missing-fence-namespace").unwrap(),
+        ValidatorId::new([0xAF; 32]),
+        AtomicityDomainId::new([0xB0; 32]).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        advance_postgres_writer_fence(
+            &mut client,
+            &missing_namespace,
+            conformance_fence,
+            WriterFenceGeneration::new(32).unwrap(),
+        ),
+        Err(PostgresSchemaError::NamespaceMetadataMismatch)
+    ));
+    let conformance_fixture = postgres_conformance_fixture(
+        &database_url,
+        conformance_pool.clone(),
+        conformance_namespace,
+        conformance_fence,
+    );
+    {
+        let mut conformance_operator = conformance_fixture.operator.lock().unwrap();
+        assert!(matches!(
+            advance_postgres_writer_fence(
+                &mut conformance_operator,
+                &conformance_fixture.namespace,
+                conformance_fence,
+                conformance_fence,
+            ),
+            Err(PostgresSchemaError::WriterFenceNotAdvanced { .. })
+        ));
+        assert!(matches!(
+            advance_postgres_writer_fence(
+                &mut conformance_operator,
+                &conformance_fixture.namespace,
+                WriterFenceGeneration::new(30).unwrap(),
+                WriterFenceGeneration::new(32).unwrap(),
+            ),
+            Err(PostgresSchemaError::WriterFenceMismatch {
+                expected,
+                actual,
+            }) if expected == WriterFenceGeneration::new(30).unwrap()
+                && actual == conformance_fence
+        ));
+    }
+    run_durable_store_conformance(&conformance_fixture).unwrap();
+
+    let schema_namespace = PostgresNamespace::new(
+        &ChainId::new("postgres-schema-skew-conformance").unwrap(),
+        ValidatorId::new([0xA3; 32]),
+        AtomicityDomainId::new([0xA4; 32]).unwrap(),
+    )
+    .unwrap();
+    let schema_fixture = postgres_conformance_fixture(
+        &database_url,
+        conformance_pool.clone(),
+        schema_namespace,
+        WriterFenceGeneration::new(41).unwrap(),
+    );
+    schema_fixture.set_migration_phase(4).unwrap();
+    let phase_context = schema_fixture
+        .live_context(
+            WriterFenceGeneration::new(41).unwrap(),
+            0xA8,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    assert_eq!(
+        schema_fixture.store.get_versioned_durable(
+            &phase_context,
+            schema_fixture.namespace.domain(),
+            b"migration-phase-skew",
+        ),
+        Err(DurableReadError::SchemaMismatch)
+    );
+    {
+        let mut schema_operator = schema_fixture.operator.lock().unwrap();
+        assert!(matches!(
+            advance_postgres_writer_fence(
+                &mut schema_operator,
+                &schema_fixture.namespace,
+                WriterFenceGeneration::new(41).unwrap(),
+                WriterFenceGeneration::new(42).unwrap(),
+            ),
+            Err(PostgresSchemaError::SchemaMismatch)
+        ));
+    }
+    schema_fixture.set_migration_phase(5).unwrap();
+    schema_fixture.install_unsupported_schema().unwrap();
+    {
+        let mut schema_operator = schema_fixture.operator.lock().unwrap();
+        assert!(matches!(
+            advance_postgres_writer_fence(
+                &mut schema_operator,
+                &schema_fixture.namespace,
+                WriterFenceGeneration::new(41).unwrap(),
+                WriterFenceGeneration::new(42).unwrap(),
+            ),
+            Err(PostgresSchemaError::SchemaMismatch)
+        ));
+    }
+    schema_fixture.restore_supported_schema().unwrap();
+    run_schema_skew_conformance(&schema_fixture).unwrap();
+
+    let serialization_namespace = PostgresNamespace::new(
+        &ChainId::new("postgres-serialization-exhaustion").unwrap(),
+        ValidatorId::new([0xA5; 32]),
+        AtomicityDomainId::new([0xA6; 32]).unwrap(),
+    )
+    .unwrap();
+    let serialization_fence = WriterFenceGeneration::new(51).unwrap();
+    bootstrap_namespace(
+        &mut client,
+        &serialization_namespace,
+        POSTGRES_SCHEMA_GENERATION,
+        serialization_fence,
+    )
+    .unwrap();
+    let serialization_store = Arc::new(PostgresDurableStore::new(
+        conformance_pool,
+        serialization_namespace.clone(),
+        PostgresTransactionPolicy::new(NonZeroU32::new(1).unwrap()).unwrap(),
+    ));
+    let serialization_now: u64 = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let serialization_context = DurableOperationContext::new(
+        serialization_fence,
+        StorageDeadline::new(serialization_now.checked_add(60_000).unwrap()).unwrap(),
+        StorageCorrelationId::new([0xA7; 16]).unwrap(),
+    );
+    let serialization_key = b"serialization-exhaustion".to_vec();
+    let serialization_transaction = AtomicStateTransaction::new(
+        serialization_namespace.domain(),
+        AtomicStateReadSet::new(vec![
+            StateReadAssertion::new(serialization_key.clone(), StateRevision::INITIAL).unwrap(),
+        ])
+        .unwrap(),
+        AtomicStateMutationSet::new(vec![
+            StateMutationEntry::new(
+                serialization_key.clone(),
+                StateMutation::Put(b"must-not-commit".to_vec()),
+            )
+            .unwrap(),
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+    let mut serialization_locker = Client::connect(&database_url, NoTls).unwrap();
+    let mut serialization_locker_transaction = serialization_locker.transaction().unwrap();
+    serialization_locker_transaction
+        .execute(
+            "UPDATE sunrise_edge.storage_metadata
+             SET operator_metadata = operator_metadata
+             WHERE chain_id_bytes = $1 AND validator_id = $2
+               AND atomicity_domain_id = $3",
+            &[
+                &serialization_namespace.chain_id_bytes(),
+                &&serialization_namespace.validator_id().as_bytes()[..],
+                &&serialization_namespace.domain().as_bytes()[..],
+            ],
+        )
+        .unwrap();
+    let serialization_store_for_thread = Arc::clone(&serialization_store);
+    let serialization_handle = thread::spawn(move || {
+        serialization_store_for_thread
+            .commit_durable(&serialization_context, serialization_transaction)
+    });
+    let mut observed_serialization_wait = false;
+    for _ in 0..10_000 {
+        observed_serialization_wait = client
+            .query_one(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                     WHERE application_name = 'sunrise-edge-pr74-conformance'
+                       AND wait_event_type = 'Lock'
+                 )",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        if observed_serialization_wait {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        observed_serialization_wait,
+        "adapter never reached the serialization-exhaustion metadata lock"
+    );
+    serialization_locker_transaction.commit().unwrap();
+    assert_eq!(
+        serialization_handle.join().unwrap(),
+        DurableCommitOutcome::Rejected(DurableCommitRejection::SerializationFailure)
+    );
+    assert_eq!(
+        serialization_store
+            .get_versioned_durable(
+                &serialization_context,
+                serialization_namespace.domain(),
+                &serialization_key,
+            )
+            .unwrap(),
+        runtime::VersionedStateValue::from_persisted_parts(StateRevision::INITIAL, None).unwrap()
     );
 }
