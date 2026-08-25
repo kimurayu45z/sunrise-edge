@@ -822,8 +822,9 @@ lease. Keeping only the most recent acknowledgement would fail after a later
 message advances. Both claim and acknowledgement distinguish
 definite pre-commit rejection from indeterminate commit. Callers never send an
 indeterminate claim before reconciliation. Defining this contract does not
-itself provide a durable repository, so `StateKeyScanner` remains the current
-compatibility path.
+itself provide a durable repository. PostgreSQL now implements the boundary;
+`StateKeyScanner` remains a compatibility path for stores that have not
+migrated.
 
 Native now also exposes additive `recover_indexed_outbox_once`. Trusted
 embedding composition fixes the logical domain and current physical writer
@@ -835,9 +836,10 @@ input. The path claims at most one message, makes one same-identity
 reconciliation attempt for an indeterminate claim, validates and sends only
 reconciled canonical event bytes, then makes one same-identity acknowledgement
 reconciliation attempt. It shares native blocking admission and returns no scan
-cursor. Scripted conformance proves unresolved claims are not sent. No durable
-repository, real scheduler binding, or transport-aware cancellation/deadline
-exists yet, so the scan path remains compatibility-only rather than deleted.
+cursor. Scripted conformance proves unresolved claims are not sent. PostgreSQL
+now supplies the durable repository; real scheduler binding and transport-aware
+cancellation/deadline do not yet exist, so the scan path remains
+compatibility-only rather than deleted.
 
 [`POSTGRES.md`](POSTGRES.md) fixes the first relational implementation design:
 exact binary namespace columns, full-range unsigned numeric representation,
@@ -880,8 +882,8 @@ exact request. Commit, claim, and acknowledgement reuse one bounded operation
 context. Claim and acknowledgement ambiguity receive one same-identity
 reconciliation attempt, and an unresolved claim is never sent. The in-memory
 tests prove an older due row in the same domain is not mistaken for the current
-request. No restart-safe durable adapter uses this boundary yet, and started
-transport/storage work is not cancellable.
+request. The normalized PostgreSQL adapter now uses this boundary, while
+started transport/storage work is not cancellable.
 
 The `runtime-postgres` crate now makes the accepted generation-one schema
 executable through an operator-only migration and exact namespace bootstrap.
@@ -893,9 +895,18 @@ generation, and a non-zero physical writer fence. Full-range `u64` values use
 checked `NUMERIC(20,0)` constraints. PostgreSQL 18 CI applies the migration in a
 dedicated test database and verifies idempotent schema application, bootstrap
 fence mismatch rejection, exact relations/indexes, unsigned overflow rejection,
-and zero-domain rejection. Request traffic does not run DDL or bootstrap, and
-the crate does not yet implement structured commit or indexed outbox traits;
-therefore this is schema As-Is evidence, not a durable adapter claim.
+and zero-domain rejection. Its bounded pool performs fenced state and receipt
+reads plus serializable structured state/receipt/outbox commits. The same store
+implements exact-request and stable `(available_at_ms, request_id)` indexed
+claims, checks retained lease attempts before selecting work, expires a
+replaced attempt in the replacement transaction, and advances one message only
+through an exactly bound acknowledgement. Claim and acknowledgement take a
+shared namespace-metadata lock so a fence advance cannot race them without
+serializing unrelated delivery rows; `SKIP LOCKED` is confined to due delivery
+selection. Request traffic does not run DDL or bootstrap. Cancellation,
+abrupt-fault, commit-loss, capacity, backup/restore, failover, and production
+certification evidence remain open, so this is As-Is adapter evidence rather
+than production readiness.
 
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
@@ -1150,3 +1161,16 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   loss conservatively as indeterminate. Keep pool maintenance operational rather
   than a protocol liveness assumption, and do not claim production certification
   before indexed claim/ack and fault/capacity evidence exist.
+- DR-0060: Implement normalized PostgreSQL indexed outbox recovery with retained
+  lease-attempt history. Check the lease identity before selecting work, use
+  exact-request locking for request-path delivery and stable
+  `(available_at_ms, request_id)` ordering with `SKIP LOCKED` only for due queue
+  selection, and expire a replaced attempt in the transaction that installs its
+  successor. Reconcile an active lease to identical bytes, reject reuse after
+  acknowledgement or expiry, and make acknowledgement idempotent from retained
+  evidence after later messages advance. Hold a shared namespace-metadata lock
+  against fence changes, use checked attempt/cursor/revision arithmetic, retry
+  only proven unchanged-identity serialization aborts, and preserve unknown
+  commit results as indeterminate. Treat PostgreSQL 18 tests as As-Is evidence;
+  cancellation, abrupt faults, capacity, recovery, and provider certification
+  remain separate exit work.

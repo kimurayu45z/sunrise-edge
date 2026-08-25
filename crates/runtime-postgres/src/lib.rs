@@ -18,11 +18,14 @@ use r2d2_postgres::{
     r2d2::{ManageConnection, Pool},
 };
 use runtime::{
-    AtomicStateTransaction, DurableCommitOutcome, DurableCommitRejection, DurableDomainStateStore,
-    DurableInvocationTransaction, DurableOperationContext, DurableReadError, DurableRequestId,
-    DurableRequestReceipt, IndeterminateCommitReason, StateMutation, StateMutationEntry,
-    StateReadAssertion, StateRevision, StructuredDurableDomainStateStore, VersionedStateValue,
-    WriterFenceGeneration,
+    AtomicStateTransaction, DueOutboxClaimRequest, DurableCommitOutcome, DurableCommitRejection,
+    DurableDomainStateStore, DurableInvocationTransaction, DurableOperationContext,
+    DurableOutboxAcknowledgement, DurableOutboxAcknowledgementOutcome,
+    DurableOutboxAcknowledgementRejection, DurableOutboxClaim, DurableOutboxClaimOutcome,
+    DurableOutboxClaimRejection, DurableOutboxLeaseId, DurableReadError, DurableRequestId,
+    DurableRequestReceipt, IndeterminateCommitReason, IndexedOutboxRepository, OutboxRequestId,
+    RequestOutboxClaimRequest, StateMutation, StateMutationEntry, StateReadAssertion,
+    StateRevision, StructuredDurableDomainStateStore, VersionedStateValue, WriterFenceGeneration,
 };
 use std::{
     error::Error,
@@ -51,6 +54,9 @@ const STATE_RECORD_ENCODING_VERSION: i64 = 1;
 const RECEIPT_TERMINAL_RESULT_COMMITTED: i64 = 1;
 const OUTBOX_DELIVERY_PENDING: i16 = 1;
 const OUTBOX_DELIVERY_COMPLETED: i16 = 2;
+const OUTBOX_ATTEMPT_CLAIMED: i16 = 1;
+const OUTBOX_ATTEMPT_ACKNOWLEDGED: i16 = 2;
+const OUTBOX_ATTEMPT_EXPIRED: i16 = 3;
 const MAX_POSTGRES_TIMEOUT_MILLIS: u64 = i32::MAX as u64;
 const MAX_SERIALIZATION_ATTEMPTS: u32 = 16;
 
@@ -616,6 +622,34 @@ impl PreCommitFailure {
             Self::Unavailable => DurableCommitRejection::UnavailableBeforeCommit,
         }
     }
+
+    fn into_claim_rejection(self) -> DurableOutboxClaimRejection {
+        match self {
+            Self::Deadline => DurableOutboxClaimRejection::DeadlineExceededBeforeCommit,
+            Self::WriterFenced(active_generation) => {
+                DurableOutboxClaimRejection::WriterFenced { active_generation }
+            }
+            Self::Serialization => DurableOutboxClaimRejection::SerializationFailure,
+            Self::InvalidPersistedState => DurableOutboxClaimRejection::InvalidPersistedState,
+            Self::SchemaMismatch => DurableOutboxClaimRejection::SchemaMismatch,
+            Self::Unavailable => DurableOutboxClaimRejection::UnavailableBeforeCommit,
+        }
+    }
+
+    fn into_acknowledgement_rejection(self) -> DurableOutboxAcknowledgementRejection {
+        match self {
+            Self::Deadline => DurableOutboxAcknowledgementRejection::DeadlineExceededBeforeCommit,
+            Self::WriterFenced(active_generation) => {
+                DurableOutboxAcknowledgementRejection::WriterFenced { active_generation }
+            }
+            Self::Serialization => DurableOutboxAcknowledgementRejection::SerializationFailure,
+            Self::InvalidPersistedState => {
+                DurableOutboxAcknowledgementRejection::InvalidPersistedState
+            }
+            Self::SchemaMismatch => DurableOutboxAcknowledgementRejection::SchemaMismatch,
+            Self::Unavailable => DurableOutboxAcknowledgementRejection::UnavailableBeforeCommit,
+        }
+    }
 }
 
 fn now_unix_millis() -> Result<u64, PreCommitFailure> {
@@ -655,12 +689,23 @@ fn set_local_timeouts(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+enum MetadataLockMode {
+    None,
+    Share,
+    Update,
+}
+
 fn load_namespace_metadata(
     transaction: &mut postgres::Transaction<'_>,
     namespace: &PostgresNamespace,
-    lock_for_commit: bool,
+    lock_mode: MetadataLockMode,
 ) -> Result<PostgresSchemaMetadata, PreCommitFailure> {
-    let suffix = if lock_for_commit { " FOR UPDATE" } else { "" };
+    let suffix: &str = match lock_mode {
+        MetadataLockMode::None => "",
+        MetadataLockMode::Share => " FOR SHARE",
+        MetadataLockMode::Update => " FOR UPDATE",
+    };
     let sql = format!(
         "SELECT
              schema_identity,
@@ -1109,6 +1154,515 @@ fn insert_structured_invocation(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PersistedOutboxAttempt {
+    request_id: OutboxRequestId,
+    message_index: u32,
+    lease_expires_at_unix_millis: u64,
+    state_id: i16,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PersistedOutboxDelivery {
+    request_id: OutboxRequestId,
+    next_message_index: u32,
+    state_id: i16,
+    available_at_unix_millis: u64,
+    active_lease_id: Option<DurableOutboxLeaseId>,
+    lease_expires_at_unix_millis: Option<u64>,
+    attempt_count: u64,
+    revision: u64,
+    message_count: u32,
+}
+
+fn parse_request_id(
+    row: &postgres::Row,
+    index: usize,
+) -> Result<OutboxRequestId, PreCommitFailure> {
+    let bytes: Vec<u8> = row
+        .try_get(index)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    OutboxRequestId::new(bytes).map_err(|_| PreCommitFailure::InvalidPersistedState)
+}
+
+fn parse_lease_id(
+    row: &postgres::Row,
+    index: usize,
+) -> Result<Option<DurableOutboxLeaseId>, PreCommitFailure> {
+    let bytes: Option<Vec<u8>> = row
+        .try_get(index)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    bytes
+        .map(|bytes| {
+            let bytes: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+            DurableOutboxLeaseId::new(bytes).map_err(|_| PreCommitFailure::InvalidPersistedState)
+        })
+        .transpose()
+}
+
+fn load_outbox_attempt(
+    transaction: &mut postgres::Transaction<'_>,
+    context: &DurableOperationContext,
+    namespace: &PostgresNamespace,
+    lease_id: DurableOutboxLeaseId,
+) -> Result<Option<PersistedOutboxAttempt>, PreCommitFailure> {
+    set_local_timeouts(transaction, context)?;
+    let row = transaction
+        .query_opt(
+            "SELECT request_id, message_index, lease_expires_at_ms::TEXT, state_id
+             FROM sunrise_edge.outbox_delivery_attempts
+             WHERE chain_id_bytes = $1
+               AND validator_id = $2
+               AND atomicity_domain_id = $3
+               AND lease_id = $4
+             FOR UPDATE",
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&lease_id.as_bytes()[..],
+            ],
+        )
+        .map_err(|error| PreCommitFailure::from_database(&error))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let message_index: i32 = row
+        .try_get(1)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let message_index =
+        u32::try_from(message_index).map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let state_id: i16 = row
+        .try_get(3)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    if !matches!(
+        state_id,
+        OUTBOX_ATTEMPT_CLAIMED | OUTBOX_ATTEMPT_ACKNOWLEDGED | OUTBOX_ATTEMPT_EXPIRED
+    ) {
+        return Err(PreCommitFailure::InvalidPersistedState);
+    }
+    Ok(Some(PersistedOutboxAttempt {
+        request_id: parse_request_id(&row, 0)?,
+        message_index,
+        lease_expires_at_unix_millis: parse_database_u64(&row, 2)?,
+        state_id,
+    }))
+}
+
+fn parse_outbox_delivery(row: &postgres::Row) -> Result<PersistedOutboxDelivery, PreCommitFailure> {
+    let next_message_index: i32 = row
+        .try_get(1)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let next_message_index =
+        u32::try_from(next_message_index).map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let state_id: i16 = row
+        .try_get(2)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let active_lease_id = parse_lease_id(row, 4)?;
+    let lease_expires_at_unix_millis: Option<String> = row
+        .try_get(5)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let lease_expires_at_unix_millis = lease_expires_at_unix_millis
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| PreCommitFailure::InvalidPersistedState)
+        })
+        .transpose()?;
+    if active_lease_id.is_some() != lease_expires_at_unix_millis.is_some() {
+        return Err(PreCommitFailure::InvalidPersistedState);
+    }
+    let message_count: i32 = row
+        .try_get(8)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let message_count =
+        u32::try_from(message_count).map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    Ok(PersistedOutboxDelivery {
+        request_id: parse_request_id(row, 0)?,
+        next_message_index,
+        state_id,
+        available_at_unix_millis: parse_database_u64(row, 3)?,
+        active_lease_id,
+        lease_expires_at_unix_millis,
+        attempt_count: parse_database_u64(row, 6)?,
+        revision: parse_database_u64(row, 7)?,
+        message_count,
+    })
+}
+
+fn load_exact_outbox_delivery(
+    transaction: &mut postgres::Transaction<'_>,
+    context: &DurableOperationContext,
+    namespace: &PostgresNamespace,
+    request_id: OutboxRequestId,
+) -> Result<Option<PersistedOutboxDelivery>, PreCommitFailure> {
+    set_local_timeouts(transaction, context)?;
+    let row = transaction
+        .query_opt(
+            "SELECT delivery.request_id, delivery.next_message_index,
+                    delivery.state_id, delivery.available_at_ms::TEXT,
+                    delivery.active_lease_id, delivery.lease_expires_at_ms::TEXT,
+                    delivery.attempt_count::TEXT, delivery.revision::TEXT,
+                    batch.message_count
+             FROM sunrise_edge.outbox_delivery AS delivery
+             JOIN sunrise_edge.outbox_batches AS batch
+               USING (chain_id_bytes, validator_id, atomicity_domain_id, request_id)
+             WHERE delivery.chain_id_bytes = $1
+               AND delivery.validator_id = $2
+               AND delivery.atomicity_domain_id = $3
+               AND delivery.request_id = $4
+             FOR UPDATE OF delivery",
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&request_id.as_bytes()[..],
+            ],
+        )
+        .map_err(|error| PreCommitFailure::from_database(&error))?;
+    row.as_ref().map(parse_outbox_delivery).transpose()
+}
+
+fn load_due_outbox_delivery(
+    transaction: &mut postgres::Transaction<'_>,
+    context: &DurableOperationContext,
+    namespace: &PostgresNamespace,
+    now_unix_millis: u64,
+) -> Result<Option<PersistedOutboxDelivery>, PreCommitFailure> {
+    set_local_timeouts(transaction, context)?;
+    let now = now_unix_millis.to_string();
+    let row = transaction
+        .query_opt(
+            "SELECT delivery.request_id, delivery.next_message_index,
+                    delivery.state_id, delivery.available_at_ms::TEXT,
+                    delivery.active_lease_id, delivery.lease_expires_at_ms::TEXT,
+                    delivery.attempt_count::TEXT, delivery.revision::TEXT,
+                    batch.message_count
+             FROM sunrise_edge.outbox_delivery AS delivery
+             JOIN sunrise_edge.outbox_batches AS batch
+               USING (chain_id_bytes, validator_id, atomicity_domain_id, request_id)
+             WHERE delivery.chain_id_bytes = $1
+               AND delivery.validator_id = $2
+               AND delivery.atomicity_domain_id = $3
+               AND delivery.state_id = 1
+               AND delivery.available_at_ms <= CAST(CAST($4 AS TEXT) AS NUMERIC)
+               AND (
+                    delivery.active_lease_id IS NULL
+                    OR delivery.lease_expires_at_ms <= CAST(CAST($4 AS TEXT) AS NUMERIC)
+               )
+             ORDER BY delivery.available_at_ms, delivery.request_id
+             LIMIT 1
+             FOR UPDATE OF delivery SKIP LOCKED",
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &now,
+            ],
+        )
+        .map_err(|error| PreCommitFailure::from_database(&error))?;
+    row.as_ref().map(parse_outbox_delivery).transpose()
+}
+
+fn load_outbox_payload(
+    transaction: &mut postgres::Transaction<'_>,
+    context: &DurableOperationContext,
+    namespace: &PostgresNamespace,
+    request_id: OutboxRequestId,
+    message_index: u32,
+) -> Result<Vec<u8>, PreCommitFailure> {
+    let message_index =
+        i32::try_from(message_index).map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    set_local_timeouts(transaction, context)?;
+    transaction
+        .query_opt(
+            "SELECT canonical_payload
+             FROM sunrise_edge.outbox_messages
+             WHERE chain_id_bytes = $1
+               AND validator_id = $2
+               AND atomicity_domain_id = $3
+               AND request_id = $4
+               AND message_index = $5",
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&request_id.as_bytes()[..],
+                &message_index,
+            ],
+        )
+        .map_err(|error| PreCommitFailure::from_database(&error))?
+        .ok_or(PreCommitFailure::InvalidPersistedState)?
+        .try_get(0)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)
+}
+
+fn reconcile_outbox_claim(
+    transaction: &mut postgres::Transaction<'_>,
+    context: &DurableOperationContext,
+    namespace: &PostgresNamespace,
+    lease_id: DurableOutboxLeaseId,
+    attempt: PersistedOutboxAttempt,
+    now_unix_millis: u64,
+) -> Result<DurableOutboxClaim, DurableOutboxClaimRejection> {
+    if attempt.state_id != OUTBOX_ATTEMPT_CLAIMED
+        || attempt.lease_expires_at_unix_millis <= now_unix_millis
+    {
+        return Err(DurableOutboxClaimRejection::LeaseIdReuse);
+    }
+    let delivery = load_exact_outbox_delivery(transaction, context, namespace, attempt.request_id)
+        .map_err(PreCommitFailure::into_claim_rejection)?
+        .ok_or(DurableOutboxClaimRejection::InvalidPersistedState)?;
+    if delivery.state_id != OUTBOX_DELIVERY_PENDING
+        || delivery.next_message_index != attempt.message_index
+        || delivery.active_lease_id != Some(lease_id)
+        || delivery.lease_expires_at_unix_millis != Some(attempt.lease_expires_at_unix_millis)
+        || delivery.available_at_unix_millis != attempt.lease_expires_at_unix_millis
+    {
+        return Err(DurableOutboxClaimRejection::InvalidPersistedState);
+    }
+    let payload = load_outbox_payload(
+        transaction,
+        context,
+        namespace,
+        attempt.request_id,
+        attempt.message_index,
+    )
+    .map_err(PreCommitFailure::into_claim_rejection)?;
+    DurableOutboxClaim::from_parts(
+        attempt.request_id,
+        attempt.message_index,
+        lease_id,
+        attempt.lease_expires_at_unix_millis,
+        payload,
+    )
+    .map_err(|_| DurableOutboxClaimRejection::InvalidPersistedState)
+}
+
+fn install_outbox_claim(
+    transaction: &mut postgres::Transaction<'_>,
+    context: &DurableOperationContext,
+    namespace: &PostgresNamespace,
+    delivery: PersistedOutboxDelivery,
+    now_unix_millis: u64,
+    lease_id: DurableOutboxLeaseId,
+    lease_expires_at_unix_millis: u64,
+) -> Result<DurableOutboxClaim, DurableOutboxClaimRejection> {
+    if delivery.state_id != OUTBOX_DELIVERY_PENDING
+        || delivery.available_at_unix_millis > now_unix_millis
+    {
+        return Err(DurableOutboxClaimRejection::InvalidPersistedState);
+    }
+    if delivery.next_message_index >= delivery.message_count {
+        return Err(DurableOutboxClaimRejection::InvalidPersistedState);
+    }
+    match (
+        delivery.active_lease_id,
+        delivery.lease_expires_at_unix_millis,
+    ) {
+        (Some(expired_lease_id), Some(expired_at)) if expired_at <= now_unix_millis => {
+            if delivery.available_at_unix_millis != expired_at {
+                return Err(DurableOutboxClaimRejection::InvalidPersistedState);
+            }
+            let expired_attempt =
+                load_outbox_attempt(transaction, context, namespace, expired_lease_id)
+                    .map_err(PreCommitFailure::into_claim_rejection)?
+                    .ok_or(DurableOutboxClaimRejection::InvalidPersistedState)?;
+            if expired_attempt.request_id != delivery.request_id
+                || expired_attempt.message_index != delivery.next_message_index
+                || expired_attempt.lease_expires_at_unix_millis != expired_at
+                || expired_attempt.state_id != OUTBOX_ATTEMPT_CLAIMED
+            {
+                return Err(DurableOutboxClaimRejection::InvalidPersistedState);
+            }
+            set_local_timeouts(transaction, context)
+                .map_err(PreCommitFailure::into_claim_rejection)?;
+            let updated = transaction
+                .execute(
+                    "UPDATE sunrise_edge.outbox_delivery_attempts
+                     SET state_id = $1
+                     WHERE chain_id_bytes = $2
+                       AND validator_id = $3
+                       AND atomicity_domain_id = $4
+                       AND lease_id = $5
+                       AND state_id = $6",
+                    &[
+                        &OUTBOX_ATTEMPT_EXPIRED,
+                        &namespace.chain_id_bytes(),
+                        &&namespace.validator_id().as_bytes()[..],
+                        &&namespace.domain().as_bytes()[..],
+                        &&expired_lease_id.as_bytes()[..],
+                        &OUTBOX_ATTEMPT_CLAIMED,
+                    ],
+                )
+                .map_err(|error| PreCommitFailure::from_database(&error).into_claim_rejection())?;
+            if updated != 1 {
+                return Err(DurableOutboxClaimRejection::InvalidPersistedState);
+            }
+        }
+        (None, None) => {}
+        (Some(_), Some(_)) => return Err(DurableOutboxClaimRejection::InvalidPersistedState),
+        _ => return Err(DurableOutboxClaimRejection::InvalidPersistedState),
+    }
+
+    let attempt_count = delivery
+        .attempt_count
+        .checked_add(1)
+        .ok_or(DurableOutboxClaimRejection::ArithmeticOverflow)?;
+    let revision = delivery
+        .revision
+        .checked_add(1)
+        .ok_or(DurableOutboxClaimRejection::ArithmeticOverflow)?;
+    let payload = load_outbox_payload(
+        transaction,
+        context,
+        namespace,
+        delivery.request_id,
+        delivery.next_message_index,
+    )
+    .map_err(PreCommitFailure::into_claim_rejection)?;
+    let claim = DurableOutboxClaim::from_parts(
+        delivery.request_id,
+        delivery.next_message_index,
+        lease_id,
+        lease_expires_at_unix_millis,
+        payload,
+    )
+    .map_err(|_| DurableOutboxClaimRejection::InvalidPersistedState)?;
+    let message_index = i32::try_from(delivery.next_message_index)
+        .map_err(|_| DurableOutboxClaimRejection::ArithmeticOverflow)?;
+    set_local_timeouts(transaction, context).map_err(PreCommitFailure::into_claim_rejection)?;
+    let inserted: u64 = transaction
+        .execute(
+            "INSERT INTO sunrise_edge.outbox_delivery_attempts (
+                 chain_id_bytes, validator_id, atomicity_domain_id, lease_id,
+                 request_id, message_index, lease_expires_at_ms, state_id
+             ) VALUES (
+                 $1, $2, $3, $4, $5, $6,
+                 CAST(CAST($7 AS TEXT) AS NUMERIC), $8
+             ) ON CONFLICT (
+                 chain_id_bytes, validator_id, atomicity_domain_id, lease_id
+             ) DO NOTHING",
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&lease_id.as_bytes()[..],
+                &&delivery.request_id.as_bytes()[..],
+                &message_index,
+                &lease_expires_at_unix_millis.to_string(),
+                &OUTBOX_ATTEMPT_CLAIMED,
+            ],
+        )
+        .map_err(|error| PreCommitFailure::from_database(&error).into_claim_rejection())?;
+    if inserted != 1 {
+        return Err(DurableOutboxClaimRejection::LeaseIdReuse);
+    }
+    set_local_timeouts(transaction, context).map_err(PreCommitFailure::into_claim_rejection)?;
+    let updated = transaction
+        .execute(
+            "UPDATE sunrise_edge.outbox_delivery
+             SET active_lease_id = $1,
+                 lease_expires_at_ms = CAST(CAST($2 AS TEXT) AS NUMERIC),
+                 available_at_ms = CAST(CAST($2 AS TEXT) AS NUMERIC),
+                 attempt_count = CAST(CAST($3 AS TEXT) AS NUMERIC),
+                 revision = CAST(CAST($4 AS TEXT) AS NUMERIC)
+             WHERE chain_id_bytes = $5
+               AND validator_id = $6
+               AND atomicity_domain_id = $7
+               AND request_id = $8
+               AND revision = CAST(CAST($9 AS TEXT) AS NUMERIC)",
+            &[
+                &&lease_id.as_bytes()[..],
+                &lease_expires_at_unix_millis.to_string(),
+                &attempt_count.to_string(),
+                &revision.to_string(),
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&delivery.request_id.as_bytes()[..],
+                &delivery.revision.to_string(),
+            ],
+        )
+        .map_err(|error| PreCommitFailure::from_database(&error).into_claim_rejection())?;
+    if updated != 1 {
+        return Err(DurableOutboxClaimRejection::InvalidPersistedState);
+    }
+    Ok(claim)
+}
+
+fn finalize_outbox_claim(
+    transaction: postgres::Transaction<'_>,
+    claim: DurableOutboxClaim,
+) -> DurableOutboxClaimOutcome {
+    match transaction.commit() {
+        Ok(()) => DurableOutboxClaimOutcome::Claimed(claim),
+        Err(error) => {
+            classify_outbox_claim_commit_error(error.code().map(postgres::error::SqlState::code))
+        }
+    }
+}
+
+fn classify_outbox_claim_commit_error(sqlstate: Option<&str>) -> DurableOutboxClaimOutcome {
+    match sqlstate {
+        Some("40001" | "40P01") => {
+            DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::SerializationFailure)
+        }
+        Some("3F000" | "42P01" | "42703" | "42883") => {
+            DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::SchemaMismatch)
+        }
+        Some(code) if code.starts_with("22") || code.starts_with("23") => {
+            DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::InvalidPersistedState)
+        }
+        Some("57014") => {
+            DurableOutboxClaimOutcome::Indeterminate(IndeterminateCommitReason::DeadlineExceeded)
+        }
+        _ => DurableOutboxClaimOutcome::Indeterminate(IndeterminateCommitReason::ConnectionLost),
+    }
+}
+
+fn finalize_outbox_acknowledgement(
+    transaction: postgres::Transaction<'_>,
+) -> DurableOutboxAcknowledgementOutcome {
+    match transaction.commit() {
+        Ok(()) => DurableOutboxAcknowledgementOutcome::Acknowledged,
+        Err(error) => classify_outbox_acknowledgement_commit_error(
+            error.code().map(postgres::error::SqlState::code),
+        ),
+    }
+}
+
+fn classify_outbox_acknowledgement_commit_error(
+    sqlstate: Option<&str>,
+) -> DurableOutboxAcknowledgementOutcome {
+    match sqlstate {
+        Some("40001" | "40P01") => DurableOutboxAcknowledgementOutcome::Rejected(
+            DurableOutboxAcknowledgementRejection::SerializationFailure,
+        ),
+        Some("3F000" | "42P01" | "42703" | "42883") => {
+            DurableOutboxAcknowledgementOutcome::Rejected(
+                DurableOutboxAcknowledgementRejection::SchemaMismatch,
+            )
+        }
+        Some(code) if code.starts_with("22") || code.starts_with("23") => {
+            DurableOutboxAcknowledgementOutcome::Rejected(
+                DurableOutboxAcknowledgementRejection::InvalidPersistedState,
+            )
+        }
+        Some("57014") => DurableOutboxAcknowledgementOutcome::Indeterminate(
+            IndeterminateCommitReason::DeadlineExceeded,
+        ),
+        _ => DurableOutboxAcknowledgementOutcome::Indeterminate(
+            IndeterminateCommitReason::ConnectionLost,
+        ),
+    }
+}
+
 fn finalize_commit(transaction: postgres::Transaction<'_>) -> DurableCommitOutcome {
     match transaction.commit() {
         Ok(()) => DurableCommitOutcome::Committed,
@@ -1172,6 +1726,58 @@ where
         }
         DurableCommitOutcome::Rejected(DurableCommitRejection::SerializationFailure)
     }
+
+    fn retry_outbox_claim(
+        &self,
+        context: &DurableOperationContext,
+        mut attempt: impl FnMut() -> DurableOutboxClaimOutcome,
+    ) -> DurableOutboxClaimOutcome {
+        let maximum: u32 = self.transaction_policy.max_serialization_attempts().get();
+        for attempt_number in 1..=maximum {
+            let outcome: DurableOutboxClaimOutcome = attempt();
+            if !matches!(
+                outcome,
+                DurableOutboxClaimOutcome::Rejected(
+                    DurableOutboxClaimRejection::SerializationFailure
+                )
+            ) || attempt_number == maximum
+            {
+                return outcome;
+            }
+            if let Err(reason) = remaining_deadline(context) {
+                return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+            }
+        }
+        DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::SerializationFailure)
+    }
+
+    fn retry_outbox_acknowledgement(
+        &self,
+        context: &DurableOperationContext,
+        mut attempt: impl FnMut() -> DurableOutboxAcknowledgementOutcome,
+    ) -> DurableOutboxAcknowledgementOutcome {
+        let maximum: u32 = self.transaction_policy.max_serialization_attempts().get();
+        for attempt_number in 1..=maximum {
+            let outcome: DurableOutboxAcknowledgementOutcome = attempt();
+            if !matches!(
+                outcome,
+                DurableOutboxAcknowledgementOutcome::Rejected(
+                    DurableOutboxAcknowledgementRejection::SerializationFailure
+                )
+            ) || attempt_number == maximum
+            {
+                return outcome;
+            }
+            if let Err(reason) = remaining_deadline(context) {
+                return DurableOutboxAcknowledgementOutcome::Rejected(
+                    reason.into_acknowledgement_rejection(),
+                );
+            }
+        }
+        DurableOutboxAcknowledgementOutcome::Rejected(
+            DurableOutboxAcknowledgementRejection::SerializationFailure,
+        )
+    }
 }
 
 impl<M> DurableDomainStateStore for PostgresDurableStore<M>
@@ -1201,8 +1807,9 @@ where
             .start()
             .map_err(|error| PreCommitFailure::from_database(&error).into_read_error())?;
         set_local_timeouts(&mut transaction, context).map_err(PreCommitFailure::into_read_error)?;
-        let metadata = load_namespace_metadata(&mut transaction, &self.namespace, false)
-            .map_err(PreCommitFailure::into_read_error)?;
+        let metadata =
+            load_namespace_metadata(&mut transaction, &self.namespace, MetadataLockMode::None)
+                .map_err(PreCommitFailure::into_read_error)?;
         validate_operation_authority(metadata, context)
             .map_err(PreCommitFailure::into_read_error)?;
         let value = load_state_value(&mut transaction, &self.namespace, key)
@@ -1244,7 +1851,11 @@ where
             if let Err(reason) = set_local_timeouts(&mut transaction, context) {
                 return DurableCommitOutcome::Rejected(reason.into_commit_rejection());
             }
-            let metadata = match load_namespace_metadata(&mut transaction, &self.namespace, true) {
+            let metadata = match load_namespace_metadata(
+                &mut transaction,
+                &self.namespace,
+                MetadataLockMode::Update,
+            ) {
                 Ok(metadata) => metadata,
                 Err(reason) => {
                     return DurableCommitOutcome::Rejected(reason.into_commit_rejection());
@@ -1316,8 +1927,9 @@ where
             .start()
             .map_err(|error| PreCommitFailure::from_database(&error).into_read_error())?;
         set_local_timeouts(&mut transaction, context).map_err(PreCommitFailure::into_read_error)?;
-        let metadata = load_namespace_metadata(&mut transaction, &self.namespace, false)
-            .map_err(PreCommitFailure::into_read_error)?;
+        let metadata =
+            load_namespace_metadata(&mut transaction, &self.namespace, MetadataLockMode::None)
+                .map_err(PreCommitFailure::into_read_error)?;
         validate_operation_authority(metadata, context)
             .map_err(PreCommitFailure::into_read_error)?;
         let receipt = load_receipt(&mut transaction, &self.namespace, request_id)
@@ -1362,7 +1974,11 @@ where
             if let Err(reason) = set_local_timeouts(&mut transaction, context) {
                 return DurableCommitOutcome::Rejected(reason.into_commit_rejection());
             }
-            let metadata = match load_namespace_metadata(&mut transaction, &self.namespace, true) {
+            let metadata = match load_namespace_metadata(
+                &mut transaction,
+                &self.namespace,
+                MetadataLockMode::Update,
+            ) {
                 Ok(metadata) => metadata,
                 Err(reason) => {
                     return DurableCommitOutcome::Rejected(reason.into_commit_rejection());
@@ -1437,6 +2053,491 @@ where
     }
 }
 
+impl<M> IndexedOutboxRepository for PostgresDurableStore<M>
+where
+    M: ManageConnection<Connection = Client, Error = postgres::Error> + 'static,
+{
+    fn claim_request_outbox(
+        &self,
+        context: &DurableOperationContext,
+        request: RequestOutboxClaimRequest,
+    ) -> DurableOutboxClaimOutcome {
+        if !self.domain_is_bound(request.domain()) {
+            return DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::LeaseIdReuse);
+        }
+        self.retry_outbox_claim(context, || {
+            let mut client = match self.acquire(context) {
+                Ok(client) => client,
+                Err(reason) => {
+                    return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+                }
+            };
+            let mut transaction = match client
+                .build_transaction()
+                .isolation_level(IsolationLevel::Serializable)
+                .start()
+            {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    return DurableOutboxClaimOutcome::Rejected(
+                        PreCommitFailure::from_database(&error).into_claim_rejection(),
+                    );
+                }
+            };
+            if let Err(reason) = set_local_timeouts(&mut transaction, context) {
+                return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+            }
+            let metadata = match load_namespace_metadata(
+                &mut transaction,
+                &self.namespace,
+                MetadataLockMode::Share,
+            ) {
+                Ok(metadata) => metadata,
+                Err(reason) => {
+                    return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+                }
+            };
+            if let Err(reason) = validate_operation_authority(metadata, context) {
+                return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+            }
+            let existing = match load_outbox_attempt(
+                &mut transaction,
+                context,
+                &self.namespace,
+                request.lease_id(),
+            ) {
+                Ok(existing) => existing,
+                Err(reason) => {
+                    return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+                }
+            };
+            if let Some(attempt) = existing {
+                if attempt.request_id != request.request_id() {
+                    return DurableOutboxClaimOutcome::Rejected(
+                        DurableOutboxClaimRejection::LeaseIdReuse,
+                    );
+                }
+                return match reconcile_outbox_claim(
+                    &mut transaction,
+                    context,
+                    &self.namespace,
+                    request.lease_id(),
+                    attempt,
+                    request.now_unix_millis(),
+                ) {
+                    Ok(claim) => DurableOutboxClaimOutcome::Claimed(claim),
+                    Err(reason) => DurableOutboxClaimOutcome::Rejected(reason),
+                };
+            }
+            let delivery = match load_exact_outbox_delivery(
+                &mut transaction,
+                context,
+                &self.namespace,
+                request.request_id(),
+            ) {
+                Ok(Some(delivery)) => delivery,
+                Ok(None) => return DurableOutboxClaimOutcome::NoDueWork,
+                Err(reason) => {
+                    return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+                }
+            };
+            if delivery.state_id != OUTBOX_DELIVERY_PENDING
+                || delivery.available_at_unix_millis > request.now_unix_millis()
+                || delivery
+                    .lease_expires_at_unix_millis
+                    .is_some_and(|expires_at| expires_at > request.now_unix_millis())
+            {
+                return DurableOutboxClaimOutcome::NoDueWork;
+            }
+            let claim = match install_outbox_claim(
+                &mut transaction,
+                context,
+                &self.namespace,
+                delivery,
+                request.now_unix_millis(),
+                request.lease_id(),
+                request.lease_expires_at_unix_millis(),
+            ) {
+                Ok(claim) => claim,
+                Err(reason) => return DurableOutboxClaimOutcome::Rejected(reason),
+            };
+            if let Err(reason) = set_local_timeouts(&mut transaction, context) {
+                return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+            }
+            if let Err(error) = transaction.batch_execute("SET CONSTRAINTS ALL IMMEDIATE") {
+                return DurableOutboxClaimOutcome::Rejected(
+                    PreCommitFailure::from_database(&error).into_claim_rejection(),
+                );
+            }
+            if let Err(reason) = remaining_deadline(context) {
+                return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+            }
+            finalize_outbox_claim(transaction, claim)
+        })
+    }
+
+    fn claim_due_outbox(
+        &self,
+        context: &DurableOperationContext,
+        request: DueOutboxClaimRequest,
+    ) -> DurableOutboxClaimOutcome {
+        if !self.domain_is_bound(request.domain()) {
+            return DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::LeaseIdReuse);
+        }
+        self.retry_outbox_claim(context, || {
+            let mut client = match self.acquire(context) {
+                Ok(client) => client,
+                Err(reason) => {
+                    return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+                }
+            };
+            let mut transaction = match client
+                .build_transaction()
+                .isolation_level(IsolationLevel::Serializable)
+                .start()
+            {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    return DurableOutboxClaimOutcome::Rejected(
+                        PreCommitFailure::from_database(&error).into_claim_rejection(),
+                    );
+                }
+            };
+            if let Err(reason) = set_local_timeouts(&mut transaction, context) {
+                return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+            }
+            let metadata = match load_namespace_metadata(
+                &mut transaction,
+                &self.namespace,
+                MetadataLockMode::Share,
+            ) {
+                Ok(metadata) => metadata,
+                Err(reason) => {
+                    return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+                }
+            };
+            if let Err(reason) = validate_operation_authority(metadata, context) {
+                return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+            }
+            let existing = match load_outbox_attempt(
+                &mut transaction,
+                context,
+                &self.namespace,
+                request.lease_id(),
+            ) {
+                Ok(existing) => existing,
+                Err(reason) => {
+                    return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+                }
+            };
+            if let Some(attempt) = existing {
+                return match reconcile_outbox_claim(
+                    &mut transaction,
+                    context,
+                    &self.namespace,
+                    request.lease_id(),
+                    attempt,
+                    request.now_unix_millis(),
+                ) {
+                    Ok(claim) => DurableOutboxClaimOutcome::Claimed(claim),
+                    Err(reason) => DurableOutboxClaimOutcome::Rejected(reason),
+                };
+            }
+            let delivery = match load_due_outbox_delivery(
+                &mut transaction,
+                context,
+                &self.namespace,
+                request.now_unix_millis(),
+            ) {
+                Ok(Some(delivery)) => delivery,
+                Ok(None) => return DurableOutboxClaimOutcome::NoDueWork,
+                Err(reason) => {
+                    return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+                }
+            };
+            let claim = match install_outbox_claim(
+                &mut transaction,
+                context,
+                &self.namespace,
+                delivery,
+                request.now_unix_millis(),
+                request.lease_id(),
+                request.lease_expires_at_unix_millis(),
+            ) {
+                Ok(claim) => claim,
+                Err(reason) => return DurableOutboxClaimOutcome::Rejected(reason),
+            };
+            if let Err(reason) = set_local_timeouts(&mut transaction, context) {
+                return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+            }
+            if let Err(error) = transaction.batch_execute("SET CONSTRAINTS ALL IMMEDIATE") {
+                return DurableOutboxClaimOutcome::Rejected(
+                    PreCommitFailure::from_database(&error).into_claim_rejection(),
+                );
+            }
+            if let Err(reason) = remaining_deadline(context) {
+                return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+            }
+            finalize_outbox_claim(transaction, claim)
+        })
+    }
+
+    fn acknowledge_outbox(
+        &self,
+        context: &DurableOperationContext,
+        acknowledgement: DurableOutboxAcknowledgement,
+    ) -> DurableOutboxAcknowledgementOutcome {
+        if !self.domain_is_bound(acknowledgement.domain()) {
+            return DurableOutboxAcknowledgementOutcome::Rejected(
+                DurableOutboxAcknowledgementRejection::LeaseMismatch,
+            );
+        }
+        self.retry_outbox_acknowledgement(context, || {
+            let mut client = match self.acquire(context) {
+                Ok(client) => client,
+                Err(reason) => {
+                    return DurableOutboxAcknowledgementOutcome::Rejected(
+                        reason.into_acknowledgement_rejection(),
+                    );
+                }
+            };
+            let mut transaction = match client
+                .build_transaction()
+                .isolation_level(IsolationLevel::Serializable)
+                .start()
+            {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    return DurableOutboxAcknowledgementOutcome::Rejected(
+                        PreCommitFailure::from_database(&error).into_acknowledgement_rejection(),
+                    );
+                }
+            };
+            if let Err(reason) = set_local_timeouts(&mut transaction, context) {
+                return DurableOutboxAcknowledgementOutcome::Rejected(
+                    reason.into_acknowledgement_rejection(),
+                );
+            }
+            let metadata = match load_namespace_metadata(
+                &mut transaction,
+                &self.namespace,
+                MetadataLockMode::Share,
+            ) {
+                Ok(metadata) => metadata,
+                Err(reason) => {
+                    return DurableOutboxAcknowledgementOutcome::Rejected(
+                        reason.into_acknowledgement_rejection(),
+                    );
+                }
+            };
+            if let Err(reason) = validate_operation_authority(metadata, context) {
+                return DurableOutboxAcknowledgementOutcome::Rejected(
+                    reason.into_acknowledgement_rejection(),
+                );
+            }
+            let attempt = match load_outbox_attempt(
+                &mut transaction,
+                context,
+                &self.namespace,
+                acknowledgement.lease_id(),
+            ) {
+                Ok(Some(attempt)) => attempt,
+                Ok(None) => {
+                    return DurableOutboxAcknowledgementOutcome::Rejected(
+                        DurableOutboxAcknowledgementRejection::LeaseMismatch,
+                    );
+                }
+                Err(reason) => {
+                    return DurableOutboxAcknowledgementOutcome::Rejected(
+                        reason.into_acknowledgement_rejection(),
+                    );
+                }
+            };
+            if attempt.request_id != acknowledgement.request_id()
+                || attempt.message_index != acknowledgement.message_index()
+            {
+                return DurableOutboxAcknowledgementOutcome::Rejected(
+                    DurableOutboxAcknowledgementRejection::LeaseMismatch,
+                );
+            }
+            let delivery = match load_exact_outbox_delivery(
+                &mut transaction,
+                context,
+                &self.namespace,
+                acknowledgement.request_id(),
+            ) {
+                Ok(Some(delivery)) => delivery,
+                Ok(None) => {
+                    return DurableOutboxAcknowledgementOutcome::Rejected(
+                        DurableOutboxAcknowledgementRejection::InvalidPersistedState,
+                    );
+                }
+                Err(reason) => {
+                    return DurableOutboxAcknowledgementOutcome::Rejected(
+                        reason.into_acknowledgement_rejection(),
+                    );
+                }
+            };
+            if attempt.state_id == OUTBOX_ATTEMPT_ACKNOWLEDGED {
+                if attempt.message_index >= delivery.message_count
+                    || delivery.next_message_index <= attempt.message_index
+                    || delivery.next_message_index > delivery.message_count
+                {
+                    return DurableOutboxAcknowledgementOutcome::Rejected(
+                        DurableOutboxAcknowledgementRejection::InvalidPersistedState,
+                    );
+                }
+                return DurableOutboxAcknowledgementOutcome::Acknowledged;
+            }
+            if attempt.state_id != OUTBOX_ATTEMPT_CLAIMED {
+                return DurableOutboxAcknowledgementOutcome::Rejected(
+                    DurableOutboxAcknowledgementRejection::LeaseMismatch,
+                );
+            }
+            if delivery.next_message_index != acknowledgement.message_index() {
+                return DurableOutboxAcknowledgementOutcome::Rejected(
+                    DurableOutboxAcknowledgementRejection::IndexMismatch,
+                );
+            }
+            if delivery.state_id != OUTBOX_DELIVERY_PENDING
+                || delivery.active_lease_id != Some(acknowledgement.lease_id())
+                || delivery.lease_expires_at_unix_millis
+                    != Some(attempt.lease_expires_at_unix_millis)
+                || delivery.available_at_unix_millis != attempt.lease_expires_at_unix_millis
+            {
+                return DurableOutboxAcknowledgementOutcome::Rejected(
+                    DurableOutboxAcknowledgementRejection::LeaseMismatch,
+                );
+            }
+            let next_message_index = match delivery.next_message_index.checked_add(1) {
+                Some(index) => index,
+                None => {
+                    return DurableOutboxAcknowledgementOutcome::Rejected(
+                        DurableOutboxAcknowledgementRejection::ArithmeticOverflow,
+                    );
+                }
+            };
+            if next_message_index > delivery.message_count {
+                return DurableOutboxAcknowledgementOutcome::Rejected(
+                    DurableOutboxAcknowledgementRejection::InvalidPersistedState,
+                );
+            }
+            let revision = match delivery.revision.checked_add(1) {
+                Some(revision) => revision,
+                None => {
+                    return DurableOutboxAcknowledgementOutcome::Rejected(
+                        DurableOutboxAcknowledgementRejection::ArithmeticOverflow,
+                    );
+                }
+            };
+            if let Err(reason) = set_local_timeouts(&mut transaction, context) {
+                return DurableOutboxAcknowledgementOutcome::Rejected(
+                    reason.into_acknowledgement_rejection(),
+                );
+            }
+            let attempt_updated = match transaction.execute(
+                "UPDATE sunrise_edge.outbox_delivery_attempts
+                 SET state_id = $1
+                 WHERE chain_id_bytes = $2
+                   AND validator_id = $3
+                   AND atomicity_domain_id = $4
+                   AND lease_id = $5
+                   AND state_id = $6",
+                &[
+                    &OUTBOX_ATTEMPT_ACKNOWLEDGED,
+                    &self.namespace.chain_id_bytes(),
+                    &&self.namespace.validator_id().as_bytes()[..],
+                    &&self.namespace.domain().as_bytes()[..],
+                    &&acknowledgement.lease_id().as_bytes()[..],
+                    &OUTBOX_ATTEMPT_CLAIMED,
+                ],
+            ) {
+                Ok(updated) => updated,
+                Err(error) => {
+                    return DurableOutboxAcknowledgementOutcome::Rejected(
+                        PreCommitFailure::from_database(&error).into_acknowledgement_rejection(),
+                    );
+                }
+            };
+            if attempt_updated != 1 {
+                return DurableOutboxAcknowledgementOutcome::Rejected(
+                    DurableOutboxAcknowledgementRejection::InvalidPersistedState,
+                );
+            }
+            let state_id: i16 = if next_message_index == delivery.message_count {
+                OUTBOX_DELIVERY_COMPLETED
+            } else {
+                OUTBOX_DELIVERY_PENDING
+            };
+            let next_message_index_i32 = match i32::try_from(next_message_index) {
+                Ok(index) => index,
+                Err(_) => {
+                    return DurableOutboxAcknowledgementOutcome::Rejected(
+                        DurableOutboxAcknowledgementRejection::ArithmeticOverflow,
+                    );
+                }
+            };
+            if let Err(reason) = set_local_timeouts(&mut transaction, context) {
+                return DurableOutboxAcknowledgementOutcome::Rejected(
+                    reason.into_acknowledgement_rejection(),
+                );
+            }
+            let delivery_updated = match transaction.execute(
+                "UPDATE sunrise_edge.outbox_delivery
+                 SET next_message_index = $1,
+                     state_id = $2,
+                     available_at_ms = 0,
+                     active_lease_id = NULL,
+                     lease_expires_at_ms = NULL,
+                     revision = CAST(CAST($3 AS TEXT) AS NUMERIC)
+                 WHERE chain_id_bytes = $4
+                   AND validator_id = $5
+                   AND atomicity_domain_id = $6
+                   AND request_id = $7
+                   AND revision = CAST(CAST($8 AS TEXT) AS NUMERIC)",
+                &[
+                    &next_message_index_i32,
+                    &state_id,
+                    &revision.to_string(),
+                    &self.namespace.chain_id_bytes(),
+                    &&self.namespace.validator_id().as_bytes()[..],
+                    &&self.namespace.domain().as_bytes()[..],
+                    &&acknowledgement.request_id().as_bytes()[..],
+                    &delivery.revision.to_string(),
+                ],
+            ) {
+                Ok(updated) => updated,
+                Err(error) => {
+                    return DurableOutboxAcknowledgementOutcome::Rejected(
+                        PreCommitFailure::from_database(&error).into_acknowledgement_rejection(),
+                    );
+                }
+            };
+            if delivery_updated != 1 {
+                return DurableOutboxAcknowledgementOutcome::Rejected(
+                    DurableOutboxAcknowledgementRejection::InvalidPersistedState,
+                );
+            }
+            if let Err(reason) = set_local_timeouts(&mut transaction, context) {
+                return DurableOutboxAcknowledgementOutcome::Rejected(
+                    reason.into_acknowledgement_rejection(),
+                );
+            }
+            if let Err(error) = transaction.batch_execute("SET CONSTRAINTS ALL IMMEDIATE") {
+                return DurableOutboxAcknowledgementOutcome::Rejected(
+                    PreCommitFailure::from_database(&error).into_acknowledgement_rejection(),
+                );
+            }
+            if let Err(reason) = remaining_deadline(context) {
+                return DurableOutboxAcknowledgementOutcome::Rejected(
+                    reason.into_acknowledgement_rejection(),
+                );
+            }
+            finalize_outbox_acknowledgement(transaction)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1471,5 +2572,27 @@ mod tests {
                 }
             )
         ));
+    }
+
+    #[test]
+    fn unknown_outbox_commit_results_remain_indeterminate() {
+        assert_eq!(
+            classify_outbox_claim_commit_error(None),
+            DurableOutboxClaimOutcome::Indeterminate(IndeterminateCommitReason::ConnectionLost)
+        );
+        assert_eq!(
+            classify_outbox_claim_commit_error(Some("XX999")),
+            DurableOutboxClaimOutcome::Indeterminate(IndeterminateCommitReason::ConnectionLost)
+        );
+        assert_eq!(
+            classify_outbox_acknowledgement_commit_error(None),
+            DurableOutboxAcknowledgementOutcome::Indeterminate(
+                IndeterminateCommitReason::ConnectionLost
+            )
+        );
+        assert_eq!(
+            classify_outbox_claim_commit_error(Some("40001")),
+            DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::SerializationFailure)
+        );
     }
 }

@@ -5,9 +5,10 @@ node-core/native wiring, and explicit generation-one schema migration/bootstrap
 exist As-Is. A bounded synchronous pool now implements fenced state/receipt
 reads and serializable structured state/receipt/outbox commit with transaction-
 local deadlines, bounded unchanged-envelope serialization retry, and typed
-outcomes. Indexed outbox claim/ack, migration
-operations beyond initial bootstrap, fault/capacity evidence, and production
-certification are not implemented.
+outcomes. Indexed exact-request/due outbox claim and acknowledgement now use
+the normalized delivery index and retained lease-attempt history As-Is.
+Migration operations beyond initial bootstrap, cancellation, fault/capacity
+evidence, and production certification are not implemented.
 
 This document refines [`PERSISTENCE.md`](PERSISTENCE.md) for the first
 production-oriented PostgreSQL backend. It deliberately does not map the
@@ -232,6 +233,12 @@ attempt returns success without changing the cursor.
 Claim and acknowledgement use the same fence/deadline/indeterminate rules as
 state commit. An indeterminate claim is retried only with the same lease ID and
 is never transported unresolved.
+
+The adapter is bound to one logical domain at construction. A claim naming a
+different domain is rejected as lease-ID reuse and an acknowledgement naming a
+different domain is a definite lease mismatch. These are fail-closed mutation
+outcomes because the runtime outbox rejection types do not currently expose a
+separate domain-mismatch variant.
 
 ## 7. Pool, sessions, and reads
 

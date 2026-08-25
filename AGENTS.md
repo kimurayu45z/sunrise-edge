@@ -227,9 +227,9 @@ one message for that exact request; it never sends an unresolved claim.
 `runtime-postgres` now applies the explicit generation-one normalized schema
 and bootstraps exact namespace/schema/fence metadata through operator-only APIs,
 with real PostgreSQL CI. Its bounded pool now implements fenced structured
-state/receipt reads and serializable state/receipt/outbox commit As-Is. Next,
-implement the indexed claim/ack path required by [`POSTGRES.md`](POSTGRES.md)
-behind native recovery; then run shared conformance, deadline/cancellation,
+state/receipt reads, serializable state/receipt/outbox commit, and indexed
+claim/ack with retained attempt history As-Is. Next, run shared conformance,
+deadline/cancellation,
 abrupt fault,
 backup/restore, capacity, and provider implementations. Do not spend further
 effort treating the opaque SQLite table or prefix scanner as the production

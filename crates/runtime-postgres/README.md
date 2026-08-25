@@ -9,8 +9,11 @@ The structured store performs fenced state/receipt reads and serializable
 state/receipt/outbox commits with complete read assertions, checked revisions,
 per-statement remaining-deadline timeouts, bounded unchanged-envelope
 serialization retry, and conservative commit-result classification.
-It does not yet implement `IndexedOutboxRepository`, cancellation after a
-started synchronous operation, or production fault/capacity certification.
+It also implements `IndexedOutboxRepository` with exact-request and stable
+indexed due claims, same-lease reconciliation, expired-lease replacement,
+retained attempt history, and idempotent acknowledgement. It does not yet
+implement cancellation after a started synchronous operation or production
+fault/capacity certification.
 Request handling must never call `apply_initial_schema` or
 `bootstrap_namespace`; those remain operator-only actions.
 
