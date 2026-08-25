@@ -883,6 +883,20 @@ tests prove an older due row in the same domain is not mistaken for the current
 request. No restart-safe durable adapter uses this boundary yet, and started
 transport/storage work is not cancellable.
 
+The `runtime-postgres` crate now makes the accepted generation-one schema
+executable through an operator-only migration and exact namespace bootstrap.
+Its dedicated `sunrise_edge` schema separates metadata, state records, object
+versions/heads, request receipts, outbox batches/messages, indexed delivery,
+retained lease attempts, checkpoints, and migration jobs. Namespace rows bind
+exact chain bytes, validator identity, logical domain, schema identity and
+generation, and a non-zero physical writer fence. Full-range `u64` values use
+checked `NUMERIC(20,0)` constraints. PostgreSQL 18 CI applies the migration in a
+dedicated test database and verifies idempotent schema application, bootstrap
+fence mismatch rejection, exact relations/indexes, unsigned overflow rejection,
+and zero-domain rejection. Request traffic does not run DDL or bootstrap, and
+the crate does not yet implement structured commit or indexed outbox traits;
+therefore this is schema As-Is evidence, not a durable adapter claim.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -1118,3 +1132,9 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   once with the same identity, and never send an unresolved claim. Bound the
   synchronous path with existing native admission and keep durable adapters,
   cancellation, and production capacity evidence as separate exit work.
+- DR-0058: Materialize the accepted normalized PostgreSQL generation-one schema
+  before implementing transaction code. Keep migration and namespace bootstrap
+  as explicit operator APIs, bind exact binary namespace and writer metadata,
+  represent full-range unsigned values with checked decimal constraints, and
+  verify the real schema and due index in PostgreSQL 18 CI. Do not expose DDL on
+  request paths or claim schema application alone is a durable adapter.

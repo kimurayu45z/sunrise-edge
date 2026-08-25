@@ -2054,7 +2054,8 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
 3. `POSTGRES.md`のexact namespace、unsigned SQL representation、normalized relation、attempt history、
    transaction order、migration policyを維持する。adapterがopaque PersistenceLayout key prefixをparseせずに済むよう、
    state/object/receipt/outboxを明示的sectionとして持つstructured durable transaction envelopeを先に実装する
-   （runtime/node-core/memory/native composition implemented As-Is; migration/durable adapter pending）。その後explicit migration、bounded pool/deadline、
+   （runtime/node-core/memory/native compositionとgeneration-one normalized schema migration/operator bootstrapは
+   implemented As-Is; fenced structured commit/indexed claim adapter pending）。その後explicit migration、bounded pool/deadline、
    typed conflictを持つPostgreSQL adapterを実装する。
 4. shared conformanceにwrite skew、absent-key race、serialization failure、lease fencing、schema/version skewを追加する。
 5. kill/power fault、disk full、connection exhaustion、capacity/load/soak、backup/restore、writer failoverをrehearsalする。

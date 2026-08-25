@@ -1,8 +1,9 @@
 # PostgreSQL Reference Design
 
-Status: accepted implementation design. The runtime structured envelope exists
-As-Is; node-core wiring, schema migration, Rust adapter, and production
-certification are not implemented.
+Status: accepted implementation design. The runtime structured envelope,
+node-core/native wiring, and explicit generation-one schema migration/bootstrap
+exist As-Is. Fenced durable commit, indexed outbox adapter, migration operations
+beyond initial bootstrap, and production certification are not implemented.
 
 This document refines [`PERSISTENCE.md`](PERSISTENCE.md) for the first
 production-oriented PostgreSQL backend. It deliberately does not map the
@@ -19,21 +20,21 @@ Runtime now has a structured durable transaction envelope with explicit bounded
 sections:
 
 - exact state-record read assertions and mutations;
-- object-version creation and object-head assertions/mutations;
+- an explicitly empty object section reserved for later typed object-version and
+  object-head assertions/mutations;
 - one typed request-receipt insertion;
 - zero or one typed immutable outbox batch and its ordered messages;
 - one initial outbox-delivery row when a batch is present;
 - the logical domain plus `DurableOperationContext`.
 
 The implemented runtime envelope rejects cross-domain and receipt/outbox
-request/event-digest drift, permits read-only state assertions, and bounds
-aggregate bytes. Node-core has not migrated to construct it, and the concrete
-object section intentionally supports only explicit empty. Before the adapter,
-the envelope must additionally reject duplicate logical identities across
-future object sections, require
-every mutable head/state record to have a read assertion, and account for all
-represented bytes before storage I/O. Receipt and outbox identities must match
-the invocation request and event digest. The PostgreSQL adapter consumes those
+request/event-digest drift, permits read-only state assertions, requires every
+state mutation to have a read assertion, and bounds all currently represented
+bytes. Node-core constructs it and the additive native path consumes the
+structured store contract. The concrete object section intentionally supports
+only explicit empty and must gain duplicate-identity and mutation/read checks
+when typed object changes are added. Receipt and outbox identities match the
+invocation request and event digest. The PostgreSQL adapter consumes those
 sections directly. It never parses a `PersistenceLayout` path as correctness
 input.
 
