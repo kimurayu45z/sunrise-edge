@@ -78,6 +78,8 @@ pub enum RuntimeError {
     DurableStoreUnavailable,
     /// Persisted state violated the runtime revision/value invariants.
     InvalidPersistedState,
+    /// An operation named a domain other than the store's bound domain.
+    AtomicityDomainMismatch,
     /// A state-key scan requested more keys than one page permits.
     StateScanLimitTooLarge {
         /// Requested page size.
@@ -134,6 +136,12 @@ impl fmt::Display for RuntimeError {
             Self::TransportUnavailable => write!(f, "outbound transport is unavailable"),
             Self::DurableStoreUnavailable => write!(f, "durable state store is unavailable"),
             Self::InvalidPersistedState => write!(f, "persisted state violates runtime invariants"),
+            Self::AtomicityDomainMismatch => {
+                write!(
+                    f,
+                    "operation atomicity domain does not match store authority"
+                )
+            }
             Self::StateScanLimitTooLarge { requested, maximum } => write!(
                 f,
                 "state scan requested {requested} keys, maximum is {maximum}"
@@ -1478,6 +1486,10 @@ pub enum DurableCommitRejection {
         /// Revision observed while the store held commit authority.
         current_revision: StateRevision,
     },
+    /// The request receipt appeared after the caller's replay read.
+    RequestAlreadyCommitted,
+    /// The transaction named a domain other than the store's bound domain.
+    AtomicityDomainMismatch,
     /// The supplied writer generation was not the active generation.
     WriterFenced {
         /// Generation that is currently authoritative.
@@ -1489,6 +1501,8 @@ pub enum DurableCommitRejection {
     SerializationFailure,
     /// A mutation revision would overflow, so no row was changed.
     StateRevisionOverflow,
+    /// The namespace commit sequence would overflow, so no row was changed.
+    CommitSequenceOverflow,
     /// Persisted state or an operational projection violated invariants before commit.
     InvalidPersistedState,
     /// The durable schema identity or generation is unsupported by this adapter.
@@ -2441,10 +2455,7 @@ impl StructuredDurableDomainStateStore for MemoryDurableStateStore {
         let domain = *transaction.domain.as_bytes();
         let request_key = (domain, *transaction.receipt.request_id.as_bytes());
         if data.receipts.contains_key(&request_key) {
-            return DurableCommitOutcome::Rejected(DurableCommitRejection::Conflict {
-                key: transaction.receipt.request_id.as_bytes().to_vec(),
-                current_revision: StateRevision::new(1),
-            });
+            return DurableCommitOutcome::Rejected(DurableCommitRejection::RequestAlreadyCommitted);
         }
 
         let revisions = if let Some(state_transaction) = transaction.state.as_ref() {

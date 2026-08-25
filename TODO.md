@@ -2055,8 +2055,10 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
    transaction order、migration policyを維持する。adapterがopaque PersistenceLayout key prefixをparseせずに済むよう、
    state/object/receipt/outboxを明示的sectionとして持つstructured durable transaction envelopeを先に実装する
    （runtime/node-core/memory/native compositionとgeneration-one normalized schema migration/operator bootstrapは
-   implemented As-Is; fenced structured commit/indexed claim adapter pending）。その後explicit migration、bounded pool/deadline、
-   typed conflictを持つPostgreSQL adapterを実装する。
+   implemented As-Is; bounded pool、fenced state/receipt read、serializable structured state/receipt/outbox commit、
+   statementごとの残deadline timeout、bounded unchanged-envelope serialization retry、typed conflict/indeterminate分類も
+   PostgreSQLでimplemented As-Is; indexed claim/ack、
+   cancellation/fault/capacity certification pending）。その後explicit migrationとindexed PostgreSQL recoveryを実装する。
 4. shared conformanceにwrite skew、absent-key race、serialization failure、lease fencing、schema/version skewを追加する。
 5. kill/power fault、disk full、connection exhaustion、capacity/load/soak、backup/restore、writer failoverをrehearsalする。
 6. 同じcontractをCloudflare Durable ObjectとAWS persistenceへ実装し、real providerでcertifyする。

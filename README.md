@@ -85,8 +85,13 @@ cross-provider ingress milestones implemented through Phase 17:
   state, object, receipt, outbox, delivery-attempt, checkpoint, and migration-job
   relations. Operator-only bootstrap binds exact schema identity/generation and
   writer fence metadata; PostgreSQL 18 CI verifies the migration and core SQL
-  constraints. Durable commit and indexed outbox trait implementations remain
-  pending, so this is schema As-Is evidence rather than a production adapter.
+  constraints. A bounded synchronous pool now implements fenced/deadline-aware
+  state reads, typed receipt reads, and serializable structured state/receipt/
+  outbox commits with complete read assertions and conservative commit-result
+  classification. Serialization/deadlock aborts retry the unchanged envelope
+  only within an explicit attempt ceiling and remaining deadline. Indexed
+  claim/ack, shared fault conformance, operations, and
+  production certification remain pending, so this is still As-Is evidence.
 - An explicit `ComposedRuntime` for assembling independently selected state,
   blob, signer, transport, clock, and scheduler components without hidden
   defaults. Native conformance tests close/reopen SQLite into a new composition,
@@ -207,9 +212,8 @@ independent security review.
 The next planned technical milestones work backward through the Phase 15
 production exit criteria in [`TODO.md`](TODO.md) and the accepted
 [persistence design](PERSISTENCE.md): implement the accepted
-[PostgreSQL reference design](POSTGRES.md): implement the fenced structured
-commit adapter over the accepted and now executable normalized schema, then its
-indexed recovery boundary.
+[PostgreSQL reference design](POSTGRES.md): implement the indexed claim/ack
+recovery boundary over the accepted schema and fenced structured commit adapter.
 Deadline/cancellation, abrupt
 fault, backup/restore, capacity, and provider conformance follow on that
 foundation. Phase 16/17 provider trust, deployment, observability, and release

@@ -1,14 +1,18 @@
 # PostgreSQL runtime schema
 
-This crate is the explicit schema-lifecycle foundation for Sunrise Edge's
-normalized PostgreSQL durable adapter. It currently applies and verifies the
-generation-one schema and bootstraps an exact
-`(chain, validator, atomicity domain)` metadata row.
+This crate applies and verifies Sunrise Edge's generation-one normalized
+PostgreSQL schema, bootstraps an exact `(chain, validator, atomicity domain)`
+metadata row, and implements `StructuredDurableDomainStateStore` over an
+explicit bounded synchronous connection pool.
 
-It does not yet implement `StructuredDurableDomainStateStore` or
-`IndexedOutboxRepository`, and applying the migration is not production
-certification. Request handling must never call `apply_initial_schema` or
-`bootstrap_namespace`; those are operator-only actions.
+The structured store performs fenced state/receipt reads and serializable
+state/receipt/outbox commits with complete read assertions, checked revisions,
+per-statement remaining-deadline timeouts, bounded unchanged-envelope
+serialization retry, and conservative commit-result classification.
+It does not yet implement `IndexedOutboxRepository`, cancellation after a
+started synchronous operation, or production fault/capacity certification.
+Request handling must never call `apply_initial_schema` or
+`bootstrap_namespace`; those remain operator-only actions.
 
 The live integration test runs only against a dedicated database named
 `sunrise_edge_test`:

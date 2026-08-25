@@ -2,8 +2,12 @@
 
 Status: accepted implementation design. The runtime structured envelope,
 node-core/native wiring, and explicit generation-one schema migration/bootstrap
-exist As-Is. Fenced durable commit, indexed outbox adapter, migration operations
-beyond initial bootstrap, and production certification are not implemented.
+exist As-Is. A bounded synchronous pool now implements fenced state/receipt
+reads and serializable structured state/receipt/outbox commit with transaction-
+local deadlines, bounded unchanged-envelope serialization retry, and typed
+outcomes. Indexed outbox claim/ack, migration
+operations beyond initial bootstrap, fault/capacity evidence, and production
+certification are not implemented.
 
 This document refines [`PERSISTENCE.md`](PERSISTENCE.md) for the first
 production-oriented PostgreSQL backend. It deliberately does not map the
@@ -101,6 +105,10 @@ Stores small canonical protocol/configuration records with `type_id`,
 `encoding_version`, ABA-safe `revision`, canonical bytes, and tombstone state.
 Rows are point-read only during transitions. A tombstone retains its revision;
 delete/recreate never resets to zero. Absent means no row and revision zero.
+The current adapter uses one closed application-state record kind and closed
+operational opaque-canonical type/version projections. It does not infer a
+protocol payload type from arbitrary state bytes or key prefixes. A future
+typed state section must expand these projections explicitly.
 
 ### `object_versions`
 
