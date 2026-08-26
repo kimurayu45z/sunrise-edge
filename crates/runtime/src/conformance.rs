@@ -1171,6 +1171,12 @@ fn writer_fence_conformance<F: DurableStoreFixture>(
 
 /// Runs the typed object lifecycle against one fresh object-capable fixture.
 ///
+/// In addition to lifecycle/replay/rollback, this exercises bound-domain,
+/// non-active-fence, exact-deadline, and blob-reference store behavior. The
+/// object read-count limit is a constructor invariant, so its deterministic
+/// rejection is shared here but necessarily occurs before either backend is
+/// dispatched.
+///
 /// This remains separate from [`run_durable_store_conformance`] until durable
 /// providers implement normalized immutable versions and object heads.
 #[cfg(any(test, feature = "durable-conformance"))]
@@ -1180,6 +1186,183 @@ pub fn run_durable_object_conformance<F: DurableStoreFixture>(fixture: &F) -> Co
     let domain: AtomicityDomainId = fixture.domain();
     let fence: WriterFenceGeneration = fixture.initial_writer_fence();
     let context: DurableOperationContext = build_context(fixture, fence, 0x51)?;
+
+    // Count bounds are constructor invariants rather than backend behavior,
+    // but keeping this case in the shared suite proves both fixtures consume
+    // the identical bounded object envelope before storage dispatch.
+    let too_many_reads: Vec<DurableObjectHeadRead> = (0..=MAX_DURABLE_OBJECT_READS)
+        .map(|index: usize| {
+            let mut bytes: [u8; 32] = [0; 32];
+            bytes[..size_of::<usize>()].copy_from_slice(&index.to_be_bytes());
+            DurableObjectHeadRead::new(ObjectId::new(bytes), DurableObjectHead::Absent)
+        })
+        .collect();
+    if DurableObjectChanges::new(too_many_reads, Vec::new())
+        != Err(DurableInvocationError::TooManyObjectReads {
+            count: MAX_DURABLE_OBJECT_READS + 1,
+            maximum: MAX_DURABLE_OBJECT_READS,
+        })
+    {
+        return Err(ConformanceFailure::new(
+            CASE,
+            "object read count bound was not deterministic",
+        ));
+    }
+
+    let mut wrong_domain_bytes: [u8; 32] = *domain.as_bytes();
+    wrong_domain_bytes[0] ^= 0xFF;
+    let wrong_domain: AtomicityDomainId = AtomicityDomainId::new(wrong_domain_bytes)
+        .map_err(|error| ConformanceFailure::new(CASE, error.to_string()))?;
+    let authority_object_id: ObjectId = ObjectId::new([0x41; 32]);
+    let wrong_domain_read = store.get_object_head(&context, wrong_domain, authority_object_id);
+    if wrong_domain_read
+        != Err(DurableReadError::InvalidRequest(
+            RuntimeError::AtomicityDomainMismatch,
+        ))
+    {
+        return Err(mismatch(
+            CASE,
+            "object read accepted a domain other than the bound domain",
+            &wrong_domain_read,
+        ));
+    }
+    let (authority_owner, authority_routing) = object_projections(CASE, 0x41)?;
+    let wrong_domain_invocation: DurableInvocationTransaction = object_invocation(
+        CASE,
+        wrong_domain,
+        0x41,
+        None,
+        object_changes(
+            CASE,
+            authority_object_id,
+            DurableObjectHead::Absent,
+            DurableObjectMutation::Create {
+                version: object_version(CASE, authority_object_id, 1, 0x41, 1)?,
+                owner_projection: authority_owner,
+                routing_projection: authority_routing,
+            },
+        )?,
+        None,
+    )?;
+    let wrong_domain_commit: DurableCommitOutcome =
+        store.commit_invocation(&context, wrong_domain_invocation);
+    if wrong_domain_commit
+        != DurableCommitOutcome::Rejected(DurableCommitRejection::AtomicityDomainMismatch)
+    {
+        return Err(mismatch(
+            CASE,
+            "object commit accepted a domain other than the bound domain",
+            &wrong_domain_commit,
+        ));
+    }
+
+    let non_active_fence_value: u64 = fence
+        .get()
+        .checked_add(1)
+        .or_else(|| fence.get().checked_sub(1))
+        .ok_or_else(|| ConformanceFailure::new(CASE, "no unequal writer fence exists"))?;
+    let non_active_fence: WriterFenceGeneration =
+        WriterFenceGeneration::new(non_active_fence_value)
+            .ok_or_else(|| ConformanceFailure::new(CASE, "non-active test fence was zero"))?;
+    let stale_context: DurableOperationContext =
+        fixture.live_context(non_active_fence, 0x42, LIVE_CONTEXT_BUDGET)?;
+    let stale_read = store.get_object_head(&stale_context, domain, authority_object_id);
+    if stale_read
+        != Err(DurableReadError::WriterFenced {
+            active_generation: fence,
+        })
+    {
+        return Err(mismatch(
+            CASE,
+            "object read did not reject a non-active writer fence",
+            &stale_read,
+        ));
+    }
+    let stale_object_id: ObjectId = ObjectId::new([0x42; 32]);
+    let (stale_owner, stale_routing) = object_projections(CASE, 0x42)?;
+    let stale_invocation: DurableInvocationTransaction = object_invocation(
+        CASE,
+        domain,
+        0x42,
+        None,
+        object_changes(
+            CASE,
+            stale_object_id,
+            DurableObjectHead::Absent,
+            DurableObjectMutation::Create {
+                version: object_version(CASE, stale_object_id, 1, 0x42, 2)?,
+                owner_projection: stale_owner,
+                routing_projection: stale_routing,
+            },
+        )?,
+        None,
+    )?;
+    let stale_commit: DurableCommitOutcome =
+        store.commit_invocation(&stale_context, stale_invocation);
+    if stale_commit
+        != DurableCommitOutcome::Rejected(DurableCommitRejection::WriterFenced {
+            active_generation: fence,
+        })
+    {
+        return Err(mismatch(
+            CASE,
+            "object commit did not reject a non-active writer fence",
+            &stale_commit,
+        ));
+    }
+    let expired_context: DurableOperationContext =
+        fixture.live_context(fence, 0x43, std::time::Duration::ZERO)?;
+    let expired_read = store.get_object_head(&expired_context, domain, authority_object_id);
+    if expired_read != Err(DurableReadError::DeadlineExceeded) {
+        return Err(mismatch(
+            CASE,
+            "object read did not reject the exact expired deadline boundary",
+            &expired_read,
+        ));
+    }
+    let expired_object_id: ObjectId = ObjectId::new([0x43; 32]);
+    let (expired_owner, expired_routing) = object_projections(CASE, 0x43)?;
+    let expired_invocation: DurableInvocationTransaction = object_invocation(
+        CASE,
+        domain,
+        0x43,
+        None,
+        object_changes(
+            CASE,
+            expired_object_id,
+            DurableObjectHead::Absent,
+            DurableObjectMutation::Create {
+                version: object_version(CASE, expired_object_id, 1, 0x43, 3)?,
+                owner_projection: expired_owner,
+                routing_projection: expired_routing,
+            },
+        )?,
+        None,
+    )?;
+    let expired_commit: DurableCommitOutcome =
+        store.commit_invocation(&expired_context, expired_invocation);
+    if expired_commit
+        != DurableCommitOutcome::Rejected(DurableCommitRejection::DeadlineExceededBeforeCommit)
+    {
+        return Err(mismatch(
+            CASE,
+            "object commit did not reject the exact expired deadline boundary",
+            &expired_commit,
+        ));
+    }
+    for authority_case_id in [authority_object_id, stale_object_id, expired_object_id] {
+        let authority_head: DurableObjectHead = store
+            .get_object_head(&context, domain, authority_case_id)
+            .map_err(|error| mismatch(CASE, "authority rollback read must succeed", &error))?;
+        if authority_head != DurableObjectHead::Absent {
+            return Err(mismatch(
+                CASE,
+                "rejected authority case leaked an object",
+                &authority_head,
+            ));
+        }
+    }
+
     let object_id: ObjectId = ObjectId::new([0x51; 32]);
 
     let absent: DurableObjectHead = store
@@ -1455,6 +1638,72 @@ pub fn run_durable_object_conformance<F: DurableStoreFixture>(fixture: &F) -> Co
             CASE,
             "object conflict leaked due work",
             &due_claim,
+        ));
+    }
+
+    let blob_object_id: ObjectId = ObjectId::new([0x58; 32]);
+    let blob_version: DurableObjectVersionRecord = DurableObjectVersionRecord::from_blob_reference(
+        blob_object_id,
+        DurableObjectVersion::FIRST,
+        Digest32::new(protocol_types::HashAlgorithmId::Sha2_256, [0x59; 32]),
+        9,
+        14,
+        Digest32::new(protocol_types::HashAlgorithmId::Sha3_256, [0x5A; 32]),
+    );
+    let blob_create: DurableInvocationTransaction = object_invocation(
+        CASE,
+        domain,
+        0x58,
+        None,
+        object_changes(
+            CASE,
+            blob_object_id,
+            DurableObjectHead::Absent,
+            DurableObjectMutation::Create {
+                version: blob_version.clone(),
+                owner_projection: DurableObjectOwnerProjection::default(),
+                routing_projection: DurableObjectRoutingProjection::default(),
+            },
+        )?,
+        None,
+    )?;
+    if store.commit_invocation(&context, blob_create) != DurableCommitOutcome::Committed {
+        return Err(ConformanceFailure::new(
+            CASE,
+            "blob-reference object create failed",
+        ));
+    }
+    let stored_blob: Option<DurableObjectVersionRecord> = store
+        .get_object_version(
+            &context,
+            domain,
+            blob_object_id,
+            DurableObjectVersion::FIRST,
+        )
+        .map_err(|error| mismatch(CASE, "blob-reference version read must succeed", &error))?;
+    if stored_blob.as_ref() != Some(&blob_version) {
+        return Err(mismatch(
+            CASE,
+            "blob-reference version did not round trip",
+            &stored_blob,
+        ));
+    }
+    let blob_head: DurableObjectHead = store
+        .get_object_head(&context, domain, blob_object_id)
+        .map_err(|error| mismatch(CASE, "blob-reference head read must succeed", &error))?;
+    if blob_head
+        != (DurableObjectHead::Current {
+            head_revision: ObjectHeadRevision::FIRST,
+            object_version: DurableObjectVersion::FIRST,
+            digest: blob_version.digest(),
+            owner_projection: DurableObjectOwnerProjection::default(),
+            routing_projection: DurableObjectRoutingProjection::default(),
+        })
+    {
+        return Err(mismatch(
+            CASE,
+            "blob-reference head projection was not preserved",
+            &blob_head,
         ));
     }
     Ok(())
@@ -2067,11 +2316,17 @@ mod tests {
     impl MemoryFixture {
         fn new() -> Self {
             let fence: WriterFenceGeneration = WriterFenceGeneration::new(7).unwrap();
-            let store: Arc<MemoryDurableStateStore> = Arc::new(MemoryDurableStateStore::new(fence));
+            Self::with_fence(fence)
+        }
+
+        fn with_fence(fence: WriterFenceGeneration) -> Self {
+            let domain: AtomicityDomainId = AtomicityDomainId::new([0x71; 32]).unwrap();
+            let store: Arc<MemoryDurableStateStore> =
+                Arc::new(MemoryDurableStateStore::new_bound(domain, fence));
             store.set_time(OUTBOX_NOW);
             Self {
                 store,
-                domain: AtomicityDomainId::new([0x71; 32]).unwrap(),
+                domain,
                 fence,
                 now_unix_millis: Mutex::new(OUTBOX_NOW),
             }
@@ -2143,5 +2398,13 @@ mod tests {
     #[test]
     fn memory_durable_store_passes_object_conformance() {
         run_durable_object_conformance(&MemoryFixture::new()).unwrap();
+    }
+
+    #[test]
+    fn object_conformance_accepts_boundary_initial_fences() {
+        for fence_value in [1_u64, u64::MAX] {
+            let fence: WriterFenceGeneration = WriterFenceGeneration::new(fence_value).unwrap();
+            run_durable_object_conformance(&MemoryFixture::with_fence(fence)).unwrap();
+        }
     }
 }

@@ -2396,15 +2396,17 @@ fn postgres_schema_and_durable_store_conformance() {
         } if last_object_version == DurableObjectVersion::new(3).unwrap()
     ));
 
-    let wrong_owner_projection: Vec<u8> =
-        encode_owner(&Owner::Address(Address::new([0x99; 32]))).unwrap();
     let correct_owner_projection: Vec<u8> =
         encode_owner(&Owner::Address(Address::new([0x33; 32]))).unwrap();
-    let (version_three_algorithm, version_three_digest): (i32, Vec<u8>) = {
+    let (version_three_algorithm, version_three_digest, version_three_bytes): (
+        i32,
+        Vec<u8>,
+        Vec<u8>,
+    ) = {
         let mut object_operator = object_fixture.operator.lock().unwrap();
         let row = object_operator
             .query_one(
-                "SELECT digest_algorithm_id, digest_bytes
+                "SELECT digest_algorithm_id, digest_bytes, inline_canonical_bytes
                  FROM sunrise_edge.object_versions
                  WHERE chain_id_bytes = $1
                    AND validator_id = $2
@@ -2419,27 +2421,22 @@ fn postgres_schema_and_durable_store_conformance() {
                 ],
             )
             .unwrap();
-        (row.get(0), row.get(1))
+        (row.get(0), row.get(1), row.get(2))
     };
     {
+        let malformed_inline_bytes: Vec<u8> = vec![0xFF];
         let mut object_operator = object_fixture.operator.lock().unwrap();
         object_operator
             .execute(
-                "UPDATE sunrise_edge.object_heads
-                 SET current_version = 3,
-                     digest_algorithm_id = $1,
-                     digest_bytes = $2,
-                     owner_projection = $3,
-                     routing_projection = NULL,
-                     tombstone = FALSE
-                 WHERE chain_id_bytes = $4
-                   AND validator_id = $5
-                   AND atomicity_domain_id = $6
-                   AND object_id = $7",
+                "UPDATE sunrise_edge.object_versions
+                 SET inline_canonical_bytes = $1
+                 WHERE chain_id_bytes = $2
+                   AND validator_id = $3
+                   AND atomicity_domain_id = $4
+                   AND object_id = $5
+                   AND object_version = 3",
                 &[
-                    &version_three_algorithm,
-                    &version_three_digest,
-                    &wrong_owner_projection,
+                    &malformed_inline_bytes,
                     &object_fixture.namespace.chain_id_bytes(),
                     &&object_fixture.namespace.validator_id().as_bytes()[..],
                     &&object_fixture.namespace.domain().as_bytes()[..],
@@ -2448,11 +2445,26 @@ fn postgres_schema_and_durable_store_conformance() {
             )
             .unwrap();
     }
+    assert!(matches!(
+        object_fixture
+            .store
+            .get_object_head(
+                &object_context,
+                object_fixture.namespace.domain(),
+                lifecycle_object_id,
+            )
+            .unwrap(),
+        DurableObjectHead::Tombstoned {
+            last_object_version,
+            ..
+        } if last_object_version == DurableObjectVersion::new(3).unwrap()
+    ));
     assert_eq!(
-        object_fixture.store.get_object_head(
+        object_fixture.store.get_object_version(
             &object_context,
             object_fixture.namespace.domain(),
             lifecycle_object_id,
+            DurableObjectVersion::new(3).unwrap(),
         ),
         Err(DurableReadError::InvalidPersistedState)
     );
@@ -2460,18 +2472,15 @@ fn postgres_schema_and_durable_store_conformance() {
         let mut object_operator = object_fixture.operator.lock().unwrap();
         object_operator
             .execute(
-                "UPDATE sunrise_edge.object_heads
-                 SET current_version = NULL,
-                     digest_algorithm_id = NULL,
-                     digest_bytes = NULL,
-                     owner_projection = NULL,
-                     routing_projection = NULL,
-                     tombstone = TRUE
-                 WHERE chain_id_bytes = $1
-                   AND validator_id = $2
-                   AND atomicity_domain_id = $3
-                   AND object_id = $4",
+                "UPDATE sunrise_edge.object_versions
+                 SET inline_canonical_bytes = $1
+                 WHERE chain_id_bytes = $2
+                   AND validator_id = $3
+                   AND atomicity_domain_id = $4
+                   AND object_id = $5
+                   AND object_version = 3",
                 &[
+                    &version_three_bytes,
                     &object_fixture.namespace.chain_id_bytes(),
                     &&object_fixture.namespace.validator_id().as_bytes()[..],
                     &&object_fixture.namespace.domain().as_bytes()[..],

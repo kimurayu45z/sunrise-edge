@@ -230,10 +230,16 @@ and bootstraps exact namespace/schema/fence metadata through operator-only APIs,
 with real PostgreSQL CI. Its bounded pool now implements fenced structured
 state/body-free object-head/immutable object-version/receipt reads,
 serializable state/object/receipt/outbox commit, and indexed
-claim/ack with retained attempt history As-Is. A shared memory/PostgreSQL
-conformance suite now covers typed object create/update/delete/recreate ABA,
-conflict rollback, inline/blob mapping, exact-boundary deadlines, complete-read
-races, definite contention classification, lease/writer fencing, and PostgreSQL-only
+claim/ack with retained attempt history As-Is. Object-head reads validate
+strict immutable metadata and inline presence/length without selecting inline
+bodies. Head owner/routing projections are routing data, never authorization;
+execution must separately load and match the linked version, decode inline
+objects, and compare typed owner, while blob execution remains fail-closed
+until fetch/content verification. A shared memory/PostgreSQL conformance suite
+now covers bound-domain/fence/deadline rejection, the object read-count bound,
+typed object create/update/delete/recreate ABA, conflict rollback, inline/blob
+mapping and blob round-trip, exact-boundary deadlines, complete-read races,
+definite contention classification, lease/writer fencing, and PostgreSQL-only
 pool/row-lock deadline exhaustion, serialization exhaustion, and schema skew
 As-Is. An optional shared commit-loss capability, exercised only by that live
 PostgreSQL fixture through a bounded `NoTls` TCP proxy, injects a

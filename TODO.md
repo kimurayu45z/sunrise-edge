@@ -1946,13 +1946,17 @@ Phase 15 As-Is scope:
   aggregate bytesとstate domain、receipt/outbox request ID、event digest一致をI/O前に検証する。
   object sectionはcanonical unique/sortedなbody-free head assertion、read containment付きcreate/update/delete、
   distinct immutable versionとABA-safe head revision、inline canonical `objects::Object`またはself-describing blob参照を持つ。
-  inline owner projectionはtyped `Owner`から導出し、immutable versionはheadと別APIで読む。
+  inline owner projectionはwrite時にtyped `Owner`から導出し、immutable versionはheadと別APIで読む。head readは
+  inline bytesをSELECTせず、immutable row metadataとinline presence/lengthのみを検証する。headのowner/routing projectionは
+  routing hintでありauthorizationではない。executionは別途exact versionを読み、head version/digestとの一致、inline Object decode、
+  typed owner一致を検証しなければならず、blob-backed executionはfetch/content verification実装までfail closedとする。
   memoryとPostgreSQLはstate/object/receipt/outboxを同一atomic boundaryで実装済みだが、node-core object dispatch、
   fee debit、blob upload/fetch verification、owned fast pathは未実装である。
   node-core additive handlerはmanifest domainをI/O前にresolveし、typed receipt replayをstate readより先に行い、
   read-only assertionを含むstate/receipt/outboxをこのenvelopeへ構築する。definite commitまたはexact replay以外では
   outputを返さない。single-lock memoryとnormalized PostgreSQL conformance storeでatomic publication、object lifecycle/ABA、
-  conflict rollback、read-only、fence、deadline、replayを検証する（runtime/memory/PostgreSQL implemented As-Is;
+  conflict rollback、read-only、bound domain、fence、deadline、object read-count bound、blob round-trip、replayを検証する
+  （runtime/memory/PostgreSQL implemented As-Is;
   node-core object dispatchとprovider certification pending）。
 - request pathのcommit直後deliveryはdomain-wide `claim_due_outbox`を流用しない。同じdomainのolder due workを
   今回requestと誤認しないよう、trusted `(domain, request_id, now, lease, expiry)`を持つexact-request claimを使う。
@@ -2089,9 +2093,11 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
    idempotent ack、pool/row-lock deadline exhaustionとcommit-boundary deadline classificationもPostgreSQLで
    implemented As-Is; in-flight cancellation/fault/capacity certification pending）。
    explicit migrationとshared contract evidenceはimplemented As-Is; broader fault/capacity evidenceは未実装である。
-4. shared conformanceにexact deadline boundary、write skew、absent-key race、object create/update/delete/recreate ABA、
+4. shared conformanceにexact deadline boundary、write skew、absent-key race、bound-domain/fence/deadline rejection、
+   object read-count bound、blob-reference round-trip、object create/update/delete/recreate ABA、
    object conflict時のstate/receipt/outbox/version rollback、definite contention classification、lease fencingを追加し、
-   PostgreSQL capability testにimmutable history/current/tombstone/blob mapping/corruption fail-closed、
+   PostgreSQL capability testにimmutable history/current/tombstone/blob mapping、head metadata corruption fail-closed、
+   separate version readでのmalformed inline body fail-closed、
    pool/row-lock deadline、serialization failure、
    schema/version skewを追加する。optional shared commit-loss capabilityはbounded test-only `NoTls` TCP proxyを介し、
    plain state commitへのCOMMIT dispatch直前connection lossとinvocation commit・outbox claim・acknowledgementへの

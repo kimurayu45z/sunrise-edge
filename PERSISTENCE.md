@@ -222,8 +222,14 @@ assertions and contained create/update/delete mutations with distinct checked
 immutable versions and ABA-safe head revisions. Immutable records contain
 exactly one inline canonical `objects::Object` or one self-describing blob
 reference; current heads contain no body and immutable versions are read
-through a separate API. Inline owner projections come from typed `Owner`
-encoding, while the SQL `type_id` is the canonical Object record identifier,
+through a separate API. Head reconstruction validates bounded immutable
+metadata and inline presence/length without selecting inline bytes. Inline
+owner projections come from typed `Owner` encoding at write construction, but
+owner/routing projections are routing metadata rather than authorization. An
+execution caller must separately load the linked version, match its
+version/digest to the head, decode an inline Object, and compare typed owner;
+blob-backed execution fails closed until fetch/content verification. The SQL
+`type_id` is the canonical Object record identifier,
 not the logical type hash retained in canonical Object bytes. Memory and
 PostgreSQL implement this section atomically with state, receipt, and outbox;
 node-core object dispatch and blob upload/fetch verification remain deferred.

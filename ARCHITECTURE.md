@@ -869,8 +869,14 @@ canonical unique/sorted body-free head assertions and contained
 create/update/delete mutations. Immutable versions and ABA-safe head revisions
 are distinct; versions contain exactly one existing canonical Object encoding
 or self-describing blob reference, and a separate read API returns immutable
-records without loading bodies into head assertions. Inline owner projections
-are derived from typed `Owner`; the generation-one SQL `type_id` is the stable
+records without loading bodies into head assertions. Head reads validate only
+bounded immutable-row metadata and inline presence/length, never fetch or
+decode inline bytes. Inline owner projections are derived from typed `Owner`
+when written, but a head projection is routing metadata, not authorization:
+an execution caller must separately read the exact immutable version, match
+its version/digest to the head, decode the inline Object, and compare its typed
+owner. Blob-backed execution fails closed until fetch and content verification.
+The generation-one SQL `type_id` is the stable
 canonical Object record ID rather than the logical `Object::type_hash` retained
 inside canonical bytes. Memory and PostgreSQL apply object/state/receipt/outbox
 sections atomically, preventing an adapter from hiding object writes in generic
@@ -913,9 +919,11 @@ structured state/object/receipt/outbox commits. Object assertions lock in
 canonical ID order; tombstones clear current/digest/projection columns and
 reconstruct the last version from immutable history; inline/blob payloads map
 losslessly to the unchanged generation-one schema. The live fixture runs the
-same create/update/delete/recreate ABA, conflict rollback, and replay contract
-as memory and asserts immutable history, current/tombstone rows, blob mapping,
-and corruption fail-closed. The same store
+same domain/fence/deadline/bounds, create/update/delete/recreate ABA, conflict
+rollback, replay, and blob round-trip contract as memory. It additionally
+asserts immutable history, current/tombstone rows, blob mapping, body-free
+metadata corruption rejection, and strict malformed-body rejection through
+the separate immutable-version read. The same store
 implements exact-request and stable `(available_at_ms, request_id)` indexed
 claims, checks retained lease attempts before selecting work, expires a
 replaced attempt in the replacement transaction, and advances one message only
@@ -1313,11 +1321,17 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   than its logical type hash. Keep current heads body-free, read immutable
   inline-or-blob versions separately, distinguish absence from retained
   tombstones, and advance an independent head revision on every lifecycle
-  mutation so delete/recreate cannot produce ABA. PostgreSQL locks canonical
+  mutation so delete/recreate cannot produce ABA. A head read validates strict
+  immutable-row metadata without selecting inline bytes. Its bounded owner and
+  routing projections are atomically written routing hints, not authorization;
+  execution must separately load the linked version, match head version/digest,
+  decode an inline Object, and compare typed owner. Blob-backed execution stays
+  fail-closed until fetch and content verification. PostgreSQL locks canonical
   object IDs, validates all head assertions and prospective immutable keys
   before applying any section, then publishes object/state/receipt/outbox rows
   in the same serializable transaction with immediate constraint validation.
-  Shared memory/PostgreSQL conformance must prove lifecycle, replay, conflict
+  Shared memory/PostgreSQL conformance must prove bound-domain/fence/deadline
+  rejection, the object read-count bound, lifecycle, replay, conflict
   rollback including outbox/version absence, and generation-one inline/blob
   mapping. Keep node-core object dispatch, fees, blob transfer verification,
   owned-object fast routing, schema migrations, and production fault/capacity/

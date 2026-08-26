@@ -43,12 +43,19 @@ state or object mutation to have a matching read assertion, rejects duplicate
 object IDs, validates checked object-version/head-revision transitions, and
 bounds every section before I/O. Current head assertions contain only revision,
 current version/digest, and canonical owner plus bounded routing projections;
-immutable payloads are read separately. An object version stores exactly one
+head reads join only strict immutable metadata and inline presence/length, not
+the inline bytes. Immutable payloads are read separately. Head owner/routing
+projections are atomically written routing data and must not authorize
+execution by themselves. An execution caller must separately read the linked
+version, verify exact head version/digest, decode an inline Object, and compare
+its typed owner. Blob-backed execution fails closed until blob fetch and
+content verification are implemented. An object version stores exactly one
 existing canonical `objects::Object` encoding or one self-describing blob
 digest. The SQL `type_id` is the stable canonical Object record identifier,
 not `Object::type_hash`, which remains inside the canonical Object bytes.
-Inline owner projections are derived with `objects::encode_owner`; blob upload,
-fetch, and digest/content verification remain upstream/deferred. Node-core does
+Inline owner projections are derived with `objects::encode_owner` at write
+construction; blob upload, fetch, and digest/content verification remain
+upstream/deferred. Node-core does
 not yet dispatch object mutations, but memory and PostgreSQL consume the typed
 section directly and never hide object writes in generic state.
 
@@ -125,12 +132,17 @@ schema/type version, and creation checkpoint. Exactly one of inline canonical
 bytes or content-addressed blob identity is present. A blob reference is
 publishable only after durable upload and digest verification.
 
+Head reconstruction selects only this row's bounded metadata, representation
+presence/inline length, and blob digest. Full inline bytes are selected and
+canonically decoded only by the separate immutable-version read.
+
 ### `object_heads`
 
 Identity: `(namespace, object_id)`.
 
 Current object version/digest, ownership/routing projection, ABA-safe revision,
 and tombstone state. Head mutation and new immutable version commit together.
+The projections support bounded routing but are not an authorization source.
 
 ### `request_receipts`
 
@@ -344,10 +356,12 @@ the exact expired-deadline boundary, absent/tombstone races, concurrent definite
 outcome classification, retained lease replacement, and writer-fence handoff
 against both memory and PostgreSQL.
 Its object extension covers absent/create/update/delete/recreate ABA behavior,
-object conflicts with full rollback, domain/fence/deadline/replay rejection,
-and deterministic bounds. The live fixture additionally asserts retained
-immutable history, body-free current and tombstoned heads, lossless blob-row
-representation, and fail-closed handling of corrupt object metadata.
+object conflicts with full rollback, bound-domain/fence/deadline/replay
+rejection, the object read-count bound, and blob-reference round-trip
+against both memory and PostgreSQL. The live fixture additionally asserts
+retained immutable history, body-free current and tombstoned heads, lossless
+blob-row representation, fail-closed corrupt metadata handling on head reads,
+and malformed inline-body handling on full immutable-version reads.
 When `SUNRISE_EDGE_TEST_POSTGRES_URL` is configured (as it is in CI), the live
 PostgreSQL fixture additionally covers pool/row-lock deadline exhaustion,
 commit-boundary deadline ambiguity, bounded retry exhaustion, non-active

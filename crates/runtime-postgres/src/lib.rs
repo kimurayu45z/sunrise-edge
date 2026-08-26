@@ -27,9 +27,9 @@ use runtime::{
     DurableOutboxAcknowledgementOutcome, DurableOutboxAcknowledgementRejection, DurableOutboxClaim,
     DurableOutboxClaimOutcome, DurableOutboxClaimRejection, DurableOutboxLeaseId, DurableReadError,
     DurableRequestId, DurableRequestReceipt, IndeterminateCommitReason, IndexedOutboxRepository,
-    ObjectHeadRevision, ObjectId, OutboxRequestId, RequestOutboxClaimRequest, StateMutation,
-    StateMutationEntry, StateReadAssertion, StateRevision, StructuredDurableDomainStateStore,
-    VersionedStateValue, WriterFenceGeneration,
+    MAX_DURABLE_INLINE_OBJECT_BYTES, ObjectHeadRevision, ObjectId, OutboxRequestId,
+    RequestOutboxClaimRequest, StateMutation, StateMutationEntry, StateReadAssertion,
+    StateRevision, StructuredDurableDomainStateStore, VersionedStateValue, WriterFenceGeneration,
 };
 use std::{
     error::Error,
@@ -1051,12 +1051,117 @@ fn load_object_version(
     Ok(Some(record))
 }
 
-fn load_last_object_version_record(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PersistedObjectVersionMetadata {
+    object_version: DurableObjectVersion,
+    digest: Digest32,
+}
+
+fn load_object_version_metadata(
+    transaction: &mut postgres::Transaction<'_>,
+    namespace: &PostgresNamespace,
+    object_id: ObjectId,
+    object_version: DurableObjectVersion,
+    lock: bool,
+) -> Result<Option<PersistedObjectVersionMetadata>, PreCommitFailure> {
+    let sql: &str = if lock {
+        "SELECT object_version::TEXT,
+                digest_algorithm_id, digest_bytes,
+                schema_version, type_id, created_checkpoint::TEXT,
+                inline_canonical_bytes IS NOT NULL,
+                CASE WHEN inline_canonical_bytes IS NULL
+                     THEN NULL
+                     ELSE octet_length(inline_canonical_bytes)
+                END,
+                blob_digest_algorithm_id, blob_digest_bytes
+         FROM sunrise_edge.object_versions
+         WHERE chain_id_bytes = $1
+           AND validator_id = $2
+           AND atomicity_domain_id = $3
+           AND object_id = $4
+           AND object_version = CAST(CAST($5 AS TEXT) AS NUMERIC)
+         FOR UPDATE"
+    } else {
+        "SELECT object_version::TEXT,
+                digest_algorithm_id, digest_bytes,
+                schema_version, type_id, created_checkpoint::TEXT,
+                inline_canonical_bytes IS NOT NULL,
+                CASE WHEN inline_canonical_bytes IS NULL
+                     THEN NULL
+                     ELSE octet_length(inline_canonical_bytes)
+                END,
+                blob_digest_algorithm_id, blob_digest_bytes
+         FROM sunrise_edge.object_versions
+         WHERE chain_id_bytes = $1
+           AND validator_id = $2
+           AND atomicity_domain_id = $3
+           AND object_id = $4
+           AND object_version = CAST(CAST($5 AS TEXT) AS NUMERIC)"
+    };
+    let row: Option<postgres::Row> = transaction
+        .query_opt(
+            sql,
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&object_id.as_bytes()[..],
+                &object_version.get().to_string(),
+            ],
+        )
+        .map_err(|error| PreCommitFailure::from_database(&error))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let persisted_version: DurableObjectVersion =
+        DurableObjectVersion::new(parse_database_u64(&row, 0)?)
+            .ok_or(PreCommitFailure::InvalidPersistedState)?;
+    if persisted_version != object_version {
+        return Err(PreCommitFailure::InvalidPersistedState);
+    }
+    let digest: Digest32 =
+        parse_optional_digest(&row, 1, 2)?.ok_or(PreCommitFailure::InvalidPersistedState)?;
+    let schema_version_value: i64 = row
+        .try_get(3)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let _schema_version: u32 =
+        u32::try_from(schema_version_value).map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let type_id_value: i64 = row
+        .try_get(4)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let type_id: u32 =
+        u32::try_from(type_id_value).map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    if type_id != DURABLE_OBJECT_CANONICAL_RECORD_TYPE_ID {
+        return Err(PreCommitFailure::InvalidPersistedState);
+    }
+    let _created_checkpoint: u64 = parse_database_u64(&row, 5)?;
+    let inline_present: bool = row
+        .try_get(6)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let inline_length: Option<i32> = row
+        .try_get(7)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let blob_digest: Option<Digest32> = parse_optional_digest(&row, 8, 9)?;
+    match (inline_present, inline_length, blob_digest) {
+        (true, Some(length), None)
+            if length > 0
+                && usize::try_from(length)
+                    .is_ok_and(|length: usize| length <= MAX_DURABLE_INLINE_OBJECT_BYTES) => {}
+        (false, None, Some(_)) => {}
+        _ => return Err(PreCommitFailure::InvalidPersistedState),
+    }
+    Ok(Some(PersistedObjectVersionMetadata {
+        object_version,
+        digest,
+    }))
+}
+
+fn load_last_object_version_metadata(
     transaction: &mut postgres::Transaction<'_>,
     namespace: &PostgresNamespace,
     object_id: ObjectId,
     lock: bool,
-) -> Result<Option<DurableObjectVersionRecord>, PreCommitFailure> {
+) -> Result<Option<PersistedObjectVersionMetadata>, PreCommitFailure> {
     let sql: &str = if lock {
         "SELECT object_version::TEXT
          FROM sunrise_edge.object_versions
@@ -1096,10 +1201,11 @@ fn load_last_object_version_record(
     let Some(latest_version) = latest_version else {
         return Ok(None);
     };
-    load_object_version(transaction, namespace, object_id, latest_version, lock)?.map_or_else(
-        || Err(PreCommitFailure::InvalidPersistedState),
-        |record: DurableObjectVersionRecord| Ok(Some(record)),
-    )
+    load_object_version_metadata(transaction, namespace, object_id, latest_version, lock)?
+        .map_or_else(
+            || Err(PreCommitFailure::InvalidPersistedState),
+            |metadata: PersistedObjectVersionMetadata| Ok(Some(metadata)),
+        )
 }
 
 fn load_object_head(
@@ -1142,7 +1248,7 @@ fn load_object_head(
         )
         .map_err(|error| PreCommitFailure::from_database(&error))?;
     let Some(row) = row else {
-        if load_last_object_version_record(transaction, namespace, object_id, lock)?.is_some() {
+        if load_last_object_version_metadata(transaction, namespace, object_id, lock)?.is_some() {
             return Err(PreCommitFailure::InvalidPersistedState);
         }
         return Ok(DurableObjectHead::Absent);
@@ -1170,12 +1276,12 @@ fn load_object_head(
         {
             return Err(PreCommitFailure::InvalidPersistedState);
         }
-        let last_object_version: DurableObjectVersionRecord =
-            load_last_object_version_record(transaction, namespace, object_id, lock)?
+        let last_object_version: PersistedObjectVersionMetadata =
+            load_last_object_version_metadata(transaction, namespace, object_id, lock)?
                 .ok_or(PreCommitFailure::InvalidPersistedState)?;
         return Ok(DurableObjectHead::Tombstoned {
             head_revision,
-            last_object_version: last_object_version.object_version(),
+            last_object_version: last_object_version.object_version,
         });
     }
     let object_version_value: u64 = current_version_text
@@ -1191,15 +1297,10 @@ fn load_object_head(
     let routing_projection: DurableObjectRoutingProjection =
         DurableObjectRoutingProjection::new(routing_bytes)
             .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
-    let latest_version: DurableObjectVersionRecord =
-        load_last_object_version_record(transaction, namespace, object_id, lock)?
+    let latest_version: PersistedObjectVersionMetadata =
+        load_last_object_version_metadata(transaction, namespace, object_id, lock)?
             .ok_or(PreCommitFailure::InvalidPersistedState)?;
-    if latest_version.object_version() != object_version || latest_version.digest() != digest {
-        return Err(PreCommitFailure::InvalidPersistedState);
-    }
-    if let DurableObjectPayload::Inline(inline) = latest_version.payload()
-        && owner_projection.owner() != Some(&inline.object().owner)
-    {
+    if latest_version.object_version != object_version || latest_version.digest != digest {
         return Err(PreCommitFailure::InvalidPersistedState);
     }
     Ok(DurableObjectHead::Current {

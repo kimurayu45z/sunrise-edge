@@ -516,6 +516,27 @@ mod tests {
     }
 
     #[test]
+    fn immutable_and_system_owners_round_trip() {
+        for owner in [Owner::Immutable, Owner::System] {
+            let canonical: Vec<u8> = encode_owner(&owner).unwrap();
+            assert_eq!(decode_owner(&canonical), Ok(owner));
+        }
+    }
+
+    #[test]
+    fn non_address_owners_reject_stray_address_field() {
+        for tag in [2_u16, 3_u16, 4_u16] {
+            let mut owner = CanonicalStruct::new(OWNER_TYPE_ID, ENCODING_VERSION);
+            owner.field_u16(1, tag).unwrap();
+            owner.field_bytes(2, [0xAA]).unwrap();
+            assert!(matches!(
+                decode_owner(&owner.finish().unwrap()),
+                Err(ObjectError::CanonicalDecoding(_))
+            ));
+        }
+    }
+
+    #[test]
     fn object_decoder_round_trips_existing_canonical_bytes() {
         let object = Object {
             id: ObjectId::new([0x21; IDENTIFIER_LEN]),

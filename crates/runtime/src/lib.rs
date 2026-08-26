@@ -1282,6 +1282,11 @@ impl DurableObjectVersionRecord {
 }
 
 /// Bounded optional typed owner projection stored on a current object head.
+///
+/// This projection supports routing and conflict assertions but is not an
+/// authorization source. Execution must load the linked immutable version,
+/// verify the head version/digest, decode an inline object, and compare its
+/// typed owner. Blob-backed execution requires verified blob content first.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DurableObjectOwnerProjection {
     owner: Option<Owner>,
@@ -2792,7 +2797,11 @@ pub trait StructuredDurableDomainStateStore: DurableDomainStateStore {
     ///
     /// Existing adapters fail closed until they implement normalized object
     /// heads and immutable versions; they must never infer objects from generic
-    /// state-key prefixes.
+    /// state-key prefixes. The returned owner/routing projections are body-free
+    /// routing metadata, not authorization. Before authorizing execution, a
+    /// caller must separately read the exact immutable version, verify its
+    /// version/digest against this head, decode an inline object, and compare
+    /// its typed owner. Blob references require verified content first.
     fn get_object_head(
         &self,
         _context: &DurableOperationContext,
@@ -3334,6 +3343,7 @@ struct PreparedMemoryObjectMutation {
 
 #[derive(Debug)]
 struct MemoryDurableStoreData {
+    bound_domain: Option<AtomicityDomainId>,
     active_writer_fence: WriterFenceGeneration,
     now_unix_millis: u64,
     state_domains: MemoryDomainState,
@@ -3385,8 +3395,29 @@ impl MemoryDurableStateStore {
     /// Creates an empty fixture with one authoritative writer generation.
     #[must_use]
     pub fn new(active_writer_fence: WriterFenceGeneration) -> Self {
+        Self::new_with_optional_domain(None, active_writer_fence)
+    }
+
+    /// Creates an empty fixture bound to one logical atomicity domain.
+    ///
+    /// This mirrors production adapters that reject a caller-selected domain
+    /// before touching storage while preserving [`Self::new`] for tests that
+    /// intentionally exercise multiple domains in one ephemeral store.
+    #[must_use]
+    pub fn new_bound(
+        bound_domain: AtomicityDomainId,
+        active_writer_fence: WriterFenceGeneration,
+    ) -> Self {
+        Self::new_with_optional_domain(Some(bound_domain), active_writer_fence)
+    }
+
+    fn new_with_optional_domain(
+        bound_domain: Option<AtomicityDomainId>,
+        active_writer_fence: WriterFenceGeneration,
+    ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(MemoryDurableStoreData {
+                bound_domain,
                 active_writer_fence,
                 now_unix_millis: 0,
                 state_domains: BTreeMap::new(),
@@ -3432,6 +3463,18 @@ fn validate_memory_durable_read_authority(
     Ok(())
 }
 
+fn validate_memory_durable_read_domain(
+    data: &MemoryDurableStoreData,
+    domain: AtomicityDomainId,
+) -> Result<(), DurableReadError> {
+    if data.bound_domain.is_some_and(|bound| bound != domain) {
+        return Err(DurableReadError::InvalidRequest(
+            RuntimeError::AtomicityDomainMismatch,
+        ));
+    }
+    Ok(())
+}
+
 fn validate_memory_durable_commit_authority(
     data: &MemoryDurableStoreData,
     context: &DurableOperationContext,
@@ -3443,6 +3486,16 @@ fn validate_memory_durable_commit_authority(
     }
     if context.deadline().is_expired_at(data.now_unix_millis) {
         return Err(DurableCommitRejection::DeadlineExceededBeforeCommit);
+    }
+    Ok(())
+}
+
+fn validate_memory_durable_commit_domain(
+    data: &MemoryDurableStoreData,
+    domain: AtomicityDomainId,
+) -> Result<(), DurableCommitRejection> {
+    if data.bound_domain.is_some_and(|bound| bound != domain) {
+        return Err(DurableCommitRejection::AtomicityDomainMismatch);
     }
     Ok(())
 }
@@ -3684,6 +3737,7 @@ impl DurableDomainStateStore for MemoryDurableStateStore {
             .inner
             .read()
             .expect("durable state store lock poisoned");
+        validate_memory_durable_read_domain(&data, domain)?;
         validate_memory_durable_read_authority(&data, context)?;
         Ok(read_memory_versioned(
             data.state_domains.get(domain.as_bytes()),
@@ -3700,6 +3754,9 @@ impl DurableDomainStateStore for MemoryDurableStateStore {
             .inner
             .write()
             .expect("durable state store lock poisoned");
+        if let Err(reason) = validate_memory_durable_commit_domain(&data, transaction.domain()) {
+            return DurableCommitOutcome::Rejected(reason);
+        }
         if let Err(reason) = validate_memory_durable_commit_authority(&data, context) {
             return DurableCommitOutcome::Rejected(reason);
         }
@@ -3731,6 +3788,7 @@ impl StructuredDurableDomainStateStore for MemoryDurableStateStore {
             .inner
             .read()
             .expect("durable state store lock poisoned");
+        validate_memory_durable_read_domain(&data, domain)?;
         validate_memory_durable_read_authority(&data, context)?;
         read_memory_object_head(&data, domain, object_id)
     }
@@ -3746,6 +3804,7 @@ impl StructuredDurableDomainStateStore for MemoryDurableStateStore {
             .inner
             .read()
             .expect("durable state store lock poisoned");
+        validate_memory_durable_read_domain(&data, domain)?;
         validate_memory_durable_read_authority(&data, context)?;
         read_memory_object_version(&data, domain, object_id, object_version)
     }
@@ -3760,6 +3819,7 @@ impl StructuredDurableDomainStateStore for MemoryDurableStateStore {
             .inner
             .read()
             .expect("durable state store lock poisoned");
+        validate_memory_durable_read_domain(&data, domain)?;
         validate_memory_durable_read_authority(&data, context)?;
         Ok(data
             .receipts
@@ -3776,6 +3836,9 @@ impl StructuredDurableDomainStateStore for MemoryDurableStateStore {
             .inner
             .write()
             .expect("durable state store lock poisoned");
+        if let Err(reason) = validate_memory_durable_commit_domain(&data, transaction.domain()) {
+            return DurableCommitOutcome::Rejected(reason);
+        }
         if let Err(reason) = validate_memory_durable_commit_authority(&data, context) {
             return DurableCommitOutcome::Rejected(reason);
         }

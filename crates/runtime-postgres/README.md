@@ -10,9 +10,14 @@ state/object/receipt/outbox commits with complete read assertions, checked revis
 per-statement remaining-deadline timeouts, bounded unchanged-envelope
 serialization retry, and conservative commit-result classification.
 Object heads are body-free and lock in canonical object-ID order. Immutable
-version reads map the generation-one inline/blob columns losslessly; inline
-payloads use the existing canonical Object encoding and canonical Owner
-projection, while tombstones retain history and reconstruct the last version.
+metadata is validated for head reads using presence/length fields without
+selecting inline payload bytes. Separate immutable-version reads map the
+generation-one inline/blob columns losslessly; inline payloads use the existing
+canonical Object encoding and canonical Owner projection, while tombstones
+retain history and reconstruct the last version. Head owner/routing projections
+are routing data, not authorization: execution must separately match and decode
+the linked inline version and compare its typed owner. Blob-backed execution
+remains fail-closed until fetch and content verification are implemented.
 It also implements `IndexedOutboxRepository` with exact-request and stable
 indexed due claims, same-lease reconciliation, expired-lease replacement,
 retained attempt history, and idempotent acknowledgement. It does not yet
