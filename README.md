@@ -96,8 +96,20 @@ cross-provider ingress milestones implemented through Phase 17:
   contention classification, and lease/writer fencing against memory and
   PostgreSQL; the live PostgreSQL fixture additionally injects pool/row-lock
   deadline exhaustion, retry exhaustion, and schema skew when its required test
-  URL is set. Broader fault, operations, and production certification remain
-  pending, so this is still As-Is evidence.
+  URL is set. An optional shared commit-loss capability, exercised only by that
+  same live fixture through a bounded `NoTls` TCP proxy, injects a connection
+  loss immediately before one plain state commit dispatches `COMMIT`, proving
+  no state ground truth was published, and separately injects a connection
+  loss immediately after the backend returns a successful acknowledgement for
+  one structured invocation commit, one outbox claim, and one acknowledgement,
+  proving exact committed state/receipt ground truth and `RequestAlreadyCommitted`
+  for the commit and same-identity reconciliation for the claim and
+  acknowledgement. Both instants classify `Indeterminate(ConnectionLost)`, and
+  the connection pool is proven to recover afterward. This shows the backend
+  returned a successful acknowledgement over the plain transport before the
+  driver lost it, not crash durability under abrupt process/power loss, and it
+  says nothing about TLS-path loss or capacity. Broader fault, operations, and
+  production certification remain pending, so this is still As-Is evidence.
 - An explicit `ComposedRuntime` for assembling independently selected state,
   blob, signer, transport, clock, and scheduler components without hidden
   defaults. Native conformance tests close/reopen SQLite into a new composition,
@@ -221,11 +233,13 @@ production exit criteria in [`TODO.md`](TODO.md) and the accepted
 [persistence design](PERSISTENCE.md): implement the accepted
 [PostgreSQL reference design](POSTGRES.md): extend the now-implemented fenced
 structured commit, indexed outbox adapter, and shared memory/PostgreSQL
-conformance with capacity evidence. Native structured requests now honor an
-explicit cooperative cancellation signal only before first storage dispatch;
-client-disconnect cancellation, abrupt fault, backup/restore, real writer
-failover, and provider conformance follow on that foundation. Phase 16/17
-provider trust, deployment, observability, and release rehearsal remain required.
+conformance, now including commit-boundary connection-loss evidence, with
+capacity evidence. Native structured requests now honor an explicit
+cooperative cancellation signal only before first storage dispatch;
+client-disconnect cancellation, abrupt process/power fault, disk-full/WAL
+exhaustion, TLS-path connection loss, backup/restore, real writer failover,
+and provider conformance follow on that foundation. Phase 16/17 provider
+trust, deployment, observability, and release rehearsal remain required.
 
 ## Workspace map
 

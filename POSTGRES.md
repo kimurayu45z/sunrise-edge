@@ -6,9 +6,14 @@ exist As-Is. A bounded synchronous pool now implements fenced state/receipt
 reads and serializable structured state/receipt/outbox commit with transaction-
 local deadlines, bounded unchanged-envelope serialization retry, and typed
 outcomes. Indexed exact-request/due outbox claim and acknowledgement now use
-the normalized delivery index and retained lease-attempt history As-Is.
-Migration operations beyond initial bootstrap, cancellation, fault/capacity
-evidence, and production certification are not implemented.
+the normalized delivery index and retained lease-attempt history As-Is. An
+optional shared commit-loss capability now proves commit-boundary connection
+loss immediately before `COMMIT` dispatch for one state commit and,
+separately, immediately after backend acceptance for a structured invocation
+commit, outbox claim, and acknowledgement, over a plain `NoTls` transport; see
+section 5. Migration operations beyond initial bootstrap, cancellation,
+TLS-path connection loss, other fault/capacity evidence, and production
+certification are not implemented.
 
 This document refines [`PERSISTENCE.md`](PERSISTENCE.md) for the first
 production-oriented PostgreSQL backend. It deliberately does not map the
@@ -219,6 +224,33 @@ returns a definite pre-commit deadline and publishes no state. SQLSTATE `57014`
 at the commit boundary remains indeterminate for structured commit, claim, and
 acknowledgement because PostgreSQL does not prove whether dispatch completed.
 
+An optional shared commit-loss capability (`runtime::conformance::
+CommitLossFixture`) now exercises the driver's own commit-boundary connection
+loss, not just deadline SQLSTATEs. Its only current implementation is a
+bounded, test-only `NoTls` TCP proxy in the live test: it binds port 0, relays
+the untyped startup message and every later `1-byte-type + 4-byte-length`
+frame, and detects the exact simple-query `COMMIT` a durable commit, claim, or
+acknowledgement dispatches last. Severing the connection immediately before
+that message reaches the backend, or forwarding it and severing immediately
+after the backend returns a successful `CommandComplete("COMMIT")`/
+`ReadyForQuery`, both surface to the driver as an unrecognized SQLSTATE and
+both classify `Indeterminate(ConnectionLost)`; the driver cannot and does not
+distinguish them by outcome alone. The shared case injects the pre-dispatch
+instant once, for one plain state commit, and proves no state was published,
+confirmed by an unfaulted retry of the same read assertion committing
+successfully. It injects the post-acceptance instant three times: for one
+structured invocation commit, proving the exact committed state revision/value
+and exact receipt content were published and that replaying the same
+invocation observes `RequestAlreadyCommitted`; for an outbox claim on that
+invocation's message, proving a same-lease replay reconciles to the identical
+claimed message; and for the corresponding acknowledgement, proving a
+same-identity replay reconciles to `Acknowledged` and that the delivery cursor
+advanced exactly once with no message left due. A final unfaulted commit
+proves the connection pool recovers a healthy connection. This is evidence
+that the backend returned a successful commit acknowledgement over the plain
+transport before the driver lost it, not proof of crash durability under
+abrupt process/power loss, and it says nothing about TLS-path connection loss.
+
 ## 6. Indexed claim and acknowledgement
 
 Claim first checks the lease-attempt identity. A matching active attempt returns
@@ -308,7 +340,13 @@ When `SUNRISE_EDGE_TEST_POSTGRES_URL` is configured (as it is in CI), the live
 PostgreSQL fixture additionally covers pool/row-lock deadline exhaustion,
 commit-boundary deadline ambiguity, bounded retry exhaustion, non-active
 migration-phase rejection, and exact schema-generation/window mismatch across
-read, commit, claim, and acknowledgement. Duplicate request races,
-commit-boundary connection loss,
-abrupt/process faults, backup/restore, migration compatibility across real old
-and new binaries, capacity, and operational certification remain open.
+read, commit, claim, and acknowledgement. The same fixture's optional
+commit-loss capability covers commit-boundary connection loss immediately
+before `COMMIT` dispatch for a plain state commit, and immediately after
+backend acceptance for the structured invocation commit, indexed outbox
+claim, and acknowledgement boundaries, over a plain `NoTls` transport only;
+it says nothing about TLS-path connection loss. Duplicate request races,
+abrupt/process faults, disk-full/WAL exhaustion, TLS-path connection loss,
+backup/restore, migration compatibility across real old and new binaries,
+capacity/load/soak, real writer failover, and operational certification
+remain open.

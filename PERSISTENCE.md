@@ -379,11 +379,25 @@ not general state reads:
    adapter, then run the shared conformance suite. The generation-one schema,
    operator-only namespace bootstrap/fence advance, fenced structured commit,
    indexed claim/ack, and shared memory/PostgreSQL contract suite are implemented
-   As-Is.
+   As-Is. An optional shared commit-loss capability, exercised only over a real,
+   severable network transport, now proves that severing the connection
+   immediately before one plain state commit dispatches `COMMIT` classifies
+   `Indeterminate(ConnectionLost)` with no state ground truth published, and
+   that severing it immediately after the backend returns a successful
+   acknowledgement for one structured invocation commit, one outbox claim, and
+   one acknowledgement also classifies `Indeterminate(ConnectionLost)` while
+   publishing exact state/receipt ground truth and `RequestAlreadyCommitted`
+   for the commit and same-identity reconciliation for the claim and
+   acknowledgement, with the connection pool proven to recover afterward. The
+   only current implementation is a bounded `NoTls` TCP proxy in
+   `runtime-postgres`'s live test; it shows the backend acknowledged commit
+   before the driver lost it, not crash durability under abrupt process/power
+   loss, and it proves nothing about TLS-path connection loss.
 4. Preserve the implemented exact-boundary/pool/lock deadline evidence and
    pre-storage native cancellation, then extend it with client-disconnect and
-   in-flight cancellation semantics, commit-loss, capacity tests, abrupt fault
-   tests, backup/restore rehearsal, and real writer-fencing failover tests.
+   in-flight cancellation semantics, abrupt process/power fault, disk-full/WAL
+   exhaustion, TLS-path connection loss, capacity/load/soak tests, backup/restore
+   rehearsal, and real writer-fencing failover tests.
 5. Implement Cloudflare Durable Object and AWS mappings against the same
    contract and pass real-provider conformance before claiming support.
 

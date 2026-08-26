@@ -232,10 +232,22 @@ claim/ack with retained attempt history As-Is. A shared memory/PostgreSQL
 conformance suite now covers exact-boundary deadlines, complete-read races,
 definite contention classification, lease/writer fencing, and PostgreSQL-only
 pool/row-lock deadline exhaustion, serialization exhaustion, and schema skew
-As-Is. Native structured requests now support explicit cancellation only before
-first storage dispatch; started work, client disconnect, and shutdown budgets
-remain uncancellable. Next, implement abrupt fault,
-backup/restore, capacity, and provider implementations. Do not spend further
+As-Is. An optional shared commit-loss capability, exercised only by that live
+PostgreSQL fixture through a bounded `NoTls` TCP proxy, now injects a
+connection loss immediately before one plain state commit dispatches `COMMIT`,
+proving no state ground truth, and separately immediately after the backend
+returns a successful acknowledgement for one structured invocation commit, one
+outbox claim, and one acknowledgement, proving exact state/receipt ground
+truth plus `RequestAlreadyCommitted` for the commit and same-identity
+reconciliation for the claim and acknowledgement, with pool recovery proven
+afterward. This shows the backend acknowledged commit before the driver lost
+it, not crash durability under abrupt process/power loss, and it says nothing
+about TLS-path loss. Native structured requests now support
+explicit cancellation only before first storage dispatch; started work, client
+disconnect, and shutdown budgets remain uncancellable. Next, implement
+abrupt process/power fault, disk-full/WAL exhaustion, TLS-path connection loss,
+backup/restore, capacity/load/soak, real writer failover, and provider
+implementations. Do not spend further
 effort treating the opaque SQLite table or prefix scanner as the production
 schema. The adapter must not infer normalized rows from opaque key prefixes.
 SQLite remains a local durable reference. Do not jump to provider deployment
