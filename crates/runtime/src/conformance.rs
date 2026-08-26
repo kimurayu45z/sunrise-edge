@@ -3,7 +3,15 @@
 //! This module is test support. It is available to `runtime` unit tests and to
 //! adapter test targets that explicitly enable the `durable-conformance`
 //! feature. Passing these cases is contract evidence, not production
-//! certification or fault/capacity evidence.
+//! certification. The shared baseline (`run_durable_store_conformance`,
+//! `run_schema_skew_conformance`) exercises complete-read contention,
+//! lease/writer fencing, and schema-identity skew against whatever store a
+//! fixture wraps; it injects no fault and is not fault or capacity evidence.
+//! The optional [`CommitLossFixture`] capability and
+//! [`run_commit_loss_conformance`] case are the exception: only a fixture
+//! backed by a real, severable network transport may implement them, and
+//! doing so is commit-boundary connection-loss fault evidence for that
+//! transport (see their doc comments for exact scope and limits).
 //! Concurrent cases use only bounded threads that are joined before returning;
 //! no background work or process lifetime is part of the store contract.
 
@@ -104,6 +112,43 @@ pub trait SchemaSkewFixture: DurableStoreFixture {
 
     /// Restores the fixture namespace to the binary's exact supported schema.
     fn restore_supported_schema(&self) -> ConformanceResult<()>;
+}
+
+/// Point, relative to one dispatched COMMIT, at which a [`CommitLossFixture`]
+/// severs its adapter's transport connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitFaultPoint {
+    /// Sever the connection before the COMMIT reaches the backend at all.
+    BeforeCommitDispatch,
+    /// Let the backend return a successful acknowledgement for COMMIT, then
+    /// sever the connection before the caller observes it. This proves the
+    /// backend accepted the commit and returned it; it is not evidence that
+    /// the commit would survive an abrupt process/power loss.
+    AfterBackendCommitAccepted,
+}
+
+/// Optional commit-boundary connection-loss capability for durable adapter
+/// fixtures backed by a real, severable network transport.
+///
+/// Ephemeral in-process stores have no connection to sever and must not
+/// implement this trait or manufacture equivalent evidence. The only current
+/// implementation (`runtime-postgres`'s live PostgreSQL test) severs a plain
+/// `NoTls` connection; it proves nothing about TLS-path connection loss.
+pub trait CommitLossFixture: DurableStoreFixture {
+    /// Arms exactly one future COMMIT dispatched through the fixture's store
+    /// to be severed at `fault_point`. The fixture must consume the arming
+    /// exactly once, on the next COMMIT the store attempts, and must leave
+    /// every later, unarmed COMMIT unaffected.
+    fn arm_commit_loss(&self, fault_point: CommitFaultPoint) -> ConformanceResult<()>;
+
+    /// Returns whether the most recently armed fault actually severed a
+    /// connection at its configured point.
+    fn commit_loss_fired(&self) -> ConformanceResult<bool>;
+
+    /// Returns whether the backend sent a successful COMMIT completion before
+    /// the fixture severed the connection. Only meaningful after arming
+    /// [`CommitFaultPoint::AfterBackendCommitAccepted`].
+    fn backend_commit_accepted(&self) -> ConformanceResult<bool>;
 }
 
 fn mismatch<T: Debug>(
@@ -1235,6 +1280,384 @@ pub fn run_schema_skew_conformance<F: SchemaSkewFixture>(fixture: &F) -> Conform
             CASE,
             "failed skewed acknowledgement must leave the original lease active",
             &restored_ack,
+        ));
+    }
+    Ok(())
+}
+
+/// Verifies commit-boundary connection-loss evidence. Every case proves that
+/// its injected fault actually fired.
+///
+/// [`CommitFaultPoint::BeforeCommitDispatch`] is injected once, for one plain
+/// state commit, and proves no state ground truth was published: an
+/// unfaulted retry of the same read assertion then commits successfully.
+///
+/// [`CommitFaultPoint::AfterBackendCommitAccepted`] is injected separately
+/// three times, after confirming the backend actually returned a successful
+/// acknowledgement before severing. A same-lease claim replay or
+/// same-identity acknowledgement replay alone cannot distinguish a persisted
+/// commit from an uncommitted one, so each case first probes the store with
+/// an independent operation whose outcome differs only if the prior
+/// transaction actually persisted:
+/// - for one structured invocation commit, proving the exact committed state
+///   revision/value and exact receipt content were published, and that
+///   replaying the same invocation observes `RequestAlreadyCommitted`;
+/// - for an outbox claim on that invocation's message, first proving with a
+///   different, never-used lease that the original lease is still active
+///   (`NoDueWork`), then that a same-lease replay reconciles to the identical
+///   claimed message;
+/// - for the corresponding acknowledgement, first proving that reclaiming
+///   with the original lease is rejected as lease-ID reuse, then that a
+///   same-identity replay reconciles to acknowledged with no message left
+///   due for this one-message batch.
+///
+/// A final unfaulted commit proves the connection pool recovers a healthy
+/// connection afterward.
+///
+/// This proves the backend returned a successful acknowledgement before the
+/// driver lost the connection; it is not evidence that the commit would
+/// survive an abrupt process/power loss. It also covers only the two
+/// connection-loss instants named by [`CommitFaultPoint`] on whatever
+/// transport the fixture severs, is not evidence for disk exhaustion,
+/// TLS-path connection loss, capacity/load/soak, real writer failover, or
+/// client disconnect/in-flight cancellation; those remain open per
+/// `POSTGRES.md`.
+pub fn run_commit_loss_conformance<F: CommitLossFixture>(fixture: &F) -> ConformanceResult {
+    let store: Arc<F::Store> = fixture.store();
+    let domain: AtomicityDomainId = fixture.domain();
+    let fence: WriterFenceGeneration = fixture.initial_writer_fence();
+
+    const BEFORE_CASE: &str = "commit-loss-before-dispatch";
+    let before_key: Vec<u8> = b"conformance/commit-loss-before".to_vec();
+    let before_context: DurableOperationContext = build_context(fixture, fence, 0xC1)?;
+    fixture.arm_commit_loss(CommitFaultPoint::BeforeCommitDispatch)?;
+    let before_transaction: AtomicStateTransaction = AtomicStateTransaction::new(
+        domain,
+        AtomicStateReadSet::new(vec![
+            StateReadAssertion::new(before_key.clone(), StateRevision::INITIAL)
+                .map_err(|error| ConformanceFailure::new(BEFORE_CASE, error.to_string()))?,
+        ])
+        .map_err(|error| ConformanceFailure::new(BEFORE_CASE, error.to_string()))?,
+        AtomicStateMutationSet::new(vec![
+            StateMutationEntry::new(before_key.clone(), StateMutation::Put(vec![0xC1]))
+                .map_err(|error| ConformanceFailure::new(BEFORE_CASE, error.to_string()))?,
+        ])
+        .map_err(|error| ConformanceFailure::new(BEFORE_CASE, error.to_string()))?,
+    )
+    .map_err(|error| ConformanceFailure::new(BEFORE_CASE, error.to_string()))?;
+    let before_outcome: DurableCommitOutcome =
+        store.commit_durable(&before_context, before_transaction);
+    if before_outcome
+        != DurableCommitOutcome::Indeterminate(IndeterminateCommitReason::ConnectionLost)
+    {
+        return Err(mismatch(
+            BEFORE_CASE,
+            "severing before COMMIT dispatch must be reported as indeterminate connection loss",
+            &before_outcome,
+        ));
+    }
+    if !fixture.commit_loss_fired()? {
+        return Err(ConformanceFailure::new(
+            BEFORE_CASE,
+            "fixture did not observe its own injected fault",
+        ));
+    }
+    let after_before_read: VersionedStateValue = store
+        .get_versioned_durable(&before_context, domain, &before_key)
+        .map_err(|error| mismatch(BEFORE_CASE, "post-fault read must succeed", &error))?;
+    if after_before_read.revision() != StateRevision::INITIAL || after_before_read.value().is_some()
+    {
+        return Err(mismatch(
+            BEFORE_CASE,
+            "a connection severed before COMMIT dispatch must publish no state",
+            &after_before_read,
+        ));
+    }
+    let before_retry: AtomicStateTransaction = AtomicStateTransaction::new(
+        domain,
+        AtomicStateReadSet::new(vec![
+            StateReadAssertion::new(before_key.clone(), StateRevision::INITIAL)
+                .map_err(|error| ConformanceFailure::new(BEFORE_CASE, error.to_string()))?,
+        ])
+        .map_err(|error| ConformanceFailure::new(BEFORE_CASE, error.to_string()))?,
+        AtomicStateMutationSet::new(vec![
+            StateMutationEntry::new(before_key, StateMutation::Put(vec![0xC2]))
+                .map_err(|error| ConformanceFailure::new(BEFORE_CASE, error.to_string()))?,
+        ])
+        .map_err(|error| ConformanceFailure::new(BEFORE_CASE, error.to_string()))?,
+    )
+    .map_err(|error| ConformanceFailure::new(BEFORE_CASE, error.to_string()))?;
+    let before_retry_outcome: DurableCommitOutcome =
+        store.commit_durable(&before_context, before_retry);
+    if before_retry_outcome != DurableCommitOutcome::Committed {
+        return Err(mismatch(
+            BEFORE_CASE,
+            "an unfaulted retry of the same absent assertion must commit, proving no ground truth was published and that the pool recovered a healthy connection",
+            &before_retry_outcome,
+        ));
+    }
+
+    const AFTER_CASE: &str = "commit-loss-invocation-after-backend-commit";
+    let after_context: DurableOperationContext = build_context(fixture, fence, 0xC3)?;
+    let after_request_byte: u8 = 0xC4;
+    let after_key: Vec<u8> = b"conformance/commit-loss-after".to_vec();
+    fixture.arm_commit_loss(CommitFaultPoint::AfterBackendCommitAccepted)?;
+    let after_invocation: DurableInvocationTransaction = invocation(
+        AFTER_CASE,
+        domain,
+        after_request_byte,
+        vec![(after_key.clone(), StateRevision::INITIAL)],
+        vec![(after_key.clone(), StateMutation::Put(vec![0xD2]))],
+        vec![vec![0xD1]],
+    )?;
+    let expected_after_receipt: DurableRequestReceipt = after_invocation.receipt().clone();
+    let after_outcome: DurableCommitOutcome =
+        store.commit_invocation(&after_context, after_invocation.clone());
+    if after_outcome
+        != DurableCommitOutcome::Indeterminate(IndeterminateCommitReason::ConnectionLost)
+    {
+        return Err(mismatch(
+            AFTER_CASE,
+            "severing after the backend accepts COMMIT must be reported as indeterminate connection loss",
+            &after_outcome,
+        ));
+    }
+    if !fixture.commit_loss_fired()? {
+        return Err(ConformanceFailure::new(
+            AFTER_CASE,
+            "fixture did not observe its own injected fault",
+        ));
+    }
+    if !fixture.backend_commit_accepted()? {
+        return Err(ConformanceFailure::new(
+            AFTER_CASE,
+            "fixture did not observe a genuine backend COMMIT acceptance before severing",
+        ));
+    }
+    let after_state: VersionedStateValue = store
+        .get_versioned_durable(&after_context, domain, &after_key)
+        .map_err(|error| mismatch(AFTER_CASE, "post-fault state read must succeed", &error))?;
+    if after_state.revision() != StateRevision::new(1)
+        || after_state.value() != Some([0xD2].as_slice())
+    {
+        return Err(mismatch(
+            AFTER_CASE,
+            "a connection severed after the backend accepts COMMIT must still publish the exact committed state revision and value",
+            &after_state,
+        ));
+    }
+    let after_request_id: DurableRequestId = request_id(AFTER_CASE, after_request_byte)?;
+    let receipt: Option<DurableRequestReceipt> = store
+        .get_request_receipt(&after_context, domain, after_request_id)
+        .map_err(|error| mismatch(AFTER_CASE, "post-fault receipt read must succeed", &error))?;
+    if receipt != Some(expected_after_receipt) {
+        return Err(mismatch(
+            AFTER_CASE,
+            "a connection severed after the backend accepts COMMIT must still publish the exact committed receipt content",
+            &receipt,
+        ));
+    }
+    let reconciled_invocation: DurableCommitOutcome =
+        store.commit_invocation(&after_context, after_invocation);
+    if reconciled_invocation
+        != DurableCommitOutcome::Rejected(DurableCommitRejection::RequestAlreadyCommitted)
+    {
+        return Err(mismatch(
+            AFTER_CASE,
+            "replaying an indeterminate but backend-committed invocation must observe RequestAlreadyCommitted rather than recommitting or losing the effect",
+            &reconciled_invocation,
+        ));
+    }
+
+    const CLAIM_CASE: &str = "commit-loss-claim-after-backend-commit";
+    let claim_outbox_request: OutboxRequestId = outbox_request_id(CLAIM_CASE, after_request_byte)?;
+    let claim_context: DurableOperationContext = build_context(fixture, fence, 0xC5)?;
+    let claim_lease: DurableOutboxLeaseId = lease_id(CLAIM_CASE, 0xC6)?;
+    fixture.arm_commit_loss(CommitFaultPoint::AfterBackendCommitAccepted)?;
+    let claim_request: RequestOutboxClaimRequest = RequestOutboxClaimRequest::new(
+        domain,
+        claim_outbox_request,
+        OUTBOX_NOW,
+        claim_lease,
+        OUTBOX_NOW + OUTBOX_LEASE_MILLIS,
+    )
+    .map_err(|error| ConformanceFailure::new(CLAIM_CASE, error.to_string()))?;
+    let claim_outcome: DurableOutboxClaimOutcome =
+        store.claim_request_outbox(&claim_context, claim_request);
+    if claim_outcome
+        != DurableOutboxClaimOutcome::Indeterminate(IndeterminateCommitReason::ConnectionLost)
+    {
+        return Err(mismatch(
+            CLAIM_CASE,
+            "severing an outbox claim after the backend accepts COMMIT must be reported as indeterminate connection loss",
+            &claim_outcome,
+        ));
+    }
+    if !fixture.commit_loss_fired()? {
+        return Err(ConformanceFailure::new(
+            CLAIM_CASE,
+            "fixture did not observe its own injected fault",
+        ));
+    }
+    if !fixture.backend_commit_accepted()? {
+        return Err(ConformanceFailure::new(
+            CLAIM_CASE,
+            "fixture did not observe a genuine backend COMMIT acceptance before severing",
+        ));
+    }
+    // A same-lease replay alone cannot distinguish a persisted claim from an
+    // uncommitted one: if the original claim never landed, replaying it would
+    // simply perform a fresh claim and return an indistinguishable `Claimed`
+    // outcome. Probe with a different, never-used lease at the same
+    // `OUTBOX_NOW` instead: the original lease has not yet expired, so this
+    // only observes `NoDueWork` if the original attempt's active lease is
+    // genuinely persisted and still bound to the request.
+    let claim_probe_lease: DurableOutboxLeaseId = lease_id(CLAIM_CASE, 0xCA)?;
+    let claim_probe_outcome: DurableOutboxClaimOutcome = store.claim_request_outbox(
+        &claim_context,
+        RequestOutboxClaimRequest::new(
+            domain,
+            claim_outbox_request,
+            OUTBOX_NOW,
+            claim_probe_lease,
+            OUTBOX_NOW + OUTBOX_LEASE_MILLIS,
+        )
+        .map_err(|error| ConformanceFailure::new(CLAIM_CASE, error.to_string()))?,
+    );
+    if claim_probe_outcome != DurableOutboxClaimOutcome::NoDueWork {
+        return Err(mismatch(
+            CLAIM_CASE,
+            "a different-lease claim while the original lease is unexpired must observe no due work, proving the indeterminate claim's active lease persisted",
+            &claim_probe_outcome,
+        ));
+    }
+    let reconciled_claim_outcome: DurableOutboxClaimOutcome =
+        store.claim_request_outbox(&claim_context, claim_request);
+    let DurableOutboxClaimOutcome::Claimed(reconciled_claim) = reconciled_claim_outcome else {
+        return Err(mismatch(
+            CLAIM_CASE,
+            "a same-lease replay after an indeterminate but backend-committed claim must reconcile the already-claimed message",
+            &reconciled_claim_outcome,
+        ));
+    };
+    if reconciled_claim.message_index() != 0 || reconciled_claim.canonical_payload() != [0xD1] {
+        return Err(mismatch(
+            CLAIM_CASE,
+            "the reconciled claim must own the exact message the backend committed",
+            &reconciled_claim,
+        ));
+    }
+
+    const ACK_CASE: &str = "commit-loss-acknowledgement-after-backend-commit";
+    let ack_context: DurableOperationContext = build_context(fixture, fence, 0xC7)?;
+    fixture.arm_commit_loss(CommitFaultPoint::AfterBackendCommitAccepted)?;
+    let acknowledgement: DurableOutboxAcknowledgement =
+        DurableOutboxAcknowledgement::new(domain, claim_outbox_request, 0, claim_lease);
+    let ack_outcome: DurableOutboxAcknowledgementOutcome =
+        store.acknowledge_outbox(&ack_context, acknowledgement);
+    if ack_outcome
+        != DurableOutboxAcknowledgementOutcome::Indeterminate(
+            IndeterminateCommitReason::ConnectionLost,
+        )
+    {
+        return Err(mismatch(
+            ACK_CASE,
+            "severing an acknowledgement after the backend accepts COMMIT must be reported as indeterminate connection loss",
+            &ack_outcome,
+        ));
+    }
+    if !fixture.commit_loss_fired()? {
+        return Err(ConformanceFailure::new(
+            ACK_CASE,
+            "fixture did not observe its own injected fault",
+        ));
+    }
+    if !fixture.backend_commit_accepted()? {
+        return Err(ConformanceFailure::new(
+            ACK_CASE,
+            "fixture did not observe a genuine backend COMMIT acceptance before severing",
+        ));
+    }
+    // A same-identity acknowledgement replay alone cannot distinguish a
+    // persisted acknowledgement from an uncommitted one: the active lease
+    // from the claim case would still satisfy a first-time acknowledgement
+    // just as well as an idempotent replay. Probe by attempting to claim
+    // again with the original lease: a lease already consumed by a persisted
+    // acknowledgement is no longer active work and must be rejected as
+    // lease-ID reuse, whereas an uncommitted acknowledgement would leave the
+    // lease active and this probe would instead reconcile to `Claimed`.
+    let ack_probe_outcome: DurableOutboxClaimOutcome = store.claim_request_outbox(
+        &ack_context,
+        RequestOutboxClaimRequest::new(
+            domain,
+            claim_outbox_request,
+            OUTBOX_NOW,
+            claim_lease,
+            OUTBOX_NOW + OUTBOX_LEASE_MILLIS,
+        )
+        .map_err(|error| ConformanceFailure::new(ACK_CASE, error.to_string()))?,
+    );
+    if ack_probe_outcome
+        != DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::LeaseIdReuse)
+    {
+        return Err(mismatch(
+            ACK_CASE,
+            "reclaiming with the original lease after an indeterminate acknowledgement must be rejected as lease-ID reuse, proving the acknowledgement persisted",
+            &ack_probe_outcome,
+        ));
+    }
+    let reconciled_ack: DurableOutboxAcknowledgementOutcome =
+        store.acknowledge_outbox(&ack_context, acknowledgement);
+    if reconciled_ack != DurableOutboxAcknowledgementOutcome::Acknowledged {
+        return Err(mismatch(
+            ACK_CASE,
+            "a replay after an indeterminate but backend-committed acknowledgement must reconcile as acknowledged",
+            &reconciled_ack,
+        ));
+    }
+    let post_ack_claim: DurableOutboxClaimOutcome = store.claim_request_outbox(
+        &ack_context,
+        RequestOutboxClaimRequest::new(
+            domain,
+            claim_outbox_request,
+            OUTBOX_NOW,
+            lease_id(ACK_CASE, 0xC9)?,
+            OUTBOX_NOW + OUTBOX_LEASE_MILLIS,
+        )
+        .map_err(|error| ConformanceFailure::new(ACK_CASE, error.to_string()))?,
+    );
+    if post_ack_claim != DurableOutboxClaimOutcome::NoDueWork {
+        return Err(mismatch(
+            ACK_CASE,
+            "the acknowledgement must persist and leave no due work for this one-message batch",
+            &post_ack_claim,
+        ));
+    }
+
+    const RECOVERY_CASE: &str = "commit-loss-pool-recovery";
+    let recovery_key: Vec<u8> = b"conformance/commit-loss-recovery".to_vec();
+    let recovery_context: DurableOperationContext = build_context(fixture, fence, 0xC8)?;
+    let recovery_transaction: AtomicStateTransaction = AtomicStateTransaction::new(
+        domain,
+        AtomicStateReadSet::new(vec![
+            StateReadAssertion::new(recovery_key.clone(), StateRevision::INITIAL)
+                .map_err(|error| ConformanceFailure::new(RECOVERY_CASE, error.to_string()))?,
+        ])
+        .map_err(|error| ConformanceFailure::new(RECOVERY_CASE, error.to_string()))?,
+        AtomicStateMutationSet::new(vec![
+            StateMutationEntry::new(recovery_key, StateMutation::Put(vec![0xC8]))
+                .map_err(|error| ConformanceFailure::new(RECOVERY_CASE, error.to_string()))?,
+        ])
+        .map_err(|error| ConformanceFailure::new(RECOVERY_CASE, error.to_string()))?,
+    )
+    .map_err(|error| ConformanceFailure::new(RECOVERY_CASE, error.to_string()))?;
+    let recovery_outcome: DurableCommitOutcome =
+        store.commit_durable(&recovery_context, recovery_transaction);
+    if recovery_outcome != DurableCommitOutcome::Committed {
+        return Err(mismatch(
+            RECOVERY_CASE,
+            "the connection pool must recover a healthy connection after repeated commit-boundary connection loss",
+            &recovery_outcome,
         ));
     }
     Ok(())

@@ -1973,7 +1973,17 @@ Phase 15 As-Is scope:
   absent-key create、tombstone ABA、definite contention outcome、retained outbox lease、writer-fence handoffを
   検証する。PostgreSQL live testはさらにpool acquisition/metadata lock待ちdeadline、retry ceiling到達時の
   serialization rejectionとunsupported schema generationのread/commit/claim/ack fail-closedを検証する
-  （implemented As-Is）。commit-loss、kill/power fault、disk full、connection exhaustion、backup/restore、
+  （implemented As-Is）。optional shared commit-loss capabilityはbounded test-only `NoTls` TCP proxyを介し、
+  plain state commitへCOMMIT dispatch直前のconnection lossを1回注入してstate ground truthが存在しないことを
+  証明し、別途structured invocation commit・outbox claim・acknowledgementの3箇所へbackend COMMIT acceptance
+  直後のconnection lossを注入して、いずれもIndeterminate(ConnectionLost)として分類されつつ、invocation commitでは
+  exact state/receipt ground truthとRequestAlreadyCommittedを証明する。same-lease claim replayや
+  same-identity ack replay単独ではpersistedとuncommittedを区別できないため、claimでは別leaseでのclaim probe
+  （元leaseがまだactiveであることをNoDueWorkで証明）、ackでは元leaseでのreclaim probe（LeaseIdReuseとして
+  rejectされることを証明）を先に行った上でsame-identity reconciliationを証明し、最後にconnection pool
+  recoveryを検証する（implemented As-Is；backendがCOMMITへ成功応答を返したことの証跡であり、abrupt
+  process/power lossに対するcrash durabilityの証明ではなく、TLS-path connection lossは
+  対象外）。kill/power fault、disk full/WAL exhaustion、connection exhaustion、backup/restore、
   capacity/load/soak、real writer failover、provider certificationは未実装である。
 - ComposedRuntimeはStateStore、BlobStore、Signer、Transport、Clock、Schedulerをhidden defaultなしで
   明示的に所有・合成する。SQLiteへstate/dedup/outboxをcommit後にruntimeをdropし、同じDBを別compositionで
@@ -2073,9 +2083,17 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
    explicit migrationとshared contract evidenceはimplemented As-Is; broader fault/capacity evidenceは未実装である。
 4. shared conformanceにexact deadline boundary、write skew、absent-key race、definite contention classification、
    lease fencingを追加し、PostgreSQL capability testにpool/row-lock deadline、serialization failure、
-   schema/version skewを追加する
-   （memory/PostgreSQL implemented As-Is; provider adapters、commit-loss、fault/capacity certification pending）。
-5. kill/power fault、disk full、connection exhaustion、capacity/load/soak、backup/restore、writer failoverをrehearsalする。
+   schema/version skewを追加する。optional shared commit-loss capabilityはbounded test-only `NoTls` TCP proxyを介し、
+   plain state commitへのCOMMIT dispatch直前connection lossとinvocation commit・outbox claim・acknowledgementへの
+   backend COMMIT acceptance直後connection lossを別々に注入し、いずれもIndeterminate(ConnectionLost)として
+   分類されることと、前者はstate ground truth不在、後者はexact state/receipt ground truth・RequestAlreadyCommitted
+   （invocation commit）を証明する。claim/ackはsame-lease/same-identity replay単独では非committedと区別できない
+   ため、別lease claim probe（NoDueWork）とoriginal lease reclaim probe（LeaseIdReuse）で先にpersistedを証明した上で
+   same-identity reconciliationを証明し、pool recoveryを証明する
+   （memory/PostgreSQL/commit-loss capability implemented As-Is；backendの成功応答の証跡でありabrupt
+   process/power lossに対するcrash durabilityの証明ではない; provider adapters、TLS-path connection loss、
+   other fault/capacity certification pending）。
+5. kill/power fault、disk full/WAL exhaustion、connection exhaustion、capacity/load/soak、backup/restore、writer failoverをrehearsalする。
 6. 同じcontractをCloudflare Durable ObjectとAWS persistenceへ実装し、real providerでcertifyする。
 
 Phase 16:

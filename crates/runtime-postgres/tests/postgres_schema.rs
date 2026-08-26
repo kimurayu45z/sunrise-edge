@@ -1,4 +1,8 @@
-use postgres::{Client, Config, NoTls, error::SqlState};
+use postgres::{
+    Client, Config, NoTls,
+    config::{Host, SslMode},
+    error::SqlState,
+};
 use protocol_types::{AtomicityDomainId, ChainId, Digest32, HashAlgorithmId, ValidatorId};
 use r2d2_postgres::{PostgresConnectionManager, r2d2::Pool};
 use runtime::{
@@ -13,7 +17,8 @@ use runtime::{
     StateRevision, StorageCorrelationId, StorageDeadline, StructuredDurableDomainStateStore,
     WriterFenceGeneration,
     conformance::{
-        ConformanceFailure, ConformanceResult, DurableStoreFixture, SchemaSkewFixture,
+        CommitFaultPoint, CommitLossFixture, ConformanceFailure, ConformanceResult,
+        DurableStoreFixture, SchemaSkewFixture, run_commit_loss_conformance,
         run_durable_store_conformance, run_schema_skew_conformance,
     },
 };
@@ -24,8 +29,13 @@ use runtime_postgres::{
     bootstrap_namespace, build_postgres_pool, inspect_namespace, verify_initial_schema,
 };
 use std::{
+    io::{self, Read, Write},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     num::NonZeroU32,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -33,6 +43,651 @@ use std::{
 const TEST_DATABASE: &str = "sunrise_edge_test";
 
 type TestPostgresManager = PostgresConnectionManager<NoTls>;
+
+// --- Bounded, test-only commit-boundary connection-loss proxy -------------
+//
+// This proxy never negotiates TLS; every proxied client must use `NoTls` and
+// `SslMode::Disable`. It relays the untyped frontend `StartupMessage`
+// verbatim, then inspects every later `1-byte-type + 4-byte-length` frame to
+// find the exact simple-query `COMMIT` round trip a durable commit dispatches
+// last. See https://www.postgresql.org/docs/current/protocol-message-formats.html
+// for the frame layout this parser relies on.
+
+/// Hard bound on a single wire message the proxy buffers in memory before
+/// deciding whether to forward, drop, or intercept it. Larger messages are
+/// streamed through in fixed-size chunks instead, so proxy memory never
+/// grows with message size.
+const COMMIT_LOSS_MAX_INSPECTED_MESSAGE_BYTES: u32 = 64 * 1024;
+/// Fixed chunk size used to stream oversized or uninspected payload bytes.
+const COMMIT_LOSS_COPY_CHUNK_BYTES: usize = 8 * 1024;
+/// Bounded number of physical connections the proxy accepts before its
+/// accept loop exits. Comfortably covers every fault case plus ordinary pool
+/// churn in the shared commit-loss conformance suite.
+const COMMIT_LOSS_MAX_ACCEPTED_CONNECTIONS: usize = 32;
+/// Bounded per-socket read/write timeout so a stalled peer cannot block a
+/// proxy thread indefinitely.
+const COMMIT_LOSS_IO_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[derive(Default)]
+struct CommitLossProxyState {
+    armed: Mutex<Option<CommitFaultPoint>>,
+    fault_fired: AtomicBool,
+    backend_commit_accepted: AtomicBool,
+}
+
+/// Cloned handles to the one physical connection the accept loop is
+/// currently servicing, kept so [`CommitLossProxy::drop`] can sever it
+/// directly instead of waiting for the pool's own client to close it.
+struct CommitLossActiveConnection {
+    client: TcpStream,
+    backend: TcpStream,
+}
+
+/// Locks `active_connection`, recovering the guard even if a prior panic
+/// poisoned the lock. This is test-only teardown bookkeeping, not protocol
+/// state, so a poisoned lock must not stop the proxy from shutting sockets
+/// down cleanly.
+fn commit_loss_lock_active_connection(
+    active_connection: &Mutex<Option<CommitLossActiveConnection>>,
+) -> std::sync::MutexGuard<'_, Option<CommitLossActiveConnection>> {
+    active_connection
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Registers clones of the given sockets as the one active connection before
+/// the accept loop enters its (possibly long-lived) serial handler. Returns
+/// `Err` if cloning fails; the caller must not proceed with an unregistered
+/// connection, since `Drop` could then no longer sever it deterministically.
+fn commit_loss_register_active_connection(
+    active_connection: &Mutex<Option<CommitLossActiveConnection>>,
+    client: &TcpStream,
+    backend: &TcpStream,
+) -> io::Result<()> {
+    let client = client.try_clone()?;
+    let backend = backend.try_clone()?;
+    *commit_loss_lock_active_connection(active_connection) =
+        Some(CommitLossActiveConnection { client, backend });
+    Ok(())
+}
+
+/// Clears the active-connection registry once the serial handler for that
+/// connection has returned on its own.
+fn commit_loss_clear_active_connection(
+    active_connection: &Mutex<Option<CommitLossActiveConnection>>,
+) {
+    *commit_loss_lock_active_connection(active_connection) = None;
+}
+
+/// Bounded, test-only PostgreSQL wire-protocol proxy that deterministically
+/// severs a client connection at a chosen point relative to one dispatched
+/// `COMMIT`.
+struct CommitLossProxy {
+    local_addr: SocketAddr,
+    state: Arc<CommitLossProxyState>,
+    shutdown: Arc<AtomicBool>,
+    active_connection: Arc<Mutex<Option<CommitLossActiveConnection>>>,
+    accept_handle: Option<thread::JoinHandle<()>>,
+}
+
+impl CommitLossProxy {
+    fn spawn(backend_addr: SocketAddr) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let state = Arc::new(CommitLossProxyState::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let active_connection: Arc<Mutex<Option<CommitLossActiveConnection>>> =
+            Arc::new(Mutex::new(None));
+        let accept_state = Arc::clone(&state);
+        let accept_shutdown = Arc::clone(&shutdown);
+        let accept_active_connection = Arc::clone(&active_connection);
+        let accept_handle = thread::spawn(move || {
+            for _ in 0..COMMIT_LOSS_MAX_ACCEPTED_CONNECTIONS {
+                let client = match listener.accept() {
+                    Ok((client, _)) => client,
+                    Err(_) => break,
+                };
+                if accept_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(backend) = TcpStream::connect(backend_addr) else {
+                    continue;
+                };
+                // Install the active-connection registry before entering the
+                // handler, which can block for the life of this physical
+                // connection: `Drop` must always be able to find and sever
+                // whichever sockets the accept thread is currently serving.
+                if commit_loss_register_active_connection(
+                    &accept_active_connection,
+                    &client,
+                    &backend,
+                )
+                .is_err()
+                {
+                    continue;
+                }
+                // `Drop` may have set the shutdown flag and already tried to
+                // sever the active connection between the check above and
+                // this registration, finding nothing registered yet. Re-check
+                // now that registration is visible: if shutdown is set, sever
+                // and clear this exact connection ourselves and stop before
+                // entering a handler that would otherwise have no way to be
+                // told to return, rather than block for
+                // `COMMIT_LOSS_IO_TIMEOUT`.
+                if accept_shutdown.load(Ordering::SeqCst) {
+                    if let Some(active) =
+                        commit_loss_lock_active_connection(&accept_active_connection).take()
+                    {
+                        commit_loss_shutdown_both(&active.client, &active.backend);
+                    }
+                    break;
+                }
+                commit_loss_handle_connection(client, backend, &accept_state);
+                commit_loss_clear_active_connection(&accept_active_connection);
+            }
+        });
+        Self {
+            local_addr,
+            state,
+            shutdown,
+            active_connection,
+            accept_handle: Some(accept_handle),
+        }
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Arms exactly one future `COMMIT` dispatched through this proxy to be
+    /// severed at `fault_point`, resetting prior fired/observed flags.
+    fn arm(&self, fault_point: CommitFaultPoint) {
+        self.state.fault_fired.store(false, Ordering::SeqCst);
+        self.state
+            .backend_commit_accepted
+            .store(false, Ordering::SeqCst);
+        *self.state.armed.lock().unwrap() = Some(fault_point);
+    }
+
+    fn fault_fired(&self) -> bool {
+        self.state.fault_fired.load(Ordering::SeqCst)
+    }
+
+    fn backend_commit_accepted(&self) -> bool {
+        self.state.backend_commit_accepted.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for CommitLossProxy {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        // Sever the one active physical connection directly, if any, rather
+        // than waiting for the pool's own client to close its side. The
+        // accept thread can be blocked for the life of this connection
+        // inside `commit_loss_handle_connection`, never returning to
+        // `accept()` on its own; without this, `join` below would wait for
+        // that connection's relay threads to hit `COMMIT_LOSS_IO_TIMEOUT`.
+        if let Some(active) = commit_loss_lock_active_connection(&self.active_connection).take() {
+            commit_loss_shutdown_both(&active.client, &active.backend);
+        }
+        // Unblock a pending `accept()` so the listener thread observes the
+        // shutdown flag and exits instead of blocking indefinitely.
+        let _ = TcpStream::connect(self.local_addr);
+        if let Some(handle) = self.accept_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Clones both sockets for the paired relay threads, or `None` if either
+/// clone fails.
+fn commit_loss_clone_relay_pair(
+    client: &TcpStream,
+    backend: &TcpStream,
+) -> Option<(TcpStream, TcpStream)> {
+    let client_reader = client.try_clone().ok()?;
+    let backend_writer = backend.try_clone().ok()?;
+    Some((client_reader, backend_writer))
+}
+
+fn commit_loss_handle_connection(
+    mut client: TcpStream,
+    mut backend: TcpStream,
+    state: &Arc<CommitLossProxyState>,
+) {
+    let _ = client.set_read_timeout(Some(COMMIT_LOSS_IO_TIMEOUT));
+    let _ = client.set_write_timeout(Some(COMMIT_LOSS_IO_TIMEOUT));
+    let _ = backend.set_read_timeout(Some(COMMIT_LOSS_IO_TIMEOUT));
+    let _ = backend.set_write_timeout(Some(COMMIT_LOSS_IO_TIMEOUT));
+    // Disable Nagle's algorithm on both legs. Every relayed message is
+    // forwarded as one or two small writes; combined with the peer's
+    // delayed-ACK timer, leaving Nagle enabled serializes each one behind a
+    // multi-hundred-millisecond wait and compounds across the many messages
+    // in one transaction into multi-second per-operation latency.
+    let _ = client.set_nodelay(true);
+    let _ = backend.set_nodelay(true);
+
+    if commit_loss_relay_startup_message(&mut client, &mut backend).is_err() {
+        let _ = client.shutdown(Shutdown::Both);
+        let _ = backend.shutdown(Shutdown::Both);
+        return;
+    }
+
+    let Some((client_reader, backend_writer)) = commit_loss_clone_relay_pair(&client, &backend)
+    else {
+        return;
+    };
+    let awaiting_ack = Arc::new(AtomicBool::new(false));
+
+    let forward_state = Arc::clone(state);
+    let forward_awaiting_ack = Arc::clone(&awaiting_ack);
+    let forward_handle = thread::spawn(move || {
+        commit_loss_client_to_backend(
+            client_reader,
+            backend_writer,
+            &forward_state,
+            &forward_awaiting_ack,
+        );
+    });
+
+    let reverse_state = Arc::clone(state);
+    let reverse_awaiting_ack = Arc::clone(&awaiting_ack);
+    let reverse_handle = thread::spawn(move || {
+        commit_loss_backend_to_client(backend, client, &reverse_state, &reverse_awaiting_ack);
+    });
+
+    let _ = forward_handle.join();
+    let _ = reverse_handle.join();
+}
+
+/// Relays the untyped, length-prefixed frontend `StartupMessage` verbatim.
+/// Every later frontend/backend message uses the typed frame this proxy
+/// inspects; only this first client-to-backend message lacks a type byte.
+fn commit_loss_relay_startup_message(
+    client: &mut TcpStream,
+    backend: &mut TcpStream,
+) -> io::Result<()> {
+    let mut length_bytes = [0_u8; 4];
+    client.read_exact(&mut length_bytes)?;
+    let length = u32::from_be_bytes(length_bytes);
+    let payload_len = length.checked_sub(4).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "startup message length below minimum",
+        )
+    })?;
+    if payload_len > COMMIT_LOSS_MAX_INSPECTED_MESSAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "startup message exceeds bounded size",
+        ));
+    }
+    let mut payload = vec![0_u8; payload_len as usize];
+    client.read_exact(&mut payload)?;
+    // Written as one buffer, not two, so it cannot land as separate small
+    // TCP segments subject to Nagle/delayed-ACK interaction.
+    let mut message = Vec::with_capacity(length_bytes.len() + payload.len());
+    message.extend_from_slice(&length_bytes);
+    message.extend_from_slice(&payload);
+    backend.write_all(&message)?;
+    backend.flush()
+}
+
+/// Reads one typed message header, returning `Ok(None)` on a clean EOF.
+fn commit_loss_read_header(reader: &mut TcpStream) -> io::Result<Option<(u8, u32)>> {
+    let mut type_byte = [0_u8; 1];
+    match reader.read_exact(&mut type_byte) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let mut length_bytes = [0_u8; 4];
+    reader.read_exact(&mut length_bytes)?;
+    let length = u32::from_be_bytes(length_bytes);
+    let payload_len = length.checked_sub(4).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "message length below minimum")
+    })?;
+    Ok(Some((type_byte[0], payload_len)))
+}
+
+fn commit_loss_forward_message(
+    writer: &mut TcpStream,
+    message_type: u8,
+    payload: &[u8],
+) -> io::Result<()> {
+    let length = u32::try_from(payload.len() + 4)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "message too large to forward"))?;
+    // Written as one buffer, not three, so it cannot land as separate small
+    // TCP segments subject to Nagle/delayed-ACK interaction.
+    let mut message = Vec::with_capacity(1 + 4 + payload.len());
+    message.push(message_type);
+    message.extend_from_slice(&length.to_be_bytes());
+    message.extend_from_slice(payload);
+    writer.write_all(&message)?;
+    writer.flush()
+}
+
+fn commit_loss_forward_header(
+    writer: &mut TcpStream,
+    message_type: u8,
+    payload_len: u32,
+) -> io::Result<()> {
+    let length = payload_len
+        .checked_add(4)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "message length overflow"))?;
+    let mut header = [0_u8; 5];
+    header[0] = message_type;
+    header[1..].copy_from_slice(&length.to_be_bytes());
+    writer.write_all(&header)
+}
+
+fn commit_loss_stream_copy(
+    reader: &mut TcpStream,
+    writer: &mut TcpStream,
+    mut remaining: u64,
+) -> io::Result<()> {
+    let mut buffer = [0_u8; COMMIT_LOSS_COPY_CHUNK_BYTES];
+    while remaining > 0 {
+        let chunk = remaining.min(buffer.len() as u64) as usize;
+        reader.read_exact(&mut buffer[..chunk])?;
+        writer.write_all(&buffer[..chunk])?;
+        remaining -= chunk as u64;
+    }
+    writer.flush()
+}
+
+fn commit_loss_drain(reader: &mut TcpStream, mut remaining: u64) -> io::Result<()> {
+    let mut buffer = [0_u8; COMMIT_LOSS_COPY_CHUNK_BYTES];
+    while remaining > 0 {
+        let chunk = remaining.min(buffer.len() as u64) as usize;
+        reader.read_exact(&mut buffer[..chunk])?;
+        remaining -= chunk as u64;
+    }
+    Ok(())
+}
+
+fn commit_loss_is_commit_query(payload: &[u8]) -> bool {
+    payload == b"COMMIT\0"
+}
+
+fn commit_loss_shutdown_both(a: &TcpStream, b: &TcpStream) {
+    let _ = a.shutdown(Shutdown::Both);
+    let _ = b.shutdown(Shutdown::Both);
+}
+
+/// Relays client-to-backend traffic, injecting [`CommitFaultPoint::BeforeCommitDispatch`]
+/// by dropping the `COMMIT` message instead of forwarding it, or arming the
+/// paired `backend_to_client` relay to intercept the response for
+/// [`CommitFaultPoint::AfterBackendCommitAccepted`].
+///
+/// Every exit path, including a clean EOF or a forwarding failure, shuts
+/// down both directions of this physical connection immediately so the
+/// paired relay thread never idles until [`COMMIT_LOSS_IO_TIMEOUT`] elapses.
+fn commit_loss_client_to_backend(
+    mut reader: TcpStream,
+    mut writer: TcpStream,
+    state: &Arc<CommitLossProxyState>,
+    awaiting_ack: &Arc<AtomicBool>,
+) {
+    commit_loss_client_to_backend_loop(&mut reader, &mut writer, state, awaiting_ack);
+    commit_loss_shutdown_both(&reader, &writer);
+}
+
+fn commit_loss_client_to_backend_loop(
+    reader: &mut TcpStream,
+    writer: &mut TcpStream,
+    state: &Arc<CommitLossProxyState>,
+    awaiting_ack: &Arc<AtomicBool>,
+) {
+    loop {
+        let (message_type, payload_len) = match commit_loss_read_header(reader) {
+            Ok(Some(header)) => header,
+            Ok(None) | Err(_) => return,
+        };
+        if message_type == b'Q' && payload_len <= COMMIT_LOSS_MAX_INSPECTED_MESSAGE_BYTES {
+            let mut payload = vec![0_u8; payload_len as usize];
+            if reader.read_exact(&mut payload).is_err() {
+                return;
+            }
+            if commit_loss_is_commit_query(&payload) {
+                let armed_point = state.armed.lock().unwrap().take();
+                match armed_point {
+                    Some(CommitFaultPoint::BeforeCommitDispatch) => {
+                        state.fault_fired.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    Some(CommitFaultPoint::AfterBackendCommitAccepted) => {
+                        // Commit the paired relay to withholding *before* the
+                        // COMMIT bytes can possibly reach the backend and
+                        // produce a response. Setting this after forwarding
+                        // would race a fast local reply: the paired thread
+                        // could observe and forward the acknowledgement
+                        // before seeing the arm.
+                        awaiting_ack.store(true, Ordering::SeqCst);
+                        if commit_loss_forward_message(writer, message_type, &payload).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    None => {
+                        if commit_loss_forward_message(writer, message_type, &payload).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+            }
+            if commit_loss_forward_message(writer, message_type, &payload).is_err() {
+                return;
+            }
+            continue;
+        }
+        if commit_loss_forward_header(writer, message_type, payload_len).is_err() {
+            return;
+        }
+        if commit_loss_stream_copy(reader, writer, u64::from(payload_len)).is_err() {
+            return;
+        }
+    }
+}
+
+/// Relays backend-to-client traffic. Once armed by
+/// [`commit_loss_client_to_backend`] for
+/// [`CommitFaultPoint::AfterBackendCommitAccepted`], this withholds every
+/// message of the `COMMIT` response instead of forwarding it, recording
+/// whether the backend actually sent a successful `CommandComplete("COMMIT")`
+/// before the paired `ReadyForQuery` proves the round trip finished.
+///
+/// Every exit path, including a clean EOF or a forwarding failure, shuts
+/// down both directions of this physical connection immediately so the
+/// paired relay thread never idles until [`COMMIT_LOSS_IO_TIMEOUT`] elapses.
+fn commit_loss_backend_to_client(
+    mut reader: TcpStream,
+    mut writer: TcpStream,
+    state: &Arc<CommitLossProxyState>,
+    awaiting_ack: &Arc<AtomicBool>,
+) {
+    commit_loss_backend_to_client_loop(&mut reader, &mut writer, state, awaiting_ack);
+    commit_loss_shutdown_both(&reader, &writer);
+}
+
+fn commit_loss_backend_to_client_loop(
+    reader: &mut TcpStream,
+    writer: &mut TcpStream,
+    state: &Arc<CommitLossProxyState>,
+    awaiting_ack: &Arc<AtomicBool>,
+) {
+    let mut commit_complete_seen = false;
+    loop {
+        let (message_type, payload_len) = match commit_loss_read_header(reader) {
+            Ok(Some(header)) => header,
+            Ok(None) | Err(_) => return,
+        };
+        if awaiting_ack.load(Ordering::SeqCst) {
+            if payload_len > COMMIT_LOSS_MAX_INSPECTED_MESSAGE_BYTES {
+                if commit_loss_drain(reader, u64::from(payload_len)).is_err() {
+                    return;
+                }
+                continue;
+            }
+            let mut payload = vec![0_u8; payload_len as usize];
+            if reader.read_exact(&mut payload).is_err() {
+                return;
+            }
+            if message_type == b'C' && payload.starts_with(b"COMMIT") {
+                commit_complete_seen = true;
+                continue;
+            }
+            if message_type == b'Z' {
+                if commit_complete_seen {
+                    state.backend_commit_accepted.store(true, Ordering::SeqCst);
+                }
+                state.fault_fired.store(true, Ordering::SeqCst);
+                return;
+            }
+            // Any other message while awaiting (for example an unexpected
+            // ErrorResponse) is dropped too: the fault always severs the
+            // connection once armed, and only a genuine
+            // `CommandComplete("COMMIT")` before `ReadyForQuery` is reported
+            // as a backend acceptance.
+            continue;
+        }
+        if commit_loss_forward_header(writer, message_type, payload_len).is_err() {
+            return;
+        }
+        if commit_loss_stream_copy(reader, writer, u64::from(payload_len)).is_err() {
+            return;
+        }
+    }
+}
+
+/// Resolves the exact TCP address the proxy must dial for one PostgreSQL
+/// connection string.
+fn commit_loss_backend_addr(database_url: &str) -> SocketAddr {
+    let config: Config = database_url.parse().unwrap();
+    let host = match config.get_hosts().first() {
+        Some(Host::Tcp(host)) => host.clone(),
+        _ => panic!("commit-loss proxy requires a TCP host"),
+    };
+    let port = config.get_ports().first().copied().unwrap_or(5432);
+    (host.as_str(), port)
+        .to_socket_addrs()
+        .unwrap()
+        .next()
+        .unwrap()
+}
+
+/// Builds a `NoTls`, `SslMode::Disable` config pointed at the proxy instead
+/// of the real backend, preserving only the credentials/database identity
+/// needed to authenticate.
+fn commit_loss_proxied_config(database_url: &str, proxy_addr: SocketAddr) -> Config {
+    let original: Config = database_url.parse().unwrap();
+    let mut proxied = Config::new();
+    if let Some(user) = original.get_user() {
+        proxied.user(user);
+    }
+    if let Some(password) = original.get_password() {
+        proxied.password(password);
+    }
+    if let Some(dbname) = original.get_dbname() {
+        proxied.dbname(dbname);
+    }
+    proxied
+        .host(&proxy_addr.ip().to_string())
+        .port(proxy_addr.port())
+        .ssl_mode(SslMode::Disable)
+        .application_name("sunrise-edge-pr76-commit-loss");
+    proxied
+}
+
+struct CommitLossPostgresFixture {
+    store: Arc<PostgresDurableStore<TestPostgresManager>>,
+    namespace: PostgresNamespace,
+    operator: Mutex<Client>,
+    initial_fence: WriterFenceGeneration,
+    proxy: CommitLossProxy,
+}
+
+impl DurableStoreFixture for CommitLossPostgresFixture {
+    type Store = PostgresDurableStore<TestPostgresManager>;
+
+    fn store(&self) -> Arc<Self::Store> {
+        Arc::clone(&self.store)
+    }
+
+    fn domain(&self) -> AtomicityDomainId {
+        self.namespace.domain()
+    }
+
+    fn initial_writer_fence(&self) -> WriterFenceGeneration {
+        self.initial_fence
+    }
+
+    fn live_context(
+        &self,
+        writer_fence: WriterFenceGeneration,
+        correlation_byte: u8,
+        budget: Duration,
+    ) -> ConformanceResult<DurableOperationContext> {
+        let now_millis: u64 = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| ConformanceFailure::new("commit-loss-fixture", error.to_string()))?
+                .as_millis(),
+        )
+        .map_err(|_| ConformanceFailure::new("commit-loss-fixture", "clock exceeds u64"))?;
+        let budget_millis: u64 = u64::try_from(budget.as_millis())
+            .map_err(|_| ConformanceFailure::new("commit-loss-fixture", "budget exceeds u64"))?;
+        let deadline: u64 = now_millis.checked_add(budget_millis).ok_or_else(|| {
+            ConformanceFailure::new("commit-loss-fixture", "deadline exceeds u64")
+        })?;
+        Ok(DurableOperationContext::new(
+            writer_fence,
+            StorageDeadline::new(deadline).ok_or_else(|| {
+                ConformanceFailure::new("commit-loss-fixture", "deadline must be non-zero")
+            })?,
+            StorageCorrelationId::new([correlation_byte; 16]).ok_or_else(|| {
+                ConformanceFailure::new("commit-loss-fixture", "correlation ID must be non-zero")
+            })?,
+        ))
+    }
+
+    fn advance_writer_fence(
+        &self,
+        expected: WriterFenceGeneration,
+        next: WriterFenceGeneration,
+    ) -> ConformanceResult<()> {
+        let mut operator = self.operator.lock().map_err(|_| {
+            ConformanceFailure::new("commit-loss-fixture", "operator client lock poisoned")
+        })?;
+        let metadata =
+            advance_postgres_writer_fence(&mut operator, &self.namespace, expected, next).map_err(
+                |error| ConformanceFailure::new("commit-loss-fixture", error.to_string()),
+            )?;
+        if metadata.writer_fence() != next {
+            return Err(ConformanceFailure::new(
+                "commit-loss-fixture",
+                "operator fence advance returned the wrong generation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl CommitLossFixture for CommitLossPostgresFixture {
+    fn arm_commit_loss(&self, fault_point: CommitFaultPoint) -> ConformanceResult<()> {
+        self.proxy.arm(fault_point);
+        Ok(())
+    }
+
+    fn commit_loss_fired(&self) -> ConformanceResult<bool> {
+        Ok(self.proxy.fault_fired())
+    }
+
+    fn backend_commit_accepted(&self) -> ConformanceResult<bool> {
+        Ok(self.proxy.backend_commit_accepted())
+    }
+}
 
 struct PostgresConformanceFixture {
     store: Arc<PostgresDurableStore<TestPostgresManager>>,
@@ -1768,4 +2423,45 @@ fn postgres_schema_and_durable_store_conformance() {
             .unwrap(),
         runtime::VersionedStateValue::from_persisted_parts(StateRevision::INITIAL, None).unwrap()
     );
+
+    let commit_loss_namespace = PostgresNamespace::new(
+        &ChainId::new("postgres-commit-loss-conformance").unwrap(),
+        ValidatorId::new([0xB1; 32]),
+        AtomicityDomainId::new([0xB2; 32]).unwrap(),
+    )
+    .unwrap();
+    let commit_loss_fence = WriterFenceGeneration::new(61).unwrap();
+    let mut commit_loss_operator = Client::connect(&database_url, NoTls).unwrap();
+    bootstrap_namespace(
+        &mut commit_loss_operator,
+        &commit_loss_namespace,
+        POSTGRES_SCHEMA_GENERATION,
+        commit_loss_fence,
+    )
+    .unwrap();
+    let commit_loss_proxy = CommitLossProxy::spawn(commit_loss_backend_addr(&database_url));
+    let commit_loss_pool: Pool<TestPostgresManager> = build_postgres_pool(
+        commit_loss_proxied_config(&database_url, commit_loss_proxy.local_addr()),
+        NoTls,
+        PostgresPoolConfig::new(
+            NonZeroU32::new(1).unwrap(),
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let commit_loss_fixture = CommitLossPostgresFixture {
+        store: Arc::new(PostgresDurableStore::new(
+            commit_loss_pool,
+            commit_loss_namespace.clone(),
+            PostgresTransactionPolicy::new(NonZeroU32::new(1).unwrap()).unwrap(),
+        )),
+        namespace: commit_loss_namespace,
+        operator: Mutex::new(commit_loss_operator),
+        initial_fence: commit_loss_fence,
+        proxy: commit_loss_proxy,
+    };
+    run_commit_loss_conformance(&commit_loss_fixture).unwrap();
 }

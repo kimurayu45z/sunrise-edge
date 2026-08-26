@@ -906,10 +906,13 @@ replaced attempt in the replacement transaction, and advances one message only
 through an exactly bound acknowledgement. Claim and acknowledgement take a
 shared namespace-metadata lock so a fence advance cannot race them without
 serializing unrelated delivery rows; `SKIP LOCKED` is confined to due delivery
-selection. Request traffic does not run DDL or bootstrap. Cancellation,
-abrupt-fault, commit-loss, capacity, backup/restore, failover, and production
-certification evidence remain open, so this is As-Is adapter evidence rather
-than production readiness.
+selection. Request traffic does not run DDL or bootstrap. In-flight
+cancellation, abrupt process/power fault, disk-full/WAL exhaustion, TLS-path
+connection loss, capacity/load/soak, real writer failover, and production
+certification evidence remain open; an optional shared commit-loss capability
+now covers commit-boundary connection loss over the plain `NoTls` transport
+(see below), so this is still As-Is adapter evidence rather than production
+readiness.
 
 Runtime exposes the vendor-neutral durable-store conformance cases only to its
 own tests or adapters that opt into the non-default `durable-conformance`
@@ -920,10 +923,32 @@ Memory and PostgreSQL run the same complete-read write-skew, concurrent absent
 and tombstone, definite contention-outcome, retained outbox-lease, and
 writer-fence cases. PostgreSQL additionally injects unsupported schema metadata
 and a real serialization abort at an exhausted retry ceiling when the live-test
-URL is configured; CI supplies it. SQL constraints, commit-loss fault injection,
-abrupt failure, backup/restore, capacity, and real failover remain
-backend-specific evidence. Passing this suite is As-Is contract evidence, not
-production certification.
+URL is configured; CI supplies it. A separate optional `CommitLossFixture`
+capability, implemented only by that same live PostgreSQL test through a
+bounded `NoTls` TCP proxy, can sever the connection either immediately before
+a dispatched `COMMIT` reaches the backend or immediately after the backend
+returns a successful acknowledgement for it; both instants classify as
+`Indeterminate(ConnectionLost)`. The shared case injects the pre-dispatch
+instant once, for one plain state commit, proving no state ground truth was
+published. It injects the post-acceptance instant three times: for one
+structured invocation commit, proving exact committed state/receipt ground
+truth and that a same-identity replay observes `RequestAlreadyCommitted`; for
+an outbox claim on that invocation's message, first proving with a different,
+never-used lease that the original lease is still active (`NoDueWork`) and
+then that a same-lease replay reconciles to the identical claimed message;
+and for the corresponding acknowledgement, first proving that reclaiming with
+the original lease is rejected as lease-ID reuse and then that a
+same-identity replay reconciles to acknowledged with the acknowledgement
+persisted and no message left due. These discriminating probes matter because
+a same-lease claim replay or same-identity acknowledgement replay alone would
+succeed identically whether or not the prior transaction actually persisted.
+A final unfaulted commit proves the connection pool recovers afterward. This
+shows the backend returned a successful acknowledgement before the driver
+lost it, not crash durability under abrupt process/power loss, and it says
+nothing about TLS-path connection loss. Abrupt process/power fault, disk-full/WAL
+exhaustion, backup/restore, capacity/load/soak, and real writer failover
+remain backend-specific evidence. Passing this suite is As-Is contract
+evidence, not production certification.
 
 A cancellation-enabled normalized native composition accepts and owns an
 explicit trusted `InvocationCancellation` signal. It checks that signal in the
@@ -1227,3 +1252,41 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   row-lock deadline exhaustion plus conservative commit-boundary classification.
   Keep client disconnect, shutdown budgets, in-flight database cancellation,
   commit loss, and capacity/fault certification deferred.
+- DR-0063: Add an optional shared commit-loss capability to durable-store
+  conformance and exercise it only against a real, severable network
+  transport. A fixture that implements it arms exactly one future `COMMIT`
+  to be severed either immediately before it reaches the backend or
+  immediately after the backend returns a successful acknowledgement for it,
+  and reports whether its own fault fired and whether the backend actually
+  returned that successful `CommandComplete`/`ReadyForQuery` before severing.
+  Both instants must classify as `Indeterminate(ConnectionLost)`. The shared
+  case injects the pre-dispatch instant once, for one plain state commit, and
+  proves no state ground truth was published. It injects the post-acceptance
+  instant three times: for one structured invocation commit, proving exact
+  committed state and receipt ground truth and that a same-identity replay
+  observes `RequestAlreadyCommitted`; for an outbox claim on that invocation's
+  message, first proving with a different, never-used lease that the original
+  lease is still active (`NoDueWork`) and then that a same-lease replay
+  reconciles to the identical claimed message; and for the corresponding
+  acknowledgement, first proving that reclaiming with the original lease is
+  rejected as lease-ID reuse and then that a same-identity replay reconciles
+  to acknowledged with the acknowledgement persisted and no message left due.
+  These discriminating probes are required because a same-lease claim replay
+  or same-identity acknowledgement replay alone would succeed identically
+  whether or not the prior transaction actually persisted. A final unfaulted
+  commit proves the connection pool recovers a healthy connection. This is
+  evidence that the backend returned a successful acknowledgement before the
+  driver lost it; it is not proof of crash durability under abrupt
+  process/power loss, and it proves nothing about TLS-path connection loss.
+  This evidence is additive to, not a replacement for, DR-0061's existing
+  induced-abort/schema-skew coverage. The only current implementation is a
+  bounded, test-only `NoTls`
+  TCP proxy in `runtime-postgres`'s live PostgreSQL test: it binds port 0,
+  relays the untyped startup message and every later typed frame, detects
+  the exact simple-query `COMMIT` a durable commit, claim, or acknowledgement
+  dispatches last, and tracks the one active physical connection so `Drop`
+  can sever it directly instead of waiting on the pool's own client teardown
+  or the bounded per-socket I/O timeout. Keep abrupt process/power fault,
+  disk-full/WAL exhaustion, TLS-path connection loss, backup/restore,
+  capacity/load/soak, real writer failover, client disconnect, and in-flight
+  cancellation deferred.
