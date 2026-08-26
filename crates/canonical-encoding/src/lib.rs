@@ -194,6 +194,8 @@ pub enum CanonicalDecodingError {
         /// Decoded encoding version.
         actual: u16,
     },
+    /// A self-describing digest named an unknown hash algorithm.
+    UnknownHashAlgorithmId(u16),
 }
 
 impl fmt::Display for CanonicalDecodingError {
@@ -244,6 +246,9 @@ impl fmt::Display for CanonicalDecodingError {
                 f,
                 "unexpected canonical encoding version: expected {expected}, got {actual}"
             ),
+            Self::UnknownHashAlgorithmId(id) => {
+                write!(f, "unknown canonical digest hash algorithm id: {id:#06x}")
+            }
         }
     }
 }
@@ -488,6 +493,27 @@ pub fn encode_digest32(digest: &Digest32) -> Result<Vec<u8>, CanonicalEncodingEr
     canonical.finish()
 }
 
+/// Decodes one self-describing digest without changing its stable encoding.
+pub fn decode_digest32(input: &[u8]) -> Result<Digest32, CanonicalDecodingError> {
+    let frame: CanonicalFrame<'_> = decode_canonical_frame(input)?;
+    frame.require_type(0x0103)?;
+    frame.require_version(1)?;
+    frame.require_only_fields(&[1, 2])?;
+    let algorithm_id: u16 = frame.required_u16(1)?;
+    let algorithm: HashAlgorithmId = HashAlgorithmId::try_from(algorithm_id)
+        .map_err(|_| CanonicalDecodingError::UnknownHashAlgorithmId(algorithm_id))?;
+    let encoded_digest: &[u8] = frame.required_field(2)?;
+    let digest_bytes: [u8; 32] =
+        encoded_digest
+            .try_into()
+            .map_err(|_| CanonicalDecodingError::InvalidFieldLength {
+                field_id: 2,
+                expected: 32,
+                actual: encoded_digest.len(),
+            })?;
+    Ok(Digest32::new(algorithm, digest_bytes))
+}
+
 /// Encodes a hash-suite identifier.
 pub fn encode_hash_suite(suite: &HashSuite) -> Result<Vec<u8>, CanonicalEncodingError> {
     let mut canonical = CanonicalStruct::new(0x0104, 1);
@@ -570,6 +596,32 @@ mod tests {
                 "020020000000",
                 "1111111111111111111111111111111111111111111111111111111111111111"
             )
+        );
+        assert_eq!(decode_digest32(&bytes), Ok(digest));
+    }
+
+    #[test]
+    fn digest_decoder_rejects_unknown_algorithms_and_wrong_lengths() {
+        let mut unknown = CanonicalStruct::new(0x0103, 1);
+        unknown.field_u16(1, 0xffff).unwrap();
+        unknown.field_bytes(2, [0x11; 32]).unwrap();
+        assert_eq!(
+            decode_digest32(&unknown.finish().unwrap()),
+            Err(CanonicalDecodingError::UnknownHashAlgorithmId(0xffff))
+        );
+
+        let mut short = CanonicalStruct::new(0x0103, 1);
+        short
+            .field_u16(1, HashAlgorithmId::Sha2_256.as_u16())
+            .unwrap();
+        short.field_bytes(2, [0x11; 31]).unwrap();
+        assert_eq!(
+            decode_digest32(&short.finish().unwrap()),
+            Err(CanonicalDecodingError::InvalidFieldLength {
+                field_id: 2,
+                expected: 32,
+                actual: 31,
+            })
         );
     }
 

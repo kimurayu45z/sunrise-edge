@@ -2,8 +2,8 @@
 
 Status: accepted implementation design. The runtime structured envelope,
 node-core/native wiring, and explicit generation-one schema migration/bootstrap
-exist As-Is. A bounded synchronous pool now implements fenced state/receipt
-reads and serializable structured state/receipt/outbox commit with transaction-
+exist As-Is. A bounded synchronous pool now implements fenced state/object/
+receipt reads and serializable structured state/object/receipt/outbox commit with transaction-
 local deadlines, bounded unchanged-envelope serialization retry, and typed
 outcomes. Indexed exact-request/due outbox claim and acknowledgement now use
 the normalized delivery index and retained lease-attempt history As-Is. An
@@ -30,8 +30,8 @@ Runtime now has a structured durable transaction envelope with explicit bounded
 sections:
 
 - exact state-record read assertions and mutations;
-- an explicitly empty object section reserved for later typed object-version and
-  object-head assertions/mutations;
+- canonical, unique, sorted body-free object-head assertions and contained
+  create/update/delete mutations, plus separate immutable-version reads;
 - one typed request-receipt insertion;
 - zero or one typed immutable outbox batch and its ordered messages;
 - one initial outbox-delivery row when a batch is present;
@@ -39,18 +39,18 @@ sections:
 
 The implemented runtime envelope rejects cross-domain and receipt/outbox
 request/event-digest drift, permits read-only state assertions, requires every
-state mutation to have a read assertion, and bounds all currently represented
-bytes. Node-core constructs it and the additive native path consumes the
-structured store contract. The concrete object section intentionally supports
-only explicit empty and must gain duplicate-identity and mutation/read checks
-when typed object changes are added. Receipt and outbox identities match the
-invocation request and event digest. The PostgreSQL adapter consumes those
-sections directly. It never parses a `PersistenceLayout` path as correctness
-input.
-
-The first implementation leaves object-specific sections explicitly empty while the
-node event dispatcher is incomplete, but their absence must be explicit. It
-must not encode objects into a generic state row and call the schema normalized.
+state or object mutation to have a matching read assertion, rejects duplicate
+object IDs, validates checked object-version/head-revision transitions, and
+bounds every section before I/O. Current head assertions contain only revision,
+current version/digest, and canonical owner plus bounded routing projections;
+immutable payloads are read separately. An object version stores exactly one
+existing canonical `objects::Object` encoding or one self-describing blob
+digest. The SQL `type_id` is the stable canonical Object record identifier,
+not `Object::type_hash`, which remains inside the canonical Object bytes.
+Inline owner projections are derived with `objects::encode_owner`; blob upload,
+fetch, and digest/content verification remain upstream/deferred. Node-core does
+not yet dispatch object mutations, but memory and PostgreSQL consume the typed
+section directly and never hide object writes in generic state.
 
 ## 2. Namespace and exact SQL representations
 
@@ -343,6 +343,11 @@ The feature-gated shared runtime suite now covers complete-read write skew,
 the exact expired-deadline boundary, absent/tombstone races, concurrent definite
 outcome classification, retained lease replacement, and writer-fence handoff
 against both memory and PostgreSQL.
+Its object extension covers absent/create/update/delete/recreate ABA behavior,
+object conflicts with full rollback, domain/fence/deadline/replay rejection,
+and deterministic bounds. The live fixture additionally asserts retained
+immutable history, body-free current and tombstoned heads, lossless blob-row
+representation, and fail-closed handling of corrupt object metadata.
 When `SUNRISE_EDGE_TEST_POSTGRES_URL` is configured (as it is in CI), the live
 PostgreSQL fixture additionally covers pool/row-lock deadline exhaustion,
 commit-boundary deadline ambiguity, bounded retry exhaustion, non-active

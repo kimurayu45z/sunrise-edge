@@ -18,14 +18,18 @@ use r2d2_postgres::{
     r2d2::{ManageConnection, Pool},
 };
 use runtime::{
-    AtomicStateTransaction, DueOutboxClaimRequest, DurableCommitOutcome, DurableCommitRejection,
-    DurableDomainStateStore, DurableInvocationTransaction, DurableOperationContext,
-    DurableOutboxAcknowledgement, DurableOutboxAcknowledgementOutcome,
-    DurableOutboxAcknowledgementRejection, DurableOutboxClaim, DurableOutboxClaimOutcome,
-    DurableOutboxClaimRejection, DurableOutboxLeaseId, DurableReadError, DurableRequestId,
-    DurableRequestReceipt, IndeterminateCommitReason, IndexedOutboxRepository, OutboxRequestId,
-    RequestOutboxClaimRequest, StateMutation, StateMutationEntry, StateReadAssertion,
-    StateRevision, StructuredDurableDomainStateStore, VersionedStateValue, WriterFenceGeneration,
+    AtomicStateTransaction, DURABLE_OBJECT_CANONICAL_RECORD_TYPE_ID, DueOutboxClaimRequest,
+    DurableCommitOutcome, DurableCommitRejection, DurableDomainStateStore,
+    DurableInvocationTransaction, DurableObjectChanges, DurableObjectHead, DurableObjectHeadRead,
+    DurableObjectHeadSummary, DurableObjectMutation, DurableObjectOwnerProjection,
+    DurableObjectPayload, DurableObjectRoutingProjection, DurableObjectVersion,
+    DurableObjectVersionRecord, DurableOperationContext, DurableOutboxAcknowledgement,
+    DurableOutboxAcknowledgementOutcome, DurableOutboxAcknowledgementRejection, DurableOutboxClaim,
+    DurableOutboxClaimOutcome, DurableOutboxClaimRejection, DurableOutboxLeaseId, DurableReadError,
+    DurableRequestId, DurableRequestReceipt, IndeterminateCommitReason, IndexedOutboxRepository,
+    ObjectHeadRevision, ObjectId, OutboxRequestId, RequestOutboxClaimRequest, StateMutation,
+    StateMutationEntry, StateReadAssertion, StateRevision, StructuredDurableDomainStateStore,
+    VersionedStateValue, WriterFenceGeneration,
 };
 use std::{
     error::Error,
@@ -917,6 +921,296 @@ fn load_state_value(
         .map_err(|_| PreCommitFailure::InvalidPersistedState)
 }
 
+fn parse_optional_digest(
+    row: &postgres::Row,
+    algorithm_index: usize,
+    bytes_index: usize,
+) -> Result<Option<Digest32>, PreCommitFailure> {
+    let algorithm_id: Option<i32> = row
+        .try_get(algorithm_index)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let digest_bytes: Option<Vec<u8>> = row
+        .try_get(bytes_index)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    match (algorithm_id, digest_bytes) {
+        (None, None) => Ok(None),
+        (Some(algorithm_id), Some(digest_bytes)) => {
+            let algorithm: HashAlgorithmId = u16::try_from(algorithm_id)
+                .ok()
+                .and_then(|value: u16| HashAlgorithmId::try_from(value).ok())
+                .ok_or(PreCommitFailure::InvalidPersistedState)?;
+            let bytes: [u8; 32] = digest_bytes
+                .try_into()
+                .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+            Ok(Some(Digest32::new(algorithm, bytes)))
+        }
+        (None, Some(_)) | (Some(_), None) => Err(PreCommitFailure::InvalidPersistedState),
+    }
+}
+
+fn load_object_version(
+    transaction: &mut postgres::Transaction<'_>,
+    namespace: &PostgresNamespace,
+    object_id: ObjectId,
+    object_version: DurableObjectVersion,
+    lock: bool,
+) -> Result<Option<DurableObjectVersionRecord>, PreCommitFailure> {
+    let sql: &str = if lock {
+        "SELECT object_version::TEXT,
+                digest_algorithm_id, digest_bytes,
+                schema_version, type_id, created_checkpoint::TEXT,
+                inline_canonical_bytes,
+                blob_digest_algorithm_id, blob_digest_bytes
+         FROM sunrise_edge.object_versions
+         WHERE chain_id_bytes = $1
+           AND validator_id = $2
+           AND atomicity_domain_id = $3
+           AND object_id = $4
+           AND object_version = CAST(CAST($5 AS TEXT) AS NUMERIC)
+         FOR UPDATE"
+    } else {
+        "SELECT object_version::TEXT,
+                digest_algorithm_id, digest_bytes,
+                schema_version, type_id, created_checkpoint::TEXT,
+                inline_canonical_bytes,
+                blob_digest_algorithm_id, blob_digest_bytes
+         FROM sunrise_edge.object_versions
+         WHERE chain_id_bytes = $1
+           AND validator_id = $2
+           AND atomicity_domain_id = $3
+           AND object_id = $4
+           AND object_version = CAST(CAST($5 AS TEXT) AS NUMERIC)"
+    };
+    let row = transaction
+        .query_opt(
+            sql,
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&object_id.as_bytes()[..],
+                &object_version.get().to_string(),
+            ],
+        )
+        .map_err(|error| PreCommitFailure::from_database(&error))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let persisted_version: DurableObjectVersion =
+        DurableObjectVersion::new(parse_database_u64(&row, 0)?)
+            .ok_or(PreCommitFailure::InvalidPersistedState)?;
+    if persisted_version != object_version {
+        return Err(PreCommitFailure::InvalidPersistedState);
+    }
+    let digest: Digest32 =
+        parse_optional_digest(&row, 1, 2)?.ok_or(PreCommitFailure::InvalidPersistedState)?;
+    let schema_version_value: i64 = row
+        .try_get(3)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let schema_version: u32 =
+        u32::try_from(schema_version_value).map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let type_id_value: i64 = row
+        .try_get(4)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let type_id: u32 =
+        u32::try_from(type_id_value).map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    if type_id != DURABLE_OBJECT_CANONICAL_RECORD_TYPE_ID {
+        return Err(PreCommitFailure::InvalidPersistedState);
+    }
+    let created_checkpoint: u64 = parse_database_u64(&row, 5)?;
+    let inline_bytes: Option<Vec<u8>> = row
+        .try_get(6)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let blob_digest: Option<Digest32> = parse_optional_digest(&row, 7, 8)?;
+    let record: DurableObjectVersionRecord = match (inline_bytes, blob_digest) {
+        (Some(canonical_bytes), None) => DurableObjectVersionRecord::from_inline_canonical_bytes(
+            canonical_bytes,
+            digest,
+            created_checkpoint,
+        )
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?,
+        (None, Some(blob_digest)) => DurableObjectVersionRecord::from_blob_reference(
+            object_id,
+            object_version,
+            digest,
+            schema_version,
+            created_checkpoint,
+            blob_digest,
+        ),
+        (None, None) | (Some(_), Some(_)) => {
+            return Err(PreCommitFailure::InvalidPersistedState);
+        }
+    };
+    if record.object_id() != object_id
+        || record.object_version() != object_version
+        || record.schema_version() != schema_version
+        || record.canonical_record_type_id() != type_id
+    {
+        return Err(PreCommitFailure::InvalidPersistedState);
+    }
+    Ok(Some(record))
+}
+
+fn load_last_object_version_record(
+    transaction: &mut postgres::Transaction<'_>,
+    namespace: &PostgresNamespace,
+    object_id: ObjectId,
+    lock: bool,
+) -> Result<Option<DurableObjectVersionRecord>, PreCommitFailure> {
+    let sql: &str = if lock {
+        "SELECT object_version::TEXT
+         FROM sunrise_edge.object_versions
+         WHERE chain_id_bytes = $1
+           AND validator_id = $2
+           AND atomicity_domain_id = $3
+           AND object_id = $4
+         ORDER BY object_version DESC
+         LIMIT 1
+         FOR UPDATE"
+    } else {
+        "SELECT object_version::TEXT
+         FROM sunrise_edge.object_versions
+         WHERE chain_id_bytes = $1
+           AND validator_id = $2
+           AND atomicity_domain_id = $3
+           AND object_id = $4
+         ORDER BY object_version DESC
+         LIMIT 1"
+    };
+    let latest_version: Option<DurableObjectVersion> = transaction
+        .query_opt(
+            sql,
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&object_id.as_bytes()[..],
+            ],
+        )
+        .map_err(|error| PreCommitFailure::from_database(&error))?
+        .map(|row: postgres::Row| {
+            DurableObjectVersion::new(parse_database_u64(&row, 0)?)
+                .ok_or(PreCommitFailure::InvalidPersistedState)
+        })
+        .transpose()?;
+    let Some(latest_version) = latest_version else {
+        return Ok(None);
+    };
+    load_object_version(transaction, namespace, object_id, latest_version, lock)?.map_or_else(
+        || Err(PreCommitFailure::InvalidPersistedState),
+        |record: DurableObjectVersionRecord| Ok(Some(record)),
+    )
+}
+
+fn load_object_head(
+    transaction: &mut postgres::Transaction<'_>,
+    namespace: &PostgresNamespace,
+    object_id: ObjectId,
+    lock: bool,
+) -> Result<DurableObjectHead, PreCommitFailure> {
+    let sql: &str = if lock {
+        "SELECT current_version::TEXT,
+                digest_algorithm_id, digest_bytes,
+                owner_projection, routing_projection,
+                revision::TEXT, tombstone
+         FROM sunrise_edge.object_heads
+         WHERE chain_id_bytes = $1
+           AND validator_id = $2
+           AND atomicity_domain_id = $3
+           AND object_id = $4
+         FOR UPDATE"
+    } else {
+        "SELECT current_version::TEXT,
+                digest_algorithm_id, digest_bytes,
+                owner_projection, routing_projection,
+                revision::TEXT, tombstone
+         FROM sunrise_edge.object_heads
+         WHERE chain_id_bytes = $1
+           AND validator_id = $2
+           AND atomicity_domain_id = $3
+           AND object_id = $4"
+    };
+    let row = transaction
+        .query_opt(
+            sql,
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&object_id.as_bytes()[..],
+            ],
+        )
+        .map_err(|error| PreCommitFailure::from_database(&error))?;
+    let Some(row) = row else {
+        if load_last_object_version_record(transaction, namespace, object_id, lock)?.is_some() {
+            return Err(PreCommitFailure::InvalidPersistedState);
+        }
+        return Ok(DurableObjectHead::Absent);
+    };
+    let current_version_text: Option<String> = row
+        .try_get(0)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let digest: Option<Digest32> = parse_optional_digest(&row, 1, 2)?;
+    let owner_bytes: Option<Vec<u8>> = row
+        .try_get(3)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let routing_bytes: Option<Vec<u8>> = row
+        .try_get(4)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let head_revision: ObjectHeadRevision = ObjectHeadRevision::new(parse_database_u64(&row, 5)?)
+        .ok_or(PreCommitFailure::InvalidPersistedState)?;
+    let tombstone: bool = row
+        .try_get(6)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    if tombstone {
+        if current_version_text.is_some()
+            || digest.is_some()
+            || owner_bytes.is_some()
+            || routing_bytes.is_some()
+        {
+            return Err(PreCommitFailure::InvalidPersistedState);
+        }
+        let last_object_version: DurableObjectVersionRecord =
+            load_last_object_version_record(transaction, namespace, object_id, lock)?
+                .ok_or(PreCommitFailure::InvalidPersistedState)?;
+        return Ok(DurableObjectHead::Tombstoned {
+            head_revision,
+            last_object_version: last_object_version.object_version(),
+        });
+    }
+    let object_version_value: u64 = current_version_text
+        .ok_or(PreCommitFailure::InvalidPersistedState)?
+        .parse()
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let object_version: DurableObjectVersion = DurableObjectVersion::new(object_version_value)
+        .ok_or(PreCommitFailure::InvalidPersistedState)?;
+    let digest: Digest32 = digest.ok_or(PreCommitFailure::InvalidPersistedState)?;
+    let owner_projection: DurableObjectOwnerProjection =
+        DurableObjectOwnerProjection::from_canonical_bytes(owner_bytes)
+            .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let routing_projection: DurableObjectRoutingProjection =
+        DurableObjectRoutingProjection::new(routing_bytes)
+            .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let latest_version: DurableObjectVersionRecord =
+        load_last_object_version_record(transaction, namespace, object_id, lock)?
+            .ok_or(PreCommitFailure::InvalidPersistedState)?;
+    if latest_version.object_version() != object_version || latest_version.digest() != digest {
+        return Err(PreCommitFailure::InvalidPersistedState);
+    }
+    if let DurableObjectPayload::Inline(inline) = latest_version.payload()
+        && owner_projection.owner() != Some(&inline.object().owner)
+    {
+        return Err(PreCommitFailure::InvalidPersistedState);
+    }
+    Ok(DurableObjectHead::Current {
+        head_revision,
+        object_version,
+        digest,
+        owner_projection,
+        routing_projection,
+    })
+}
+
 fn load_receipt(
     transaction: &mut postgres::Transaction<'_>,
     namespace: &PostgresNamespace,
@@ -1055,6 +1349,254 @@ fn apply_state_mutations(
                 ],
             )
             .map_err(|error| PreCommitFailure::from_database(&error).into_commit_rejection())?;
+    }
+    Ok(())
+}
+
+fn validate_object_reads(
+    transaction: &mut postgres::Transaction<'_>,
+    context: &DurableOperationContext,
+    namespace: &PostgresNamespace,
+    reads: &[DurableObjectHeadRead],
+) -> Result<(), DurableCommitRejection> {
+    for read in reads {
+        set_local_timeouts(transaction, context)
+            .map_err(PreCommitFailure::into_commit_rejection)?;
+        let current: DurableObjectHead =
+            load_object_head(transaction, namespace, read.object_id(), true)
+                .map_err(PreCommitFailure::into_commit_rejection)?;
+        if &current != read.expected() {
+            return Err(DurableCommitRejection::ObjectConflict {
+                object_id: read.object_id(),
+                current: DurableObjectHeadSummary::from(&current),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreparedObjectMutation {
+    object_id: ObjectId,
+    next_head_revision: ObjectHeadRevision,
+}
+
+fn prepare_object_mutations(
+    transaction: &mut postgres::Transaction<'_>,
+    context: &DurableOperationContext,
+    namespace: &PostgresNamespace,
+    changes: &DurableObjectChanges,
+) -> Result<Vec<PreparedObjectMutation>, DurableCommitRejection> {
+    let mut prepared: Vec<PreparedObjectMutation> = Vec::with_capacity(changes.mutations().len());
+    for mutation in changes.mutations() {
+        let read_index: usize = changes
+            .reads()
+            .binary_search_by_key(&mutation.object_id(), DurableObjectHeadRead::object_id)
+            .map_err(|_| DurableCommitRejection::InvalidPersistedState)?;
+        let expected: &DurableObjectHead = changes.reads()[read_index].expected();
+        let next_head_revision: ObjectHeadRevision = match expected.head_revision() {
+            Some(revision) => revision
+                .checked_next()
+                .ok_or(DurableCommitRejection::InvalidPersistedState)?,
+            None => ObjectHeadRevision::FIRST,
+        };
+        if let Some(version) = mutation.mutation().version() {
+            set_local_timeouts(transaction, context)
+                .map_err(PreCommitFailure::into_commit_rejection)?;
+            let existing = transaction
+                .query_opt(
+                    "SELECT 1
+                     FROM sunrise_edge.object_versions
+                     WHERE chain_id_bytes = $1
+                       AND validator_id = $2
+                       AND atomicity_domain_id = $3
+                       AND object_id = $4
+                       AND object_version = CAST(CAST($5 AS TEXT) AS NUMERIC)
+                     FOR UPDATE",
+                    &[
+                        &namespace.chain_id_bytes(),
+                        &&namespace.validator_id().as_bytes()[..],
+                        &&namespace.domain().as_bytes()[..],
+                        &&mutation.object_id().as_bytes()[..],
+                        &version.object_version().get().to_string(),
+                    ],
+                )
+                .map_err(|error| PreCommitFailure::from_database(&error).into_commit_rejection())?;
+            if existing.is_some() {
+                return Err(DurableCommitRejection::InvalidPersistedState);
+            }
+        }
+        prepared.push(PreparedObjectMutation {
+            object_id: mutation.object_id(),
+            next_head_revision,
+        });
+    }
+    Ok(prepared)
+}
+
+fn insert_object_version(
+    transaction: &mut postgres::Transaction<'_>,
+    context: &DurableOperationContext,
+    namespace: &PostgresNamespace,
+    version: &DurableObjectVersionRecord,
+) -> Result<(), DurableCommitRejection> {
+    set_local_timeouts(transaction, context).map_err(PreCommitFailure::into_commit_rejection)?;
+    let (inline_bytes, blob_algorithm_id, blob_digest_bytes): (
+        Option<&[u8]>,
+        Option<i32>,
+        Option<&[u8]>,
+    ) = match version.payload() {
+        DurableObjectPayload::Inline(inline) => (Some(inline.canonical_bytes()), None, None),
+        DurableObjectPayload::BlobReference(blob_digest) => (
+            None,
+            Some(i32::from(blob_digest.algorithm().as_u16())),
+            Some(&blob_digest.bytes()[..]),
+        ),
+    };
+    let digest: Digest32 = version.digest();
+    let inserted: u64 = transaction
+        .execute(
+            "INSERT INTO sunrise_edge.object_versions (
+                 chain_id_bytes, validator_id, atomicity_domain_id,
+                 object_id, object_version,
+                 digest_algorithm_id, digest_bytes,
+                 schema_version, type_id, created_checkpoint,
+                 inline_canonical_bytes,
+                 blob_digest_algorithm_id, blob_digest_bytes
+             ) VALUES (
+                 $1, $2, $3, $4, CAST(CAST($5 AS TEXT) AS NUMERIC),
+                 $6, $7, $8, $9, CAST(CAST($10 AS TEXT) AS NUMERIC),
+                 $11, $12, $13
+             )",
+            &[
+                &namespace.chain_id_bytes(),
+                &&namespace.validator_id().as_bytes()[..],
+                &&namespace.domain().as_bytes()[..],
+                &&version.object_id().as_bytes()[..],
+                &version.object_version().get().to_string(),
+                &i32::from(digest.algorithm().as_u16()),
+                &&digest.bytes()[..],
+                &i64::from(version.schema_version()),
+                &i64::from(version.canonical_record_type_id()),
+                &version.created_checkpoint().to_string(),
+                &inline_bytes,
+                &blob_algorithm_id,
+                &blob_digest_bytes,
+            ],
+        )
+        .map_err(|error| PreCommitFailure::from_database(&error).into_commit_rejection())?;
+    if inserted != 1 {
+        return Err(DurableCommitRejection::InvalidPersistedState);
+    }
+    Ok(())
+}
+
+fn apply_object_mutations(
+    transaction: &mut postgres::Transaction<'_>,
+    context: &DurableOperationContext,
+    namespace: &PostgresNamespace,
+    changes: &DurableObjectChanges,
+    prepared: &[PreparedObjectMutation],
+) -> Result<(), DurableCommitRejection> {
+    if changes.mutations().len() != prepared.len() {
+        return Err(DurableCommitRejection::InvalidPersistedState);
+    }
+    for (mutation, prepared) in changes.mutations().iter().zip(prepared) {
+        if mutation.object_id() != prepared.object_id {
+            return Err(DurableCommitRejection::InvalidPersistedState);
+        }
+        match mutation.mutation() {
+            DurableObjectMutation::Create {
+                version,
+                owner_projection,
+                routing_projection,
+            }
+            | DurableObjectMutation::Update {
+                version,
+                owner_projection,
+                routing_projection,
+            } => {
+                insert_object_version(transaction, context, namespace, version)?;
+                set_local_timeouts(transaction, context)
+                    .map_err(PreCommitFailure::into_commit_rejection)?;
+                let digest: Digest32 = version.digest();
+                let owner_bytes: Option<&[u8]> = owner_projection.bytes();
+                let routing_bytes: Option<&[u8]> = routing_projection.bytes();
+                let updated: u64 = transaction
+                    .execute(
+                        "INSERT INTO sunrise_edge.object_heads (
+                             chain_id_bytes, validator_id, atomicity_domain_id,
+                             object_id, current_version,
+                             digest_algorithm_id, digest_bytes,
+                             owner_projection, routing_projection,
+                             revision, tombstone
+                         ) VALUES (
+                             $1, $2, $3, $4,
+                             CAST(CAST($5 AS TEXT) AS NUMERIC), $6, $7, $8, $9,
+                             CAST(CAST($10 AS TEXT) AS NUMERIC), FALSE
+                         ) ON CONFLICT (
+                             chain_id_bytes, validator_id, atomicity_domain_id, object_id
+                         ) DO UPDATE SET
+                             current_version = EXCLUDED.current_version,
+                             digest_algorithm_id = EXCLUDED.digest_algorithm_id,
+                             digest_bytes = EXCLUDED.digest_bytes,
+                             owner_projection = EXCLUDED.owner_projection,
+                             routing_projection = EXCLUDED.routing_projection,
+                             revision = EXCLUDED.revision,
+                             tombstone = FALSE",
+                        &[
+                            &namespace.chain_id_bytes(),
+                            &&namespace.validator_id().as_bytes()[..],
+                            &&namespace.domain().as_bytes()[..],
+                            &&mutation.object_id().as_bytes()[..],
+                            &version.object_version().get().to_string(),
+                            &i32::from(digest.algorithm().as_u16()),
+                            &&digest.bytes()[..],
+                            &owner_bytes,
+                            &routing_bytes,
+                            &prepared.next_head_revision.get().to_string(),
+                        ],
+                    )
+                    .map_err(|error| {
+                        PreCommitFailure::from_database(&error).into_commit_rejection()
+                    })?;
+                if updated != 1 {
+                    return Err(DurableCommitRejection::InvalidPersistedState);
+                }
+            }
+            DurableObjectMutation::Delete => {
+                set_local_timeouts(transaction, context)
+                    .map_err(PreCommitFailure::into_commit_rejection)?;
+                let updated: u64 = transaction
+                    .execute(
+                        "UPDATE sunrise_edge.object_heads
+                         SET current_version = NULL,
+                             digest_algorithm_id = NULL,
+                             digest_bytes = NULL,
+                             owner_projection = NULL,
+                             routing_projection = NULL,
+                             revision = CAST(CAST($1 AS TEXT) AS NUMERIC),
+                             tombstone = TRUE
+                         WHERE chain_id_bytes = $2
+                           AND validator_id = $3
+                           AND atomicity_domain_id = $4
+                           AND object_id = $5",
+                        &[
+                            &prepared.next_head_revision.get().to_string(),
+                            &namespace.chain_id_bytes(),
+                            &&namespace.validator_id().as_bytes()[..],
+                            &&namespace.domain().as_bytes()[..],
+                            &&mutation.object_id().as_bytes()[..],
+                        ],
+                    )
+                    .map_err(|error| {
+                        PreCommitFailure::from_database(&error).into_commit_rejection()
+                    })?;
+                if updated != 1 {
+                    return Err(DurableCommitRejection::InvalidPersistedState);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -2012,6 +2554,84 @@ impl<M> StructuredDurableDomainStateStore for PostgresDurableStore<M>
 where
     M: ManageConnection<Connection = Client, Error = postgres::Error> + 'static,
 {
+    fn get_object_head(
+        &self,
+        context: &DurableOperationContext,
+        domain: AtomicityDomainId,
+        object_id: ObjectId,
+    ) -> Result<DurableObjectHead, DurableReadError> {
+        if !self.domain_is_bound(domain) {
+            return Err(DurableReadError::InvalidRequest(
+                runtime::RuntimeError::AtomicityDomainMismatch,
+            ));
+        }
+        let mut client = self
+            .acquire(context)
+            .map_err(PreCommitFailure::into_read_error)?;
+        let mut transaction = client
+            .build_transaction()
+            .isolation_level(IsolationLevel::Serializable)
+            .read_only(true)
+            .start()
+            .map_err(|error| PreCommitFailure::from_database(&error).into_read_error())?;
+        set_local_timeouts(&mut transaction, context).map_err(PreCommitFailure::into_read_error)?;
+        let metadata =
+            load_namespace_metadata(&mut transaction, &self.namespace, MetadataLockMode::None)
+                .map_err(PreCommitFailure::into_read_error)?;
+        validate_operation_authority(metadata, context)
+            .map_err(PreCommitFailure::into_read_error)?;
+        let head: DurableObjectHead =
+            load_object_head(&mut transaction, &self.namespace, object_id, false)
+                .map_err(PreCommitFailure::into_read_error)?;
+        transaction
+            .rollback()
+            .map_err(|error| PreCommitFailure::from_database(&error).into_read_error())?;
+        remaining_deadline(context).map_err(PreCommitFailure::into_read_error)?;
+        Ok(head)
+    }
+
+    fn get_object_version(
+        &self,
+        context: &DurableOperationContext,
+        domain: AtomicityDomainId,
+        object_id: ObjectId,
+        object_version: DurableObjectVersion,
+    ) -> Result<Option<DurableObjectVersionRecord>, DurableReadError> {
+        if !self.domain_is_bound(domain) {
+            return Err(DurableReadError::InvalidRequest(
+                runtime::RuntimeError::AtomicityDomainMismatch,
+            ));
+        }
+        let mut client = self
+            .acquire(context)
+            .map_err(PreCommitFailure::into_read_error)?;
+        let mut transaction = client
+            .build_transaction()
+            .isolation_level(IsolationLevel::Serializable)
+            .read_only(true)
+            .start()
+            .map_err(|error| PreCommitFailure::from_database(&error).into_read_error())?;
+        set_local_timeouts(&mut transaction, context).map_err(PreCommitFailure::into_read_error)?;
+        let metadata =
+            load_namespace_metadata(&mut transaction, &self.namespace, MetadataLockMode::None)
+                .map_err(PreCommitFailure::into_read_error)?;
+        validate_operation_authority(metadata, context)
+            .map_err(PreCommitFailure::into_read_error)?;
+        let version: Option<DurableObjectVersionRecord> = load_object_version(
+            &mut transaction,
+            &self.namespace,
+            object_id,
+            object_version,
+            false,
+        )
+        .map_err(PreCommitFailure::into_read_error)?;
+        transaction
+            .rollback()
+            .map_err(|error| PreCommitFailure::from_database(&error).into_read_error())?;
+        remaining_deadline(context).map_err(PreCommitFailure::into_read_error)?;
+        Ok(version)
+    }
+
     fn get_request_receipt(
         &self,
         context: &DurableOperationContext,
@@ -2054,9 +2674,6 @@ where
     ) -> DurableCommitOutcome {
         if !self.domain_is_bound(invocation.domain()) {
             return DurableCommitOutcome::Rejected(DurableCommitRejection::AtomicityDomainMismatch);
-        }
-        if !invocation.objects().is_empty() {
-            return DurableCommitOutcome::Rejected(DurableCommitRejection::InvalidPersistedState);
         }
         self.retry_serializable(context, || {
             let mut client = match self.acquire(context) {
@@ -2114,6 +2731,23 @@ where
             {
                 return DurableCommitOutcome::Rejected(reason);
             }
+            if let Err(reason) = validate_object_reads(
+                &mut transaction,
+                context,
+                &self.namespace,
+                invocation.object_changes().reads(),
+            ) {
+                return DurableCommitOutcome::Rejected(reason);
+            }
+            let prepared_objects: Vec<PreparedObjectMutation> = match prepare_object_mutations(
+                &mut transaction,
+                context,
+                &self.namespace,
+                invocation.object_changes(),
+            ) {
+                Ok(prepared) => prepared,
+                Err(reason) => return DurableCommitOutcome::Rejected(reason),
+            };
             let commit_sequence = match allocate_commit_sequence(
                 &mut transaction,
                 context,
@@ -2132,6 +2766,15 @@ where
                     state.mutations(),
                 )
             {
+                return DurableCommitOutcome::Rejected(reason);
+            }
+            if let Err(reason) = apply_object_mutations(
+                &mut transaction,
+                context,
+                &self.namespace,
+                invocation.object_changes(),
+                &prepared_objects,
+            ) {
                 return DurableCommitOutcome::Rejected(reason);
             }
             if let Err(reason) = insert_structured_invocation(

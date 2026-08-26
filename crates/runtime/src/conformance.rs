@@ -16,6 +16,8 @@
 //! no background work or process lifetime is part of the store contract.
 
 use super::*;
+#[cfg(any(test, feature = "durable-conformance"))]
+use hashing::{BuiltinHashFunction, HashFunction};
 use std::fmt::Debug;
 use std::sync::{Arc, Barrier};
 
@@ -251,6 +253,102 @@ fn invocation(
         DurableObjectChanges::empty(),
         receipt,
         outbox,
+    )
+    .map_err(|error| ConformanceFailure::new(case, error.to_string()))
+}
+
+#[cfg(any(test, feature = "durable-conformance"))]
+fn object_version(
+    case: &'static str,
+    object_id: ObjectId,
+    version: u64,
+    byte: u8,
+    checkpoint: u64,
+) -> ConformanceResult<DurableObjectVersionRecord> {
+    let object: Object = Object {
+        id: object_id,
+        version,
+        owner: Owner::Address(objects::Address::new([byte; 32])),
+        type_hash: Digest32::new(
+            protocol_types::HashAlgorithmId::Sha2_256,
+            [byte.wrapping_add(1); 32],
+        ),
+        schema_version: u32::from(byte),
+        data: vec![byte.wrapping_add(2)],
+    };
+    let canonical_bytes: Vec<u8> =
+        encode_object(&object).map_err(|error| ConformanceFailure::new(case, error.to_string()))?;
+    let chain_id: ChainId = ChainId::new("sunrise-runtime-conformance")
+        .map_err(|error| ConformanceFailure::new(case, error.to_string()))?;
+    let digest: Digest32 = BuiltinHashFunction::new(protocol_types::HashAlgorithmId::Sha2_256)
+        .hash(
+            protocol_types::HashPurpose::Object,
+            ProtocolVersion::new(1),
+            &chain_id,
+            &canonical_bytes,
+        )
+        .map_err(|error| ConformanceFailure::new(case, error.to_string()))?;
+    DurableObjectVersionRecord::from_inline_object(object, digest, checkpoint)
+        .map_err(|error| ConformanceFailure::new(case, error.to_string()))
+}
+
+#[cfg(any(test, feature = "durable-conformance"))]
+fn object_projections(
+    case: &'static str,
+    byte: u8,
+) -> ConformanceResult<(DurableObjectOwnerProjection, DurableObjectRoutingProjection)> {
+    let owner: DurableObjectOwnerProjection =
+        DurableObjectOwnerProjection::from_owner(Owner::Address(objects::Address::new([byte; 32])))
+            .map_err(|error| ConformanceFailure::new(case, error.to_string()))?;
+    let routing: DurableObjectRoutingProjection =
+        DurableObjectRoutingProjection::new(Some(vec![byte.wrapping_add(1)]))
+            .map_err(|error| ConformanceFailure::new(case, error.to_string()))?;
+    Ok((owner, routing))
+}
+
+#[cfg(any(test, feature = "durable-conformance"))]
+fn object_invocation(
+    case: &'static str,
+    domain: AtomicityDomainId,
+    request_byte: u8,
+    state: Option<DurableStateTransaction>,
+    objects: DurableObjectChanges,
+    outbox_payload: Option<Vec<u8>>,
+) -> ConformanceResult<DurableInvocationTransaction> {
+    let durable_request_id: DurableRequestId = request_id(case, request_byte)?;
+    let event_digest: Digest32 = Digest32::new(
+        protocol_types::HashAlgorithmId::Sha2_256,
+        [request_byte.wrapping_add(1); 32],
+    );
+    let receipt: DurableRequestReceipt =
+        DurableRequestReceipt::new(durable_request_id, event_digest, vec![request_byte])
+            .map_err(|error| ConformanceFailure::new(case, error.to_string()))?;
+    let outbox: Option<DurableOutboxBatch> = outbox_payload
+        .map(|payload: Vec<u8>| {
+            let payload_digest: Digest32 = Digest32::new(
+                protocol_types::HashAlgorithmId::Sha2_256,
+                [request_byte.wrapping_add(2); 32],
+            );
+            let message: DurableOutboxMessage = DurableOutboxMessage::new(payload_digest, payload)
+                .map_err(|error| ConformanceFailure::new(case, error.to_string()))?;
+            DurableOutboxBatch::new(durable_request_id, event_digest, vec![message])
+                .map_err(|error| ConformanceFailure::new(case, error.to_string()))
+        })
+        .transpose()?;
+    DurableInvocationTransaction::new(domain, state, objects, receipt, outbox)
+        .map_err(|error| ConformanceFailure::new(case, error.to_string()))
+}
+
+#[cfg(any(test, feature = "durable-conformance"))]
+fn object_changes(
+    case: &'static str,
+    object_id: ObjectId,
+    expected: DurableObjectHead,
+    mutation: DurableObjectMutation,
+) -> ConformanceResult<DurableObjectChanges> {
+    DurableObjectChanges::new(
+        vec![DurableObjectHeadRead::new(object_id, expected)],
+        vec![DurableObjectMutationEntry::new(object_id, mutation)],
     )
     .map_err(|error| ConformanceFailure::new(case, error.to_string()))
 }
@@ -1071,6 +1169,297 @@ fn writer_fence_conformance<F: DurableStoreFixture>(
     Ok(())
 }
 
+/// Runs the typed object lifecycle against one fresh object-capable fixture.
+///
+/// This remains separate from [`run_durable_store_conformance`] until durable
+/// providers implement normalized immutable versions and object heads.
+#[cfg(any(test, feature = "durable-conformance"))]
+pub fn run_durable_object_conformance<F: DurableStoreFixture>(fixture: &F) -> ConformanceResult {
+    const CASE: &str = "durable-object-lifecycle";
+    let store: Arc<F::Store> = fixture.store();
+    let domain: AtomicityDomainId = fixture.domain();
+    let fence: WriterFenceGeneration = fixture.initial_writer_fence();
+    let context: DurableOperationContext = build_context(fixture, fence, 0x51)?;
+    let object_id: ObjectId = ObjectId::new([0x51; 32]);
+
+    let absent: DurableObjectHead = store
+        .get_object_head(&context, domain, object_id)
+        .map_err(|error| mismatch(CASE, "initial object read must succeed", &error))?;
+    if absent != DurableObjectHead::Absent {
+        return Err(mismatch(CASE, "new object must be absent", &absent));
+    }
+
+    let (owner_one, routing_one) = object_projections(CASE, 0x11)?;
+    let create_mutation: DurableObjectMutation = DurableObjectMutation::Create {
+        version: object_version(CASE, object_id, 1, 0x11, 10)?,
+        owner_projection: owner_one,
+        routing_projection: routing_one,
+    };
+    let create: DurableInvocationTransaction = object_invocation(
+        CASE,
+        domain,
+        0x51,
+        None,
+        object_changes(CASE, object_id, absent, create_mutation)?,
+        None,
+    )?;
+    if store.commit_invocation(&context, create) != DurableCommitOutcome::Committed {
+        return Err(ConformanceFailure::new(CASE, "object create failed"));
+    }
+    let current_one: DurableObjectHead = store
+        .get_object_head(&context, domain, object_id)
+        .map_err(|error| mismatch(CASE, "created object read must succeed", &error))?;
+    if current_one.head_revision() != Some(ObjectHeadRevision::FIRST)
+        || current_one.object_version() != Some(DurableObjectVersion::FIRST)
+    {
+        return Err(mismatch(CASE, "create installed wrong head", &current_one));
+    }
+    let stored_one: DurableObjectVersionRecord = store
+        .get_object_version(&context, domain, object_id, DurableObjectVersion::FIRST)
+        .map_err(|error| mismatch(CASE, "created version read must succeed", &error))?
+        .ok_or_else(|| ConformanceFailure::new(CASE, "created version is missing"))?;
+    let inline_one: &DurableInlineObject = stored_one
+        .payload()
+        .inline()
+        .ok_or_else(|| ConformanceFailure::new(CASE, "created version is not inline"))?;
+    if inline_one.object().id != object_id
+        || inline_one.object().version != 1
+        || inline_one.object().owner != Owner::Address(objects::Address::new([0x11; 32]))
+        || inline_one.object().type_hash
+            != Digest32::new(protocol_types::HashAlgorithmId::Sha2_256, [0x12; 32])
+        || stored_one.canonical_record_type_id() != u32::from(OBJECT_CANONICAL_TYPE_ID)
+    {
+        return Err(mismatch(
+            CASE,
+            "created immutable version projection is incoherent",
+            &stored_one,
+        ));
+    }
+
+    let (owner_two, routing_two) = object_projections(CASE, 0x22)?;
+    let update_version: DurableObjectVersionRecord = object_version(CASE, object_id, 2, 0x22, 11)?;
+    let update_digest: Digest32 = update_version.digest();
+    let update_mutation: DurableObjectMutation = DurableObjectMutation::Update {
+        version: update_version,
+        owner_projection: owner_two,
+        routing_projection: routing_two,
+    };
+    let update: DurableInvocationTransaction = object_invocation(
+        CASE,
+        domain,
+        0x52,
+        None,
+        object_changes(CASE, object_id, current_one, update_mutation)?,
+        None,
+    )?;
+    if store.commit_invocation(&context, update) != DurableCommitOutcome::Committed {
+        return Err(ConformanceFailure::new(CASE, "object update failed"));
+    }
+    let current_two: DurableObjectHead = store
+        .get_object_head(&context, domain, object_id)
+        .map_err(|error| mismatch(CASE, "updated object read must succeed", &error))?;
+    if current_two.head_revision() != ObjectHeadRevision::new(2)
+        || current_two.object_version() != DurableObjectVersion::new(2)
+        || current_two.digest() != Some(update_digest)
+    {
+        return Err(mismatch(CASE, "update installed wrong head", &current_two));
+    }
+
+    let delete: DurableInvocationTransaction = object_invocation(
+        CASE,
+        domain,
+        0x53,
+        None,
+        object_changes(CASE, object_id, current_two, DurableObjectMutation::Delete)?,
+        None,
+    )?;
+    if store.commit_invocation(&context, delete) != DurableCommitOutcome::Committed {
+        return Err(ConformanceFailure::new(CASE, "object delete failed"));
+    }
+    let tombstone: DurableObjectHead = store
+        .get_object_head(&context, domain, object_id)
+        .map_err(|error| mismatch(CASE, "tombstone read must succeed", &error))?;
+    if tombstone.head_revision() != ObjectHeadRevision::new(3)
+        || tombstone.object_version() != DurableObjectVersion::new(2)
+        || tombstone.digest().is_some()
+    {
+        return Err(mismatch(
+            CASE,
+            "delete installed wrong tombstone",
+            &tombstone,
+        ));
+    }
+
+    let (owner_three, routing_three) = object_projections(CASE, 0x33)?;
+    let recreate_mutation: DurableObjectMutation = DurableObjectMutation::Create {
+        version: object_version(CASE, object_id, 3, 0x33, 12)?,
+        owner_projection: owner_three.clone(),
+        routing_projection: routing_three.clone(),
+    };
+    let recreate: DurableInvocationTransaction = object_invocation(
+        CASE,
+        domain,
+        0x54,
+        None,
+        object_changes(
+            CASE,
+            object_id,
+            tombstone.clone(),
+            recreate_mutation.clone(),
+        )?,
+        None,
+    )?;
+    if store.commit_invocation(&context, recreate) != DurableCommitOutcome::Committed {
+        return Err(ConformanceFailure::new(CASE, "object recreate failed"));
+    }
+    let current_three: DurableObjectHead = store
+        .get_object_head(&context, domain, object_id)
+        .map_err(|error| mismatch(CASE, "recreated object read must succeed", &error))?;
+    if current_three.head_revision() != ObjectHeadRevision::new(4)
+        || current_three.object_version() != DurableObjectVersion::new(3)
+    {
+        return Err(mismatch(CASE, "recreate permitted ABA", &current_three));
+    }
+
+    let replay: DurableInvocationTransaction = object_invocation(
+        CASE,
+        domain,
+        0x54,
+        None,
+        object_changes(
+            CASE,
+            object_id,
+            current_three.clone(),
+            DurableObjectMutation::Delete,
+        )?,
+        None,
+    )?;
+    if store.commit_invocation(&context, replay)
+        != DurableCommitOutcome::Rejected(DurableCommitRejection::RequestAlreadyCommitted)
+    {
+        return Err(ConformanceFailure::new(CASE, "object replay was reapplied"));
+    }
+    let after_replay: DurableObjectHead = store
+        .get_object_head(&context, domain, object_id)
+        .map_err(|error| mismatch(CASE, "post-replay read must succeed", &error))?;
+    if after_replay != current_three {
+        return Err(mismatch(
+            CASE,
+            "object replay changed the head",
+            &after_replay,
+        ));
+    }
+
+    let advance: DurableInvocationTransaction = object_invocation(
+        CASE,
+        domain,
+        0x56,
+        None,
+        object_changes(
+            CASE,
+            object_id,
+            current_three.clone(),
+            DurableObjectMutation::Delete,
+        )?,
+        None,
+    )?;
+    if store.commit_invocation(&context, advance) != DurableCommitOutcome::Committed {
+        return Err(ConformanceFailure::new(
+            CASE,
+            "conflict setup delete failed",
+        ));
+    }
+
+    let (owner_four, routing_four) = object_projections(CASE, 0x44)?;
+    let stale_update: DurableObjectMutation = DurableObjectMutation::Update {
+        version: object_version(CASE, object_id, 4, 0x44, 13)?,
+        owner_projection: owner_four,
+        routing_projection: routing_four,
+    };
+    let rollback_key: Vec<u8> = b"conformance/object-conflict".to_vec();
+    let rollback_state: DurableStateTransaction = DurableStateTransaction::new(
+        domain,
+        AtomicStateReadSet::new(vec![
+            StateReadAssertion::new(rollback_key.clone(), StateRevision::INITIAL)
+                .map_err(|error| ConformanceFailure::new(CASE, error.to_string()))?,
+        ])
+        .map_err(|error| ConformanceFailure::new(CASE, error.to_string()))?,
+        vec![
+            StateMutationEntry::new(rollback_key.clone(), StateMutation::Put(vec![0x55]))
+                .map_err(|error| ConformanceFailure::new(CASE, error.to_string()))?,
+        ],
+    )
+    .map_err(|error| ConformanceFailure::new(CASE, error.to_string()))?;
+    let stale: DurableInvocationTransaction = object_invocation(
+        CASE,
+        domain,
+        0x55,
+        Some(rollback_state),
+        object_changes(CASE, object_id, current_three, stale_update)?,
+        Some(vec![0x55]),
+    )?;
+    let stale_outcome: DurableCommitOutcome = store.commit_invocation(&context, stale);
+    if !matches!(
+        stale_outcome,
+        DurableCommitOutcome::Rejected(DurableCommitRejection::ObjectConflict {
+            object_id: conflicting_id,
+            current: DurableObjectHeadSummary::Tombstoned { .. },
+        }) if conflicting_id == object_id
+    ) {
+        return Err(mismatch(CASE, "stale update must conflict", &stale_outcome));
+    }
+    let rolled_back: VersionedStateValue = store
+        .get_versioned_durable(&context, domain, &rollback_key)
+        .map_err(|error| mismatch(CASE, "rollback read must succeed", &error))?;
+    if rolled_back.revision() != StateRevision::INITIAL || rolled_back.value().is_some() {
+        return Err(mismatch(CASE, "object conflict leaked state", &rolled_back));
+    }
+    let rolled_back_receipt: Option<DurableRequestReceipt> = store
+        .get_request_receipt(&context, domain, request_id(CASE, 0x55)?)
+        .map_err(|error| mismatch(CASE, "rollback receipt read must succeed", &error))?;
+    if rolled_back_receipt.is_some() {
+        return Err(mismatch(
+            CASE,
+            "object conflict leaked a receipt",
+            &rolled_back_receipt,
+        ));
+    }
+    let leaked_version: Option<DurableObjectVersionRecord> = store
+        .get_object_version(
+            &context,
+            domain,
+            object_id,
+            DurableObjectVersion::new(4)
+                .ok_or_else(|| ConformanceFailure::new(CASE, "version four is invalid"))?,
+        )
+        .map_err(|error| mismatch(CASE, "rollback version read must succeed", &error))?;
+    if leaked_version.is_some() {
+        return Err(mismatch(
+            CASE,
+            "object conflict leaked an immutable version",
+            &leaked_version,
+        ));
+    }
+    let due_claim: DurableOutboxClaimOutcome = store.claim_due_outbox(
+        &context,
+        DueOutboxClaimRequest::new(
+            domain,
+            OUTBOX_NOW,
+            lease_id(CASE, 0x57)?,
+            OUTBOX_NOW + OUTBOX_LEASE_MILLIS,
+        )
+        .map_err(|error| ConformanceFailure::new(CASE, error.to_string()))?,
+    );
+    if due_claim != DurableOutboxClaimOutcome::NoDueWork {
+        return Err(mismatch(
+            CASE,
+            "object conflict leaked due work",
+            &due_claim,
+        ));
+    }
+    Ok(())
+}
+
 /// Runs the shared complete-read, contention, lease, and writer-fence cases.
 ///
 /// The fixture is consumed logically: it must not be reused for another run.
@@ -1749,5 +2138,10 @@ mod tests {
     #[test]
     fn memory_durable_store_passes_shared_conformance() {
         run_durable_store_conformance(&MemoryFixture::new()).unwrap();
+    }
+
+    #[test]
+    fn memory_durable_store_passes_object_conformance() {
+        run_durable_object_conformance(&MemoryFixture::new()).unwrap();
     }
 }

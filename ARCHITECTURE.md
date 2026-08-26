@@ -791,8 +791,9 @@ in that same domain transaction. Domain-aware outbox claim/ack reuses one
 storage-neutral validation and cursor-transition implementation: only point
 reads and the final transaction commit differ between legacy and domain stores.
 The immutable batch observation and delivery-cursor mutation remain one domain
-transaction. An additive native request path now composes these operations, but
-durable-store migration and indexed unattended recovery are still pending.
+transaction. An additive native request path now composes these operations.
+Normalized PostgreSQL implements the structured store and indexed unattended
+recovery As-Is; other durable providers remain pending.
 
 The additive `DurableDomainStateStore` boundary makes production operation
 authority and uncertainty explicit without changing the legacy or domain
@@ -863,9 +864,17 @@ optional typed ordered outbox batch, and an explicit object section. The state
 section keeps a complete read set but may have zero mutations, allowing a
 read-only transition to bind its observations while the receipt is written.
 Constructors reject cross-domain state and receipt/outbox request or event
-digest drift and cap the aggregate represented bytes. The object section is
-closed to explicit empty until concrete object dispatch exists, preventing an
-adapter from hiding unsupported object writes in generic state. Indexed outbox
+digest drift and cap the aggregate represented bytes. The object section has
+canonical unique/sorted body-free head assertions and contained
+create/update/delete mutations. Immutable versions and ABA-safe head revisions
+are distinct; versions contain exactly one existing canonical Object encoding
+or self-describing blob reference, and a separate read API returns immutable
+records without loading bodies into head assertions. Inline owner projections
+are derived from typed `Owner`; the generation-one SQL `type_id` is the stable
+canonical Object record ID rather than the logical `Object::type_hash` retained
+inside canonical bytes. Memory and PostgreSQL apply object/state/receipt/outbox
+sections atomically, preventing an adapter from hiding object writes in generic
+state. Node-core object dispatch remains deferred. Indexed outbox
 repositories now refine the structured store trait so one implementation owns
 initial commit and later delivery state. An additive node-core handler now
 resolves the manifest domain before I/O, checks the typed receipt before state
@@ -898,8 +907,15 @@ generation, and a non-zero physical writer fence. Full-range `u64` values use
 checked `NUMERIC(20,0)` constraints. PostgreSQL 18 CI applies the migration in a
 dedicated test database and verifies idempotent schema application, bootstrap
 fence mismatch rejection, exact relations/indexes, unsigned overflow rejection,
-and zero-domain rejection. Its bounded pool performs fenced state and receipt
-reads plus serializable structured state/receipt/outbox commits. The same store
+and zero-domain rejection. Its bounded pool performs fenced state, body-free
+object-head, immutable object-version, and receipt reads plus serializable
+structured state/object/receipt/outbox commits. Object assertions lock in
+canonical ID order; tombstones clear current/digest/projection columns and
+reconstruct the last version from immutable history; inline/blob payloads map
+losslessly to the unchanged generation-one schema. The live fixture runs the
+same create/update/delete/recreate ABA, conflict rollback, and replay contract
+as memory and asserts immutable history, current/tombstone rows, blob mapping,
+and corruption fail-closed. The same store
 implements exact-request and stable `(available_at_ms, request_id)` indexed
 claims, checks retained lease attempts before selecting work, expires a
 replaced attempt in the replacement transaction, and advances one message only
@@ -1290,3 +1306,19 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   disk-full/WAL exhaustion, TLS-path connection loss, backup/restore,
   capacity/load/soak, real writer failover, client disconnect, and in-flight
   cancellation deferred.
+- DR-0064: Activate the already-normalized generation-one object tables through
+  one typed runtime contract without changing canonical bytes or schema
+  generation. Reuse `objects::Object`, its canonical encoder/decoder, and typed
+  `Owner`; treat SQL `type_id` as the canonical Object record projection rather
+  than its logical type hash. Keep current heads body-free, read immutable
+  inline-or-blob versions separately, distinguish absence from retained
+  tombstones, and advance an independent head revision on every lifecycle
+  mutation so delete/recreate cannot produce ABA. PostgreSQL locks canonical
+  object IDs, validates all head assertions and prospective immutable keys
+  before applying any section, then publishes object/state/receipt/outbox rows
+  in the same serializable transaction with immediate constraint validation.
+  Shared memory/PostgreSQL conformance must prove lifecycle, replay, conflict
+  rollback including outbox/version absence, and generation-one inline/blob
+  mapping. Keep node-core object dispatch, fees, blob transfer verification,
+  owned-object fast routing, schema migrations, and production fault/capacity/
+  provider certification deferred.

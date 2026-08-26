@@ -1938,22 +1938,28 @@ Phase 15 As-Is scope:
   definite Rejected、Indeterminateへ閉じた。revision conflict、stale fence、serialization abort、
   commit dispatch前に証明されたdeadline/unavailabilityだけをdefinite abortとし、dispatch後のdeadline、
   connection loss、cancellationはbackendのauthoritative abort evidenceなしに失敗扱いしない
-  （boundary implemented As-Is; node-core/native composition implemented; durable adapter wiring pending）。correlation ID、fence、deadlineを
+  （boundary/node-core/native composition/normalized PostgreSQL implemented As-Is;
+  other durable provider wiring pending）。correlation ID、fence、deadlineを
   protocol canonical input、request dedup identity、HTTP caller-selected authorityにしてはならない。
 - runtimeはnormalized store向け`DurableInvocationTransaction`を持つ。logical domain、read-onlyも許すoptional
   complete state section、typed canonical receipt、optional typed ordered outbox、explicit object sectionを分離し、
   aggregate bytesとstate domain、receipt/outbox request ID、event digest一致をI/O前に検証する。
-  object dispatch未実装中のobject sectionはexplicit emptyだけを許し、generic stateへの隠蔽を禁止する
+  object sectionはcanonical unique/sortedなbody-free head assertion、read containment付きcreate/update/delete、
+  distinct immutable versionとABA-safe head revision、inline canonical `objects::Object`またはself-describing blob参照を持つ。
+  inline owner projectionはtyped `Owner`から導出し、immutable versionはheadと別APIで読む。
+  memoryとPostgreSQLはstate/object/receipt/outboxを同一atomic boundaryで実装済みだが、node-core object dispatch、
+  fee debit、blob upload/fetch verification、owned fast pathは未実装である。
   node-core additive handlerはmanifest domainをI/O前にresolveし、typed receipt replayをstate readより先に行い、
   read-only assertionを含むstate/receipt/outboxをこのenvelopeへ構築する。definite commitまたはexact replay以外では
-  outputを返さない。single-lock memory conformance storeでatomic publication、conflict、read-only、fence、deadline、
-  node-core commit/replayを検証する（runtime/node-core/memory/native composition implemented As-Is; durable store wiring pending）。
+  outputを返さない。single-lock memoryとnormalized PostgreSQL conformance storeでatomic publication、object lifecycle/ABA、
+  conflict rollback、read-only、fence、deadline、replayを検証する（runtime/memory/PostgreSQL implemented As-Is;
+  node-core object dispatchとprovider certification pending）。
 - request pathのcommit直後deliveryはdomain-wide `claim_due_outbox`を流用しない。同じdomainのolder due workを
   今回requestと誤認しないよう、trusted `(domain, request_id, now, lease, expiry)`を持つexact-request claimを使う。
   memory conformanceはolder due rowが存在しても指定requestだけをclaimし、cross-request/domain lease reuseを拒否する
   native structured request pathは同一operation contextでcommit後にexact requestを最大1 message claimし、
   Indeterminate claim/ackを同一identityで1回reconcileし、未解決claimをsendしない
-  （contract/memory/native implemented As-Is; durable adapter wiring pending）。
+  （contract/memory/native/PostgreSQL implemented As-Is; provider durable adapters pending）。
 - indexed production outbox boundaryはtrusted runtime timeとbounded restart-safe leaseを受け、
   `(available_at, request_id)`のstable index順で最大1件だけclaimする。scheduler cursorやprefix scanを
   authorityにせず、同じlease IDの再claimはindeterminate claimのreconciliationとして同じworkを返し、
@@ -2075,14 +2081,18 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
    transaction order、migration policyを維持する。adapterがopaque PersistenceLayout key prefixをparseせずに済むよう、
    state/object/receipt/outboxを明示的sectionとして持つstructured durable transaction envelopeを先に実装する
    （runtime/node-core/memory/native compositionとgeneration-one normalized schema migration/operator bootstrapは
-   implemented As-Is; bounded pool、fenced state/receipt read、serializable structured state/receipt/outbox commit、
+   implemented As-Is; bounded pool、fenced state/body-free object head/immutable object version/receipt read、
+   serializable structured state/object/receipt/outbox commit、canonical object lock order、tombstone history reconstruction、
+   inline/blob lossless mapping、
    statementごとの残deadline timeout、bounded unchanged-envelope serialization retry、typed conflict/indeterminate分類も
    PostgreSQLでimplemented As-Is; indexed exact-request/due claim、same-lease reconciliation、retained attempt history、
    idempotent ack、pool/row-lock deadline exhaustionとcommit-boundary deadline classificationもPostgreSQLで
    implemented As-Is; in-flight cancellation/fault/capacity certification pending）。
    explicit migrationとshared contract evidenceはimplemented As-Is; broader fault/capacity evidenceは未実装である。
-4. shared conformanceにexact deadline boundary、write skew、absent-key race、definite contention classification、
-   lease fencingを追加し、PostgreSQL capability testにpool/row-lock deadline、serialization failure、
+4. shared conformanceにexact deadline boundary、write skew、absent-key race、object create/update/delete/recreate ABA、
+   object conflict時のstate/receipt/outbox/version rollback、definite contention classification、lease fencingを追加し、
+   PostgreSQL capability testにimmutable history/current/tombstone/blob mapping/corruption fail-closed、
+   pool/row-lock deadline、serialization failure、
    schema/version skewを追加する。optional shared commit-loss capabilityはbounded test-only `NoTls` TCP proxyを介し、
    plain state commitへのCOMMIT dispatch直前connection lossとinvocation commit・outbox claim・acknowledgementへの
    backend COMMIT acceptance直後connection lossを別々に注入し、いずれもIndeterminate(ConnectionLost)として

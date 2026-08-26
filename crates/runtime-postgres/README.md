@@ -5,10 +5,14 @@ PostgreSQL schema, bootstraps an exact `(chain, validator, atomicity domain)`
 metadata row, and implements `StructuredDurableDomainStateStore` over an
 explicit bounded synchronous connection pool.
 
-The structured store performs fenced state/receipt reads and serializable
-state/receipt/outbox commits with complete read assertions, checked revisions,
+The structured store performs fenced state/object/receipt reads and serializable
+state/object/receipt/outbox commits with complete read assertions, checked revisions,
 per-statement remaining-deadline timeouts, bounded unchanged-envelope
 serialization retry, and conservative commit-result classification.
+Object heads are body-free and lock in canonical object-ID order. Immutable
+version reads map the generation-one inline/blob columns losslessly; inline
+payloads use the existing canonical Object encoding and canonical Owner
+projection, while tombstones retain history and reconstruct the last version.
 It also implements `IndexedOutboxRepository` with exact-request and stable
 indexed due claims, same-lease reconciliation, expired-lease replacement,
 retained attempt history, and idempotent acknowledgement. It does not yet
