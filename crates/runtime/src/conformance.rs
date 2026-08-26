@@ -1294,15 +1294,22 @@ pub fn run_schema_skew_conformance<F: SchemaSkewFixture>(fixture: &F) -> Conform
 ///
 /// [`CommitFaultPoint::AfterBackendCommitAccepted`] is injected separately
 /// three times, after confirming the backend actually returned a successful
-/// acknowledgement before severing:
+/// acknowledgement before severing. A same-lease claim replay or
+/// same-identity acknowledgement replay alone cannot distinguish a persisted
+/// commit from an uncommitted one, so each case first probes the store with
+/// an independent operation whose outcome differs only if the prior
+/// transaction actually persisted:
 /// - for one structured invocation commit, proving the exact committed state
 ///   revision/value and exact receipt content were published, and that
 ///   replaying the same invocation observes `RequestAlreadyCommitted`;
-/// - for an outbox claim on that invocation's message, proving a same-lease
-///   replay reconciles to the identical claimed message;
-/// - for the corresponding acknowledgement, proving a same-identity replay
-///   reconciles to acknowledged and that the delivery cursor advanced exactly
-///   once with no message left due.
+/// - for an outbox claim on that invocation's message, first proving with a
+///   different, never-used lease that the original lease is still active
+///   (`NoDueWork`), then that a same-lease replay reconciles to the identical
+///   claimed message;
+/// - for the corresponding acknowledgement, first proving that reclaiming
+///   with the original lease is rejected as lease-ID reuse, then that a
+///   same-identity replay reconciles to acknowledged with no message left
+///   due for this one-message batch.
 ///
 /// A final unfaulted commit proves the connection pool recovers a healthy
 /// connection afterward.
@@ -1498,6 +1505,32 @@ pub fn run_commit_loss_conformance<F: CommitLossFixture>(fixture: &F) -> Conform
             "fixture did not observe a genuine backend COMMIT acceptance before severing",
         ));
     }
+    // A same-lease replay alone cannot distinguish a persisted claim from an
+    // uncommitted one: if the original claim never landed, replaying it would
+    // simply perform a fresh claim and return an indistinguishable `Claimed`
+    // outcome. Probe with a different, never-used lease at the same
+    // `OUTBOX_NOW` instead: the original lease has not yet expired, so this
+    // only observes `NoDueWork` if the original attempt's active lease is
+    // genuinely persisted and still bound to the request.
+    let claim_probe_lease: DurableOutboxLeaseId = lease_id(CLAIM_CASE, 0xCA)?;
+    let claim_probe_outcome: DurableOutboxClaimOutcome = store.claim_request_outbox(
+        &claim_context,
+        RequestOutboxClaimRequest::new(
+            domain,
+            claim_outbox_request,
+            OUTBOX_NOW,
+            claim_probe_lease,
+            OUTBOX_NOW + OUTBOX_LEASE_MILLIS,
+        )
+        .map_err(|error| ConformanceFailure::new(CLAIM_CASE, error.to_string()))?,
+    );
+    if claim_probe_outcome != DurableOutboxClaimOutcome::NoDueWork {
+        return Err(mismatch(
+            CLAIM_CASE,
+            "a different-lease claim while the original lease is unexpired must observe no due work, proving the indeterminate claim's active lease persisted",
+            &claim_probe_outcome,
+        ));
+    }
     let reconciled_claim_outcome: DurableOutboxClaimOutcome =
         store.claim_request_outbox(&claim_context, claim_request);
     let DurableOutboxClaimOutcome::Claimed(reconciled_claim) = reconciled_claim_outcome else {
@@ -1545,6 +1578,34 @@ pub fn run_commit_loss_conformance<F: CommitLossFixture>(fixture: &F) -> Conform
             "fixture did not observe a genuine backend COMMIT acceptance before severing",
         ));
     }
+    // A same-identity acknowledgement replay alone cannot distinguish a
+    // persisted acknowledgement from an uncommitted one: the active lease
+    // from the claim case would still satisfy a first-time acknowledgement
+    // just as well as an idempotent replay. Probe by attempting to claim
+    // again with the original lease: a lease already consumed by a persisted
+    // acknowledgement is no longer active work and must be rejected as
+    // lease-ID reuse, whereas an uncommitted acknowledgement would leave the
+    // lease active and this probe would instead reconcile to `Claimed`.
+    let ack_probe_outcome: DurableOutboxClaimOutcome = store.claim_request_outbox(
+        &ack_context,
+        RequestOutboxClaimRequest::new(
+            domain,
+            claim_outbox_request,
+            OUTBOX_NOW,
+            claim_lease,
+            OUTBOX_NOW + OUTBOX_LEASE_MILLIS,
+        )
+        .map_err(|error| ConformanceFailure::new(ACK_CASE, error.to_string()))?,
+    );
+    if ack_probe_outcome
+        != DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::LeaseIdReuse)
+    {
+        return Err(mismatch(
+            ACK_CASE,
+            "reclaiming with the original lease after an indeterminate acknowledgement must be rejected as lease-ID reuse, proving the acknowledgement persisted",
+            &ack_probe_outcome,
+        ));
+    }
     let reconciled_ack: DurableOutboxAcknowledgementOutcome =
         store.acknowledge_outbox(&ack_context, acknowledgement);
     if reconciled_ack != DurableOutboxAcknowledgementOutcome::Acknowledged {
@@ -1568,7 +1629,7 @@ pub fn run_commit_loss_conformance<F: CommitLossFixture>(fixture: &F) -> Conform
     if post_ack_claim != DurableOutboxClaimOutcome::NoDueWork {
         return Err(mismatch(
             ACK_CASE,
-            "the cursor must advance exactly once and leave no due work for this one-message batch",
+            "the acknowledgement must persist and leave no due work for this one-message batch",
             &post_ack_claim,
         ));
     }

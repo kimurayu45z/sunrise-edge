@@ -233,23 +233,30 @@ frame, and detects the exact simple-query `COMMIT` a durable commit, claim, or
 acknowledgement dispatches last. Severing the connection immediately before
 that message reaches the backend, or forwarding it and severing immediately
 after the backend returns a successful `CommandComplete("COMMIT")`/
-`ReadyForQuery`, both surface to the driver as an unrecognized SQLSTATE and
-both classify `Indeterminate(ConnectionLost)`; the driver cannot and does not
-distinguish them by outcome alone. The shared case injects the pre-dispatch
-instant once, for one plain state commit, and proves no state was published,
-confirmed by an unfaulted retry of the same read assertion committing
-successfully. It injects the post-acceptance instant three times: for one
-structured invocation commit, proving the exact committed state revision/value
-and exact receipt content were published and that replaying the same
-invocation observes `RequestAlreadyCommitted`; for an outbox claim on that
-invocation's message, proving a same-lease replay reconciles to the identical
-claimed message; and for the corresponding acknowledgement, proving a
-same-identity replay reconciles to `Acknowledged` and that the delivery cursor
-advanced exactly once with no message left due. A final unfaulted commit
-proves the connection pool recovers a healthy connection. This is evidence
-that the backend returned a successful commit acknowledgement over the plain
-transport before the driver lost it, not proof of crash durability under
-abrupt process/power loss, and it says nothing about TLS-path connection loss.
+`ReadyForQuery`, both surface to the driver with no SQLSTATE at all, a plain
+transport-level I/O error rather than a database error response, and both are
+classified by the catch-all arm as `Indeterminate(ConnectionLost)`; the driver
+cannot and does not distinguish them by outcome alone. The shared case injects
+the pre-dispatch instant once, for one plain state commit, and proves no state
+was published, confirmed by an unfaulted retry of the same read assertion
+committing successfully. It injects the post-acceptance instant three times:
+for one structured invocation commit, proving the exact committed state
+revision/value and exact receipt content were published and that replaying
+the same invocation observes `RequestAlreadyCommitted`; for an outbox claim on
+that invocation's message, first proving with a different, never-used lease
+that the original lease is still active (`NoDueWork`) and then that a
+same-lease replay reconciles to the identical claimed message; and for the
+corresponding acknowledgement, first proving that reclaiming with the
+original lease is rejected as lease-ID reuse and then that a same-identity
+replay reconciles to `Acknowledged` with the acknowledgement persisted and no
+message left due for this one-message batch. The discriminating probes matter
+because a same-lease claim replay or same-identity acknowledgement replay
+alone would succeed identically whether or not the prior transaction actually
+persisted. A final unfaulted commit proves the connection pool recovers a
+healthy connection. This is evidence that the backend returned a successful
+commit acknowledgement over the plain transport before the driver lost it,
+not proof of crash durability under abrupt process/power loss, and it says
+nothing about TLS-path connection loss.
 
 ## 6. Indexed claim and acknowledgement
 

@@ -103,13 +103,18 @@ cross-provider ingress milestones implemented through Phase 17:
   loss immediately after the backend returns a successful acknowledgement for
   one structured invocation commit, one outbox claim, and one acknowledgement,
   proving exact committed state/receipt ground truth and `RequestAlreadyCommitted`
-  for the commit and same-identity reconciliation for the claim and
-  acknowledgement. Both instants classify `Indeterminate(ConnectionLost)`, and
-  the connection pool is proven to recover afterward. This shows the backend
-  returned a successful acknowledgement over the plain transport before the
-  driver lost it, not crash durability under abrupt process/power loss, and it
-  says nothing about TLS-path loss or capacity. Broader fault, operations, and
-  production certification remain pending, so this is still As-Is evidence.
+  for the commit. Because a same-lease claim replay or same-identity
+  acknowledgement replay alone cannot tell a persisted commit from an
+  uncommitted one, the claim and acknowledgement cases each first probe the
+  store independently (a different-lease claim while the original lease is
+  still active, and a reclaim attempt with the original lease after
+  acknowledgement) before checking same-identity reconciliation. Both instants
+  classify `Indeterminate(ConnectionLost)`, and the connection pool is proven
+  to recover afterward. This shows the backend returned a successful
+  acknowledgement over the plain transport before the driver lost it, not
+  crash durability under abrupt process/power loss, and it says nothing about
+  TLS-path loss or capacity. Broader fault, operations, and production
+  certification remain pending, so this is still As-Is evidence.
 - An explicit `ComposedRuntime` for assembling independently selected state,
   blob, signer, transport, clock, and scheduler components without hidden
   defaults. Native conformance tests close/reopen SQLite into a new composition,

@@ -28,16 +28,21 @@ committing successfully. It injects the after-acceptance instant three times:
 for one structured invocation commit, proving the exact committed state
 revision/value and exact receipt content were published and that replaying the
 same invocation observes `RequestAlreadyCommitted`; for an outbox claim on
-that invocation's message, proving a same-lease replay reconciles to the
-identical claimed message; and for the corresponding acknowledgement, proving
-a same-identity replay reconciles to `Acknowledged` and that the delivery
-cursor advanced exactly once with no message left due. A final unfaulted
-commit proves the connection pool recovers a healthy connection. This is
-evidence that the backend returned a successful commit acknowledgement over
-the plain transport before the driver lost it, not proof of crash durability
-under abrupt process/power loss; it says nothing about TLS-path connection
-loss, disk-full/WAL exhaustion, backup/restore, capacity/load/soak, or real
-failover.
+that invocation's message, first proving with a different, never-used lease
+that the original lease is still active (`NoDueWork`) and then that a
+same-lease replay reconciles to the identical claimed message; and for the
+corresponding acknowledgement, first proving that reclaiming with the original
+lease is rejected as lease-ID reuse and then that a same-identity replay
+reconciles to `Acknowledged` with the acknowledgement persisted and no message
+left due for this one-message batch. These discriminating probes matter
+because a same-lease claim replay or same-identity acknowledgement replay
+alone would succeed identically whether or not the prior transaction actually
+persisted. A final unfaulted commit proves the connection pool recovers a
+healthy connection. This is evidence that the backend returned a successful
+commit acknowledgement over the plain transport before the driver lost it,
+not proof of crash durability under abrupt process/power loss; it says
+nothing about TLS-path connection loss, disk-full/WAL exhaustion,
+backup/restore, capacity/load/soak, or real failover.
 Request handling must never call `apply_initial_schema` or
 `bootstrap_namespace`; those remain operator-only actions. Writer failover uses
 the separate expected-generation `advance_writer_fence` operator seam and must

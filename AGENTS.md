@@ -238,8 +238,12 @@ connection loss immediately before one plain state commit dispatches `COMMIT`,
 proving no state ground truth, and separately immediately after the backend
 returns a successful acknowledgement for one structured invocation commit, one
 outbox claim, and one acknowledgement, proving exact state/receipt ground
-truth plus `RequestAlreadyCommitted` for the commit and same-identity
-reconciliation for the claim and acknowledgement, with pool recovery proven
+truth plus `RequestAlreadyCommitted` for the commit. The claim and
+acknowledgement cases each first probe the store independently (a
+different-lease claim while the original lease is still active, and a reclaim
+attempt with the original lease after acknowledgement) since a same-lease or
+same-identity replay alone cannot tell a persisted commit from an uncommitted
+one, then check same-identity reconciliation, with pool recovery proven
 afterward. This shows the backend acknowledged commit before the driver lost
 it, not crash durability under abrupt process/power loss, and it says nothing
 about TLS-path loss. Native structured requests now support

@@ -387,9 +387,14 @@ not general state reads:
    acknowledgement for one structured invocation commit, one outbox claim, and
    one acknowledgement also classifies `Indeterminate(ConnectionLost)` while
    publishing exact state/receipt ground truth and `RequestAlreadyCommitted`
-   for the commit and same-identity reconciliation for the claim and
-   acknowledgement, with the connection pool proven to recover afterward. The
-   only current implementation is a bounded `NoTls` TCP proxy in
+   for the commit. Because a same-lease claim replay or same-identity
+   acknowledgement replay alone cannot tell a persisted commit from an
+   uncommitted one, the claim and acknowledgement cases each first probe the
+   store independently (a different-lease claim while the original lease is
+   still active, and a reclaim attempt with the original lease after
+   acknowledgement) before checking same-identity reconciliation, with the
+   connection pool proven to recover afterward. The only current
+   implementation is a bounded `NoTls` TCP proxy in
    `runtime-postgres`'s live test; it shows the backend acknowledged commit
    before the driver lost it, not crash durability under abrupt process/power
    loss, and it proves nothing about TLS-path connection loss.

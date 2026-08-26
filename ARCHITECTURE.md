@@ -933,14 +933,19 @@ instant once, for one plain state commit, proving no state ground truth was
 published. It injects the post-acceptance instant three times: for one
 structured invocation commit, proving exact committed state/receipt ground
 truth and that a same-identity replay observes `RequestAlreadyCommitted`; for
-an outbox claim on that invocation's message, proving a same-lease replay
-reconciles to the identical claimed message; and for the corresponding
-acknowledgement, proving a same-identity replay reconciles to acknowledged
-with the delivery cursor advanced exactly once. A final unfaulted commit
-proves the connection pool recovers afterward. This shows the backend
-returned a successful acknowledgement before the driver lost it, not crash
-durability under abrupt process/power loss, and it says nothing about
-TLS-path connection loss. Abrupt process/power fault, disk-full/WAL
+an outbox claim on that invocation's message, first proving with a different,
+never-used lease that the original lease is still active (`NoDueWork`) and
+then that a same-lease replay reconciles to the identical claimed message;
+and for the corresponding acknowledgement, first proving that reclaiming with
+the original lease is rejected as lease-ID reuse and then that a
+same-identity replay reconciles to acknowledged with the acknowledgement
+persisted and no message left due. These discriminating probes matter because
+a same-lease claim replay or same-identity acknowledgement replay alone would
+succeed identically whether or not the prior transaction actually persisted.
+A final unfaulted commit proves the connection pool recovers afterward. This
+shows the backend returned a successful acknowledgement before the driver
+lost it, not crash durability under abrupt process/power loss, and it says
+nothing about TLS-path connection loss. Abrupt process/power fault, disk-full/WAL
 exhaustion, backup/restore, capacity/load/soak, and real writer failover
 remain backend-specific evidence. Passing this suite is As-Is contract
 evidence, not production certification.
@@ -1260,16 +1265,22 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   instant three times: for one structured invocation commit, proving exact
   committed state and receipt ground truth and that a same-identity replay
   observes `RequestAlreadyCommitted`; for an outbox claim on that invocation's
-  message, proving a same-lease replay reconciles to the identical claimed
-  message; and for the corresponding acknowledgement, proving a same-identity
-  replay reconciles to acknowledged with the delivery cursor advanced exactly
-  once and no message left due. A final unfaulted commit proves the
-  connection pool recovers a healthy connection. This is evidence that the
-  backend returned a successful acknowledgement before the driver lost it; it
-  is not proof of crash durability under abrupt process/power loss, and it
-  proves nothing about TLS-path connection loss. This evidence is additive
-  to, not a replacement for, DR-0061's existing induced-abort/schema-skew
-  coverage. The only current implementation is a bounded, test-only `NoTls`
+  message, first proving with a different, never-used lease that the original
+  lease is still active (`NoDueWork`) and then that a same-lease replay
+  reconciles to the identical claimed message; and for the corresponding
+  acknowledgement, first proving that reclaiming with the original lease is
+  rejected as lease-ID reuse and then that a same-identity replay reconciles
+  to acknowledged with the acknowledgement persisted and no message left due.
+  These discriminating probes are required because a same-lease claim replay
+  or same-identity acknowledgement replay alone would succeed identically
+  whether or not the prior transaction actually persisted. A final unfaulted
+  commit proves the connection pool recovers a healthy connection. This is
+  evidence that the backend returned a successful acknowledgement before the
+  driver lost it; it is not proof of crash durability under abrupt
+  process/power loss, and it proves nothing about TLS-path connection loss.
+  This evidence is additive to, not a replacement for, DR-0061's existing
+  induced-abort/schema-skew coverage. The only current implementation is a
+  bounded, test-only `NoTls`
   TCP proxy in `runtime-postgres`'s live PostgreSQL test: it binds port 0,
   relays the untyped startup message and every later typed frame, detects
   the exact simple-query `COMMIT` a durable commit, claim, or acknowledgement
