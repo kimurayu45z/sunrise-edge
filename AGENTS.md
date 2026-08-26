@@ -229,10 +229,12 @@ and bootstraps exact namespace/schema/fence metadata through operator-only APIs,
 with real PostgreSQL CI. Its bounded pool now implements fenced structured
 state/receipt reads, serializable state/receipt/outbox commit, and indexed
 claim/ack with retained attempt history As-Is. A shared memory/PostgreSQL
-conformance suite now covers complete-read races, definite contention
-classification, lease/writer fencing, and PostgreSQL-only
-serialization exhaustion/schema skew As-Is. Next, implement deadline/cancellation,
-abrupt fault,
+conformance suite now covers exact-boundary deadlines, complete-read races,
+definite contention classification, lease/writer fencing, and PostgreSQL-only
+pool/row-lock deadline exhaustion, serialization exhaustion, and schema skew
+As-Is. Native structured requests now support explicit cancellation only before
+first storage dispatch; started work, client disconnect, and shutdown budgets
+remain uncancellable. Next, implement abrupt fault,
 backup/restore, capacity, and provider implementations. Do not spend further
 effort treating the opaque SQLite table or prefix scanner as the production
 schema. The adapter must not infer normalized rows from opaque key prefixes.

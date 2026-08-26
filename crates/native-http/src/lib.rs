@@ -32,10 +32,10 @@ use runtime::{
     DurableOperationContext, DurableOutboxAcknowledgement, DurableOutboxAcknowledgementOutcome,
     DurableOutboxAcknowledgementRejection, DurableOutboxClaimOutcome, DurableOutboxClaimRejection,
     DurableOutboxLeaseId, IndeterminateCommitReason, IndexedOutboxContractError,
-    IndexedOutboxRepository, MAX_DURABLE_OUTBOX_LEASE_MILLIS, OutboxRequestId, PersistenceLayout,
-    RequestOutboxClaimRequest, Runtime, RuntimeError, StateKeyScan, StateKeyScanner,
-    StorageCorrelationId, StorageDeadline, TransactionalStateStore, Transport,
-    WriterFenceGeneration,
+    IndexedOutboxRepository, InvocationCancellation, MAX_DURABLE_OUTBOX_LEASE_MILLIS,
+    OutboxRequestId, PersistenceLayout, RequestOutboxClaimRequest, Runtime, RuntimeError,
+    StateKeyScan, StateKeyScanner, StorageCorrelationId, StorageDeadline, TransactionalStateStore,
+    Transport, WriterFenceGeneration,
 };
 use std::{
     error::Error,
@@ -116,10 +116,14 @@ pub struct StructuredDurableNativeComponents<S, T, C, I> {
     transport: Arc<T>,
     clock: Arc<C>,
     identities: Arc<I>,
+    cancellation: Option<Arc<dyn InvocationCancellation>>,
 }
 
 impl<S, T, C, I> StructuredDurableNativeComponents<S, T, C, I> {
-    /// Creates a composition without hidden defaults or request authority.
+    /// Creates a composition that never cancels before storage dispatch.
+    ///
+    /// Existing compositions retain their original behavior. Use
+    /// [`Self::with_cancellation`] when the host has an explicit trusted signal.
     #[must_use]
     pub const fn new(store: Arc<S>, transport: Arc<T>, clock: Arc<C>, identities: Arc<I>) -> Self {
         Self {
@@ -127,6 +131,32 @@ impl<S, T, C, I> StructuredDurableNativeComponents<S, T, C, I> {
             transport,
             clock,
             identities,
+            cancellation: None,
+        }
+    }
+
+    /// Creates a composition with an explicit trusted pre-storage cancellation signal.
+    #[must_use]
+    pub fn with_cancellation(
+        store: Arc<S>,
+        transport: Arc<T>,
+        clock: Arc<C>,
+        identities: Arc<I>,
+        cancellation: Arc<dyn InvocationCancellation>,
+    ) -> Self {
+        Self {
+            store,
+            transport,
+            clock,
+            identities,
+            cancellation: Some(cancellation),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        match &self.cancellation {
+            Some(cancellation) => cancellation.is_cancelled(),
+            None => false,
         }
     }
 }
@@ -1365,6 +1395,9 @@ where
         Ok(body) => body,
         Err(error) => return error_response(error.status(), "body-rejected"),
     };
+    if state.components.is_cancelled() {
+        return cancelled_before_storage_response();
+    }
     let permit = match state.blocking_executor.try_acquire() {
         Ok(permit) => permit,
         Err(TryAcquireError::NoPermits) => return overload_response(),
@@ -1396,6 +1429,7 @@ where
 }
 
 enum InvocationError {
+    CancelledBeforeStorage,
     Node(NodeCoreError),
     Delivery(OutboxDeliveryError),
     Indexed(IndexedOutboxRecoveryError),
@@ -1479,6 +1513,9 @@ where
     C: Clock,
     I: IndexedOutboxIdentitySource,
 {
+    if state.components.is_cancelled() {
+        return Err(InvocationError::CancelledBeforeStorage);
+    }
     let event = NodeEvent::decode(body).map_err(InvocationError::Node)?;
     validate_native_event_context(&event, &state.config).map_err(InvocationError::Node)?;
     let request_id = event.request_id();
@@ -1509,6 +1546,9 @@ where
         deadline,
         identity.correlation_id,
     );
+    if state.components.is_cancelled() {
+        return Err(InvocationError::CancelledBeforeStorage);
+    }
     let resolved = handle_resolved_durable_idempotent_event(
         state.components.store.as_ref(),
         &context,
@@ -1628,6 +1668,7 @@ where
 
 fn invocation_error_response(error: &InvocationError) -> Response {
     match error {
+        InvocationError::CancelledBeforeStorage => cancelled_before_storage_response(),
         InvocationError::Node(error) => node_error_response(error),
         InvocationError::Delivery(OutboxDeliveryError::Node(error)) => node_error_response(error),
         InvocationError::Delivery(OutboxDeliveryError::Send) => {
@@ -1953,6 +1994,13 @@ fn error_response(status: StatusCode, code: &'static str) -> Response {
         .into_response()
 }
 
+fn cancelled_before_storage_response() -> Response {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "invocation-cancelled-before-storage",
+    )
+}
+
 fn overload_response() -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
@@ -2012,7 +2060,7 @@ mod tests {
         path::PathBuf,
         sync::{
             Condvar, Mutex,
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         },
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -2289,6 +2337,48 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct StepCancellation {
+        cancel_at_call: usize,
+        calls: AtomicUsize,
+    }
+
+    impl StepCancellation {
+        fn new(cancel_at_call: usize) -> Self {
+            Self {
+                cancel_at_call,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl InvocationCancellation for StepCancellation {
+        fn is_cancelled(&self) -> bool {
+            self.calls.fetch_add(1, Ordering::SeqCst) + 1 >= self.cancel_at_call
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ManualCancellation {
+        cancelled: AtomicBool,
+    }
+
+    impl ManualCancellation {
+        fn cancel(&self) {
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl InvocationCancellation for ManualCancellation {
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::SeqCst)
+        }
+    }
+
     struct ScriptedIndexedStore {
         claims: Mutex<VecDeque<DurableOutboxClaimOutcome>>,
         acknowledgements: Mutex<VecDeque<DurableOutboxAcknowledgementOutcome>>,
@@ -2495,6 +2585,89 @@ mod tests {
         }
     }
 
+    struct CancelOnFirstReceiptReadStore {
+        inner: MemoryDurableStateStore,
+        cancellation: Arc<ManualCancellation>,
+        cancelled: AtomicBool,
+    }
+
+    impl CancelOnFirstReceiptReadStore {
+        fn new(inner: MemoryDurableStateStore, cancellation: Arc<ManualCancellation>) -> Self {
+            Self {
+                inner,
+                cancellation,
+                cancelled: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl DurableDomainStateStore for CancelOnFirstReceiptReadStore {
+        fn get_versioned_durable(
+            &self,
+            context: &DurableOperationContext,
+            domain: AtomicityDomainId,
+            key: &[u8],
+        ) -> Result<VersionedStateValue, DurableReadError> {
+            self.inner.get_versioned_durable(context, domain, key)
+        }
+
+        fn commit_durable(
+            &self,
+            context: &DurableOperationContext,
+            transaction: AtomicStateTransaction,
+        ) -> DurableCommitOutcome {
+            self.inner.commit_durable(context, transaction)
+        }
+    }
+
+    impl StructuredDurableDomainStateStore for CancelOnFirstReceiptReadStore {
+        fn get_request_receipt(
+            &self,
+            context: &DurableOperationContext,
+            domain: AtomicityDomainId,
+            request_id: DurableRequestId,
+        ) -> Result<Option<DurableRequestReceipt>, DurableReadError> {
+            if !self.cancelled.swap(true, Ordering::SeqCst) {
+                self.cancellation.cancel();
+            }
+            self.inner.get_request_receipt(context, domain, request_id)
+        }
+
+        fn commit_invocation(
+            &self,
+            context: &DurableOperationContext,
+            transaction: DurableInvocationTransaction,
+        ) -> DurableCommitOutcome {
+            self.inner.commit_invocation(context, transaction)
+        }
+    }
+
+    impl IndexedOutboxRepository for CancelOnFirstReceiptReadStore {
+        fn claim_request_outbox(
+            &self,
+            context: &DurableOperationContext,
+            request: RequestOutboxClaimRequest,
+        ) -> DurableOutboxClaimOutcome {
+            self.inner.claim_request_outbox(context, request)
+        }
+
+        fn claim_due_outbox(
+            &self,
+            context: &DurableOperationContext,
+            request: DueOutboxClaimRequest,
+        ) -> DurableOutboxClaimOutcome {
+            self.inner.claim_due_outbox(context, request)
+        }
+
+        fn acknowledge_outbox(
+            &self,
+            context: &DurableOperationContext,
+            acknowledgement: DurableOutboxAcknowledgement,
+        ) -> DurableOutboxAcknowledgementOutcome {
+            self.inner.acknowledge_outbox(context, acknowledgement)
+        }
+    }
+
     fn indexed_runtime(
         store: ScriptedIndexedStore,
     ) -> ComposedRuntime<
@@ -2577,13 +2750,42 @@ mod tests {
     where
         S: IndexedOutboxRepository + Send + Sync + 'static,
     {
-        let machine = Arc::new(IncrementMachine::new(config.state_key()));
+        let machine: Arc<IncrementMachine> = Arc::new(IncrementMachine::new(config.state_key()));
         structured_durable_router(
             StructuredDurableNativeComponents::new(
                 store,
                 transport,
                 clock,
                 Arc::new(SequenceIndexedIdentities::default()),
+            ),
+            placement,
+            structured_request_authority(),
+            config,
+            resolver(),
+            machine,
+            NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+        )
+    }
+
+    fn structured_app_with_cancellation<S>(
+        store: Arc<S>,
+        transport: Arc<MemoryTransport>,
+        clock: Arc<ManualClock>,
+        placement: DomainPlacementManifest,
+        config: NodeConfig,
+        cancellation: Arc<dyn InvocationCancellation>,
+    ) -> Router
+    where
+        S: IndexedOutboxRepository + Send + Sync + 'static,
+    {
+        let machine = Arc::new(IncrementMachine::new(config.state_key()));
+        structured_durable_router(
+            StructuredDurableNativeComponents::with_cancellation(
+                store,
+                transport,
+                clock,
+                Arc::new(SequenceIndexedIdentities::default()),
+                cancellation,
             ),
             placement,
             structured_request_authority(),
@@ -2834,6 +3036,137 @@ mod tests {
                 .lock()
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_route_rejects_cancellation_at_each_pre_storage_checkpoint() {
+        for cancel_at_call in 1_usize..=3_usize {
+            let fence: WriterFenceGeneration = WriterFenceGeneration::new(3).unwrap();
+            let store: Arc<MemoryDurableStateStore> = Arc::new(MemoryDurableStateStore::new(fence));
+            store.set_time(10_000);
+            let transport: Arc<MemoryTransport> = Arc::new(MemoryTransport::default());
+            let clock: Arc<ManualClock> = Arc::new(ManualClock::new(10_000));
+            let config: NodeConfig = config();
+            let placement: DomainPlacementManifest = placement(0x84, 7);
+            let domain: AtomicityDomainId = placement.domain();
+            let cancellation: Arc<StepCancellation> =
+                Arc::new(StepCancellation::new(cancel_at_call));
+            let app: Router = structured_app_with_cancellation(
+                Arc::clone(&store),
+                Arc::clone(&transport),
+                clock,
+                placement,
+                config.clone(),
+                cancellation.clone(),
+            );
+            let id: RequestId = request_id(u8::try_from(0x30_usize + cancel_at_call).unwrap());
+
+            let response: Response = app
+                .oneshot(
+                    Request::post(NODE_EVENT_PATH)
+                        .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                        .body(Body::from(event(id).encode().unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                to_bytes(response.into_body(), 128).await.unwrap(),
+                "invocation-cancelled-before-storage"
+            );
+            assert_eq!(cancellation.calls(), cancel_at_call);
+            assert!(transport.drain_outbound().unwrap().is_empty());
+            let verification_context: DurableOperationContext = DurableOperationContext::new(
+                fence,
+                StorageDeadline::new(11_000).unwrap(),
+                StorageCorrelationId::new([0x41; 16]).unwrap(),
+            );
+            let state: VersionedStateValue = store
+                .get_versioned_durable(&verification_context, domain, config.state_key())
+                .unwrap();
+            assert_eq!(state.revision(), runtime::StateRevision::INITIAL);
+            assert_eq!(state.value(), None);
+            assert_eq!(
+                store
+                    .get_request_receipt(
+                        &verification_context,
+                        domain,
+                        DurableRequestId::new(*id.as_bytes()).unwrap(),
+                    )
+                    .unwrap(),
+                None
+            );
+            let claim_request: RequestOutboxClaimRequest = RequestOutboxClaimRequest::new(
+                domain,
+                OutboxRequestId::new(*id.as_bytes()).unwrap(),
+                10_000,
+                DurableOutboxLeaseId::new([u8::try_from(0x44_usize + cancel_at_call).unwrap(); 32])
+                    .unwrap(),
+                11_000,
+            )
+            .unwrap();
+            assert_eq!(
+                store.claim_request_outbox(&verification_context, claim_request),
+                DurableOutboxClaimOutcome::NoDueWork
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_route_ignores_cancellation_after_storage_dispatch_begins() {
+        let fence: WriterFenceGeneration = WriterFenceGeneration::new(3).unwrap();
+        let inner: MemoryDurableStateStore = MemoryDurableStateStore::new(fence);
+        inner.set_time(10_000);
+        let cancellation: Arc<ManualCancellation> = Arc::new(ManualCancellation::default());
+        let store: Arc<CancelOnFirstReceiptReadStore> = Arc::new(
+            CancelOnFirstReceiptReadStore::new(inner, Arc::clone(&cancellation)),
+        );
+        let transport: Arc<MemoryTransport> = Arc::new(MemoryTransport::default());
+        let config: NodeConfig = config();
+        let placement: DomainPlacementManifest = placement(0x85, 7);
+        let domain: AtomicityDomainId = placement.domain();
+        let id: RequestId = request_id(0x35);
+        let app: Router = structured_app_with_cancellation(
+            Arc::clone(&store),
+            Arc::clone(&transport),
+            Arc::new(ManualClock::new(10_000)),
+            placement,
+            config,
+            cancellation.clone(),
+        );
+
+        let response: Response = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event(id).encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(cancellation.is_cancelled());
+        assert_eq!(transport.drain_outbound().unwrap().len(), 1);
+        let verification_context: DurableOperationContext = DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(11_000).unwrap(),
+            StorageCorrelationId::new([0x42; 16]).unwrap(),
+        );
+        let claim_request: RequestOutboxClaimRequest = RequestOutboxClaimRequest::new(
+            domain,
+            OutboxRequestId::new(*id.as_bytes()).unwrap(),
+            10_000,
+            DurableOutboxLeaseId::new([0x43; 32]).unwrap(),
+            11_000,
+        )
+        .unwrap();
+        assert_eq!(
+            store.claim_request_outbox(&verification_context, claim_request),
+            DurableOutboxClaimOutcome::NoDueWork
         );
     }
 

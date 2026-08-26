@@ -999,6 +999,27 @@ impl DurableOperationContext {
     }
 }
 
+/// Trusted cooperative signal that can stop an invocation before storage dispatch.
+///
+/// Native compositions may consult this signal until the first durable storage
+/// operation is dispatched. Durable stores deliberately do not receive it:
+/// once that operation begins, cancellation cannot prove that a later commit
+/// aborted and must not terminate started synchronous work.
+pub trait InvocationCancellation: fmt::Debug + Send + Sync {
+    /// Returns whether the composition should reject a not-yet-dispatched invocation.
+    fn is_cancelled(&self) -> bool;
+}
+
+/// Explicit cancellation policy for compositions that never cancel dispatch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NeverCancelled;
+
+impl InvocationCancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
 /// Monotonic optimistic-concurrency token for one state key.
 ///
 /// Revision zero means that the key has never been written. Deletions retain a

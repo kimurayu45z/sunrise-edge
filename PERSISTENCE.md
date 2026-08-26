@@ -202,6 +202,14 @@ blindly. Node-core uses this boundary through an additive structured handler;
 an additive native composition supplies the trusted context, while restart-safe
 durable adapters remain pending.
 
+Native structured composition now accepts an explicit cooperative cancellation
+signal but consults it only while no storage call has begun. Cancellation before
+dispatch returns without state, receipt, or outbox effects. Once the first store
+read starts, later cancellation is ignored and the bounded synchronous job
+finishes commit and outbox reconciliation; the signal is not passed into the
+store and does not construct a cancellation-flavored commit result. Client
+disconnect and in-flight database cancellation remain deferred.
+
 Runtime also now defines `DurableInvocationTransaction` and
 `StructuredDurableDomainStateStore`. The transaction carries one logical
 domain, an optional complete state section that may be read-only, one typed
@@ -372,9 +380,10 @@ not general state reads:
    operator-only namespace bootstrap/fence advance, fenced structured commit,
    indexed claim/ack, and shared memory/PostgreSQL contract suite are implemented
    As-Is.
-4. Extend that evidence with deadline/cancellation semantics, commit-loss,
-   capacity tests, abrupt fault tests, backup/restore rehearsal, and real
-   writer-fencing failover tests.
+4. Preserve the implemented exact-boundary/pool/lock deadline evidence and
+   pre-storage native cancellation, then extend it with client-disconnect and
+   in-flight cancellation semantics, commit-loss, capacity tests, abrupt fault
+   tests, backup/restore rehearsal, and real writer-fencing failover tests.
 5. Implement Cloudflare Durable Object and AWS mappings against the same
    contract and pass real-provider conformance before claiming support.
 
