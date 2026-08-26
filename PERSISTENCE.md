@@ -199,8 +199,9 @@ Deadline, connection loss, or cancellation after dispatch is indeterminate
 unless the backend supplies authoritative abort evidence. Callers reconcile
 that case through the persisted request receipt instead of rerunning effects
 blindly. Node-core uses this boundary through an additive structured handler;
-an additive native composition supplies the trusted context, while restart-safe
-durable adapters remain pending.
+an additive native composition supplies the trusted context. Normalized
+PostgreSQL is the first restart-safe As-Is adapter; other providers remain
+pending.
 
 Native structured composition now accepts an explicit cooperative cancellation
 signal but consults it only while no storage call has begun. Cancellation before
@@ -216,16 +217,29 @@ domain, an optional complete state section that may be read-only, one typed
 canonical completed-request receipt, an optional typed ordered outbox batch,
 and an explicit object section. Aggregate bytes are bounded before I/O, and
 state domain plus receipt/outbox request and event-digest identity must match.
-The object section currently permits only explicit empty because concrete
-object dispatch is not implemented; normalized adapters must fail closed rather
-than hide object writes in generic state. Indexed repositories now refine this
-structured store boundary. Node-core now constructs the envelope after one
+The object section now carries canonical unique/sorted body-free head
+assertions and contained create/update/delete mutations with distinct checked
+immutable versions and ABA-safe head revisions. Immutable records contain
+exactly one inline canonical `objects::Object` or one self-describing blob
+reference; current heads contain no body and immutable versions are read
+through a separate API. Head reconstruction validates bounded immutable
+metadata and inline presence/length without selecting inline bytes. Inline
+owner projections come from typed `Owner` encoding at write construction, but
+owner/routing projections are routing metadata rather than authorization. An
+execution caller must separately load the linked version, match its
+version/digest to the head, decode an inline Object, and compare typed owner;
+blob-backed execution fails closed until fetch/content verification. The SQL
+`type_id` is the canonical Object record identifier,
+not the logical type hash retained in canonical Object bytes. Memory and
+PostgreSQL implement this section atomically with state, receipt, and outbox;
+node-core object dispatch and blob upload/fetch verification remain deferred.
+Indexed repositories refine this structured store boundary. Node-core constructs the envelope after one
 manifest resolution and one pure transition, checks typed receipts before
 state reads, preserves read-only assertions, and withholds output for rejected
 or indeterminate commits. A single-lock in-memory structured store now provides
-atomic state/receipt/outbox, deadline, fence, conflict, read-only, and node-core
-replay conformance. An additive native composition now consumes this boundary;
-restart-safe durable implementations remain pending.
+atomic state/object/receipt/outbox, deadline, fence, conflict, read-only, and
+node-core replay conformance. PostgreSQL is the first restart-safe As-Is
+implementation; provider certification remains pending.
 
 The store validates the complete read set and fencing generation, then commits
 all rows or none. A pure transition is not re-run inside a storage driver. An
@@ -265,10 +279,10 @@ storage-operation timeout shorter than the lease, and restart-safe lease and
 correlation identities. The scheduler supplies none of those values. Claim and
 acknowledgement each receive one same-identity reconciliation attempt; an
 unresolved claim is never sent. The path shares native blocking admission and
-returns no scan cursor. It has only scripted in-memory conformance: no durable
-adapter implements the repository, and transport-aware cancellation/deadlines
-remain pending. The shared in-memory structured store now implements the actual
-indexed repository contract as ephemeral conformance: initial delivery rows,
+returns no scan cursor. Memory and PostgreSQL run shared repository conformance;
+transport-aware in-flight cancellation and provider certification remain
+pending. The shared stores implement the actual indexed repository contract:
+initial delivery rows,
 stable due ordering, lease expiry/replacement, same-lease claim replay, retained
 attempt history, and delayed acknowledgement after later progress are covered.
 
@@ -284,7 +298,8 @@ transport, and store. It resolves the manifest through node-core, commits the
 typed invocation, then claims at most one message for that exact request using
 the same operation context. One same-identity reconciliation is attempted for
 an indeterminate claim or acknowledgement; unresolved claims are never sent.
-This is an in-memory As-Is seam, not durable production evidence.
+PostgreSQL provides restart-safe As-Is evidence for this seam, not production
+fault/capacity/provider certification.
 
 `StateKeyScanner` remains useful for repair, audit, bounded migration, and
 compatibility recovery. It is not a production work queue.
@@ -371,8 +386,8 @@ not general state reads:
 1. Preserve the additive fenced/deadline-aware durable boundary and add the
    structured state/receipt/outbox/object transaction envelope required by
    normalized stores without silently migrating legacy data (runtime envelope
-   and node-core plus memory conformance and native composition implemented;
-   restart-safe durable wiring pending).
+   and node-core plus memory conformance, native composition, and normalized
+   PostgreSQL implemented; other provider wiring pending).
 2. Add a dedicated indexed outbox repository/claim contract; retain key scans
    only for maintenance and compatibility.
 3. Apply the accepted PostgreSQL schema design, explicit migrations, and

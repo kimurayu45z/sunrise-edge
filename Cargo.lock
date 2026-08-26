@@ -892,6 +892,8 @@ dependencies = [
 name = "runtime"
 version = "0.1.0"
 dependencies = [
+ "hashing",
+ "objects",
  "protocol-types",
 ]
 
@@ -899,6 +901,7 @@ dependencies = [
 name = "runtime-postgres"
 version = "0.1.0"
 dependencies = [
+ "objects",
  "postgres",
  "protocol-types",
  "r2d2_postgres",

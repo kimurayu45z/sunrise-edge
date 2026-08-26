@@ -86,10 +86,19 @@ cross-provider ingress milestones implemented through Phase 17:
   relations. Operator-only bootstrap binds exact schema identity/generation and
   writer fence metadata; PostgreSQL 18 CI verifies the migration and core SQL
   constraints. A bounded synchronous pool now implements fenced/deadline-aware
-  state reads, typed receipt reads, and serializable structured state/receipt/
-  outbox commits with complete read assertions and conservative commit-result
-  classification. Serialization/deadlock aborts retry the unchanged envelope
-  only within an explicit attempt ceiling and remaining deadline. Indexed
+  state/object/receipt reads, separate immutable object-version reads, and
+  serializable structured state/object/receipt/outbox commits with complete
+  read assertions and conservative commit-result classification. Current
+  object heads remain body-free; canonical inline objects and blob references
+  map losslessly to the generation-one schema. Head reads validate strict
+  immutable metadata and representation presence/length without selecting an
+  inline body. Owner/routing head projections are routing data, not execution
+  authorization; authorization must separately load the linked immutable
+  version, match version/digest, decode an inline Object, and compare its typed
+  owner. Blob-backed execution remains unavailable until fetch and content
+  verification exist. Serialization/deadlock aborts
+  retry the unchanged envelope only within an explicit attempt ceiling and
+  remaining deadline. Indexed
   exact-request/due claim and acknowledgement now use retained attempt history.
   One feature-gated shared suite exercises complete-read write skew,
   absent/tombstone races, exact-boundary pre-dispatch deadlines, definite
@@ -136,15 +145,23 @@ cross-provider ingress milestones implemented through Phase 17:
   commit that must be reconciled by persisted request identity.
 - A structured durable invocation envelope with an optional read-only-capable
   application state section, a typed canonical request receipt, a typed ordered
-  outbox batch, and an explicit currently-empty object section. It bounds total
+  outbox batch, and typed body-free object-head assertions plus contained
+  create/update/delete mutations. Immutable versions use exactly one inline
+  canonical Object or self-describing blob reference and are read separately.
+  Head projections alone never authorize execution: a caller must match the
+  separately loaded inline version to the head and validate its typed owner;
+  blob-backed execution fails closed while blob verification is deferred.
+  It bounds total
   represented bytes and rejects domain/request/event-digest drift, so a
   normalized adapter never needs to classify opaque key prefixes. An additive
   node-core handler constructs this envelope, replays typed receipts before
   state reads, supports read-only state assertions, and withholds output for
   rejected or indeterminate commits. A single-lock in-memory conformance store
-  validates atomic state/receipt/outbox publication, trusted time, fencing,
-  conflicts, and exact replay. An additive native composition uses this
-  boundary; no restart-safe durable store implements it yet.
+  validates atomic state/object/receipt/outbox publication, bound domains,
+  trusted time, fencing, conflicts, lifecycle ABA safety, the object read-count
+  bound, blob round-trip, and exact replay. PostgreSQL now
+  implements the same object boundary As-Is; node-core object dispatch and
+  blob upload/fetch verification remain deferred.
 - An additive indexed durable-outbox repository contract that claims at most
   one due message in stable availability/request order, installs a bounded
   restart-safe lease atomically, and makes same-lease claim and acknowledgement

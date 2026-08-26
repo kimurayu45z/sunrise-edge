@@ -11,4 +11,5 @@ r2d2_postgres.workspace = true
 runtime.workspace = true
 
 [dev-dependencies]
+objects.workspace = true
 runtime = { workspace = true, features = ["durable-conformance"] }

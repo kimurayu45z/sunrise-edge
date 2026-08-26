@@ -6,6 +6,11 @@
 pub mod conformance;
 
 use core::{fmt, mem::size_of};
+pub use objects::ObjectId;
+use objects::{
+    OBJECT_CANONICAL_TYPE_ID, Object, ObjectError, Owner, decode_object, decode_owner,
+    encode_object, encode_owner,
+};
 pub use protocol_types::{AtomicityDomainId, ValidatorId};
 use protocol_types::{ChainId, Digest32, Epoch, ProtocolVersion};
 use std::collections::{BTreeMap, HashMap};
@@ -79,6 +84,8 @@ pub enum RuntimeError {
     TransportUnavailable,
     /// A durable state store could not complete the requested operation.
     DurableStoreUnavailable,
+    /// This durable adapter has not implemented typed object-head storage.
+    UnsupportedObjectStorage,
     /// Persisted state violated the runtime revision/value invariants.
     InvalidPersistedState,
     /// An operation named a domain other than the store's bound domain.
@@ -138,6 +145,9 @@ impl fmt::Display for RuntimeError {
             Self::ClockOverflow => write!(f, "clock value exceeds u64 milliseconds range"),
             Self::TransportUnavailable => write!(f, "outbound transport is unavailable"),
             Self::DurableStoreUnavailable => write!(f, "durable state store is unavailable"),
+            Self::UnsupportedObjectStorage => {
+                write!(f, "durable adapter does not support typed object storage")
+            }
             Self::InvalidPersistedState => write!(f, "persisted state violates runtime invariants"),
             Self::AtomicityDomainMismatch => {
                 write!(
@@ -179,6 +189,21 @@ pub const MAX_DURABLE_OUTBOX_LEASE_MILLIS: u64 = 5 * 60 * 1_000;
 pub const MAX_DURABLE_OUTBOX_MESSAGES: usize = 1_024;
 /// Maximum canonical receipt bytes in one structured durable invocation.
 pub const MAX_DURABLE_RECEIPT_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum object-head assertions in one structured durable invocation.
+pub const MAX_DURABLE_OBJECT_READS: usize = 4_096;
+/// Maximum object-head mutations in one structured durable invocation.
+pub const MAX_DURABLE_OBJECT_MUTATIONS: usize = 4_096;
+/// Maximum inline canonical bytes for one durable object version.
+pub const MAX_DURABLE_INLINE_OBJECT_BYTES: usize = MAX_STATE_VALUE_BYTES;
+/// Maximum bytes in one owner or routing head projection.
+pub const MAX_DURABLE_OBJECT_PROJECTION_BYTES: usize = 4 * 1024;
+/// Maximum aggregate represented bytes in one durable object section.
+pub const MAX_DURABLE_OBJECT_CHANGES_BYTES: usize = MAX_ATOMIC_STATE_TRANSACTION_BYTES;
+/// Generation-one SQL `type_id` projection for canonical [`Object`] records.
+///
+/// This is not the logical [`Object::type_hash`], which remains inside the
+/// canonical object payload.
+pub const DURABLE_OBJECT_CANONICAL_RECORD_TYPE_ID: u32 = OBJECT_CANONICAL_TYPE_ID as u32;
 
 /// Monotonic deployment-generation token for one domain's authoritative writer.
 ///
@@ -647,6 +672,76 @@ pub enum DurableInvocationError {
         /// Maximum accepted count.
         maximum: usize,
     },
+    /// Existing canonical object encoding or decoding failed.
+    InvalidCanonicalObject(ObjectError),
+    /// One existing object model value used reserved object version zero.
+    ZeroObjectVersion,
+    /// One inline canonical object body exceeded its per-version bound.
+    ObjectBodyTooLarge {
+        /// Actual canonical bytes.
+        length: usize,
+        /// Maximum accepted bytes.
+        maximum: usize,
+    },
+    /// One owner projection exceeded its head-row bound.
+    ObjectOwnerProjectionTooLarge {
+        /// Actual projection bytes.
+        length: usize,
+        /// Maximum accepted bytes.
+        maximum: usize,
+    },
+    /// One routing projection exceeded its head-row bound.
+    ObjectRoutingProjectionTooLarge {
+        /// Actual projection bytes.
+        length: usize,
+        /// Maximum accepted bytes.
+        maximum: usize,
+    },
+    /// One object section contained too many head assertions.
+    TooManyObjectReads {
+        /// Actual assertion count.
+        count: usize,
+        /// Maximum accepted count.
+        maximum: usize,
+    },
+    /// One object section contained too many mutations.
+    TooManyObjectMutations {
+        /// Actual mutation count.
+        count: usize,
+        /// Maximum accepted count.
+        maximum: usize,
+    },
+    /// One object section asserted the same object identifier more than once.
+    DuplicateObjectReadId,
+    /// One object section mutated the same object identifier more than once.
+    DuplicateObjectMutationId,
+    /// One object mutation had no matching head assertion.
+    ObjectMutationWithoutRead {
+        /// Object missing from the read set.
+        object_id: ObjectId,
+    },
+    /// One object mutation was incompatible with the asserted head state.
+    InvalidObjectTransition {
+        /// Object whose create/update/delete transition was invalid.
+        object_id: ObjectId,
+    },
+    /// An asserted object version could not be incremented.
+    ObjectVersionOverflow {
+        /// Object whose next immutable version overflowed.
+        object_id: ObjectId,
+    },
+    /// An asserted object-head revision could not be incremented.
+    ObjectHeadRevisionOverflow {
+        /// Object whose ABA-safe head revision overflowed.
+        object_id: ObjectId,
+    },
+    /// One object section exceeded its aggregate represented-byte bound.
+    ObjectChangesTooLarge {
+        /// Aggregate represented bytes.
+        bytes: usize,
+        /// Maximum accepted bytes.
+        maximum: usize,
+    },
     /// State and invocation sections named different logical domains.
     StateDomainMismatch,
     /// Receipt and outbox request identities differed.
@@ -679,6 +774,54 @@ impl fmt::Display for DurableInvocationError {
                 f,
                 "durable outbox has {count} messages, maximum is {maximum}"
             ),
+            Self::InvalidCanonicalObject(error) => {
+                write!(f, "invalid canonical durable object: {error}")
+            }
+            Self::ZeroObjectVersion => f.write_str("durable object version must be non-zero"),
+            Self::ObjectBodyTooLarge { length, maximum } => write!(
+                f,
+                "durable object body is {length} bytes, maximum is {maximum}"
+            ),
+            Self::ObjectOwnerProjectionTooLarge { length, maximum } => write!(
+                f,
+                "durable object owner projection is {length} bytes, maximum is {maximum}"
+            ),
+            Self::ObjectRoutingProjectionTooLarge { length, maximum } => write!(
+                f,
+                "durable object routing projection is {length} bytes, maximum is {maximum}"
+            ),
+            Self::TooManyObjectReads { count, maximum } => write!(
+                f,
+                "durable object section has {count} reads, maximum is {maximum}"
+            ),
+            Self::TooManyObjectMutations { count, maximum } => write!(
+                f,
+                "durable object section has {count} mutations, maximum is {maximum}"
+            ),
+            Self::DuplicateObjectReadId => {
+                f.write_str("durable object section contains a duplicate read identifier")
+            }
+            Self::DuplicateObjectMutationId => {
+                f.write_str("durable object section contains a duplicate mutation identifier")
+            }
+            Self::ObjectMutationWithoutRead { object_id } => write!(
+                f,
+                "durable object mutation for {object_id} has no matching head assertion"
+            ),
+            Self::InvalidObjectTransition { object_id } => write!(
+                f,
+                "durable object mutation for {object_id} is incompatible with its asserted head"
+            ),
+            Self::ObjectVersionOverflow { object_id } => {
+                write!(f, "durable object version overflow for {object_id}")
+            }
+            Self::ObjectHeadRevisionOverflow { object_id } => {
+                write!(f, "durable object head revision overflow for {object_id}")
+            }
+            Self::ObjectChangesTooLarge { bytes, maximum } => write!(
+                f,
+                "durable object section represents {bytes} bytes, maximum is {maximum}"
+            ),
             Self::StateDomainMismatch => {
                 f.write_str("durable state section belongs to another domain")
             }
@@ -697,6 +840,12 @@ impl fmt::Display for DurableInvocationError {
 }
 
 impl Error for DurableInvocationError {}
+
+impl From<ObjectError> for DurableInvocationError {
+    fn from(value: ObjectError) -> Self {
+        Self::InvalidCanonicalObject(value)
+    }
+}
 
 /// Typed completed-request insertion for a structured durable invocation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -836,26 +985,914 @@ impl DurableOutboxBatch {
     }
 }
 
-/// Explicit object section while concrete object dispatch remains unsupported.
+/// Non-zero immutable version of one protocol object.
 ///
-/// This closed empty value prevents a normalized adapter from silently storing
-/// object data as generic state. Concrete object assertions/version/head writes
-/// require a later reviewed expansion of this operational API.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DurableObjectChanges;
+/// This is distinct from [`ObjectHeadRevision`]: object versions identify
+/// immutable bodies, while head revisions advance on every create, update,
+/// delete, and recreate to prevent ABA matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DurableObjectVersion(NonZeroU64);
+
+impl DurableObjectVersion {
+    /// First version assigned to a never-before-created object.
+    pub const FIRST: Self = Self(NonZeroU64::MIN);
+    /// Largest representable immutable object version.
+    pub const MAX: Self = Self(NonZeroU64::MAX);
+
+    /// Creates a non-zero immutable object version.
+    #[must_use]
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Returns the persisted unsigned representation.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    /// Returns the next immutable version without permitting wraparound.
+    #[must_use]
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.get().checked_add(1) {
+            Some(value) => Self::new(value),
+            None => None,
+        }
+    }
+}
+
+/// Non-zero ABA-safe revision of one mutable object-head row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ObjectHeadRevision(NonZeroU64);
+
+impl ObjectHeadRevision {
+    /// First revision installed by a create from true absence.
+    pub const FIRST: Self = Self(NonZeroU64::MIN);
+
+    /// Creates a non-zero object-head revision.
+    #[must_use]
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Returns the persisted unsigned representation.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    /// Returns the next head revision without permitting wraparound.
+    #[must_use]
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.get().checked_add(1) {
+            Some(value) => Self::new(value),
+            None => None,
+        }
+    }
+}
+
+/// Existing typed object plus its unchanged canonical [`objects::encode_object`] bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableInlineObject {
+    object: Object,
+    canonical_bytes: Vec<u8>,
+}
+
+impl DurableInlineObject {
+    fn from_object(object: Object) -> Result<Self, DurableInvocationError> {
+        let canonical_bytes: Vec<u8> = encode_object(&object)?;
+        Self::from_parts(object, canonical_bytes)
+    }
+
+    fn from_canonical_bytes(canonical_bytes: Vec<u8>) -> Result<Self, DurableInvocationError> {
+        if canonical_bytes.len() > MAX_DURABLE_INLINE_OBJECT_BYTES {
+            return Err(DurableInvocationError::ObjectBodyTooLarge {
+                length: canonical_bytes.len(),
+                maximum: MAX_DURABLE_INLINE_OBJECT_BYTES,
+            });
+        }
+        let object: Object = decode_object(&canonical_bytes)?;
+        Self::from_parts(object, canonical_bytes)
+    }
+
+    fn from_parts(
+        object: Object,
+        canonical_bytes: Vec<u8>,
+    ) -> Result<Self, DurableInvocationError> {
+        if canonical_bytes.len() > MAX_DURABLE_INLINE_OBJECT_BYTES {
+            return Err(DurableInvocationError::ObjectBodyTooLarge {
+                length: canonical_bytes.len(),
+                maximum: MAX_DURABLE_INLINE_OBJECT_BYTES,
+            });
+        }
+        Ok(Self {
+            object,
+            canonical_bytes,
+        })
+    }
+
+    /// Returns the existing typed object recovered from these canonical bytes.
+    #[must_use]
+    pub const fn object(&self) -> &Object {
+        &self.object
+    }
+
+    /// Returns exact bytes produced by the existing canonical object encoder.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+}
+
+/// Generation-one object payload: exactly one inline object or blob reference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DurableObjectPayload {
+    /// Existing canonical [`Object`] bytes stored in the version row.
+    Inline(DurableInlineObject),
+    /// Self-describing digest of canonical [`Object`] bytes in the blob store.
+    BlobReference(Digest32),
+}
+
+impl DurableObjectPayload {
+    /// Returns the inline typed object when the payload is stored locally.
+    #[must_use]
+    pub const fn inline(&self) -> Option<&DurableInlineObject> {
+        match self {
+            Self::Inline(inline) => Some(inline),
+            Self::BlobReference(_) => None,
+        }
+    }
+
+    /// Returns the external canonical-object digest when this is a blob row.
+    #[must_use]
+    pub const fn blob_digest(&self) -> Option<Digest32> {
+        match self {
+            Self::Inline(_) => None,
+            Self::BlobReference(digest) => Some(*digest),
+        }
+    }
+}
+
+/// Complete generation-one immutable object-version row projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableObjectVersionRecord {
+    object_id: ObjectId,
+    object_version: DurableObjectVersion,
+    digest: Digest32,
+    schema_version: u32,
+    created_checkpoint: u64,
+    payload: DurableObjectPayload,
+}
+
+impl DurableObjectVersionRecord {
+    /// Builds one inline record from the existing typed object model and encoder.
+    ///
+    /// The digest is supplied by the trusted execution layer after hashing with
+    /// its configured object-digest suite; storage does not select or recompute
+    /// protocol hashes.
+    pub fn from_inline_object(
+        object: Object,
+        digest: Digest32,
+        created_checkpoint: u64,
+    ) -> Result<Self, DurableInvocationError> {
+        let object_version: DurableObjectVersion = DurableObjectVersion::new(object.version)
+            .ok_or(DurableInvocationError::ZeroObjectVersion)?;
+        let object_id: ObjectId = object.id;
+        let schema_version: u32 = object.schema_version;
+        let payload: DurableObjectPayload =
+            DurableObjectPayload::Inline(DurableInlineObject::from_object(object)?);
+        Ok(Self {
+            object_id,
+            object_version,
+            digest,
+            schema_version,
+            created_checkpoint,
+            payload,
+        })
+    }
+
+    /// Reconstructs an inline row from persisted canonical object bytes.
+    pub fn from_inline_canonical_bytes(
+        canonical_bytes: Vec<u8>,
+        digest: Digest32,
+        created_checkpoint: u64,
+    ) -> Result<Self, DurableInvocationError> {
+        let inline: DurableInlineObject =
+            DurableInlineObject::from_canonical_bytes(canonical_bytes)?;
+        let object: &Object = inline.object();
+        let object_version: DurableObjectVersion = DurableObjectVersion::new(object.version)
+            .ok_or(DurableInvocationError::ZeroObjectVersion)?;
+        Ok(Self {
+            object_id: object.id,
+            object_version,
+            digest,
+            schema_version: object.schema_version,
+            created_checkpoint,
+            payload: DurableObjectPayload::Inline(inline),
+        })
+    }
+
+    /// Builds one existing-schema blob-reference row.
+    ///
+    /// The trusted execution layer must already have verified that the
+    /// referenced canonical [`Object`] has this identity, version, schema, and
+    /// object digest. Storage persists the self-describing reference and does
+    /// not fetch blobs or select a protocol hash suite during commit.
+    #[must_use]
+    pub const fn from_blob_reference(
+        object_id: ObjectId,
+        object_version: DurableObjectVersion,
+        digest: Digest32,
+        schema_version: u32,
+        created_checkpoint: u64,
+        blob_digest: Digest32,
+    ) -> Self {
+        Self {
+            object_id,
+            object_version,
+            digest,
+            schema_version,
+            created_checkpoint,
+            payload: DurableObjectPayload::BlobReference(blob_digest),
+        }
+    }
+
+    /// Returns the row's stable object identifier.
+    #[must_use]
+    pub const fn object_id(&self) -> ObjectId {
+        self.object_id
+    }
+
+    /// Returns the immutable object version.
+    #[must_use]
+    pub const fn object_version(&self) -> DurableObjectVersion {
+        self.object_version
+    }
+
+    /// Returns the verified self-describing digest of this object version.
+    #[must_use]
+    pub const fn digest(&self) -> Digest32 {
+        self.digest
+    }
+
+    /// Returns the explicit object schema version stored with this payload.
+    #[must_use]
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    /// Returns the generation-one canonical record type projection.
+    ///
+    /// This is the stable `objects::Object` frame identifier stored in the SQL
+    /// `type_id` column, not the logical [`Object::type_hash`].
+    #[must_use]
+    pub const fn canonical_record_type_id(&self) -> u32 {
+        DURABLE_OBJECT_CANONICAL_RECORD_TYPE_ID
+    }
+
+    /// Returns the checkpoint that created this immutable version.
+    #[must_use]
+    pub const fn created_checkpoint(&self) -> u64 {
+        self.created_checkpoint
+    }
+
+    /// Returns the exactly-one inline/blob payload.
+    #[must_use]
+    pub const fn payload(&self) -> &DurableObjectPayload {
+        &self.payload
+    }
+
+    /// Returns the logical type hash when inline bytes are locally available.
+    ///
+    /// Blob-backed rows recover this value by fetching and decoding the
+    /// referenced canonical [`Object`] with [`objects::decode_object`].
+    #[must_use]
+    pub const fn inline_type_hash(&self) -> Option<Digest32> {
+        match &self.payload {
+            DurableObjectPayload::Inline(inline) => Some(inline.object().type_hash),
+            DurableObjectPayload::BlobReference(_) => None,
+        }
+    }
+}
+
+/// Bounded optional typed owner projection stored on a current object head.
+///
+/// This projection supports routing and conflict assertions but is not an
+/// authorization source. Execution must load the linked immutable version,
+/// verify the head version/digest, decode an inline object, and compare its
+/// typed owner. Blob-backed execution requires verified blob content first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DurableObjectOwnerProjection {
+    owner: Option<Owner>,
+    canonical_bytes: Option<Vec<u8>>,
+}
+
+impl DurableObjectOwnerProjection {
+    /// Derives a bounded projection through the existing canonical owner encoder.
+    pub fn from_owner(owner: Owner) -> Result<Self, DurableInvocationError> {
+        let canonical_bytes: Vec<u8> = encode_owner(&owner)?;
+        Self::from_parts(Some(owner), Some(canonical_bytes))
+    }
+
+    /// Reconstructs an optional typed projection from an existing head row.
+    pub fn from_canonical_bytes(
+        canonical_bytes: Option<Vec<u8>>,
+    ) -> Result<Self, DurableInvocationError> {
+        if let Some(bytes) = &canonical_bytes
+            && bytes.len() > MAX_DURABLE_OBJECT_PROJECTION_BYTES
+        {
+            return Err(DurableInvocationError::ObjectOwnerProjectionTooLarge {
+                length: bytes.len(),
+                maximum: MAX_DURABLE_OBJECT_PROJECTION_BYTES,
+            });
+        }
+        let owner: Option<Owner> = canonical_bytes.as_deref().map(decode_owner).transpose()?;
+        Self::from_parts(owner, canonical_bytes)
+    }
+
+    fn from_parts(
+        owner: Option<Owner>,
+        canonical_bytes: Option<Vec<u8>>,
+    ) -> Result<Self, DurableInvocationError> {
+        if let Some(bytes) = &canonical_bytes
+            && bytes.len() > MAX_DURABLE_OBJECT_PROJECTION_BYTES
+        {
+            return Err(DurableInvocationError::ObjectOwnerProjectionTooLarge {
+                length: bytes.len(),
+                maximum: MAX_DURABLE_OBJECT_PROJECTION_BYTES,
+            });
+        }
+        Ok(Self {
+            owner,
+            canonical_bytes,
+        })
+    }
+
+    /// Returns the typed owner when the projection is present.
+    #[must_use]
+    pub const fn owner(&self) -> Option<&Owner> {
+        self.owner.as_ref()
+    }
+
+    /// Returns the exact optional canonical owner bytes.
+    #[must_use]
+    pub fn bytes(&self) -> Option<&[u8]> {
+        self.canonical_bytes.as_deref()
+    }
+}
+
+/// Bounded optional routing projection stored on a current object head.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DurableObjectRoutingProjection(Option<Vec<u8>>);
+
+impl DurableObjectRoutingProjection {
+    /// Creates a bounded projection while preserving absent versus empty bytes.
+    pub fn new(bytes: Option<Vec<u8>>) -> Result<Self, DurableInvocationError> {
+        if let Some(bytes) = &bytes
+            && bytes.len() > MAX_DURABLE_OBJECT_PROJECTION_BYTES
+        {
+            return Err(DurableInvocationError::ObjectRoutingProjectionTooLarge {
+                length: bytes.len(),
+                maximum: MAX_DURABLE_OBJECT_PROJECTION_BYTES,
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the exact optional routing projection bytes.
+    #[must_use]
+    pub fn bytes(&self) -> Option<&[u8]> {
+        self.0.as_deref()
+    }
+}
+
+/// Exact object-head observation, including absence and retained tombstones.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DurableObjectHead {
+    /// No head row has ever existed for this object identifier.
+    Absent,
+    /// A delete retained the last object version and an ABA-safe head revision.
+    Tombstoned {
+        /// Revision installed by the delete.
+        head_revision: ObjectHeadRevision,
+        /// Last immutable version reconstructed from retained version history.
+        ///
+        /// A normalized tombstone head stores current version/digest as NULL;
+        /// adapters obtain this value from the locked immutable-version history.
+        last_object_version: DurableObjectVersion,
+    },
+    /// The body-free head points to one current immutable object version.
+    Current {
+        /// Revision installed by the latest create, update, or recreate.
+        head_revision: ObjectHeadRevision,
+        /// Current immutable object version.
+        object_version: DurableObjectVersion,
+        /// Verified self-describing digest of the current object version.
+        digest: Digest32,
+        /// Bounded ownership projection used by later routing/fast-path policy.
+        owner_projection: DurableObjectOwnerProjection,
+        /// Bounded logical routing projection; never physical placement authority.
+        routing_projection: DurableObjectRoutingProjection,
+    },
+}
+
+impl DurableObjectHead {
+    /// Returns the ABA-safe revision, or `None` only for true absence.
+    #[must_use]
+    pub const fn head_revision(&self) -> Option<ObjectHeadRevision> {
+        match self {
+            Self::Absent => None,
+            Self::Tombstoned { head_revision, .. } | Self::Current { head_revision, .. } => {
+                Some(*head_revision)
+            }
+        }
+    }
+
+    /// Returns the current or retained last object version.
+    #[must_use]
+    pub const fn object_version(&self) -> Option<DurableObjectVersion> {
+        match self {
+            Self::Absent => None,
+            Self::Tombstoned {
+                last_object_version,
+                ..
+            } => Some(*last_object_version),
+            Self::Current { object_version, .. } => Some(*object_version),
+        }
+    }
+
+    /// Returns the current self-describing digest.
+    #[must_use]
+    pub const fn digest(&self) -> Option<Digest32> {
+        match self {
+            Self::Current { digest, .. } => Some(*digest),
+            Self::Absent | Self::Tombstoned { .. } => None,
+        }
+    }
+
+    /// Returns the current owner projection.
+    #[must_use]
+    pub const fn owner_projection(&self) -> Option<&DurableObjectOwnerProjection> {
+        match self {
+            Self::Current {
+                owner_projection, ..
+            } => Some(owner_projection),
+            Self::Absent | Self::Tombstoned { .. } => None,
+        }
+    }
+
+    /// Returns the current logical routing projection.
+    #[must_use]
+    pub const fn routing_projection(&self) -> Option<&DurableObjectRoutingProjection> {
+        match self {
+            Self::Current {
+                routing_projection, ..
+            } => Some(routing_projection),
+            Self::Absent | Self::Tombstoned { .. } => None,
+        }
+    }
+}
+
+/// Body-free object-head projection suitable for typed conflict outcomes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurableObjectHeadSummary {
+    /// No head row exists.
+    Absent,
+    /// A delete retained the last version and head revision.
+    Tombstoned {
+        /// Revision installed by the delete.
+        head_revision: ObjectHeadRevision,
+        /// Last immutable version reconstructed from retained history.
+        last_object_version: DurableObjectVersion,
+    },
+    /// The head points to a current immutable version.
+    Current {
+        /// Revision installed by the latest write.
+        head_revision: ObjectHeadRevision,
+        /// Current immutable version.
+        object_version: DurableObjectVersion,
+    },
+}
+
+impl From<&DurableObjectHead> for DurableObjectHeadSummary {
+    fn from(head: &DurableObjectHead) -> Self {
+        match head {
+            DurableObjectHead::Absent => Self::Absent,
+            DurableObjectHead::Tombstoned {
+                head_revision,
+                last_object_version,
+            } => Self::Tombstoned {
+                head_revision: *head_revision,
+                last_object_version: *last_object_version,
+            },
+            DurableObjectHead::Current {
+                head_revision,
+                object_version,
+                ..
+            } => Self::Current {
+                head_revision: *head_revision,
+                object_version: *object_version,
+            },
+        }
+    }
+}
+
+/// One typed exact object-head assertion from a complete invocation read set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableObjectHeadRead {
+    object_id: ObjectId,
+    expected: DurableObjectHead,
+}
+
+impl DurableObjectHeadRead {
+    /// Creates one exact object-head assertion.
+    #[must_use]
+    pub const fn new(object_id: ObjectId, expected: DurableObjectHead) -> Self {
+        Self {
+            object_id,
+            expected,
+        }
+    }
+
+    /// Returns the exact object identifier that was read.
+    #[must_use]
+    pub const fn object_id(&self) -> ObjectId {
+        self.object_id
+    }
+
+    /// Returns the complete expected head observation.
+    #[must_use]
+    pub const fn expected(&self) -> &DurableObjectHead {
+        &self.expected
+    }
+}
+
+/// Create, update, or delete applied after the matching head assertion passes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DurableObjectMutation {
+    /// Creates a truly absent object or recreates a retained tombstone.
+    Create {
+        /// New immutable version metadata and inline canonical body.
+        version: DurableObjectVersionRecord,
+        /// New bounded owner projection.
+        owner_projection: DurableObjectOwnerProjection,
+        /// New bounded logical routing projection.
+        routing_projection: DurableObjectRoutingProjection,
+    },
+    /// Replaces one current object with its checked next immutable version.
+    Update {
+        /// New immutable version metadata and inline canonical body.
+        version: DurableObjectVersionRecord,
+        /// Replacement bounded owner projection.
+        owner_projection: DurableObjectOwnerProjection,
+        /// Replacement bounded logical routing projection.
+        routing_projection: DurableObjectRoutingProjection,
+    },
+    /// Deletes one current object while retaining version and head tombstones.
+    Delete,
+}
+
+impl DurableObjectMutation {
+    /// Returns the new immutable version for create/update mutations.
+    #[must_use]
+    pub const fn object_version(&self) -> Option<DurableObjectVersion> {
+        match self {
+            Self::Create { version, .. } | Self::Update { version, .. } => {
+                Some(version.object_version())
+            }
+            Self::Delete => None,
+        }
+    }
+
+    /// Returns the new immutable record for create/update mutations.
+    #[must_use]
+    pub const fn version(&self) -> Option<&DurableObjectVersionRecord> {
+        match self {
+            Self::Create { version, .. } | Self::Update { version, .. } => Some(version),
+            Self::Delete => None,
+        }
+    }
+}
+
+/// One object mutation keyed separately from its required read assertion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableObjectMutationEntry {
+    object_id: ObjectId,
+    mutation: DurableObjectMutation,
+}
+
+impl DurableObjectMutationEntry {
+    /// Creates one typed object mutation.
+    #[must_use]
+    pub const fn new(object_id: ObjectId, mutation: DurableObjectMutation) -> Self {
+        Self {
+            object_id,
+            mutation,
+        }
+    }
+
+    /// Returns the object identifier to mutate.
+    #[must_use]
+    pub const fn object_id(&self) -> ObjectId {
+        self.object_id
+    }
+
+    /// Returns the requested create/update/delete operation.
+    #[must_use]
+    pub const fn mutation(&self) -> &DurableObjectMutation {
+        &self.mutation
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DurableObjectChangeData {
+    reads: Vec<DurableObjectHeadRead>,
+    mutations: Vec<DurableObjectMutationEntry>,
+}
+
+/// Bounded canonical object-head reads and contained object mutations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableObjectChanges {
+    data: Option<Arc<DurableObjectChangeData>>,
+    represented_bytes: usize,
+}
+
+impl Default for DurableObjectChanges {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
 
 impl DurableObjectChanges {
-    /// Creates the only currently supported empty object section.
+    /// Creates an explicit empty object section without allocating.
     #[must_use]
     pub const fn empty() -> Self {
-        Self
+        Self {
+            data: None,
+            represented_bytes: 0,
+        }
     }
 
-    /// Returns true until concrete typed object changes are implemented.
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        true
+    /// Validates, canonicalizes, and bounds one complete object section.
+    pub fn new(
+        mut reads: Vec<DurableObjectHeadRead>,
+        mut mutations: Vec<DurableObjectMutationEntry>,
+    ) -> Result<Self, DurableInvocationError> {
+        if reads.len() > MAX_DURABLE_OBJECT_READS {
+            return Err(DurableInvocationError::TooManyObjectReads {
+                count: reads.len(),
+                maximum: MAX_DURABLE_OBJECT_READS,
+            });
+        }
+        if mutations.len() > MAX_DURABLE_OBJECT_MUTATIONS {
+            return Err(DurableInvocationError::TooManyObjectMutations {
+                count: mutations.len(),
+                maximum: MAX_DURABLE_OBJECT_MUTATIONS,
+            });
+        }
+        if reads.is_empty() && mutations.is_empty() {
+            return Ok(Self::empty());
+        }
+
+        reads.sort_by_key(DurableObjectHeadRead::object_id);
+        if reads
+            .windows(2)
+            .any(|pair| pair[0].object_id() == pair[1].object_id())
+        {
+            return Err(DurableInvocationError::DuplicateObjectReadId);
+        }
+        mutations.sort_by_key(DurableObjectMutationEntry::object_id);
+        if mutations
+            .windows(2)
+            .any(|pair| pair[0].object_id() == pair[1].object_id())
+        {
+            return Err(DurableInvocationError::DuplicateObjectMutationId);
+        }
+
+        for mutation in &mutations {
+            let read_index: usize = reads
+                .binary_search_by_key(&mutation.object_id(), DurableObjectHeadRead::object_id)
+                .map_err(|_| DurableInvocationError::ObjectMutationWithoutRead {
+                    object_id: mutation.object_id(),
+                })?;
+            validate_object_transition(&reads[read_index], mutation)?;
+        }
+
+        let represented_bytes: usize = represented_object_change_bytes(&reads, &mutations)?;
+        Ok(Self {
+            data: Some(Arc::new(DurableObjectChangeData { reads, mutations })),
+            represented_bytes,
+        })
     }
+
+    /// Returns whether this invocation observes and mutates no objects.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.data.is_none()
+    }
+
+    /// Returns object-head assertions in canonical identifier order.
+    #[must_use]
+    pub fn reads(&self) -> &[DurableObjectHeadRead] {
+        self.data.as_ref().map_or(&[], |data| data.reads.as_slice())
+    }
+
+    /// Returns object mutations in canonical identifier order.
+    #[must_use]
+    pub fn mutations(&self) -> &[DurableObjectMutationEntry] {
+        self.data
+            .as_ref()
+            .map_or(&[], |data| data.mutations.as_slice())
+    }
+
+    /// Returns bytes covered by deterministic object-section accounting.
+    #[must_use]
+    pub const fn represented_bytes(&self) -> usize {
+        self.represented_bytes
+    }
+}
+
+fn validate_object_transition(
+    read: &DurableObjectHeadRead,
+    mutation: &DurableObjectMutationEntry,
+) -> Result<(), DurableInvocationError> {
+    let object_id: ObjectId = mutation.object_id();
+    if let Some(version) = mutation.mutation().version() {
+        if version.object_id() != object_id {
+            return Err(DurableInvocationError::InvalidObjectTransition { object_id });
+        }
+        if let DurableObjectPayload::Inline(inline) = version.payload() {
+            let projected_owner: Option<&Owner> = match mutation.mutation() {
+                DurableObjectMutation::Create {
+                    owner_projection, ..
+                }
+                | DurableObjectMutation::Update {
+                    owner_projection, ..
+                } => owner_projection.owner(),
+                DurableObjectMutation::Delete => None,
+            };
+            if projected_owner != Some(&inline.object().owner) {
+                return Err(DurableInvocationError::InvalidObjectTransition { object_id });
+            }
+        }
+    }
+    let next_head_revision: Option<ObjectHeadRevision> = match read.expected() {
+        DurableObjectHead::Absent => Some(ObjectHeadRevision::FIRST),
+        DurableObjectHead::Tombstoned { head_revision, .. }
+        | DurableObjectHead::Current { head_revision, .. } => head_revision.checked_next(),
+    };
+    if next_head_revision.is_none() {
+        return Err(DurableInvocationError::ObjectHeadRevisionOverflow { object_id });
+    }
+
+    match (read.expected(), mutation.mutation()) {
+        (DurableObjectHead::Absent, DurableObjectMutation::Create { version, .. })
+            if version.object_version() == DurableObjectVersion::FIRST =>
+        {
+            Ok(())
+        }
+        (
+            DurableObjectHead::Tombstoned {
+                last_object_version: previous,
+                ..
+            },
+            DurableObjectMutation::Create { version, .. },
+        ) => match previous.checked_next() {
+            Some(expected) if expected == version.object_version() => Ok(()),
+            Some(_) => Err(DurableInvocationError::InvalidObjectTransition { object_id }),
+            None => Err(DurableInvocationError::ObjectVersionOverflow { object_id }),
+        },
+        (
+            DurableObjectHead::Current {
+                object_version: previous,
+                ..
+            },
+            DurableObjectMutation::Update { version, .. },
+        ) => match previous.checked_next() {
+            Some(expected) if expected == version.object_version() => Ok(()),
+            Some(_) => Err(DurableInvocationError::InvalidObjectTransition { object_id }),
+            None => Err(DurableInvocationError::ObjectVersionOverflow { object_id }),
+        },
+        (DurableObjectHead::Current { .. }, DurableObjectMutation::Delete) => Ok(()),
+        _ => Err(DurableInvocationError::InvalidObjectTransition { object_id }),
+    }
+}
+
+fn represented_object_change_bytes(
+    reads: &[DurableObjectHeadRead],
+    mutations: &[DurableObjectMutationEntry],
+) -> Result<usize, DurableInvocationError> {
+    let mut bytes: usize = 2 * size_of::<u32>();
+    for read in reads {
+        bytes = checked_object_bytes(bytes, read.object_id().as_bytes().len().saturating_add(1))?;
+        match read.expected() {
+            DurableObjectHead::Absent => {}
+            DurableObjectHead::Tombstoned { .. } => {
+                bytes = checked_object_bytes(bytes, 2 * size_of::<u64>())?;
+            }
+            DurableObjectHead::Current {
+                owner_projection,
+                routing_projection,
+                ..
+            } => {
+                bytes = checked_object_bytes(
+                    bytes,
+                    (2 * size_of::<u64>()).saturating_add(size_of::<u16>() + 32),
+                )?;
+                bytes = represented_object_projection_bytes(bytes, owner_projection.bytes())?;
+                bytes = represented_object_projection_bytes(bytes, routing_projection.bytes())?;
+            }
+        }
+    }
+    for mutation in mutations {
+        bytes = checked_object_bytes(
+            bytes,
+            mutation.object_id().as_bytes().len().saturating_add(1),
+        )?;
+        match mutation.mutation() {
+            DurableObjectMutation::Create {
+                version,
+                owner_projection,
+                routing_projection,
+            }
+            | DurableObjectMutation::Update {
+                version,
+                owner_projection,
+                routing_projection,
+            } => {
+                bytes = represented_object_version_bytes(bytes, version)?;
+                bytes = represented_object_projection_bytes(bytes, owner_projection.bytes())?;
+                bytes = represented_object_projection_bytes(bytes, routing_projection.bytes())?;
+            }
+            DurableObjectMutation::Delete => {}
+        }
+    }
+    Ok(bytes)
+}
+
+fn represented_object_version_bytes(
+    bytes: usize,
+    version: &DurableObjectVersionRecord,
+) -> Result<usize, DurableInvocationError> {
+    let bytes: usize = checked_object_bytes(
+        bytes,
+        version
+            .object_id()
+            .as_bytes()
+            .len()
+            .saturating_add(2 * size_of::<u64>())
+            .saturating_add(2 * size_of::<u32>())
+            .saturating_add(size_of::<u16>() + 32)
+            .saturating_add(1),
+    )?;
+    match version.payload() {
+        DurableObjectPayload::Inline(inline) => checked_object_bytes(
+            bytes,
+            size_of::<u32>().saturating_add(inline.canonical_bytes().len()),
+        ),
+        DurableObjectPayload::BlobReference(_) => {
+            checked_object_bytes(bytes, size_of::<u16>() + 32)
+        }
+    }
+}
+
+fn represented_object_projection_bytes(
+    bytes: usize,
+    projection: Option<&[u8]>,
+) -> Result<usize, DurableInvocationError> {
+    let projection_bytes: usize = projection.map_or(0, <[u8]>::len);
+    checked_object_bytes(
+        bytes,
+        1_usize
+            .saturating_add(size_of::<u32>())
+            .saturating_add(projection_bytes),
+    )
+}
+
+fn checked_object_bytes(
+    current: usize,
+    additional: usize,
+) -> Result<usize, DurableInvocationError> {
+    let bytes: usize =
+        current
+            .checked_add(additional)
+            .ok_or(DurableInvocationError::ObjectChangesTooLarge {
+                bytes: usize::MAX,
+                maximum: MAX_DURABLE_OBJECT_CHANGES_BYTES,
+            })?;
+    if bytes > MAX_DURABLE_OBJECT_CHANGES_BYTES {
+        return Err(DurableInvocationError::ObjectChangesTooLarge {
+            bytes,
+            maximum: MAX_DURABLE_OBJECT_CHANGES_BYTES,
+        });
+    }
+    Ok(bytes)
 }
 
 /// Structured, bounded input consumed directly by normalized durable stores.
@@ -900,6 +1937,7 @@ impl DurableInvocationTransaction {
         if let Some(state) = &state {
             represented_bytes = represented_bytes.saturating_add(state.represented_bytes());
         }
+        represented_bytes = represented_bytes.saturating_add(objects.represented_bytes());
         if let Some(outbox) = &outbox {
             represented_bytes = represented_bytes
                 .saturating_add(outbox.request_id().as_bytes().len())
@@ -942,8 +1980,14 @@ impl DurableInvocationTransaction {
 
     /// Returns the explicit object section.
     #[must_use]
-    pub const fn objects(&self) -> DurableObjectChanges {
-        self.objects
+    pub fn objects(&self) -> DurableObjectChanges {
+        self.objects.clone()
+    }
+
+    /// Borrows the explicit object section without cloning its shared backing.
+    #[must_use]
+    pub const fn object_changes(&self) -> &DurableObjectChanges {
+        &self.objects
     }
 
     /// Returns the typed completed-request insertion.
@@ -1510,6 +2554,13 @@ pub enum DurableCommitRejection {
         /// Revision observed while the store held commit authority.
         current_revision: StateRevision,
     },
+    /// One object-head assertion no longer matched and no section was applied.
+    ObjectConflict {
+        /// First conflicting object in canonical identifier order.
+        object_id: ObjectId,
+        /// Body-free head observed while holding commit authority.
+        current: DurableObjectHeadSummary,
+    },
     /// The request receipt appeared after the caller's replay read.
     RequestAlreadyCommitted,
     /// The transaction named a domain other than the store's bound domain.
@@ -1742,6 +2793,43 @@ pub trait DurableDomainStateStore {
 /// Implementations consume typed receipt/outbox sections directly. They must
 /// not inspect generic state-key prefixes to infer relational record kinds.
 pub trait StructuredDurableDomainStateStore: DurableDomainStateStore {
+    /// Reads one exact typed object head under the invocation authority.
+    ///
+    /// Existing adapters fail closed until they implement normalized object
+    /// heads and immutable versions; they must never infer objects from generic
+    /// state-key prefixes. The returned owner/routing projections are body-free
+    /// routing metadata, not authorization. Before authorizing execution, a
+    /// caller must separately read the exact immutable version, verify its
+    /// version/digest against this head, decode an inline object, and compare
+    /// its typed owner. Blob references require verified content first.
+    fn get_object_head(
+        &self,
+        _context: &DurableOperationContext,
+        _domain: AtomicityDomainId,
+        _object_id: ObjectId,
+    ) -> Result<DurableObjectHead, DurableReadError> {
+        Err(DurableReadError::InvalidRequest(
+            RuntimeError::UnsupportedObjectStorage,
+        ))
+    }
+
+    /// Reads one exact immutable object-version payload record.
+    ///
+    /// Existing adapters fail closed until they implement normalized object
+    /// versions. Blob-backed records return their typed external digest rather
+    /// than inventing unavailable inline bytes.
+    fn get_object_version(
+        &self,
+        _context: &DurableOperationContext,
+        _domain: AtomicityDomainId,
+        _object_id: ObjectId,
+        _object_version: DurableObjectVersion,
+    ) -> Result<Option<DurableObjectVersionRecord>, DurableReadError> {
+        Err(DurableReadError::InvalidRequest(
+            RuntimeError::UnsupportedObjectStorage,
+        ))
+    }
+
     /// Reads and validates one typed completed-request receipt projection.
     fn get_request_receipt(
         &self,
@@ -2229,12 +3317,38 @@ fn read_memory_versioned(
 }
 
 type MemoryDurableInvocationKey = ([u8; 32], [u8; 32]);
+type MemoryDurableObjectHeadKey = ([u8; 32], ObjectId);
+type MemoryDurableObjectVersionKey = ([u8; 32], ObjectId, DurableObjectVersion);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MemoryStoredObjectHead {
+    Tombstoned {
+        head_revision: ObjectHeadRevision,
+    },
+    Current {
+        head_revision: ObjectHeadRevision,
+        object_version: DurableObjectVersion,
+        digest: Digest32,
+        owner_projection: DurableObjectOwnerProjection,
+        routing_projection: DurableObjectRoutingProjection,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct PreparedMemoryObjectMutation {
+    object_id: ObjectId,
+    head: MemoryStoredObjectHead,
+    version: Option<DurableObjectVersionRecord>,
+}
 
 #[derive(Debug)]
 struct MemoryDurableStoreData {
+    bound_domain: Option<AtomicityDomainId>,
     active_writer_fence: WriterFenceGeneration,
     now_unix_millis: u64,
     state_domains: MemoryDomainState,
+    object_heads: BTreeMap<MemoryDurableObjectHeadKey, MemoryStoredObjectHead>,
+    object_versions: BTreeMap<MemoryDurableObjectVersionKey, DurableObjectVersionRecord>,
     receipts: BTreeMap<MemoryDurableInvocationKey, DurableRequestReceipt>,
     outboxes: BTreeMap<MemoryDurableInvocationKey, DurableOutboxBatch>,
     deliveries: BTreeMap<MemoryDurableInvocationKey, MemoryOutboxDelivery>,
@@ -2281,11 +3395,34 @@ impl MemoryDurableStateStore {
     /// Creates an empty fixture with one authoritative writer generation.
     #[must_use]
     pub fn new(active_writer_fence: WriterFenceGeneration) -> Self {
+        Self::new_with_optional_domain(None, active_writer_fence)
+    }
+
+    /// Creates an empty fixture bound to one logical atomicity domain.
+    ///
+    /// This mirrors production adapters that reject a caller-selected domain
+    /// before touching storage while preserving [`Self::new`] for tests that
+    /// intentionally exercise multiple domains in one ephemeral store.
+    #[must_use]
+    pub fn new_bound(
+        bound_domain: AtomicityDomainId,
+        active_writer_fence: WriterFenceGeneration,
+    ) -> Self {
+        Self::new_with_optional_domain(Some(bound_domain), active_writer_fence)
+    }
+
+    fn new_with_optional_domain(
+        bound_domain: Option<AtomicityDomainId>,
+        active_writer_fence: WriterFenceGeneration,
+    ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(MemoryDurableStoreData {
+                bound_domain,
                 active_writer_fence,
                 now_unix_millis: 0,
                 state_domains: BTreeMap::new(),
+                object_heads: BTreeMap::new(),
+                object_versions: BTreeMap::new(),
                 receipts: BTreeMap::new(),
                 outboxes: BTreeMap::new(),
                 deliveries: BTreeMap::new(),
@@ -2326,6 +3463,18 @@ fn validate_memory_durable_read_authority(
     Ok(())
 }
 
+fn validate_memory_durable_read_domain(
+    data: &MemoryDurableStoreData,
+    domain: AtomicityDomainId,
+) -> Result<(), DurableReadError> {
+    if data.bound_domain.is_some_and(|bound| bound != domain) {
+        return Err(DurableReadError::InvalidRequest(
+            RuntimeError::AtomicityDomainMismatch,
+        ));
+    }
+    Ok(())
+}
+
 fn validate_memory_durable_commit_authority(
     data: &MemoryDurableStoreData,
     context: &DurableOperationContext,
@@ -2337,6 +3486,16 @@ fn validate_memory_durable_commit_authority(
     }
     if context.deadline().is_expired_at(data.now_unix_millis) {
         return Err(DurableCommitRejection::DeadlineExceededBeforeCommit);
+    }
+    Ok(())
+}
+
+fn validate_memory_durable_commit_domain(
+    data: &MemoryDurableStoreData,
+    domain: AtomicityDomainId,
+) -> Result<(), DurableCommitRejection> {
+    if data.bound_domain.is_some_and(|bound| bound != domain) {
+        return Err(DurableCommitRejection::AtomicityDomainMismatch);
     }
     Ok(())
 }
@@ -2397,6 +3556,175 @@ fn apply_memory_durable_mutations(
     Ok(())
 }
 
+fn read_memory_object_head(
+    data: &MemoryDurableStoreData,
+    domain: AtomicityDomainId,
+    object_id: ObjectId,
+) -> Result<DurableObjectHead, DurableReadError> {
+    let domain_bytes: [u8; 32] = *domain.as_bytes();
+    let head_key: MemoryDurableObjectHeadKey = (domain_bytes, object_id);
+    match data.object_heads.get(&head_key) {
+        None => {
+            let retained_version_exists: bool = data
+                .object_versions
+                .range(
+                    (domain_bytes, object_id, DurableObjectVersion::FIRST)
+                        ..=(domain_bytes, object_id, DurableObjectVersion::MAX),
+                )
+                .next()
+                .is_some();
+            if retained_version_exists {
+                return Err(DurableReadError::InvalidPersistedState);
+            }
+            Ok(DurableObjectHead::Absent)
+        }
+        Some(MemoryStoredObjectHead::Tombstoned { head_revision }) => {
+            let last_object_version: DurableObjectVersion = data
+                .object_versions
+                .range(
+                    (domain_bytes, object_id, DurableObjectVersion::FIRST)
+                        ..=(domain_bytes, object_id, DurableObjectVersion::MAX),
+                )
+                .next_back()
+                .map(|(key, _)| key.2)
+                .ok_or(DurableReadError::InvalidPersistedState)?;
+            Ok(DurableObjectHead::Tombstoned {
+                head_revision: *head_revision,
+                last_object_version,
+            })
+        }
+        Some(MemoryStoredObjectHead::Current {
+            head_revision,
+            object_version,
+            digest,
+            owner_projection,
+            routing_projection,
+        }) => Ok(DurableObjectHead::Current {
+            head_revision: *head_revision,
+            object_version: *object_version,
+            digest: *digest,
+            owner_projection: owner_projection.clone(),
+            routing_projection: routing_projection.clone(),
+        }),
+    }
+}
+
+fn read_memory_object_version(
+    data: &MemoryDurableStoreData,
+    domain: AtomicityDomainId,
+    object_id: ObjectId,
+    object_version: DurableObjectVersion,
+) -> Result<Option<DurableObjectVersionRecord>, DurableReadError> {
+    let key: MemoryDurableObjectVersionKey = (*domain.as_bytes(), object_id, object_version);
+    let record: Option<DurableObjectVersionRecord> = data.object_versions.get(&key).cloned();
+    if record.as_ref().is_some_and(|record| {
+        record.object_id() != object_id || record.object_version() != object_version
+    }) {
+        return Err(DurableReadError::InvalidPersistedState);
+    }
+    Ok(record)
+}
+
+fn validate_memory_object_reads(
+    data: &MemoryDurableStoreData,
+    domain: AtomicityDomainId,
+    reads: &[DurableObjectHeadRead],
+) -> Result<(), DurableCommitRejection> {
+    for read in reads {
+        let current: DurableObjectHead = read_memory_object_head(data, domain, read.object_id())
+            .map_err(|_| DurableCommitRejection::InvalidPersistedState)?;
+        if &current != read.expected() {
+            return Err(DurableCommitRejection::ObjectConflict {
+                object_id: read.object_id(),
+                current: DurableObjectHeadSummary::from(&current),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn prepare_memory_object_mutations(
+    data: &MemoryDurableStoreData,
+    domain: AtomicityDomainId,
+    changes: &DurableObjectChanges,
+) -> Result<Vec<PreparedMemoryObjectMutation>, DurableCommitRejection> {
+    let domain_bytes: [u8; 32] = *domain.as_bytes();
+    let mut prepared: Vec<PreparedMemoryObjectMutation> =
+        Vec::with_capacity(changes.mutations().len());
+    for mutation in changes.mutations() {
+        let read_index: usize = changes
+            .reads()
+            .binary_search_by_key(&mutation.object_id(), DurableObjectHeadRead::object_id)
+            .map_err(|_| DurableCommitRejection::InvalidPersistedState)?;
+        let expected: &DurableObjectHead = changes.reads()[read_index].expected();
+        let next_head_revision: ObjectHeadRevision = match expected.head_revision() {
+            Some(revision) => revision
+                .checked_next()
+                .ok_or(DurableCommitRejection::InvalidPersistedState)?,
+            None => ObjectHeadRevision::FIRST,
+        };
+        let (head, version): (MemoryStoredObjectHead, Option<DurableObjectVersionRecord>) =
+            match mutation.mutation() {
+                DurableObjectMutation::Create {
+                    version,
+                    owner_projection,
+                    routing_projection,
+                }
+                | DurableObjectMutation::Update {
+                    version,
+                    owner_projection,
+                    routing_projection,
+                } => {
+                    let object_version: DurableObjectVersion = version.object_version();
+                    let version_key: MemoryDurableObjectVersionKey =
+                        (domain_bytes, mutation.object_id(), object_version);
+                    if data.object_versions.contains_key(&version_key) {
+                        return Err(DurableCommitRejection::InvalidPersistedState);
+                    }
+                    (
+                        MemoryStoredObjectHead::Current {
+                            head_revision: next_head_revision,
+                            object_version,
+                            digest: version.digest(),
+                            owner_projection: owner_projection.clone(),
+                            routing_projection: routing_projection.clone(),
+                        },
+                        Some(version.clone()),
+                    )
+                }
+                DurableObjectMutation::Delete => (
+                    MemoryStoredObjectHead::Tombstoned {
+                        head_revision: next_head_revision,
+                    },
+                    None,
+                ),
+            };
+        prepared.push(PreparedMemoryObjectMutation {
+            object_id: mutation.object_id(),
+            head,
+            version,
+        });
+    }
+    Ok(prepared)
+}
+
+fn apply_memory_object_mutations(
+    data: &mut MemoryDurableStoreData,
+    domain: AtomicityDomainId,
+    prepared: Vec<PreparedMemoryObjectMutation>,
+) {
+    let domain_bytes: [u8; 32] = *domain.as_bytes();
+    for mutation in prepared {
+        if let Some(version) = mutation.version {
+            let object_version: DurableObjectVersion = version.object_version();
+            data.object_versions
+                .insert((domain_bytes, mutation.object_id, object_version), version);
+        }
+        data.object_heads
+            .insert((domain_bytes, mutation.object_id), mutation.head);
+    }
+}
+
 impl DurableDomainStateStore for MemoryDurableStateStore {
     fn get_versioned_durable(
         &self,
@@ -2409,6 +3737,7 @@ impl DurableDomainStateStore for MemoryDurableStateStore {
             .inner
             .read()
             .expect("durable state store lock poisoned");
+        validate_memory_durable_read_domain(&data, domain)?;
         validate_memory_durable_read_authority(&data, context)?;
         Ok(read_memory_versioned(
             data.state_domains.get(domain.as_bytes()),
@@ -2425,6 +3754,9 @@ impl DurableDomainStateStore for MemoryDurableStateStore {
             .inner
             .write()
             .expect("durable state store lock poisoned");
+        if let Err(reason) = validate_memory_durable_commit_domain(&data, transaction.domain()) {
+            return DurableCommitOutcome::Rejected(reason);
+        }
         if let Err(reason) = validate_memory_durable_commit_authority(&data, context) {
             return DurableCommitOutcome::Rejected(reason);
         }
@@ -2446,6 +3778,37 @@ impl DurableDomainStateStore for MemoryDurableStateStore {
 }
 
 impl StructuredDurableDomainStateStore for MemoryDurableStateStore {
+    fn get_object_head(
+        &self,
+        context: &DurableOperationContext,
+        domain: AtomicityDomainId,
+        object_id: ObjectId,
+    ) -> Result<DurableObjectHead, DurableReadError> {
+        let data = self
+            .inner
+            .read()
+            .expect("durable state store lock poisoned");
+        validate_memory_durable_read_domain(&data, domain)?;
+        validate_memory_durable_read_authority(&data, context)?;
+        read_memory_object_head(&data, domain, object_id)
+    }
+
+    fn get_object_version(
+        &self,
+        context: &DurableOperationContext,
+        domain: AtomicityDomainId,
+        object_id: ObjectId,
+        object_version: DurableObjectVersion,
+    ) -> Result<Option<DurableObjectVersionRecord>, DurableReadError> {
+        let data = self
+            .inner
+            .read()
+            .expect("durable state store lock poisoned");
+        validate_memory_durable_read_domain(&data, domain)?;
+        validate_memory_durable_read_authority(&data, context)?;
+        read_memory_object_version(&data, domain, object_id, object_version)
+    }
+
     fn get_request_receipt(
         &self,
         context: &DurableOperationContext,
@@ -2456,6 +3819,7 @@ impl StructuredDurableDomainStateStore for MemoryDurableStateStore {
             .inner
             .read()
             .expect("durable state store lock poisoned");
+        validate_memory_durable_read_domain(&data, domain)?;
         validate_memory_durable_read_authority(&data, context)?;
         Ok(data
             .receipts
@@ -2472,6 +3836,9 @@ impl StructuredDurableDomainStateStore for MemoryDurableStateStore {
             .inner
             .write()
             .expect("durable state store lock poisoned");
+        if let Err(reason) = validate_memory_durable_commit_domain(&data, transaction.domain()) {
+            return DurableCommitOutcome::Rejected(reason);
+        }
         if let Err(reason) = validate_memory_durable_commit_authority(&data, context) {
             return DurableCommitOutcome::Rejected(reason);
         }
@@ -2494,6 +3861,16 @@ impl StructuredDurableDomainStateStore for MemoryDurableStateStore {
         } else {
             Vec::new()
         };
+        if let Err(reason) =
+            validate_memory_object_reads(&data, transaction.domain, transaction.objects.reads())
+        {
+            return DurableCommitOutcome::Rejected(reason);
+        }
+        let prepared_objects: Vec<PreparedMemoryObjectMutation> =
+            match prepare_memory_object_mutations(&data, transaction.domain, &transaction.objects) {
+                Ok(prepared) => prepared,
+                Err(reason) => return DurableCommitOutcome::Rejected(reason),
+            };
         let delivery = transaction
             .outbox
             .as_ref()
@@ -2515,6 +3892,7 @@ impl StructuredDurableDomainStateStore for MemoryDurableStateStore {
                 return DurableCommitOutcome::Rejected(reason);
             }
         }
+        apply_memory_object_mutations(&mut data, transaction.domain, prepared_objects);
         data.receipts.insert(request_key, transaction.receipt);
         if let Some(outbox) = transaction.outbox {
             data.outboxes.insert(request_key, outbox);
@@ -3454,7 +4832,8 @@ fn hex32(bytes: [u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol_types::HashAlgorithmId;
+    use hashing::{BuiltinHashFunction, HashFunction};
+    use protocol_types::{HashAlgorithmId, HashPurpose};
 
     fn key(text: &str) -> Vec<u8> {
         text.as_bytes().to_vec()
@@ -3528,6 +4907,53 @@ mod tests {
             outbox,
         )
         .unwrap()
+    }
+
+    fn test_object_version(version: u64, byte: u8) -> DurableObjectVersionRecord {
+        let object: Object = Object {
+            id: ObjectId::new([byte; 32]),
+            version,
+            owner: Owner::Address(objects::Address::new([byte.wrapping_add(1); 32])),
+            type_hash: Digest32::new(HashAlgorithmId::Sha2_256, [byte.wrapping_add(2); 32]),
+            schema_version: u32::from(byte),
+            data: vec![byte.wrapping_add(3)],
+        };
+        let canonical: Vec<u8> = encode_object(&object).unwrap();
+        let digest: Digest32 = BuiltinHashFunction::new(HashAlgorithmId::Sha2_256)
+            .hash(
+                HashPurpose::Object,
+                ProtocolVersion::new(1),
+                &ChainId::new("sunrise-runtime-tests").unwrap(),
+                &canonical,
+            )
+            .unwrap();
+        DurableObjectVersionRecord::from_inline_object(object, digest, u64::from(byte)).unwrap()
+    }
+
+    fn test_create_mutation(version: u64, byte: u8) -> DurableObjectMutation {
+        DurableObjectMutation::Create {
+            version: test_object_version(version, byte),
+            owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Address(
+                objects::Address::new([byte.wrapping_add(1); 32]),
+            ))
+            .unwrap(),
+            routing_projection: DurableObjectRoutingProjection::new(Some(vec![byte])).unwrap(),
+        }
+    }
+
+    fn test_object_invocation(
+        invocation_domain: AtomicityDomainId,
+        request_byte: u8,
+        objects: DurableObjectChanges,
+    ) -> DurableInvocationTransaction {
+        let request_id: DurableRequestId = DurableRequestId::new([request_byte; 32]).unwrap();
+        let digest: Digest32 = Digest32::new(
+            HashAlgorithmId::Sha2_256,
+            [request_byte.wrapping_add(1); 32],
+        );
+        let receipt: DurableRequestReceipt =
+            DurableRequestReceipt::new(request_id, digest, vec![request_byte]).unwrap();
+        DurableInvocationTransaction::new(invocation_domain, None, objects, receipt, None).unwrap()
     }
 
     fn durable_outbox_invocation(
@@ -3798,6 +5224,388 @@ mod tests {
                 vec![mutation("other", StateMutation::Delete)],
             ),
             Err(RuntimeError::StateMutationWithoutRead)
+        );
+    }
+
+    #[test]
+    fn durable_object_section_is_typed_canonical_contained_and_bounded() {
+        assert_eq!(DurableObjectChanges::empty().represented_bytes(), 0);
+        assert_eq!(DurableObjectVersion::new(0), None);
+        assert_eq!(ObjectHeadRevision::new(0), None);
+        assert_eq!(DurableObjectVersion::MAX.checked_next(), None);
+        assert_eq!(
+            ObjectHeadRevision::new(u64::MAX).unwrap().checked_next(),
+            None
+        );
+        assert_eq!(
+            DurableObjectVersionRecord::from_inline_canonical_bytes(
+                vec![0; MAX_DURABLE_INLINE_OBJECT_BYTES + 1],
+                Digest32::new(HashAlgorithmId::Sha2_256, [0x01; 32]),
+                1,
+            ),
+            Err(DurableInvocationError::ObjectBodyTooLarge {
+                length: MAX_DURABLE_INLINE_OBJECT_BYTES + 1,
+                maximum: MAX_DURABLE_INLINE_OBJECT_BYTES,
+            })
+        );
+        assert_eq!(
+            DurableObjectOwnerProjection::from_canonical_bytes(Some(vec![
+                0;
+                MAX_DURABLE_OBJECT_PROJECTION_BYTES
+                    + 1
+            ])),
+            Err(DurableInvocationError::ObjectOwnerProjectionTooLarge {
+                length: MAX_DURABLE_OBJECT_PROJECTION_BYTES + 1,
+                maximum: MAX_DURABLE_OBJECT_PROJECTION_BYTES,
+            })
+        );
+        assert_eq!(
+            DurableObjectRoutingProjection::new(Some(vec![
+                0;
+                MAX_DURABLE_OBJECT_PROJECTION_BYTES + 1
+            ])),
+            Err(DurableInvocationError::ObjectRoutingProjectionTooLarge {
+                length: MAX_DURABLE_OBJECT_PROJECTION_BYTES + 1,
+                maximum: MAX_DURABLE_OBJECT_PROJECTION_BYTES,
+            })
+        );
+
+        let first_id: ObjectId = ObjectId::new([0x11; 32]);
+        let second_id: ObjectId = ObjectId::new([0x22; 32]);
+        let blob_record: DurableObjectVersionRecord =
+            DurableObjectVersionRecord::from_blob_reference(
+                first_id,
+                DurableObjectVersion::FIRST,
+                Digest32::new(HashAlgorithmId::Sha2_256, [0x31; 32]),
+                7,
+                8,
+                Digest32::new(HashAlgorithmId::Sha3_256, [0x32; 32]),
+            );
+        assert_eq!(
+            blob_record.canonical_record_type_id(),
+            u32::from(OBJECT_CANONICAL_TYPE_ID)
+        );
+        assert_eq!(blob_record.inline_type_hash(), None);
+        assert_eq!(
+            blob_record.payload().blob_digest(),
+            Some(Digest32::new(HashAlgorithmId::Sha3_256, [0x32; 32]))
+        );
+        assert!(
+            DurableObjectChanges::new(
+                vec![DurableObjectHeadRead::new(
+                    first_id,
+                    DurableObjectHead::Absent,
+                )],
+                vec![DurableObjectMutationEntry::new(
+                    first_id,
+                    DurableObjectMutation::Create {
+                        version: blob_record,
+                        owner_projection: DurableObjectOwnerProjection::default(),
+                        routing_projection: DurableObjectRoutingProjection::default(),
+                    },
+                )],
+            )
+            .is_ok()
+        );
+        let changes: DurableObjectChanges = DurableObjectChanges::new(
+            vec![
+                DurableObjectHeadRead::new(second_id, DurableObjectHead::Absent),
+                DurableObjectHeadRead::new(first_id, DurableObjectHead::Absent),
+            ],
+            vec![
+                DurableObjectMutationEntry::new(second_id, test_create_mutation(1, 0x22)),
+                DurableObjectMutationEntry::new(first_id, test_create_mutation(1, 0x11)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(changes.reads()[0].object_id(), first_id);
+        assert_eq!(changes.reads()[1].object_id(), second_id);
+        assert_eq!(changes.mutations()[0].object_id(), first_id);
+        assert_eq!(changes.mutations()[1].object_id(), second_id);
+        assert!(changes.represented_bytes() > 2 * size_of::<u32>());
+
+        assert_eq!(
+            DurableObjectChanges::new(
+                vec![
+                    DurableObjectHeadRead::new(first_id, DurableObjectHead::Absent),
+                    DurableObjectHeadRead::new(first_id, DurableObjectHead::Absent),
+                ],
+                Vec::new(),
+            ),
+            Err(DurableInvocationError::DuplicateObjectReadId)
+        );
+        assert_eq!(
+            DurableObjectChanges::new(
+                Vec::new(),
+                vec![DurableObjectMutationEntry::new(
+                    first_id,
+                    test_create_mutation(1, 0x11),
+                )],
+            ),
+            Err(DurableInvocationError::ObjectMutationWithoutRead {
+                object_id: first_id,
+            })
+        );
+        assert_eq!(
+            DurableObjectChanges::new(
+                vec![DurableObjectHeadRead::new(
+                    first_id,
+                    DurableObjectHead::Absent,
+                )],
+                vec![DurableObjectMutationEntry::new(
+                    first_id,
+                    test_create_mutation(1, 0x22),
+                )],
+            ),
+            Err(DurableInvocationError::InvalidObjectTransition {
+                object_id: first_id,
+            })
+        );
+        assert_eq!(
+            DurableObjectChanges::new(
+                vec![DurableObjectHeadRead::new(
+                    first_id,
+                    DurableObjectHead::Absent,
+                )],
+                vec![DurableObjectMutationEntry::new(
+                    first_id,
+                    DurableObjectMutation::Create {
+                        version: test_object_version(1, 0x11),
+                        owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Shared)
+                            .unwrap(),
+                        routing_projection: DurableObjectRoutingProjection::default(),
+                    },
+                )],
+            ),
+            Err(DurableInvocationError::InvalidObjectTransition {
+                object_id: first_id,
+            })
+        );
+        assert_eq!(
+            DurableObjectChanges::new(
+                vec![DurableObjectHeadRead::new(
+                    first_id,
+                    DurableObjectHead::Absent,
+                )],
+                vec![
+                    DurableObjectMutationEntry::new(first_id, test_create_mutation(1, 0x11),),
+                    DurableObjectMutationEntry::new(first_id, test_create_mutation(1, 0x11),),
+                ],
+            ),
+            Err(DurableInvocationError::DuplicateObjectMutationId)
+        );
+        assert_eq!(
+            DurableObjectChanges::new(
+                vec![DurableObjectHeadRead::new(
+                    first_id,
+                    DurableObjectHead::Absent,
+                )],
+                vec![DurableObjectMutationEntry::new(
+                    first_id,
+                    test_create_mutation(2, 0x11),
+                )],
+            ),
+            Err(DurableInvocationError::InvalidObjectTransition {
+                object_id: first_id,
+            })
+        );
+
+        let too_many_mutations: Vec<DurableObjectMutationEntry> = (0
+            ..=MAX_DURABLE_OBJECT_MUTATIONS)
+            .map(|index: usize| {
+                let mut bytes: [u8; 32] = [0; 32];
+                bytes[..size_of::<usize>()].copy_from_slice(&index.to_be_bytes());
+                DurableObjectMutationEntry::new(ObjectId::new(bytes), test_create_mutation(1, 0x33))
+            })
+            .collect();
+        assert_eq!(
+            DurableObjectChanges::new(Vec::new(), too_many_mutations),
+            Err(DurableInvocationError::TooManyObjectMutations {
+                count: MAX_DURABLE_OBJECT_MUTATIONS + 1,
+                maximum: MAX_DURABLE_OBJECT_MUTATIONS,
+            })
+        );
+
+        let too_many_reads: Vec<DurableObjectHeadRead> = (0_u16
+            ..=u16::try_from(MAX_DURABLE_OBJECT_READS).unwrap())
+            .map(|index: u16| {
+                let mut bytes: [u8; 32] = [0; 32];
+                bytes[..2].copy_from_slice(&index.to_be_bytes());
+                DurableObjectHeadRead::new(ObjectId::new(bytes), DurableObjectHead::Absent)
+            })
+            .collect();
+        assert_eq!(
+            DurableObjectChanges::new(too_many_reads, Vec::new()),
+            Err(DurableInvocationError::TooManyObjectReads {
+                count: MAX_DURABLE_OBJECT_READS + 1,
+                maximum: MAX_DURABLE_OBJECT_READS,
+            })
+        );
+
+        let empty_object: Object = Object {
+            id: first_id,
+            version: 2,
+            owner: Owner::Shared,
+            type_hash: Digest32::new(HashAlgorithmId::Sha2_256, [0x46; 32]),
+            schema_version: 1,
+            data: Vec::new(),
+        };
+        let empty_length: usize = encode_object(&empty_object).unwrap().len();
+        let mut maximum_object: Object = empty_object;
+        maximum_object.data = vec![0; MAX_DURABLE_INLINE_OBJECT_BYTES - empty_length];
+        let next_version: DurableObjectVersionRecord =
+            DurableObjectVersionRecord::from_inline_object(
+                maximum_object,
+                Digest32::new(HashAlgorithmId::Sha2_256, [0x45; 32]),
+                4,
+            )
+            .unwrap();
+        assert_eq!(
+            next_version
+                .payload()
+                .inline()
+                .unwrap()
+                .canonical_bytes()
+                .len(),
+            MAX_DURABLE_INLINE_OBJECT_BYTES
+        );
+        assert!(
+            DurableObjectChanges::new(
+                vec![DurableObjectHeadRead::new(
+                    first_id,
+                    DurableObjectHead::Current {
+                        head_revision: ObjectHeadRevision::FIRST,
+                        object_version: DurableObjectVersion::FIRST,
+                        digest: Digest32::new(HashAlgorithmId::Sha2_256, [0x44; 32]),
+                        owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Shared)
+                            .unwrap(),
+                        routing_projection: DurableObjectRoutingProjection::default(),
+                    },
+                )],
+                vec![DurableObjectMutationEntry::new(
+                    first_id,
+                    DurableObjectMutation::Update {
+                        version: next_version,
+                        owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Shared)
+                            .unwrap(),
+                        routing_projection: DurableObjectRoutingProjection::default(),
+                    },
+                )],
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn memory_durable_objects_enforce_domain_fence_and_deadline() {
+        let fence: WriterFenceGeneration = WriterFenceGeneration::new(7).unwrap();
+        let store: MemoryDurableStateStore = MemoryDurableStateStore::new(fence);
+        store.set_time(100);
+        let first_domain: AtomicityDomainId = domain(0x31);
+        let second_domain: AtomicityDomainId = domain(0x32);
+        let object_id: ObjectId = ObjectId::new([0x41; 32]);
+        let objects: DurableObjectChanges = DurableObjectChanges::new(
+            vec![DurableObjectHeadRead::new(
+                object_id,
+                DurableObjectHead::Absent,
+            )],
+            vec![DurableObjectMutationEntry::new(
+                object_id,
+                test_create_mutation(1, 0x41),
+            )],
+        )
+        .unwrap();
+
+        let stale_context: DurableOperationContext = durable_context(6, 200, 0x41);
+        assert_eq!(
+            store.commit_invocation(
+                &stale_context,
+                test_object_invocation(first_domain, 0x41, objects.clone()),
+            ),
+            DurableCommitOutcome::Rejected(DurableCommitRejection::WriterFenced {
+                active_generation: fence,
+            })
+        );
+        assert_eq!(
+            store.get_object_head(&stale_context, first_domain, object_id),
+            Err(DurableReadError::WriterFenced {
+                active_generation: fence,
+            })
+        );
+        assert_eq!(
+            store.get_object_version(
+                &stale_context,
+                first_domain,
+                object_id,
+                DurableObjectVersion::FIRST,
+            ),
+            Err(DurableReadError::WriterFenced {
+                active_generation: fence,
+            })
+        );
+        let expired_context: DurableOperationContext = durable_context(7, 100, 0x42);
+        assert_eq!(
+            store.commit_invocation(
+                &expired_context,
+                test_object_invocation(first_domain, 0x42, objects.clone()),
+            ),
+            DurableCommitOutcome::Rejected(DurableCommitRejection::DeadlineExceededBeforeCommit)
+        );
+        assert_eq!(
+            store.get_object_head(&expired_context, first_domain, object_id),
+            Err(DurableReadError::DeadlineExceeded)
+        );
+        assert_eq!(
+            store.get_object_version(
+                &expired_context,
+                first_domain,
+                object_id,
+                DurableObjectVersion::FIRST,
+            ),
+            Err(DurableReadError::DeadlineExceeded)
+        );
+
+        let live_context: DurableOperationContext = durable_context(7, 200, 0x43);
+        assert_eq!(
+            store.commit_invocation(
+                &live_context,
+                test_object_invocation(first_domain, 0x43, objects),
+            ),
+            DurableCommitOutcome::Committed
+        );
+        assert!(matches!(
+            store
+                .get_object_head(&live_context, first_domain, object_id)
+                .unwrap(),
+            DurableObjectHead::Current { .. }
+        ));
+        assert_eq!(
+            store
+                .get_object_head(&live_context, second_domain, object_id)
+                .unwrap(),
+            DurableObjectHead::Absent
+        );
+        assert!(
+            store
+                .get_object_version(
+                    &live_context,
+                    first_domain,
+                    object_id,
+                    DurableObjectVersion::FIRST,
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .get_object_version(
+                    &live_context,
+                    second_domain,
+                    object_id,
+                    DurableObjectVersion::FIRST,
+                )
+                .unwrap(),
+            None
         );
     }
 

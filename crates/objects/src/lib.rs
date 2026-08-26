@@ -2,7 +2,10 @@
 
 //! Versioned object identifiers and canonical object references.
 
-use canonical_encoding::{CanonicalEncodingError, CanonicalStruct, encode_digest32};
+use canonical_encoding::{
+    CanonicalDecodingError, CanonicalEncodingError, CanonicalFrame, CanonicalStruct,
+    decode_canonical_frame, decode_digest32, encode_digest32,
+};
 use core::fmt;
 use protocol_types::Digest32;
 use protocol_upgrades::{MigrationDescriptor, ProtocolUpgradeError};
@@ -12,9 +15,12 @@ const OBJECT_ID_TYPE_ID: u16 = 0x4001;
 const ADDRESS_TYPE_ID: u16 = 0x4002;
 const OWNER_TYPE_ID: u16 = 0x4003;
 const OBJECT_REF_TYPE_ID: u16 = 0x4004;
-const OBJECT_TYPE_ID: u16 = 0x4005;
+/// Stable canonical type identifier for an [`Object`] record.
+pub const OBJECT_CANONICAL_TYPE_ID: u16 = 0x4005;
 const ACCESS_MODE_TYPE_ID: u16 = 0x4006;
 const ENCODING_VERSION: u16 = 1;
+/// Stable canonical encoding version for an [`Object`] record.
+pub const OBJECT_CANONICAL_ENCODING_VERSION: u16 = ENCODING_VERSION;
 const IDENTIFIER_LEN: usize = 32;
 
 /// Errors returned by object model helpers.
@@ -26,8 +32,12 @@ pub enum ObjectError {
     InvalidAddressLength(usize),
     /// The access mode identifier is unknown.
     UnknownAccessMode(u8),
+    /// The owner variant identifier is unknown.
+    UnknownOwnerTag(u16),
     /// Canonical encoding failed.
     CanonicalEncoding(CanonicalEncodingError),
+    /// Canonical decoding failed.
+    CanonicalDecoding(CanonicalDecodingError),
 }
 
 impl fmt::Display for ObjectError {
@@ -41,7 +51,9 @@ impl fmt::Display for ObjectError {
                 write!(f, "addresses must be {IDENTIFIER_LEN} bytes, got {length}")
             }
             Self::UnknownAccessMode(mode) => write!(f, "unknown access mode: {mode}"),
+            Self::UnknownOwnerTag(tag) => write!(f, "unknown object owner tag: {tag}"),
             Self::CanonicalEncoding(error) => error.fmt(f),
+            Self::CanonicalDecoding(error) => error.fmt(f),
         }
     }
 }
@@ -51,6 +63,12 @@ impl Error for ObjectError {}
 impl From<CanonicalEncodingError> for ObjectError {
     fn from(value: CanonicalEncodingError) -> Self {
         Self::CanonicalEncoding(value)
+    }
+}
+
+impl From<CanonicalDecodingError> for ObjectError {
+    fn from(value: CanonicalDecodingError) -> Self {
+        Self::CanonicalDecoding(value)
     }
 }
 
@@ -362,7 +380,8 @@ pub fn encode_object_ref(object_ref: &ObjectRef) -> Result<Vec<u8>, ObjectError>
 
 /// Encodes an object.
 pub fn encode_object(object: &Object) -> Result<Vec<u8>, ObjectError> {
-    let mut canonical = CanonicalStruct::new(OBJECT_TYPE_ID, ENCODING_VERSION);
+    let mut canonical =
+        CanonicalStruct::new(OBJECT_CANONICAL_TYPE_ID, OBJECT_CANONICAL_ENCODING_VERSION);
     canonical.field_bytes(1, encode_object_id(&object.id)?)?;
     canonical.field_u64(2, object.version)?;
     canonical.field_bytes(3, encode_owner(&object.owner)?)?;
@@ -370,6 +389,65 @@ pub fn encode_object(object: &Object) -> Result<Vec<u8>, ObjectError> {
     canonical.field_u32(5, object.schema_version)?;
     canonical.field_bytes(6, object.data.as_slice())?;
     Ok(canonical.finish()?)
+}
+
+fn decode_object_id(input: &[u8]) -> Result<ObjectId, ObjectError> {
+    let frame: CanonicalFrame<'_> = decode_canonical_frame(input)?;
+    frame.require_type(OBJECT_ID_TYPE_ID)?;
+    frame.require_version(ENCODING_VERSION)?;
+    frame.require_only_fields(&[1])?;
+    ObjectId::try_from_slice(frame.required_field(1)?)
+}
+
+fn decode_address(input: &[u8]) -> Result<Address, ObjectError> {
+    let frame: CanonicalFrame<'_> = decode_canonical_frame(input)?;
+    frame.require_type(ADDRESS_TYPE_ID)?;
+    frame.require_version(ENCODING_VERSION)?;
+    frame.require_only_fields(&[1])?;
+    Address::try_from_slice(frame.required_field(1)?)
+}
+
+/// Decodes one canonical owner projection and rejects non-canonical fields.
+pub fn decode_owner(input: &[u8]) -> Result<Owner, ObjectError> {
+    let frame: CanonicalFrame<'_> = decode_canonical_frame(input)?;
+    frame.require_type(OWNER_TYPE_ID)?;
+    frame.require_version(ENCODING_VERSION)?;
+    let tag: u16 = frame.required_u16(1)?;
+    match tag {
+        1 => {
+            frame.require_only_fields(&[1, 2])?;
+            Ok(Owner::Address(decode_address(frame.required_field(2)?)?))
+        }
+        2 => {
+            frame.require_only_fields(&[1])?;
+            Ok(Owner::Shared)
+        }
+        3 => {
+            frame.require_only_fields(&[1])?;
+            Ok(Owner::Immutable)
+        }
+        4 => {
+            frame.require_only_fields(&[1])?;
+            Ok(Owner::System)
+        }
+        other => Err(ObjectError::UnknownOwnerTag(other)),
+    }
+}
+
+/// Decodes one existing canonical [`Object`] record without changing its bytes.
+pub fn decode_object(input: &[u8]) -> Result<Object, ObjectError> {
+    let frame: CanonicalFrame<'_> = decode_canonical_frame(input)?;
+    frame.require_type(OBJECT_CANONICAL_TYPE_ID)?;
+    frame.require_version(OBJECT_CANONICAL_ENCODING_VERSION)?;
+    frame.require_only_fields(&[1, 2, 3, 4, 5, 6])?;
+    Ok(Object {
+        id: decode_object_id(frame.required_field(1)?)?,
+        version: frame.required_u64(2)?,
+        owner: decode_owner(frame.required_field(3)?)?,
+        type_hash: decode_digest32(frame.required_field(4)?)?,
+        schema_version: frame.required_u32(5)?,
+        data: frame.required_field(6)?.to_vec(),
+    })
 }
 
 /// Encodes an access mode.
@@ -435,6 +513,68 @@ mod tests {
         assert_ne!(shared_owner, immutable_owner);
         assert_ne!(immutable_owner, system_owner);
         assert_ne!(address_owner, system_owner);
+    }
+
+    #[test]
+    fn immutable_and_system_owners_round_trip() {
+        for owner in [Owner::Immutable, Owner::System] {
+            let canonical: Vec<u8> = encode_owner(&owner).unwrap();
+            assert_eq!(decode_owner(&canonical), Ok(owner));
+        }
+    }
+
+    #[test]
+    fn non_address_owners_reject_stray_address_field() {
+        for tag in [2_u16, 3_u16, 4_u16] {
+            let mut owner = CanonicalStruct::new(OWNER_TYPE_ID, ENCODING_VERSION);
+            owner.field_u16(1, tag).unwrap();
+            owner.field_bytes(2, [0xAA]).unwrap();
+            assert!(matches!(
+                decode_owner(&owner.finish().unwrap()),
+                Err(ObjectError::CanonicalDecoding(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn object_decoder_round_trips_existing_canonical_bytes() {
+        let object = Object {
+            id: ObjectId::new([0x21; IDENTIFIER_LEN]),
+            version: 9,
+            owner: Owner::Address(Address::new([0x22; IDENTIFIER_LEN])),
+            type_hash: Digest32::new(HashAlgorithmId::Sha3_256, [0x23; IDENTIFIER_LEN]),
+            schema_version: 7,
+            data: vec![0x24, 0x25],
+        };
+        let canonical: Vec<u8> = encode_object(&object).unwrap();
+        assert_eq!(decode_object(&canonical), Ok(object));
+    }
+
+    #[test]
+    fn object_decoder_rejects_wrong_type_and_unknown_owner() {
+        let object = Object {
+            id: ObjectId::new([0x31; IDENTIFIER_LEN]),
+            version: 1,
+            owner: Owner::Shared,
+            type_hash: Digest32::new(HashAlgorithmId::Sha2_256, [0x32; IDENTIFIER_LEN]),
+            schema_version: 1,
+            data: vec![0x33],
+        };
+        let mut wrong_type: Vec<u8> = encode_object(&object).unwrap();
+        wrong_type[4..6].copy_from_slice(&0x4999_u16.to_le_bytes());
+        assert!(matches!(
+            decode_object(&wrong_type),
+            Err(ObjectError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedTypeId { .. }
+            ))
+        ));
+
+        let mut owner = CanonicalStruct::new(OWNER_TYPE_ID, ENCODING_VERSION);
+        owner.field_u16(1, 99).unwrap();
+        assert_eq!(
+            decode_owner(&owner.finish().unwrap()),
+            Err(ObjectError::UnknownOwnerTag(99))
+        );
     }
 
     #[test]

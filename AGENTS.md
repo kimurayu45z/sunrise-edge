@@ -213,7 +213,8 @@ next work is closing Phase 15-17 production gaps using the accepted
 read revision in its atomic write set. Runtime has the explicit atomicity
 domain and dedicated read/mutation envelope with memory conformance; additive
 node-core transaction, outbox delivery, and native request entrypoints now use
-it, while durable stores have not migrated. The logical-domain manifest
+it; normalized PostgreSQL implements it As-Is, while other durable providers
+have not migrated. The logical-domain manifest
 is committed as ProtocolConfig encoding v2 without changing historical v1
 bytes. Additive node-core handlers resolve it from one access-plan derivation
 before storage reads and return the domain beside output. An additive native
@@ -227,13 +228,21 @@ one message for that exact request; it never sends an unresolved claim.
 `runtime-postgres` now applies the explicit generation-one normalized schema
 and bootstraps exact namespace/schema/fence metadata through operator-only APIs,
 with real PostgreSQL CI. Its bounded pool now implements fenced structured
-state/receipt reads, serializable state/receipt/outbox commit, and indexed
-claim/ack with retained attempt history As-Is. A shared memory/PostgreSQL
-conformance suite now covers exact-boundary deadlines, complete-read races,
+state/body-free object-head/immutable object-version/receipt reads,
+serializable state/object/receipt/outbox commit, and indexed
+claim/ack with retained attempt history As-Is. Object-head reads validate
+strict immutable metadata and inline presence/length without selecting inline
+bodies. Head owner/routing projections are routing data, never authorization;
+execution must separately load and match the linked version, decode inline
+objects, and compare typed owner, while blob execution remains fail-closed
+until fetch/content verification. A shared memory/PostgreSQL conformance suite
+now covers bound-domain/fence/deadline rejection, the object read-count bound,
+typed object create/update/delete/recreate ABA, conflict rollback, inline/blob
+mapping and blob round-trip, exact-boundary deadlines, complete-read races,
 definite contention classification, lease/writer fencing, and PostgreSQL-only
 pool/row-lock deadline exhaustion, serialization exhaustion, and schema skew
 As-Is. An optional shared commit-loss capability, exercised only by that live
-PostgreSQL fixture through a bounded `NoTls` TCP proxy, now injects a
+PostgreSQL fixture through a bounded `NoTls` TCP proxy, injects a
 connection loss immediately before one plain state commit dispatches `COMMIT`,
 proving no state ground truth, and separately immediately after the backend
 returns a successful acknowledgement for one structured invocation commit, one
@@ -247,7 +256,9 @@ one, then check same-identity reconciliation, with pool recovery proven
 afterward. This shows the backend acknowledged commit before the driver lost
 it, not crash durability under abrupt process/power loss, and it says nothing
 about TLS-path loss. Native structured requests now support
-explicit cancellation only before first storage dispatch; started work, client
+explicit cancellation only before first storage dispatch; node-core object
+dispatch, fees, blob transfer verification, owned fast routing, and production
+object migrations remain deferred. Started work, client
 disconnect, and shutdown budgets remain uncancellable. Next, implement
 abrupt process/power fault, disk-full/WAL exhaustion, TLS-path connection loss,
 backup/restore, capacity/load/soak, real writer failover, and provider

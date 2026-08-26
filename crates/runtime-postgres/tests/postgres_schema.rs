@@ -1,3 +1,4 @@
+use objects::{Address, Object, Owner, encode_object, encode_owner};
 use postgres::{
     Client, Config, NoTls,
     config::{Host, SslMode},
@@ -8,18 +9,19 @@ use r2d2_postgres::{PostgresConnectionManager, r2d2::Pool};
 use runtime::{
     AtomicStateMutationSet, AtomicStateReadSet, AtomicStateTransaction, DueOutboxClaimRequest,
     DurableCommitOutcome, DurableCommitRejection, DurableDomainStateStore,
-    DurableInvocationTransaction, DurableObjectChanges, DurableOperationContext,
-    DurableOutboxAcknowledgement, DurableOutboxAcknowledgementOutcome,
-    DurableOutboxAcknowledgementRejection, DurableOutboxBatch, DurableOutboxClaimOutcome,
-    DurableOutboxClaimRejection, DurableOutboxLeaseId, DurableOutboxMessage, DurableReadError,
-    DurableRequestId, DurableRequestReceipt, DurableStateTransaction, IndexedOutboxRepository,
-    RequestOutboxClaimRequest, StateMutation, StateMutationEntry, StateReadAssertion,
-    StateRevision, StorageCorrelationId, StorageDeadline, StructuredDurableDomainStateStore,
-    WriterFenceGeneration,
+    DurableInvocationTransaction, DurableObjectChanges, DurableObjectHead, DurableObjectHeadRead,
+    DurableObjectMutation, DurableObjectMutationEntry, DurableObjectPayload, DurableObjectVersion,
+    DurableObjectVersionRecord, DurableOperationContext, DurableOutboxAcknowledgement,
+    DurableOutboxAcknowledgementOutcome, DurableOutboxAcknowledgementRejection, DurableOutboxBatch,
+    DurableOutboxClaimOutcome, DurableOutboxClaimRejection, DurableOutboxLeaseId,
+    DurableOutboxMessage, DurableReadError, DurableRequestId, DurableRequestReceipt,
+    DurableStateTransaction, IndexedOutboxRepository, ObjectId, RequestOutboxClaimRequest,
+    StateMutation, StateMutationEntry, StateReadAssertion, StateRevision, StorageCorrelationId,
+    StorageDeadline, StructuredDurableDomainStateStore, WriterFenceGeneration,
     conformance::{
         CommitFaultPoint, CommitLossFixture, ConformanceFailure, ConformanceResult,
         DurableStoreFixture, SchemaSkewFixture, run_commit_loss_conformance,
-        run_durable_store_conformance, run_schema_skew_conformance,
+        run_durable_object_conformance, run_durable_store_conformance, run_schema_skew_conformance,
     },
 };
 use runtime_postgres::{
@@ -2260,6 +2262,549 @@ fn postgres_schema_and_durable_store_conformance() {
         ));
     }
     run_durable_store_conformance(&conformance_fixture).unwrap();
+
+    let object_namespace = PostgresNamespace::new(
+        &ChainId::new("postgres-object-conformance").unwrap(),
+        ValidatorId::new([0xC1; 32]),
+        AtomicityDomainId::new([0xC2; 32]).unwrap(),
+    )
+    .unwrap();
+    let object_fence = WriterFenceGeneration::new(71).unwrap();
+    let object_fixture = postgres_conformance_fixture(
+        &database_url,
+        conformance_pool.clone(),
+        object_namespace,
+        object_fence,
+    );
+    run_durable_object_conformance(&object_fixture).unwrap();
+    let object_context = object_fixture
+        .live_context(object_fence, 0xC3, Duration::from_secs(60))
+        .unwrap();
+    let lifecycle_object_id = ObjectId::new([0x51; 32]);
+    {
+        let mut object_operator = object_fixture.operator.lock().unwrap();
+        let history_count: i64 = object_operator
+            .query_one(
+                "SELECT COUNT(*)
+                 FROM sunrise_edge.object_versions
+                 WHERE chain_id_bytes = $1
+                   AND validator_id = $2
+                   AND atomicity_domain_id = $3
+                   AND object_id = $4",
+                &[
+                    &object_fixture.namespace.chain_id_bytes(),
+                    &&object_fixture.namespace.validator_id().as_bytes()[..],
+                    &&object_fixture.namespace.domain().as_bytes()[..],
+                    &&lifecycle_object_id.as_bytes()[..],
+                ],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(history_count, 3);
+        let tombstone = object_operator
+            .query_one(
+                "SELECT current_version IS NULL,
+                        digest_algorithm_id IS NULL,
+                        digest_bytes IS NULL,
+                        owner_projection IS NULL,
+                        routing_projection IS NULL,
+                        revision::TEXT,
+                        tombstone
+                 FROM sunrise_edge.object_heads
+                 WHERE chain_id_bytes = $1
+                   AND validator_id = $2
+                   AND atomicity_domain_id = $3
+                   AND object_id = $4",
+                &[
+                    &object_fixture.namespace.chain_id_bytes(),
+                    &&object_fixture.namespace.validator_id().as_bytes()[..],
+                    &&object_fixture.namespace.domain().as_bytes()[..],
+                    &&lifecycle_object_id.as_bytes()[..],
+                ],
+            )
+            .unwrap();
+        assert!(tombstone.get::<usize, bool>(0));
+        assert!(tombstone.get::<usize, bool>(1));
+        assert!(tombstone.get::<usize, bool>(2));
+        assert!(tombstone.get::<usize, bool>(3));
+        assert!(tombstone.get::<usize, bool>(4));
+        assert_eq!(tombstone.get::<usize, String>(5), "5");
+        assert!(tombstone.get::<usize, bool>(6));
+    }
+
+    {
+        let mut object_operator = object_fixture.operator.lock().unwrap();
+        object_operator
+            .execute(
+                "UPDATE sunrise_edge.object_versions
+                 SET type_id = 0
+                 WHERE chain_id_bytes = $1
+                   AND validator_id = $2
+                   AND atomicity_domain_id = $3
+                   AND object_id = $4
+                   AND object_version = 3",
+                &[
+                    &object_fixture.namespace.chain_id_bytes(),
+                    &&object_fixture.namespace.validator_id().as_bytes()[..],
+                    &&object_fixture.namespace.domain().as_bytes()[..],
+                    &&lifecycle_object_id.as_bytes()[..],
+                ],
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        object_fixture.store.get_object_head(
+            &object_context,
+            object_fixture.namespace.domain(),
+            lifecycle_object_id,
+        ),
+        Err(DurableReadError::InvalidPersistedState)
+    );
+    {
+        let mut object_operator = object_fixture.operator.lock().unwrap();
+        object_operator
+            .execute(
+                "UPDATE sunrise_edge.object_versions
+                 SET type_id = $1
+                 WHERE chain_id_bytes = $2
+                   AND validator_id = $3
+                   AND atomicity_domain_id = $4
+                   AND object_id = $5
+                   AND object_version = 3",
+                &[
+                    &i64::from(runtime::DURABLE_OBJECT_CANONICAL_RECORD_TYPE_ID),
+                    &object_fixture.namespace.chain_id_bytes(),
+                    &&object_fixture.namespace.validator_id().as_bytes()[..],
+                    &&object_fixture.namespace.domain().as_bytes()[..],
+                    &&lifecycle_object_id.as_bytes()[..],
+                ],
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        object_fixture
+            .store
+            .get_object_head(
+                &object_context,
+                object_fixture.namespace.domain(),
+                lifecycle_object_id,
+            )
+            .unwrap(),
+        DurableObjectHead::Tombstoned {
+            last_object_version,
+            ..
+        } if last_object_version == DurableObjectVersion::new(3).unwrap()
+    ));
+
+    let correct_owner_projection: Vec<u8> =
+        encode_owner(&Owner::Address(Address::new([0x33; 32]))).unwrap();
+    let (version_three_algorithm, version_three_digest, version_three_bytes): (
+        i32,
+        Vec<u8>,
+        Vec<u8>,
+    ) = {
+        let mut object_operator = object_fixture.operator.lock().unwrap();
+        let row = object_operator
+            .query_one(
+                "SELECT digest_algorithm_id, digest_bytes, inline_canonical_bytes
+                 FROM sunrise_edge.object_versions
+                 WHERE chain_id_bytes = $1
+                   AND validator_id = $2
+                   AND atomicity_domain_id = $3
+                   AND object_id = $4
+                   AND object_version = 3",
+                &[
+                    &object_fixture.namespace.chain_id_bytes(),
+                    &&object_fixture.namespace.validator_id().as_bytes()[..],
+                    &&object_fixture.namespace.domain().as_bytes()[..],
+                    &&lifecycle_object_id.as_bytes()[..],
+                ],
+            )
+            .unwrap();
+        (row.get(0), row.get(1), row.get(2))
+    };
+    {
+        let malformed_inline_bytes: Vec<u8> = vec![0xFF];
+        let mut object_operator = object_fixture.operator.lock().unwrap();
+        object_operator
+            .execute(
+                "UPDATE sunrise_edge.object_versions
+                 SET inline_canonical_bytes = $1
+                 WHERE chain_id_bytes = $2
+                   AND validator_id = $3
+                   AND atomicity_domain_id = $4
+                   AND object_id = $5
+                   AND object_version = 3",
+                &[
+                    &malformed_inline_bytes,
+                    &object_fixture.namespace.chain_id_bytes(),
+                    &&object_fixture.namespace.validator_id().as_bytes()[..],
+                    &&object_fixture.namespace.domain().as_bytes()[..],
+                    &&lifecycle_object_id.as_bytes()[..],
+                ],
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        object_fixture
+            .store
+            .get_object_head(
+                &object_context,
+                object_fixture.namespace.domain(),
+                lifecycle_object_id,
+            )
+            .unwrap(),
+        DurableObjectHead::Tombstoned {
+            last_object_version,
+            ..
+        } if last_object_version == DurableObjectVersion::new(3).unwrap()
+    ));
+    assert_eq!(
+        object_fixture.store.get_object_version(
+            &object_context,
+            object_fixture.namespace.domain(),
+            lifecycle_object_id,
+            DurableObjectVersion::new(3).unwrap(),
+        ),
+        Err(DurableReadError::InvalidPersistedState)
+    );
+    {
+        let mut object_operator = object_fixture.operator.lock().unwrap();
+        object_operator
+            .execute(
+                "UPDATE sunrise_edge.object_versions
+                 SET inline_canonical_bytes = $1
+                 WHERE chain_id_bytes = $2
+                   AND validator_id = $3
+                   AND atomicity_domain_id = $4
+                   AND object_id = $5
+                   AND object_version = 3",
+                &[
+                    &version_three_bytes,
+                    &object_fixture.namespace.chain_id_bytes(),
+                    &&object_fixture.namespace.validator_id().as_bytes()[..],
+                    &&object_fixture.namespace.domain().as_bytes()[..],
+                    &&lifecycle_object_id.as_bytes()[..],
+                ],
+            )
+            .unwrap();
+    }
+
+    let future_object: Object = Object {
+        id: lifecycle_object_id,
+        version: 4,
+        owner: Owner::Address(Address::new([0x44; 32])),
+        type_hash: Digest32::new(HashAlgorithmId::Sha2_256, [0x45; 32]),
+        schema_version: 0x44,
+        data: vec![0x46],
+    };
+    let future_canonical_bytes: Vec<u8> = encode_object(&future_object).unwrap();
+    let future_digest: Digest32 = Digest32::new(HashAlgorithmId::Sha2_256, [0x47; 32]);
+    {
+        let mut object_operator = object_fixture.operator.lock().unwrap();
+        object_operator
+            .execute(
+                "UPDATE sunrise_edge.object_heads
+                 SET current_version = 3,
+                     digest_algorithm_id = $1,
+                     digest_bytes = $2,
+                     owner_projection = $3,
+                     routing_projection = NULL,
+                     tombstone = FALSE
+                 WHERE chain_id_bytes = $4
+                   AND validator_id = $5
+                   AND atomicity_domain_id = $6
+                   AND object_id = $7",
+                &[
+                    &version_three_algorithm,
+                    &version_three_digest,
+                    &correct_owner_projection,
+                    &object_fixture.namespace.chain_id_bytes(),
+                    &&object_fixture.namespace.validator_id().as_bytes()[..],
+                    &&object_fixture.namespace.domain().as_bytes()[..],
+                    &&lifecycle_object_id.as_bytes()[..],
+                ],
+            )
+            .unwrap();
+        object_operator
+            .execute(
+                "INSERT INTO sunrise_edge.object_versions (
+                     chain_id_bytes, validator_id, atomicity_domain_id, object_id,
+                     object_version, digest_algorithm_id, digest_bytes,
+                     schema_version, type_id, created_checkpoint,
+                     inline_canonical_bytes,
+                     blob_digest_algorithm_id, blob_digest_bytes
+                 ) VALUES ($1, $2, $3, $4, 4, $5, $6, $7, $8, 13, $9, NULL, NULL)",
+                &[
+                    &object_fixture.namespace.chain_id_bytes(),
+                    &&object_fixture.namespace.validator_id().as_bytes()[..],
+                    &&object_fixture.namespace.domain().as_bytes()[..],
+                    &&lifecycle_object_id.as_bytes()[..],
+                    &i32::from(future_digest.algorithm().as_u16()),
+                    &&future_digest.bytes()[..],
+                    &i64::from(future_object.schema_version),
+                    &i64::from(runtime::DURABLE_OBJECT_CANONICAL_RECORD_TYPE_ID),
+                    &future_canonical_bytes,
+                ],
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        object_fixture.store.get_object_head(
+            &object_context,
+            object_fixture.namespace.domain(),
+            lifecycle_object_id,
+        ),
+        Err(DurableReadError::InvalidPersistedState)
+    );
+    {
+        let mut object_operator = object_fixture.operator.lock().unwrap();
+        object_operator
+            .execute(
+                "DELETE FROM sunrise_edge.object_versions
+                 WHERE chain_id_bytes = $1
+                   AND validator_id = $2
+                   AND atomicity_domain_id = $3
+                   AND object_id = $4
+                   AND object_version = 4",
+                &[
+                    &object_fixture.namespace.chain_id_bytes(),
+                    &&object_fixture.namespace.validator_id().as_bytes()[..],
+                    &&object_fixture.namespace.domain().as_bytes()[..],
+                    &&lifecycle_object_id.as_bytes()[..],
+                ],
+            )
+            .unwrap();
+        object_operator
+            .execute(
+                "UPDATE sunrise_edge.object_heads
+                 SET current_version = NULL,
+                     digest_algorithm_id = NULL,
+                     digest_bytes = NULL,
+                     owner_projection = NULL,
+                     routing_projection = NULL,
+                     tombstone = TRUE
+                 WHERE chain_id_bytes = $1
+                   AND validator_id = $2
+                   AND atomicity_domain_id = $3
+                   AND object_id = $4",
+                &[
+                    &object_fixture.namespace.chain_id_bytes(),
+                    &&object_fixture.namespace.validator_id().as_bytes()[..],
+                    &&object_fixture.namespace.domain().as_bytes()[..],
+                    &&lifecycle_object_id.as_bytes()[..],
+                ],
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        object_fixture
+            .store
+            .get_object_head(
+                &object_context,
+                object_fixture.namespace.domain(),
+                lifecycle_object_id,
+            )
+            .unwrap(),
+        DurableObjectHead::Tombstoned {
+            last_object_version,
+            ..
+        } if last_object_version == DurableObjectVersion::new(3).unwrap()
+    ));
+
+    let blob_object_id = ObjectId::new([0x61; 32]);
+    let blob_version = DurableObjectVersionRecord::from_blob_reference(
+        blob_object_id,
+        DurableObjectVersion::FIRST,
+        Digest32::new(HashAlgorithmId::Sha2_256, [0x62; 32]),
+        9,
+        10,
+        Digest32::new(HashAlgorithmId::Sha3_256, [0x63; 32]),
+    );
+    let blob_changes = DurableObjectChanges::new(
+        vec![DurableObjectHeadRead::new(
+            blob_object_id,
+            DurableObjectHead::Absent,
+        )],
+        vec![DurableObjectMutationEntry::new(
+            blob_object_id,
+            DurableObjectMutation::Create {
+                version: blob_version.clone(),
+                owner_projection: runtime::DurableObjectOwnerProjection::default(),
+                routing_projection: runtime::DurableObjectRoutingProjection::default(),
+            },
+        )],
+    )
+    .unwrap();
+    let blob_request_id = DurableRequestId::new([0x64; 32]).unwrap();
+    let blob_event_digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x65; 32]);
+    let blob_invocation = DurableInvocationTransaction::new(
+        object_fixture.namespace.domain(),
+        None,
+        blob_changes,
+        DurableRequestReceipt::new(blob_request_id, blob_event_digest, vec![0x66]).unwrap(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        object_fixture
+            .store
+            .commit_invocation(&object_context, blob_invocation),
+        DurableCommitOutcome::Committed
+    );
+    assert_eq!(
+        object_fixture
+            .store
+            .get_object_version(
+                &object_context,
+                object_fixture.namespace.domain(),
+                blob_object_id,
+                DurableObjectVersion::FIRST,
+            )
+            .unwrap(),
+        Some(blob_version.clone())
+    );
+    assert!(matches!(
+        object_fixture
+            .store
+            .get_object_head(
+                &object_context,
+                object_fixture.namespace.domain(),
+                blob_object_id,
+            )
+            .unwrap(),
+        DurableObjectHead::Current {
+            head_revision,
+            object_version,
+            digest,
+            owner_projection,
+            routing_projection,
+        } if head_revision == runtime::ObjectHeadRevision::FIRST
+            && object_version == DurableObjectVersion::FIRST
+            && digest == Digest32::new(HashAlgorithmId::Sha2_256, [0x62; 32])
+            && owner_projection.bytes().is_none()
+            && routing_projection.bytes().is_none()
+    ));
+    assert!(matches!(
+        blob_version.payload(),
+        DurableObjectPayload::BlobReference(digest)
+            if *digest == Digest32::new(HashAlgorithmId::Sha3_256, [0x63; 32])
+    ));
+    {
+        let mut object_operator = object_fixture.operator.lock().unwrap();
+        let blob_row = object_operator
+            .query_one(
+                "SELECT inline_canonical_bytes IS NULL,
+                        blob_digest_algorithm_id,
+                        blob_digest_bytes,
+                        type_id
+                 FROM sunrise_edge.object_versions
+                 WHERE chain_id_bytes = $1
+                   AND validator_id = $2
+                   AND atomicity_domain_id = $3
+                   AND object_id = $4
+                   AND object_version = 1",
+                &[
+                    &object_fixture.namespace.chain_id_bytes(),
+                    &&object_fixture.namespace.validator_id().as_bytes()[..],
+                    &&object_fixture.namespace.domain().as_bytes()[..],
+                    &&blob_object_id.as_bytes()[..],
+                ],
+            )
+            .unwrap();
+        assert!(blob_row.get::<usize, bool>(0));
+        assert_eq!(blob_row.get::<usize, i32>(1), 2);
+        assert_eq!(blob_row.get::<usize, Vec<u8>>(2), vec![0x63; 32]);
+        assert_eq!(
+            blob_row.get::<usize, i64>(3),
+            i64::from(runtime::DURABLE_OBJECT_CANONICAL_RECORD_TYPE_ID)
+        );
+        let current_head = object_operator
+            .query_one(
+                "SELECT current_version::TEXT,
+                        digest_algorithm_id,
+                        digest_bytes,
+                        owner_projection IS NULL,
+                        routing_projection IS NULL,
+                        revision::TEXT,
+                        tombstone
+                 FROM sunrise_edge.object_heads
+                 WHERE chain_id_bytes = $1
+                   AND validator_id = $2
+                   AND atomicity_domain_id = $3
+                   AND object_id = $4",
+                &[
+                    &object_fixture.namespace.chain_id_bytes(),
+                    &&object_fixture.namespace.validator_id().as_bytes()[..],
+                    &&object_fixture.namespace.domain().as_bytes()[..],
+                    &&blob_object_id.as_bytes()[..],
+                ],
+            )
+            .unwrap();
+        assert_eq!(current_head.get::<usize, String>(0), "1");
+        assert_eq!(current_head.get::<usize, i32>(1), 1);
+        assert_eq!(current_head.get::<usize, Vec<u8>>(2), vec![0x62; 32]);
+        assert!(current_head.get::<usize, bool>(3));
+        assert!(current_head.get::<usize, bool>(4));
+        assert_eq!(current_head.get::<usize, String>(5), "1");
+        assert!(!current_head.get::<usize, bool>(6));
+
+        object_operator
+            .execute(
+                "UPDATE sunrise_edge.object_versions
+                 SET type_id = 0
+                 WHERE chain_id_bytes = $1
+                   AND validator_id = $2
+                   AND atomicity_domain_id = $3
+                   AND object_id = $4
+                   AND object_version = 1",
+                &[
+                    &object_fixture.namespace.chain_id_bytes(),
+                    &&object_fixture.namespace.validator_id().as_bytes()[..],
+                    &&object_fixture.namespace.domain().as_bytes()[..],
+                    &&blob_object_id.as_bytes()[..],
+                ],
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        object_fixture.store.get_object_version(
+            &object_context,
+            object_fixture.namespace.domain(),
+            blob_object_id,
+            DurableObjectVersion::FIRST,
+        ),
+        Err(DurableReadError::InvalidPersistedState)
+    );
+    assert_eq!(
+        object_fixture.store.get_object_head(
+            &object_context,
+            object_fixture.namespace.domain(),
+            blob_object_id,
+        ),
+        Err(DurableReadError::InvalidPersistedState)
+    );
+    {
+        let mut object_operator = object_fixture.operator.lock().unwrap();
+        object_operator
+            .execute(
+                "UPDATE sunrise_edge.object_versions
+                 SET type_id = $1
+                 WHERE chain_id_bytes = $2
+                   AND validator_id = $3
+                   AND atomicity_domain_id = $4
+                   AND object_id = $5
+                   AND object_version = 1",
+                &[
+                    &i64::from(runtime::DURABLE_OBJECT_CANONICAL_RECORD_TYPE_ID),
+                    &object_fixture.namespace.chain_id_bytes(),
+                    &&object_fixture.namespace.validator_id().as_bytes()[..],
+                    &&object_fixture.namespace.domain().as_bytes()[..],
+                    &&blob_object_id.as_bytes()[..],
+                ],
+            )
+            .unwrap();
+    }
 
     let schema_namespace = PostgresNamespace::new(
         &ChainId::new("postgres-schema-skew-conformance").unwrap(),
