@@ -24,16 +24,19 @@
 //! same `CanonicalStruct` framing used throughout the workspace.  Type-id
 //! constants in this crate live in the `0x6xxx` namespace.
 
-use abi::{AbiError, AccessManifest, encode_access_manifest};
-use canonical_encoding::{CanonicalEncodingError, CanonicalStruct, encode_digest32};
+use abi::{AbiError, AccessManifest, decode_access_manifest, encode_access_manifest};
+use canonical_encoding::{
+    CanonicalDecodingError, CanonicalEncodingError, CanonicalFrame, CanonicalStruct,
+    decode_canonical_frame, encode_digest32,
+};
 use core::fmt;
-use fees::{FeeError, FeePayment, encode_fee_payment};
+use fees::{FeeError, FeePayment, decode_fee_payment, encode_fee_payment};
 use hashing::{HashSuiteResolver, HashingError};
 use objects::{
-    AccessMode, Address, Object, ObjectId, ObjectRef, encode_object, encode_object_id,
-    encode_object_ref,
+    AccessMode, Address, Object, ObjectId, ObjectRef, decode_object_ref, encode_object,
+    encode_object_id, encode_object_ref,
 };
-use protocol_types::{ChainId, Digest32, Epoch, HashPurpose, ProtocolVersion};
+use protocol_types::{ChainId, Digest32, Epoch, HashPurpose, ProtocolVersion, TypeError};
 use std::error::Error;
 
 // ── type-id constants ──────────────────────────────────────────────────────
@@ -46,6 +49,43 @@ const OBJECT_EFFECTS_LIST_TYPE_ID: u16 = 0x6005;
 const EVENT_RECORDS_LIST_TYPE_ID: u16 = 0x6006;
 const ENCODING_VERSION: u16 = 1;
 
+// ── transaction decode resource bounds ──────────────────────────────────────
+//
+// A [`Transaction`] is decoded directly from untrusted sender input, before
+// any fee or gas check runs. These bounds are deliberately tighter than the
+// shared 32 MiB canonical frame bound
+// (`canonical_encoding::MAX_CANONICAL_FRAME_BYTES`), which they reuse for
+// every nested frame rather than duplicate.
+
+/// Maximum byte length of a decoded transaction's `chain_id` string.
+///
+/// Matches the conservative bound `node-core` already applies to a
+/// `NodeEvent`'s chain identifier.
+pub const MAX_TRANSACTION_CHAIN_ID_BYTES: usize = 128;
+/// Maximum byte length of a decoded transaction's `entrypoint` name.
+///
+/// WASM export names are short identifiers, not attacker-sized payloads.
+pub const MAX_TRANSACTION_ENTRYPOINT_BYTES: usize = 256;
+/// Maximum byte length of a decoded transaction's `args` payload.
+///
+/// Matches the bound the WASM engine already enforces on argument bytes
+/// (`wasm_engine::MAX_ARGS_BYTES`), so a transaction that would be rejected
+/// at execution time is also rejected at decode time.
+pub const MAX_TRANSACTION_ARGS_BYTES: usize = 1024 * 1024;
+/// Maximum byte length of a decoded transaction's `signature` field.
+///
+/// No implemented signature scheme in this workspace produces anything
+/// close to this size; it exists to bound an attacker-supplied length
+/// before the bytes are copied.
+pub const MAX_TRANSACTION_SIGNATURE_BYTES: usize = 4_096;
+/// Maximum number of [`abi::AccessEntry`] entries a decoded transaction's
+/// [`AccessManifest`] may declare.
+///
+/// Matches the object-list bounds already used elsewhere in the workspace
+/// for a single transaction/invocation (for example
+/// `wasm_engine::MAX_INPUT_OBJECTS` and `runtime::MAX_ATOMIC_STATE_READS`).
+pub const MAX_TRANSACTION_MANIFEST_ENTRIES: usize = 4_096;
+
 // ── error type ────────────────────────────────────────────────────────────
 
 /// Errors produced by the execution crate.
@@ -53,18 +93,35 @@ const ENCODING_VERSION: u16 = 1;
 pub enum ExecutionError {
     /// Canonical encoding failed.
     CanonicalEncoding(CanonicalEncodingError),
-    /// ABI encoding failed.
+    /// Canonical decoding failed.
+    CanonicalDecoding(CanonicalDecodingError),
+    /// ABI encoding or decoding failed.
     Abi(AbiError),
-    /// Object encoding failed.
+    /// Object encoding or decoding failed.
     Object(objects::ObjectError),
     /// Hashing failed.
     Hashing(HashingError),
-    /// Fee payment encoding failed.
+    /// Fee payment encoding or decoding failed.
     Fee(FeeError),
+    /// A decoded protocol identifier failed validation.
+    ProtocolType(TypeError),
     /// The transaction entrypoint name must not be empty.
     EmptyEntrypoint,
     /// The transaction must carry a non-empty signature.
     EmptySignature,
+    /// A decoded transaction's field exceeded its deterministic resource
+    /// bound.
+    TransactionFieldTooLarge {
+        /// Name of the oversized field.
+        field: &'static str,
+        /// Actual byte or item length.
+        actual: usize,
+        /// Maximum permitted byte or item length.
+        maximum: usize,
+    },
+    /// Re-encoding a decoded transaction did not reproduce its input bytes,
+    /// meaning the input was not the unique canonical encoding of its value.
+    NonCanonicalTransactionEncoding,
     /// The WASM engine raised an error (module parse, instantiation, or trap).
     WasmEngine(String),
     /// The requested entry-point function was not found in the WASM module.
@@ -88,12 +145,26 @@ impl fmt::Display for ExecutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CanonicalEncoding(e) => write!(f, "canonical encoding error: {e}"),
+            Self::CanonicalDecoding(e) => write!(f, "canonical decoding error: {e}"),
             Self::Abi(e) => write!(f, "abi error: {e}"),
             Self::Object(e) => write!(f, "object error: {e}"),
             Self::Hashing(e) => write!(f, "hashing error: {e}"),
             Self::Fee(e) => write!(f, "fee error: {e}"),
+            Self::ProtocolType(e) => write!(f, "protocol type error: {e}"),
             Self::EmptyEntrypoint => write!(f, "transaction entrypoint must not be empty"),
             Self::EmptySignature => write!(f, "transaction signature must not be empty"),
+            Self::TransactionFieldTooLarge {
+                field,
+                actual,
+                maximum,
+            } => write!(
+                f,
+                "transaction field {field} is {actual} bytes/items, maximum is {maximum}"
+            ),
+            Self::NonCanonicalTransactionEncoding => write!(
+                f,
+                "decoded transaction does not re-encode to its input bytes"
+            ),
             Self::WasmEngine(msg) => write!(f, "wasm engine error: {msg}"),
             Self::MissingEntrypoint(name) => {
                 write!(f, "entry-point not found in wasm module: {name}")
@@ -125,6 +196,18 @@ impl Error for ExecutionError {}
 impl From<CanonicalEncodingError> for ExecutionError {
     fn from(value: CanonicalEncodingError) -> Self {
         Self::CanonicalEncoding(value)
+    }
+}
+
+impl From<CanonicalDecodingError> for ExecutionError {
+    fn from(value: CanonicalDecodingError) -> Self {
+        Self::CanonicalDecoding(value)
+    }
+}
+
+impl From<TypeError> for ExecutionError {
+    fn from(value: TypeError) -> Self {
+        Self::ProtocolType(value)
     }
 }
 
@@ -219,6 +302,121 @@ pub fn encode_transaction(tx: &Transaction) -> Result<Vec<u8>, ExecutionError> {
     }
     canonical.field_bytes(12, tx.signature.as_slice())?;
     Ok(canonical.finish()?)
+}
+
+/// Decodes a [`Transaction`] from its strict canonical wire format.
+///
+/// This is the single strict decoder for transaction bytes accepted from an
+/// untrusted sender. Beyond the shared [`decode_canonical_frame`] guarantees
+/// (correct magic, no truncation/trailing bytes, strictly increasing field
+/// order, no duplicate fields), this function additionally:
+///
+/// * requires the transaction type id (`0x6001`) and encoding version 1;
+/// * requires exactly fields 1-10 and 12, with field 11 (`fee_payment`)
+///   optional, and rejects any other field id;
+/// * recursively decodes and validates every nested frame (`access_manifest`,
+///   `module_ref`, `fee_payment`) with the same strict rules, reusing the
+///   shared 32 MiB canonical frame bound
+///   ([`canonical_encoding::MAX_CANONICAL_FRAME_BYTES`]) at every nesting
+///   level;
+/// * applies the tighter transaction-specific bounds
+///   ([`MAX_TRANSACTION_CHAIN_ID_BYTES`], [`MAX_TRANSACTION_ENTRYPOINT_BYTES`],
+///   [`MAX_TRANSACTION_ARGS_BYTES`], [`MAX_TRANSACTION_SIGNATURE_BYTES`],
+///   [`MAX_TRANSACTION_MANIFEST_ENTRIES`]) *before* copying the corresponding
+///   attacker-controlled bytes/entries out of the borrowed frame;
+/// * rejects an empty `entrypoint` or `signature`, matching
+///   [`encode_transaction`];
+/// * rejects a non-canonical `access_manifest` count/field layout and any
+///   duplicate `ObjectId` entry within it (see [`abi::decode_access_manifest`]);
+/// * finally re-encodes the decoded value with [`encode_transaction`] and
+///   requires the result to be byte-for-byte identical to `input`, so no
+///   alternate representation of the same logical transaction is accepted.
+pub fn decode_transaction(input: &[u8]) -> Result<Transaction, ExecutionError> {
+    let frame: CanonicalFrame<'_> = decode_canonical_frame(input)?;
+    frame.require_type(TRANSACTION_TYPE_ID)?;
+    frame.require_version(ENCODING_VERSION)?;
+    frame.require_only_fields(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])?;
+
+    let chain_id_str = frame.required_str(1)?;
+    if chain_id_str.len() > MAX_TRANSACTION_CHAIN_ID_BYTES {
+        return Err(ExecutionError::TransactionFieldTooLarge {
+            field: "chain_id",
+            actual: chain_id_str.len(),
+            maximum: MAX_TRANSACTION_CHAIN_ID_BYTES,
+        });
+    }
+    let chain_id = ChainId::new(chain_id_str)?;
+
+    let protocol_version = ProtocolVersion::new(frame.required_u32(2)?);
+    let epoch = Epoch::new(frame.required_u64(3)?);
+    let sender = Address::try_from_slice(frame.required_field(4)?)?;
+    let nonce = frame.required_u64(5)?;
+
+    let access_manifest =
+        decode_access_manifest(frame.required_field(6)?, MAX_TRANSACTION_MANIFEST_ENTRIES)?;
+
+    let module_ref = decode_object_ref(frame.required_field(7)?)?;
+
+    let entrypoint = frame.required_str(8)?;
+    if entrypoint.is_empty() {
+        return Err(ExecutionError::EmptyEntrypoint);
+    }
+    if entrypoint.len() > MAX_TRANSACTION_ENTRYPOINT_BYTES {
+        return Err(ExecutionError::TransactionFieldTooLarge {
+            field: "entrypoint",
+            actual: entrypoint.len(),
+            maximum: MAX_TRANSACTION_ENTRYPOINT_BYTES,
+        });
+    }
+    let entrypoint = entrypoint.to_string();
+
+    let args_bytes = frame.required_field(9)?;
+    if args_bytes.len() > MAX_TRANSACTION_ARGS_BYTES {
+        return Err(ExecutionError::TransactionFieldTooLarge {
+            field: "args",
+            actual: args_bytes.len(),
+            maximum: MAX_TRANSACTION_ARGS_BYTES,
+        });
+    }
+    let args = args_bytes.to_vec();
+
+    let gas_limit = frame.required_u64(10)?;
+
+    let fee_payment = frame.field(11).map(decode_fee_payment).transpose()?;
+
+    let signature_bytes = frame.required_field(12)?;
+    if signature_bytes.is_empty() {
+        return Err(ExecutionError::EmptySignature);
+    }
+    if signature_bytes.len() > MAX_TRANSACTION_SIGNATURE_BYTES {
+        return Err(ExecutionError::TransactionFieldTooLarge {
+            field: "signature",
+            actual: signature_bytes.len(),
+            maximum: MAX_TRANSACTION_SIGNATURE_BYTES,
+        });
+    }
+    let signature = signature_bytes.to_vec();
+
+    let transaction = Transaction {
+        chain_id,
+        protocol_version,
+        epoch,
+        sender,
+        nonce,
+        access_manifest,
+        module_ref,
+        entrypoint,
+        args,
+        gas_limit,
+        fee_payment,
+        signature,
+    };
+
+    if encode_transaction(&transaction)?.as_slice() != input {
+        return Err(ExecutionError::NonCanonicalTransactionEncoding);
+    }
+
+    Ok(transaction)
 }
 
 /// Encodes the *signable* portion of a transaction (everything except the
@@ -681,6 +879,530 @@ mod tests {
             encode_transaction(&tx1).unwrap(),
             encode_transaction(&tx2).unwrap()
         );
+    }
+
+    // ── transaction decoding ────────────────────────────────────────────────
+
+    const ALL_TRANSACTION_FIELDS: [u16; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+
+    fn indexed_object_ref(index: u32) -> ObjectRef {
+        let mut id = [0u8; 32];
+        id[28..].copy_from_slice(&index.to_be_bytes());
+        ObjectRef {
+            id: ObjectId::new(id),
+            version: 1,
+            digest: sample_digest(0x01),
+        }
+    }
+
+    /// Hand-builds a transaction frame field-by-field, so adversarial tests
+    /// can omit required fields, add unknown ones, or splice in raw bytes
+    /// that the safe [`encode_transaction`] wrapper could never produce.
+    fn manual_transaction_frame(
+        tx: &Transaction,
+        fields: &[u16],
+        overrides: &[(u16, Vec<u8>)],
+    ) -> Vec<u8> {
+        let mut canonical = CanonicalStruct::new(TRANSACTION_TYPE_ID, ENCODING_VERSION);
+        for &field in fields {
+            if let Some((_, bytes)) = overrides.iter().find(|(id, _)| *id == field) {
+                canonical.field_bytes(field, bytes.clone()).unwrap();
+                continue;
+            }
+            match field {
+                1 => canonical.field_str(1, tx.chain_id.as_str()).unwrap(),
+                2 => canonical.field_u32(2, tx.protocol_version.get()).unwrap(),
+                3 => canonical.field_u64(3, tx.epoch.get()).unwrap(),
+                4 => canonical.field_bytes(4, tx.sender.as_bytes()).unwrap(),
+                5 => canonical.field_u64(5, tx.nonce).unwrap(),
+                6 => canonical
+                    .field_bytes(6, encode_access_manifest(&tx.access_manifest).unwrap())
+                    .unwrap(),
+                7 => canonical
+                    .field_bytes(7, encode_object_ref(&tx.module_ref).unwrap())
+                    .unwrap(),
+                8 => canonical.field_str(8, &tx.entrypoint).unwrap(),
+                9 => canonical.field_bytes(9, tx.args.as_slice()).unwrap(),
+                10 => canonical.field_u64(10, tx.gas_limit).unwrap(),
+                11 => canonical
+                    .field_bytes(
+                        11,
+                        encode_fee_payment(tx.fee_payment.as_ref().unwrap()).unwrap(),
+                    )
+                    .unwrap(),
+                12 => canonical.field_bytes(12, tx.signature.as_slice()).unwrap(),
+                other => canonical.field_bytes(other, Vec::<u8>::new()).unwrap(),
+            }
+        }
+        canonical.finish().unwrap()
+    }
+
+    /// Scans a valid canonical frame's field headers (10-byte frame header,
+    /// then 2-byte field id + 4-byte length + payload per field) and returns
+    /// the byte offset of the requested field's 2-byte id header, so
+    /// adversarial tests can splice a specific field id without hand-computing
+    /// every preceding field's payload length.
+    fn field_id_offset(encoded: &[u8], field_id: u16) -> usize {
+        const FRAME_HEADER_BYTES: usize = 10;
+        const FIELD_HEADER_BYTES: usize = 6;
+        let mut offset: usize = FRAME_HEADER_BYTES;
+        loop {
+            let current_id_bytes: [u8; 2] = [encoded[offset], encoded[offset + 1]];
+            let current_id = u16::from_le_bytes(current_id_bytes);
+            if current_id == field_id {
+                return offset;
+            }
+            let length_bytes: [u8; 4] = [
+                encoded[offset + 2],
+                encoded[offset + 3],
+                encoded[offset + 4],
+                encoded[offset + 5],
+            ];
+            let length = u32::from_le_bytes(length_bytes) as usize;
+            offset += FIELD_HEADER_BYTES + length;
+        }
+    }
+
+    #[test]
+    fn transaction_decoder_round_trips_with_fee() {
+        let tx = sample_transaction();
+        let encoded = encode_transaction(&tx).unwrap();
+        assert_eq!(decode_transaction(&encoded), Ok(tx));
+    }
+
+    #[test]
+    fn transaction_decoder_round_trips_without_fee() {
+        let mut tx = sample_transaction();
+        tx.fee_payment = None;
+        let encoded = encode_transaction(&tx).unwrap();
+        assert_eq!(decode_transaction(&encoded), Ok(tx));
+    }
+
+    #[test]
+    fn transaction_decoder_round_trips_stable_vector_transaction() {
+        let mut manifest = AccessManifest::new();
+        manifest.push(AccessEntry {
+            object_ref: sample_object_ref(0x11, 1),
+            mode: AccessMode::Read,
+        });
+
+        let tx = Transaction {
+            chain_id: ChainId::new("test-chain").unwrap(),
+            protocol_version: ProtocolVersion::new(1),
+            epoch: Epoch::new(0),
+            sender: Address::new([0xAA; 32]),
+            nonce: 1,
+            access_manifest: manifest,
+            module_ref: sample_object_ref(0xBB, 1),
+            entrypoint: "run".to_string(),
+            args: vec![],
+            gas_limit: 1_000,
+            fee_payment: Some(FeePayment {
+                asset_id: AssetId::new([0xCC; 32]),
+                max_fee: Amount::new(9),
+                fee_object: sample_object_ref(0xDD, 2),
+            }),
+            signature: vec![0x01; 32],
+        };
+
+        let encoded = encode_transaction(&tx).unwrap();
+        assert_eq!(decode_transaction(&encoded), Ok(tx));
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_wrong_type_id() {
+        let tx = sample_transaction();
+        let mut encoded = encode_transaction(&tx).unwrap();
+        encoded[4..6].copy_from_slice(&0x6999_u16.to_le_bytes());
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedTypeId {
+                    expected: TRANSACTION_TYPE_ID,
+                    actual: 0x6999,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_wrong_version() {
+        let tx = sample_transaction();
+        let mut encoded = encode_transaction(&tx).unwrap();
+        encoded[6..8].copy_from_slice(&2_u16.to_le_bytes());
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedVersion {
+                    expected: ENCODING_VERSION,
+                    actual: 2,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_duplicate_field_id() {
+        let tx: Transaction = sample_transaction();
+        let mut encoded: Vec<u8> = encode_transaction(&tx).unwrap();
+        // Overwrite field 2's (`protocol_version`) 2-byte id header so it
+        // duplicates field 1's (`chain_id`) id, without touching field 2's
+        // declared length or payload bytes.
+        let field_2_id_offset: usize = field_id_offset(&encoded, 2);
+        let duplicate_id_bytes: [u8; 2] = 1_u16.to_le_bytes();
+        encoded[field_2_id_offset..field_2_id_offset + 2].copy_from_slice(&duplicate_id_bytes);
+        let expected_error: CanonicalDecodingError =
+            CanonicalDecodingError::NonCanonicalFieldOrder {
+                previous: 1,
+                current: 1,
+            };
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::CanonicalDecoding(expected_error))
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_out_of_order_field_id() {
+        let tx: Transaction = sample_transaction();
+        let mut encoded: Vec<u8> = encode_transaction(&tx).unwrap();
+        // Overwrite field 7's (`module_ref`) 2-byte id header so it becomes
+        // field 3 (`epoch`)'s id, which is strictly less than the preceding
+        // field 6 (`access_manifest`) but not equal to it, without touching
+        // field 7's declared length or payload bytes.
+        let field_7_id_offset: usize = field_id_offset(&encoded, 7);
+        let out_of_order_id_bytes: [u8; 2] = 3_u16.to_le_bytes();
+        encoded[field_7_id_offset..field_7_id_offset + 2].copy_from_slice(&out_of_order_id_bytes);
+        let expected_error: CanonicalDecodingError =
+            CanonicalDecodingError::NonCanonicalFieldOrder {
+                previous: 6,
+                current: 3,
+            };
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::CanonicalDecoding(expected_error))
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_wrong_length_numeric_field() {
+        let tx: Transaction = sample_transaction();
+        // `protocol_version` (field 2) must be a 4-byte little-endian `u32`;
+        // supply 3 bytes instead so the frame parses structurally but the
+        // typed accessor rejects the wrong length.
+        let wrong_length_protocol_version: Vec<u8> = vec![0xAA, 0xBB, 0xCC];
+        let overrides: [(u16, Vec<u8>); 1] = [(2, wrong_length_protocol_version)];
+        let encoded: Vec<u8> = manual_transaction_frame(&tx, &ALL_TRANSACTION_FIELDS, &overrides);
+        let expected_error: CanonicalDecodingError = CanonicalDecodingError::InvalidFieldLength {
+            field_id: 2,
+            expected: 4,
+            actual: 3,
+        };
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::CanonicalDecoding(expected_error))
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_missing_required_field() {
+        let tx = sample_transaction();
+        let encoded = manual_transaction_frame(&tx, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12], &[]);
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::CanonicalDecoding(
+                CanonicalDecodingError::MissingField(10)
+            ))
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_unknown_field() {
+        let tx = sample_transaction();
+        let mut fields = ALL_TRANSACTION_FIELDS.to_vec();
+        fields.push(13);
+        let encoded = manual_transaction_frame(&tx, &fields, &[]);
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedField(13)
+            ))
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_trailing_bytes() {
+        let tx = sample_transaction();
+        let mut encoded = encode_transaction(&tx).unwrap();
+        encoded.push(0x00);
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::CanonicalDecoding(
+                CanonicalDecodingError::TrailingBytes(1)
+            ))
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_every_truncated_prefix() {
+        let tx = sample_transaction();
+        let encoded = encode_transaction(&tx).unwrap();
+        for end in 0..encoded.len() {
+            assert!(matches!(
+                decode_transaction(&encoded[..end]),
+                Err(ExecutionError::CanonicalDecoding(
+                    CanonicalDecodingError::Truncated { .. }
+                ))
+            ));
+        }
+        assert!(decode_transaction(&encoded).is_ok());
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_invalid_utf8_chain_id() {
+        let tx = sample_transaction();
+        let encoded =
+            manual_transaction_frame(&tx, &ALL_TRANSACTION_FIELDS, &[(1, vec![0xFF, 0xFE])]);
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::CanonicalDecoding(
+                CanonicalDecodingError::InvalidUtf8(1)
+            ))
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_invalid_utf8_entrypoint() {
+        let tx = sample_transaction();
+        let encoded =
+            manual_transaction_frame(&tx, &ALL_TRANSACTION_FIELDS, &[(8, vec![0xFF, 0xFE])]);
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::CanonicalDecoding(
+                CanonicalDecodingError::InvalidUtf8(8)
+            ))
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_wrong_sender_length() {
+        let tx = sample_transaction();
+        let encoded =
+            manual_transaction_frame(&tx, &ALL_TRANSACTION_FIELDS, &[(4, vec![0xCC; 31])]);
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::Object(
+                objects::ObjectError::InvalidAddressLength(31)
+            ))
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_unknown_module_ref_digest_algorithm() {
+        let tx = sample_transaction();
+
+        // Digest32 (0x0103), ObjectId (0x4001), and ObjectRef (0x4004) are the
+        // stable, already-committed type ids used by `objects`; an unknown
+        // hash-algorithm tag cannot be produced through the public encoders,
+        // so it is hand-built here the same way `canonical-encoding`'s own
+        // adversarial tests build it.
+        let mut digest_frame = CanonicalStruct::new(0x0103, 1);
+        digest_frame.field_u16(1, 0xFFFF).unwrap();
+        digest_frame.field_bytes(2, [0x11; 32]).unwrap();
+        let digest_bytes = digest_frame.finish().unwrap();
+
+        let mut object_id_frame = CanonicalStruct::new(0x4001, 1);
+        object_id_frame
+            .field_bytes(1, tx.module_ref.id.as_bytes())
+            .unwrap();
+        let object_id_bytes = object_id_frame.finish().unwrap();
+
+        let mut object_ref_frame = CanonicalStruct::new(0x4004, 1);
+        object_ref_frame.field_bytes(1, object_id_bytes).unwrap();
+        object_ref_frame
+            .field_u64(2, tx.module_ref.version)
+            .unwrap();
+        object_ref_frame.field_bytes(3, digest_bytes).unwrap();
+        let object_ref_bytes = object_ref_frame.finish().unwrap();
+
+        let encoded =
+            manual_transaction_frame(&tx, &ALL_TRANSACTION_FIELDS, &[(7, object_ref_bytes)]);
+
+        let inner_error = CanonicalDecodingError::UnknownHashAlgorithmId(0xFFFF);
+        let expected_error = objects::ObjectError::CanonicalDecoding(inner_error);
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::Object(expected_error))
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_empty_entrypoint() {
+        let tx = sample_transaction();
+        let encoded = manual_transaction_frame(&tx, &ALL_TRANSACTION_FIELDS, &[(8, Vec::new())]);
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::EmptyEntrypoint)
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_empty_signature() {
+        let tx = sample_transaction();
+        let encoded = manual_transaction_frame(&tx, &ALL_TRANSACTION_FIELDS, &[(12, Vec::new())]);
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::EmptySignature)
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_oversized_chain_id() {
+        let tx = sample_transaction();
+        let oversized = vec![b'x'; MAX_TRANSACTION_CHAIN_ID_BYTES + 1];
+        let encoded = manual_transaction_frame(&tx, &ALL_TRANSACTION_FIELDS, &[(1, oversized)]);
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::TransactionFieldTooLarge {
+                field: "chain_id",
+                actual: MAX_TRANSACTION_CHAIN_ID_BYTES + 1,
+                maximum: MAX_TRANSACTION_CHAIN_ID_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_oversized_entrypoint() {
+        let tx = sample_transaction();
+        let oversized = vec![b'a'; MAX_TRANSACTION_ENTRYPOINT_BYTES + 1];
+        let encoded = manual_transaction_frame(&tx, &ALL_TRANSACTION_FIELDS, &[(8, oversized)]);
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::TransactionFieldTooLarge {
+                field: "entrypoint",
+                actual: MAX_TRANSACTION_ENTRYPOINT_BYTES + 1,
+                maximum: MAX_TRANSACTION_ENTRYPOINT_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_oversized_args() {
+        let tx = sample_transaction();
+        let oversized = vec![0u8; MAX_TRANSACTION_ARGS_BYTES + 1];
+        let encoded = manual_transaction_frame(&tx, &ALL_TRANSACTION_FIELDS, &[(9, oversized)]);
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::TransactionFieldTooLarge {
+                field: "args",
+                actual: MAX_TRANSACTION_ARGS_BYTES + 1,
+                maximum: MAX_TRANSACTION_ARGS_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_oversized_signature() {
+        let tx = sample_transaction();
+        let oversized = vec![0u8; MAX_TRANSACTION_SIGNATURE_BYTES + 1];
+        let encoded = manual_transaction_frame(&tx, &ALL_TRANSACTION_FIELDS, &[(12, oversized)]);
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::TransactionFieldTooLarge {
+                field: "signature",
+                actual: MAX_TRANSACTION_SIGNATURE_BYTES + 1,
+                maximum: MAX_TRANSACTION_SIGNATURE_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_manifest_count_above_bound_before_copying_entries() {
+        let tx = sample_transaction();
+
+        // AccessManifest (0x5002) declares an entry count above the
+        // transaction-specific bound without any of the (expensive to
+        // construct) matching entries, proving the bound is enforced before
+        // entries are decoded/copied.
+        let mut manifest_frame = CanonicalStruct::new(0x5002, 1);
+        manifest_frame
+            .field_u32(1, (MAX_TRANSACTION_MANIFEST_ENTRIES + 1) as u32)
+            .unwrap();
+        let manifest_bytes = manifest_frame.finish().unwrap();
+
+        let encoded =
+            manual_transaction_frame(&tx, &ALL_TRANSACTION_FIELDS, &[(6, manifest_bytes)]);
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::Abi(AbiError::ManifestTooLarge(
+                MAX_TRANSACTION_MANIFEST_ENTRIES + 1
+            )))
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_manifest_count_field_layout_mismatch() {
+        let tx = sample_transaction();
+        let mut manifest = AccessManifest::new();
+        manifest.push(AccessEntry {
+            object_ref: indexed_object_ref(1),
+            mode: AccessMode::Read,
+        });
+        let mut encoded_manifest = encode_access_manifest(&manifest).unwrap();
+        // Field 1 (`declared_count`) is a fixed-width little-endian `u32`
+        // located right after the 10-byte frame header and 6-byte field
+        // header.
+        encoded_manifest[16..20].copy_from_slice(&2_u32.to_le_bytes());
+
+        let encoded =
+            manual_transaction_frame(&tx, &ALL_TRANSACTION_FIELDS, &[(6, encoded_manifest)]);
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::Abi(AbiError::NonCanonicalManifestLayout {
+                declared_count: 2,
+                field_count: 2,
+            }))
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_duplicate_manifest_objects() {
+        let mut tx = sample_transaction();
+        let shared_ref = indexed_object_ref(7);
+        tx.access_manifest = AccessManifest::new();
+        tx.access_manifest.push(AccessEntry {
+            object_ref: shared_ref.clone(),
+            mode: AccessMode::Read,
+        });
+        tx.access_manifest.push(AccessEntry {
+            object_ref: shared_ref.clone(),
+            mode: AccessMode::Write,
+        });
+
+        let encoded = encode_transaction(&tx).unwrap();
+        assert_eq!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::Abi(AbiError::DuplicateObjectId(
+                shared_ref.id
+            )))
+        );
+    }
+
+    #[test]
+    fn transaction_decoder_rejects_malformed_fee_payment() {
+        let tx = sample_transaction();
+        // FeePayment (0x7002) missing its required fields entirely.
+        let mut bogus_fee = CanonicalStruct::new(0x7002, 1);
+        bogus_fee.field_u64(1, 5).unwrap();
+        let encoded = manual_transaction_frame(
+            &tx,
+            &ALL_TRANSACTION_FIELDS,
+            &[(11, bogus_fee.finish().unwrap())],
+        );
+        assert!(matches!(
+            decode_transaction(&encoded),
+            Err(ExecutionError::Fee(_))
+        ));
     }
 
     // ── transaction hashing ───────────────────────────────────────────────

@@ -147,18 +147,39 @@ address-binding scheme beyond `AddressIsPublicKey`, requires a new
 protocol/transaction version and an explicit accepted decision, not a
 silently added identifier or enum variant. This closes the
 signature-verification and committed-scheme-resolution primitives; strict
-`execution::Transaction` decoding/dispatch against this profile and the owned
+`execution::Transaction` dispatch against this profile and the owned
 fast-path certificate flow remain separate follow-up work.
+
+`execution::decode_transaction` now implements the strict, standalone
+canonical decoder that boundary must eventually consume: it requires the
+transaction type id and encoding version 1, requires exactly fields 1-10 and
+12 with field 11 (`fee_payment`) optional, and rejects unknown/missing/
+duplicate/out-of-order fields, trailing or truncated bytes, invalid UTF-8,
+wrong numeric/address/digest lengths, and unknown tags/algorithms in any
+nested frame (`AccessManifest`/`AccessEntry`, `ObjectRef`/`ObjectId`/
+`Address`/`AccessMode`, `FeePayment`/`AssetId`, all newly given matching
+decoders in `objects`, `abi`, and `fees`). It applies transaction-specific
+resource bounds — tighter than the shared 32 MiB canonical frame bound —
+to the chain id, entrypoint, args, signature, and `AccessManifest` entry
+count before copying any of that attacker-controlled data, rejects a
+non-canonical `AccessManifest` count/field layout and any duplicate
+`ObjectId` entry within it, and finally re-encodes the decoded value and
+requires it to reproduce the input bytes exactly, so no alternate
+representation of the same transaction is accepted. It performs no
+signature verification and constructs no `SignatureDomain`; it is a
+canonical-structure boundary only.
 
 **Hard activation constraint:** committing a `TransactionAuthProfile` and
 reaching protocol version 3 in `ProtocolConfig` is necessary but not
 sufficient for owned-transaction authentication to actually run. Protocol
 version 3 MUST NOT be activated on any live chain until the strict
 `execution::Transaction` v1 decoding and authentication-enforcement boundary
-described above lands and is wired into the transaction-processing path;
-activating version 3 first would commit a config that claims authentication
-is enforced while no code path actually verifies a transaction's signature
-against it.
+described above lands and is wired into the transaction-processing path.
+Strict decoding alone, as implemented by `execution::decode_transaction`,
+does not satisfy this constraint: activating version 3 before a code path
+also constructs the `SignatureDomain` from the resolved profile and verifies
+a transaction's signature against it would commit a config that claims
+authentication is enforced while no code path actually checks it.
 
 ## 9. Object lifecycle
 Objects are not implemented in Phase 1. Future object versions will reference self-describing digests so historical versions remain readable after hash-suite migration.

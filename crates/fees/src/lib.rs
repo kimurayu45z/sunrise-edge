@@ -3,9 +3,12 @@
 //! Stablecoin-denominated fee assets, deterministic fee calculation, and
 //! validator fee distribution.
 
-use canonical_encoding::{CanonicalEncodingError, CanonicalStruct};
+use canonical_encoding::{
+    CanonicalDecodingError, CanonicalEncodingError, CanonicalFrame, CanonicalStruct,
+    decode_canonical_frame,
+};
 use core::fmt;
-use objects::{ObjectRef, encode_object_ref};
+use objects::{ObjectRef, decode_object_ref, encode_object_ref};
 use runtime::ValidatorId;
 use std::error::Error;
 
@@ -49,7 +52,9 @@ pub enum FeeError {
     ArithmeticOverflow,
     /// Canonical encoding failed.
     CanonicalEncoding(CanonicalEncodingError),
-    /// Object encoding failed.
+    /// Canonical decoding failed.
+    CanonicalDecoding(CanonicalDecodingError),
+    /// Object encoding or decoding failed.
     Object(objects::ObjectError),
 }
 
@@ -85,6 +90,7 @@ impl fmt::Display for FeeError {
             }
             Self::ArithmeticOverflow => write!(f, "fee arithmetic overflow"),
             Self::CanonicalEncoding(error) => error.fmt(f),
+            Self::CanonicalDecoding(error) => error.fmt(f),
             Self::Object(error) => error.fmt(f),
         }
     }
@@ -95,6 +101,12 @@ impl Error for FeeError {}
 impl From<CanonicalEncodingError> for FeeError {
     fn from(value: CanonicalEncodingError) -> Self {
         Self::CanonicalEncoding(value)
+    }
+}
+
+impl From<CanonicalDecodingError> for FeeError {
+    fn from(value: CanonicalDecodingError) -> Self {
+        Self::CanonicalDecoding(value)
     }
 }
 
@@ -368,6 +380,15 @@ pub fn encode_asset_id(asset_id: &AssetId) -> Result<Vec<u8>, FeeError> {
     Ok(canonical.finish()?)
 }
 
+/// Decodes one canonical asset identifier.
+pub fn decode_asset_id(input: &[u8]) -> Result<AssetId, FeeError> {
+    let frame: CanonicalFrame<'_> = decode_canonical_frame(input)?;
+    frame.require_type(ASSET_ID_TYPE_ID)?;
+    frame.require_version(ENCODING_VERSION)?;
+    frame.require_only_fields(&[1])?;
+    AssetId::try_from_slice(frame.required_field(1)?)
+}
+
 /// Encodes a fee payment.
 pub fn encode_fee_payment(payment: &FeePayment) -> Result<Vec<u8>, FeeError> {
     let mut canonical = CanonicalStruct::new(FEE_PAYMENT_TYPE_ID, ENCODING_VERSION);
@@ -375,6 +396,19 @@ pub fn encode_fee_payment(payment: &FeePayment) -> Result<Vec<u8>, FeeError> {
     canonical.field_u64(2, payment.max_fee.get())?;
     canonical.field_bytes(3, encode_object_ref(&payment.fee_object)?)?;
     Ok(canonical.finish()?)
+}
+
+/// Decodes one canonical [`FeePayment`] without changing its stable encoding.
+pub fn decode_fee_payment(input: &[u8]) -> Result<FeePayment, FeeError> {
+    let frame: CanonicalFrame<'_> = decode_canonical_frame(input)?;
+    frame.require_type(FEE_PAYMENT_TYPE_ID)?;
+    frame.require_version(ENCODING_VERSION)?;
+    frame.require_only_fields(&[1, 2, 3])?;
+    Ok(FeePayment {
+        asset_id: decode_asset_id(frame.required_field(1)?)?,
+        max_fee: Amount::new(frame.required_u64(2)?),
+        fee_object: decode_object_ref(frame.required_field(3)?)?,
+    })
 }
 
 /// Encodes a fee asset configuration.
@@ -616,6 +650,62 @@ mod tests {
 
         assert_eq!(left, right);
         assert!(!left.is_empty());
+    }
+
+    #[test]
+    fn asset_id_decoder_round_trips_existing_canonical_bytes() {
+        let asset_id = sample_asset_id(0x91);
+        let canonical: Vec<u8> = encode_asset_id(&asset_id).unwrap();
+        assert_eq!(decode_asset_id(&canonical), Ok(asset_id));
+    }
+
+    #[test]
+    fn asset_id_decoder_rejects_wrong_length() {
+        let mut short = CanonicalStruct::new(ASSET_ID_TYPE_ID, ENCODING_VERSION);
+        short.field_bytes(1, [0x11; 31]).unwrap();
+        assert_eq!(
+            decode_asset_id(&short.finish().unwrap()),
+            Err(FeeError::InvalidAssetIdLength(31))
+        );
+    }
+
+    #[test]
+    fn fee_payment_decoder_round_trips_existing_canonical_bytes() {
+        let payment = FeePayment {
+            asset_id: sample_asset_id(0x92),
+            max_fee: Amount::new(1_234),
+            fee_object: sample_object_ref(0x93),
+        };
+        let canonical: Vec<u8> = encode_fee_payment(&payment).unwrap();
+        assert_eq!(decode_fee_payment(&canonical), Ok(payment));
+    }
+
+    #[test]
+    fn fee_payment_decoder_rejects_wrong_type_and_missing_fields() {
+        let payment = FeePayment {
+            asset_id: sample_asset_id(0x94),
+            max_fee: Amount::new(1),
+            fee_object: sample_object_ref(0x95),
+        };
+        let mut wrong_type: Vec<u8> = encode_fee_payment(&payment).unwrap();
+        wrong_type[4..6].copy_from_slice(&0x7999_u16.to_le_bytes());
+        assert!(matches!(
+            decode_fee_payment(&wrong_type),
+            Err(FeeError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedTypeId { .. }
+            ))
+        ));
+
+        let mut missing = CanonicalStruct::new(FEE_PAYMENT_TYPE_ID, ENCODING_VERSION);
+        missing
+            .field_bytes(1, encode_asset_id(&sample_asset_id(0x96)).unwrap())
+            .unwrap();
+        assert!(matches!(
+            decode_fee_payment(&missing.finish().unwrap()),
+            Err(FeeError::CanonicalDecoding(
+                CanonicalDecodingError::MissingField(2)
+            ))
+        ));
     }
 
     #[test]

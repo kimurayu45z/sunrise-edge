@@ -2011,6 +2011,25 @@ Phase 15 As-Is scope:
   いかなるlive chainでもactivateしてはならない。TransactionAuthProfileを
   committedしてversion 3へ到達すること自体は、authenticationが実際に
   enforceされていることを意味しない。
+- `execution::decode_transaction`はexecution::Transaction v1の厳密な
+  standalone canonical decoderを追加した：type id/encoding version 1を要求し、
+  field 1-10と12を必須、field 11（`fee_payment`）のみoptionalとして
+  exactに要求し、unknown/missing/duplicate/out-of-order field、trailing/
+  truncated bytes、invalid UTF-8、誤ったnumeric/address/digest length、
+  unknown tag/algorithmをtyped errorでrejectする。`AccessManifest`/
+  `AccessEntry`（`abi`）、`ObjectRef`/`ObjectId`/`Address`/access mode
+  （`objects`）、`FeePayment`/`AssetId`（`fees`）にも対応するpublic decoder
+  を新設し、既存のstable type idとencoding version 1を再利用した。
+  entrypoint・args・signature・manifest entry countには既存の32 MiB
+  canonical frame boundより厳しいtransaction-specific boundをattacker-
+  controlledなbytes/entriesをcopyする前に適用し、`AccessManifest`内の
+  重複`ObjectId`とnon-canonicalなcount/field layoutをrejectし、最後に
+  decode結果を再encodeしてinput bytesとbyte-for-byte一致することを要求する
+  （代替表現を一切受理しない）。署名検証やSignatureDomain構築は一切行わない
+  canonical-structure boundaryのみであり、上記の**hard activation
+  constraint**を単独で満たすものではない：protocol version 3の活性化には、
+  committed profileから`SignatureDomain`を構築し実際に署名を検証する
+  authentication dispatch層が別途必要である。
 - request pathのcommit直後deliveryはdomain-wide `claim_due_outbox`を流用しない。同じdomainのolder due workを
   今回requestと誤認しないよう、trusted `(domain, request_id, now, lease, expiry)`を持つexact-request claimを使う。
   memory conformanceはolder due rowが存在しても指定requestだけをclaimし、cross-request/domain lease reuseを拒否する
