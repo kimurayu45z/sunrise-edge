@@ -2006,11 +2006,15 @@ Phase 15 As-Is scope:
   署名を検証し、hash/verify前にcanonical signable bytesを明示的にboundする層）
   はstrict `execution::Transaction` decoding/dispatchを追加する次PRの範囲
   であり、owned fast pathのcertificate flow自体も未実装のままである。
-  **hard activation constraint**: strict `execution::Transaction` v1
-  decoding/authentication enforcementが実装されるまで、protocol version 3を
-  いかなるlive chainでもactivateしてはならない。TransactionAuthProfileを
-  committedしてversion 3へ到達すること自体は、authenticationが実際に
-  enforceされていることを意味しない。
+  **hard activation constraint**: 実際のtransaction-processing pathが
+  `node_core::authenticate_transaction_bytes`（またはそれと同等のboundary）を
+  effects/storageより前に呼び出すまで、protocol version 3をいかなるlive
+  chainでもactivateしてはならない。TransactionAuthProfileをcommittedして
+  version 3へ到達すること自体、およびstandalone `node_core::transaction_auth`
+  boundary自体が存在しテストされていることも、authenticationが実際に
+  enforceされていることを意味しない（下記の新規bulletを参照。現時点では
+  `NodeEvent::SubmitTransaction`もnative HTTP dispatchもこのboundaryを
+  呼び出していない）。
 - `execution::decode_transaction`はexecution::Transaction v1の厳密な
   standalone canonical decoderを追加した：type id/encoding version 1を要求し、
   field 1-10と12を必須、field 11（`fee_payment`）のみoptionalとして
@@ -2030,6 +2034,54 @@ Phase 15 As-Is scope:
   constraint**を単独で満たすものではない：protocol version 3の活性化には、
   committed profileから`SignatureDomain`を構築し実際に署名を検証する
   authentication dispatch層が別途必要である。
+- `node-core`はこのauthentication dispatch層をstandaloneなfail-closed
+  boundary `node_core::transaction_auth`として追加した（`node-core`が
+  workspace dependencyとして`execution`と`crypto`を新たに追加。
+  `protocol-config`はこれまで通りどちらにも依存せず、署名検証も行わない）。
+  公開entrypoint `authenticate_transaction_bytes(input, context)`は
+  明示的な`TrustedTransactionContext`（caller供給の`ChainId`/`Epoch`と
+  committed `ProtocolConfig`への参照。protocol version権限は
+  `ProtocolConfig`のみが持ち、drift可能な別のcaller供給versionは受け付けない）
+  を受け取り、(1) 委任profileをresolveし、premature/missing/invalidな
+  configをdecode前にfail closedし、(2) `execution::decode_transaction`で
+  厳密にdecodeし、(3) decode済みtransactionの`chain_id`/`protocol_version`/
+  `epoch`をtrusted context/configと比較し、鍵や署名が不正な場合でも
+  暗号処理より前に型付きmismatch errorでrejectし、(4) trusted contextと
+  resolved profileのみから、正確なstable message family文字列
+  `"transaction-v1"`を用いて`crypto::SignatureDomain`を構築し、
+  (5) signature fieldを除いたsignable payloadをencodeし、明示的で
+  deterministicな`node_core::MAX_TRANSACTION_SIGNABLE_BYTES` boundを
+  `crypto::frame_signature_message`やverifierがallocate/hashする前に適用して
+  oversizedなsignable bytesを型付きerrorでrejectし、(6) 委任profileの
+  closed `AddressBinding`のうちimplemented済みの`AddressIsPublicKey`のみを
+  実装し、transaction senderの正確な32 bytesをEd25519 verification keyとして
+  使い（未実装のfuture binding/schemeはconfig/profile validationにより
+  fail closedし、fallbackしない）、(7) committed
+  `crypto::Ed25519Verifier`で検証し、malformed key/malformed signature
+  lengthの型付き`CryptoError`と、well-formedだが暗号学的に不正な署名
+  （型付き`InvalidTransactionSignature`）を区別し、(8) `Ok(true)`の場合のみ
+  新設の`AuthenticatedTransaction`を返す。`AuthenticatedTransaction`は
+  内部の`execution::Transaction`をprivate fieldとして持ち、read-only
+  accessorとconsuming accessorのみを公開し、公開constructorを持たない。
+  production signerは追加せず、devテストのみexact-pinned workspace
+  `ed25519-zebra` `SigningKey`で決定的な署名を生成する。deterministic real
+  Ed25519 happy path、wrong signatureの`InvalidTransactionSignature`、
+  malformed signature length/malformed verification keyの型付き
+  `CryptoError`維持、chain/protocol-version/epoch mismatchの暗号処理前
+  rejection（鍵や署名が不正でも）、chain/protocol-version/epoch/message
+  family across domain replayの失敗、premature/missing profile・invalid
+  configのfail-closed、bound到達時のverifier work前rejectionを含む
+  exact signable bound behavior、strict canonical bytesのみ受理し
+  malformed/代替表現は`ExecutionError`経由で失敗すること、signature field
+  自身をsignable payloadがcoverしないこと、signable fieldの変更が
+  authenticationを無効化することをtestで検証済みである
+  （`node-core`実装、workspace test As-Is）。このboundaryはstandaloneで
+  あり、`NodeEvent::SubmitTransaction`もnative HTTP dispatchもまだ
+  呼び出していない。nonce、fee debit、certificate、object dispatch、
+  persistence、新しいwire field/type ID/encoding versionは一切追加して
+  いない。上記の**hard activation constraint**の通り、実際の
+  transaction-processing pathがこのboundaryをeffects/storageより前に
+  呼び出すまで、protocol version 3はactivateしてはならない。
 - request pathのcommit直後deliveryはdomain-wide `claim_due_outbox`を流用しない。同じdomainのolder due workを
   今回requestと誤認しないよう、trusted `(domain, request_id, now, lease, expiry)`を持つexact-request claimを使う。
   memory conformanceはolder due rowが存在しても指定requestだけをclaimし、cross-request/domain lease reuseを拒否する

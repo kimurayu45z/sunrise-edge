@@ -169,17 +169,65 @@ representation of the same transaction is accepted. It performs no
 signature verification and constructs no `SignatureDomain`; it is a
 canonical-structure boundary only.
 
+`node_core::transaction_auth` now composes those primitives into one
+standalone, fail-closed authentication boundary. Its
+`authenticate_transaction_bytes(input, context)` entrypoint, given an
+explicit `TrustedTransactionContext` (the expected `ChainId` and `Epoch`
+supplied directly, plus a reference to the committed `ProtocolConfig`; there
+is deliberately no separate caller-supplied protocol-version field, so
+protocol-version authority comes solely from `ProtocolConfig` and cannot
+drift from it):
+1. resolves the committed `TransactionAuthProfile` via
+   `resolve_transaction_auth_profile`, failing closed before decoding for a
+   premature, missing, or otherwise invalid configuration;
+2. strictly decodes `input` with `execution::decode_transaction`;
+3. compares the decoded transaction's `chain_id`, `protocol_version`, and
+   `epoch` against the trusted context/config, rejecting any mismatch with a
+   typed error before any cryptographic work runs, even against a
+   malformed key or signature;
+4. builds `crypto::SignatureDomain` solely from the trusted context and the
+   resolved profile, using the exact stable message family
+   `"transaction-v1"`;
+5. encodes the signable payload (`execution::encode_transaction_signable`,
+   which already excludes the signature field) and rejects it with a typed
+   error if it exceeds the explicit, deterministic
+   `node_core::MAX_TRANSACTION_SIGNABLE_BYTES` bound, before
+   `crypto::frame_signature_message` or the verifier can allocate or hash it;
+6. dispatches on the resolved profile's closed `AddressBinding` — only
+   `AddressIsPublicKey` is implemented, treating the transaction's exact
+   32-byte `sender` as the Ed25519 verification key directly; an
+   unimplemented binding fails to compile rather than silently falling back;
+7. verifies with the committed `crypto::Ed25519Verifier`, distinguishing a
+   malformed key or malformed signature length (`CryptoError`) from a
+   well-formed but cryptographically invalid signature
+   (`InvalidTransactionSignature`);
+8. returns the new `AuthenticatedTransaction` only on a verified `Ok(true)`.
+
+`AuthenticatedTransaction` has no public constructor: its inner
+`execution::Transaction` field is private, reachable only through a
+read-only accessor and a consuming accessor, so a caller cannot construct
+one except through a successful `authenticate_transaction_bytes` call.
+`node-core` adds workspace dependencies on `execution` and `crypto` for this
+boundary alone; `protocol-config` itself continues to depend on neither and
+performs no verification. Signature-algorithm agility remains committed
+configuration resolved at a protocol-version/profile boundary, never a
+per-transaction choice: the boundary always builds the verifier from the
+resolved profile, and today that profile can only ever resolve to Ed25519
+profile 1 (`AddressIsPublicKey`).
+
 **Hard activation constraint:** committing a `TransactionAuthProfile` and
 reaching protocol version 3 in `ProtocolConfig` is necessary but not
 sufficient for owned-transaction authentication to actually run. Protocol
-version 3 MUST NOT be activated on any live chain until the strict
-`execution::Transaction` v1 decoding and authentication-enforcement boundary
-described above lands and is wired into the transaction-processing path.
-Strict decoding alone, as implemented by `execution::decode_transaction`,
-does not satisfy this constraint: activating version 3 before a code path
-also constructs the `SignatureDomain` from the resolved profile and verifies
-a transaction's signature against it would commit a config that claims
-authentication is enforced while no code path actually checks it.
+version 3 MUST NOT be activated on any live chain until a real
+transaction-processing path calls `node_core::authenticate_transaction_bytes`
+(or an equivalent boundary) before any execution effects or storage
+mutation. Neither strict decoding alone, as implemented by
+`execution::decode_transaction`, nor the mere existence of the standalone
+`node_core::transaction_auth` boundary and its own tests satisfies this
+constraint: activating version 3 requires a live dispatch path to actually
+invoke authentication for every owned-transaction effect. As of this
+boundary's introduction, `NodeEvent::SubmitTransaction` and the native HTTP
+dispatch path do not call it yet, so no such dispatch path exists.
 
 ## 9. Object lifecycle
 Objects are not implemented in Phase 1. Future object versions will reference self-describing digests so historical versions remain readable after hash-suite migration.
@@ -557,6 +605,15 @@ replays persisted responses without re-running the transition or returning the
 outbox again; the same request ID with different event bytes fails closed.
 Outbox presence makes committed messages recoverable and at-least-once, but no
 adapter uses this path yet.
+
+`node-core` also carries a standalone Transaction v1 authentication boundary
+(`node_core::transaction_auth`, see Section 8) that composes the strict
+`execution::decode_transaction` decoder, the committed
+`protocol_config::TransactionAuthProfile`, and the concrete
+`crypto::Ed25519Verifier`. It is deliberately not wired to `NodeEvent` or any
+persistence/dispatch path here: no `NodeStateMachine`, `handle_event`, or
+`native-http` route calls it yet, and it performs no nonce, fee-debit,
+certificate, or object-dispatch handling.
 
 The outbox delivery cursor (`0xE005`) advances one message at a time. A caller
 supplies a non-zero lease ID, an observed time, and a duration bounded to five

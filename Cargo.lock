@@ -752,8 +752,13 @@ dependencies = [
 name = "node-core"
 version = "0.1.0"
 dependencies = [
+ "abi",
  "canonical-encoding",
+ "crypto",
+ "ed25519-zebra",
+ "execution",
  "hashing",
+ "objects",
  "protocol-config",
  "protocol-types",
  "runtime",

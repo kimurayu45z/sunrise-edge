@@ -29,6 +29,13 @@ use runtime::{
 use std::collections::BTreeMap;
 use std::error::Error;
 
+mod transaction_auth;
+
+pub use transaction_auth::{
+    AuthenticatedTransaction, MAX_TRANSACTION_SIGNABLE_BYTES, TransactionAuthError,
+    TrustedTransactionContext, authenticate_transaction_bytes,
+};
+
 const NODE_EVENT_TYPE_ID: u16 = 0xE001;
 const NODE_RESPONSE_TYPE_ID: u16 = 0xE002;
 const NODE_DEDUP_RECORD_TYPE_ID: u16 = 0xE003;
