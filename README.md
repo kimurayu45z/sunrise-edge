@@ -119,13 +119,18 @@ cross-provider ingress milestones implemented through Phase 17:
   key/signature `CryptoError` from a well-formed but invalid signature.
   Signature-algorithm agility remains committed configuration resolved at a
   protocol-version/profile boundary, not per-transaction negotiation; only
-  Ed25519 profile 1 (`AddressIsPublicKey`) is implemented. This boundary is
-  standalone: no `NodeEvent`, `NodeStateMachine`, or native HTTP route calls
-  it yet, and it performs no nonce, fee-debit, certificate, or
-  object-dispatch handling, so the owned fast path itself remains
-  unimplemented and protocol version 3 still must not be activated on any
-  live chain until a real transaction-processing path invokes this boundary
-  before any execution effects or storage mutation.
+  Ed25519 profile 1 (`AddressIsPublicKey`) is implemented. The production-
+  oriented structured durable native route now consumes a committed
+  `ProtocolConfig`, authenticates every `SubmitTransaction` into an
+  unforgeable `AuthenticatedSubmitTransaction`, and captures placement from
+  that same configuration before identity allocation, clock/storage work,
+  access-plan derivation, transition, outbox claim, or send. Generic
+  node-core handlers and legacy native routes reject `SubmitTransaction`
+  rather than processing it unauthenticated. Exact durable replays still
+  authenticate before receipt reconciliation. Nonce enforcement, fee debit,
+  module/object dispatch and effects, FastVote/FastCertificate, and
+  certificate publication remain unimplemented, so the owned fast path is
+  not yet safe to activate on a live chain.
 - Versioned objects, object references, access manifests, and lazy migration.
 - Runtime traits and an in-memory runtime for deterministic tests.
 - A local durable SQLite transactional store using WAL, synchronous FULL,

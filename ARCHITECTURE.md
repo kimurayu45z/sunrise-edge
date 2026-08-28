@@ -235,19 +235,30 @@ identity-point addresses at the object/asset layer); that decision belongs to
 whichever object/asset layer first lets an address hold value, and must be
 made explicitly before it does.
 
-**Hard activation constraint:** committing a `TransactionAuthProfile` and
-reaching protocol version 3 in `ProtocolConfig` is necessary but not
-sufficient for owned-transaction authentication to actually run. Protocol
-version 3 MUST NOT be activated on any live chain until a real
-transaction-processing path calls `node_core::authenticate_transaction_bytes`
-(or an equivalent boundary) before any execution effects or storage
-mutation. Neither strict decoding alone, as implemented by
-`execution::decode_transaction`, nor the mere existence of the standalone
-`node_core::transaction_auth` boundary and its own tests satisfies this
-constraint: activating version 3 requires a live dispatch path to actually
-invoke authentication for every owned-transaction effect. As of this
-boundary's introduction, `NodeEvent::SubmitTransaction` and the native HTTP
-dispatch path do not call it yet, so no such dispatch path exists.
+The production-oriented structured durable native route now supplies the
+first authenticated `SubmitTransaction` processing seam. Router composition
+accepts one committed `ProtocolConfig`, requires its protocol version to match
+the trusted `NodeConfig`, and derives both transaction-auth authority and
+logical placement from that configuration. Request handling strictly decodes
+and context-validates the outer `NodeEvent`, then constructs an
+`AuthenticatedSubmitTransaction` by authenticating the inner transaction
+before access-plan derivation, operational identity allocation, clock or
+storage work, transition, outbox claim, or send. The wrapper captures the
+committed placement used by the later normalized durable handler, preventing
+authentication under one configuration followed by routing under another.
+Exact replays authenticate again before durable receipt reconciliation.
+Generic node-core handlers and the legacy native routers fail closed on
+`SubmitTransaction`; non-transaction event behavior is unchanged.
+
+**Hard activation constraint:** this closes the strict authentication-to-
+durable-routing gap, but it does not complete the owned fast path. Protocol
+version 3 MUST NOT be activated on any live chain until persistent nonce
+equality, fee debit, module/object access and effects validation, FastVote/
+FastCertificate, and certificate publication are implemented and atomically
+composed with the authenticated transaction. The generic application machine
+still consumes the outer event while the authenticated inner transaction is
+held as an authority token; typed object dispatch remains the next separate
+boundary. This change adds no canonical field, type ID, or encoding version.
 
 ## 9. Object lifecycle
 Objects are not implemented in Phase 1. Future object versions will reference self-describing digests so historical versions remain readable after hash-suite migration.

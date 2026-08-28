@@ -2000,21 +2000,10 @@ Phase 15 As-Is scope:
   非canonical `S` rejection、signature scheme mismatch rejection、
   premature/missing profile・unsupported profile id・unsupported scheme・
   不正configのadversarial testを含み、`ed25519-zebra` 4.2.0 /
-  `curve25519-dalek` 4.1.3で再確認済み）。実際のtransaction authentication
-  （committed profileとexact transaction v1 message familyから
-  `SignatureDomain`を構築し、一致しないcontextをreconcileせずrejectし、
-  署名を検証し、hash/verify前にcanonical signable bytesを明示的にboundする層）
-  はstrict `execution::Transaction` decoding/dispatchを追加する次PRの範囲
-  であり、owned fast pathのcertificate flow自体も未実装のままである。
-  **hard activation constraint**: 実際のtransaction-processing pathが
-  `node_core::authenticate_transaction_bytes`（またはそれと同等のboundary）を
-  effects/storageより前に呼び出すまで、protocol version 3をいかなるlive
-  chainでもactivateしてはならない。TransactionAuthProfileをcommittedして
-  version 3へ到達すること自体、およびstandalone `node_core::transaction_auth`
-  boundary自体が存在しテストされていることも、authenticationが実際に
-  enforceされていることを意味しない（下記の新規bulletを参照。現時点では
-  `NodeEvent::SubmitTransaction`もnative HTTP dispatchもこのboundaryを
-  呼び出していない）。
+  `curve25519-dalek` 4.1.3で再確認済み）。strict transaction authentication
+  とproduction-oriented structured durable native routeの接続もimplemented
+  As-Is（下記bullet）。ただしnonce/fee/object dispatch/FastCertificateは
+  引き続き未実装であり、protocol version 3のlive activationは禁止する。
 - `execution::decode_transaction`はexecution::Transaction v1の厳密な
   standalone canonical decoderを追加した：type id/encoding version 1を要求し、
   field 1-10と12を必須、field 11（`fee_payment`）のみoptionalとして
@@ -2075,13 +2064,21 @@ Phase 15 As-Is scope:
   malformed/代替表現は`ExecutionError`経由で失敗すること、signature field
   自身をsignable payloadがcoverしないこと、signable fieldの変更が
   authenticationを無効化することをtestで検証済みである
-  （`node-core`実装、workspace test As-Is）。このboundaryはstandaloneで
-  あり、`NodeEvent::SubmitTransaction`もnative HTTP dispatchもまだ
-  呼び出していない。nonce、fee debit、certificate、object dispatch、
-  persistence、新しいwire field/type ID/encoding versionは一切追加して
-  いない。上記の**hard activation constraint**の通り、実際の
-  transaction-processing pathがこのboundaryをeffects/storageより前に
-  呼び出すまで、protocol version 3はactivateしてはならない。
+  （`node-core`実装、workspace test As-Is）。production-oriented
+  structured durable native routeはcommitted `ProtocolConfig`をcomposition
+  authorityとして受け、outer `NodeEvent`のcontextを検証してからinner
+  transactionを`AuthenticatedSubmitTransaction`へ変換する。認証はaccess
+  plan、identity、storage用clock、storage read/write、transition、outbox
+  claim/sendより前であり、wrapperは同じconfig由来のplacementを保持して
+  normalized durable commitへ渡す。exact duplicateもreceipt照合より前に
+  再認証する。generic node-core handlerおよびlegacy native routeは
+  `SubmitTransaction`を型付きでrejectし、unauthenticated bypassを残さない。
+  invalid signature、inner/outer chain/version/epoch mismatch、missing profile、
+  trailing/non-canonical bytesはmachine/identity/clock/storage/sendのcall count
+  zeroで失敗するtestを持つ。nonce、fee debit、certificate、object dispatch、
+  新しいwire field/type ID/encoding versionは追加していない。protocol version
+  3のlive activationはnonce/fee/object/effect/FastCertificateのatomic composition
+  が完成するまで禁止する。
 - request pathのcommit直後deliveryはdomain-wide `claim_due_outbox`を流用しない。同じdomainのolder due workを
   今回requestと誤認しないよう、trusted `(domain, request_id, now, lease, expiry)`を持つexact-request claimを使う。
   memory conformanceはolder due rowが存在しても指定requestだけをclaimし、cross-request/domain lease reuseを拒否する
