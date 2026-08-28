@@ -378,6 +378,19 @@ pub fn encode_object_ref(object_ref: &ObjectRef) -> Result<Vec<u8>, ObjectError>
     Ok(canonical.finish()?)
 }
 
+/// Decodes one canonical [`ObjectRef`] without changing its stable encoding.
+pub fn decode_object_ref(input: &[u8]) -> Result<ObjectRef, ObjectError> {
+    let frame: CanonicalFrame<'_> = decode_canonical_frame(input)?;
+    frame.require_type(OBJECT_REF_TYPE_ID)?;
+    frame.require_version(ENCODING_VERSION)?;
+    frame.require_only_fields(&[1, 2, 3])?;
+    Ok(ObjectRef {
+        id: decode_object_id(frame.required_field(1)?)?,
+        version: frame.required_u64(2)?,
+        digest: decode_digest32(frame.required_field(3)?)?,
+    })
+}
+
 /// Encodes an object.
 pub fn encode_object(object: &Object) -> Result<Vec<u8>, ObjectError> {
     let mut canonical =
@@ -455,6 +468,24 @@ pub fn encode_access_mode(mode: AccessMode) -> Result<Vec<u8>, ObjectError> {
     let mut canonical = CanonicalStruct::new(ACCESS_MODE_TYPE_ID, ENCODING_VERSION);
     canonical.field_bytes(1, [mode.as_u8()])?;
     Ok(canonical.finish()?)
+}
+
+/// Decodes one canonical [`AccessMode`], rejecting unknown mode tags.
+pub fn decode_access_mode(input: &[u8]) -> Result<AccessMode, ObjectError> {
+    let frame: CanonicalFrame<'_> = decode_canonical_frame(input)?;
+    frame.require_type(ACCESS_MODE_TYPE_ID)?;
+    frame.require_version(ENCODING_VERSION)?;
+    frame.require_only_fields(&[1])?;
+    let bytes = frame.required_field(1)?;
+    let array: [u8; 1] =
+        bytes
+            .try_into()
+            .map_err(|_| CanonicalDecodingError::InvalidFieldLength {
+                field_id: 1,
+                expected: 1,
+                actual: bytes.len(),
+            })?;
+    AccessMode::try_from(array[0])
 }
 
 #[cfg(test)]
@@ -574,6 +605,82 @@ mod tests {
         assert_eq!(
             decode_owner(&owner.finish().unwrap()),
             Err(ObjectError::UnknownOwnerTag(99))
+        );
+    }
+
+    #[test]
+    fn object_ref_decoder_round_trips_existing_canonical_bytes() {
+        let object_ref = ObjectRef {
+            id: ObjectId::new([0x51; IDENTIFIER_LEN]),
+            version: 11,
+            digest: Digest32::new(HashAlgorithmId::Sha3_256, [0x52; IDENTIFIER_LEN]),
+        };
+        let canonical: Vec<u8> = encode_object_ref(&object_ref).unwrap();
+        assert_eq!(decode_object_ref(&canonical), Ok(object_ref));
+    }
+
+    #[test]
+    fn object_ref_decoder_rejects_wrong_type_and_short_id() {
+        let object_ref = ObjectRef {
+            id: ObjectId::new([0x53; IDENTIFIER_LEN]),
+            version: 1,
+            digest: Digest32::new(HashAlgorithmId::Sha2_256, [0x54; IDENTIFIER_LEN]),
+        };
+        let mut wrong_type: Vec<u8> = encode_object_ref(&object_ref).unwrap();
+        wrong_type[4..6].copy_from_slice(&0x4999_u16.to_le_bytes());
+        assert!(matches!(
+            decode_object_ref(&wrong_type),
+            Err(ObjectError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedTypeId { .. }
+            ))
+        ));
+
+        let mut short_id = CanonicalStruct::new(OBJECT_ID_TYPE_ID, ENCODING_VERSION);
+        short_id.field_bytes(1, [0x11; 31]).unwrap();
+        let short_id_bytes = short_id.finish().unwrap();
+        let mut broken = CanonicalStruct::new(OBJECT_REF_TYPE_ID, ENCODING_VERSION);
+        broken.field_bytes(1, short_id_bytes).unwrap();
+        broken.field_u64(2, 1).unwrap();
+        broken
+            .field_bytes(
+                3,
+                encode_digest32(&Digest32::new(HashAlgorithmId::Sha2_256, [0x55; 32])).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            decode_object_ref(&broken.finish().unwrap()),
+            Err(ObjectError::InvalidObjectIdLength(31))
+        );
+    }
+
+    #[test]
+    fn access_mode_decoder_round_trips_every_variant() {
+        for mode in [AccessMode::Read, AccessMode::Write, AccessMode::Consume] {
+            let canonical: Vec<u8> = encode_access_mode(mode).unwrap();
+            assert_eq!(decode_access_mode(&canonical), Ok(mode));
+        }
+    }
+
+    #[test]
+    fn access_mode_decoder_rejects_unknown_tag_and_wrong_length() {
+        let mut unknown = CanonicalStruct::new(ACCESS_MODE_TYPE_ID, ENCODING_VERSION);
+        unknown.field_bytes(1, [0x09]).unwrap();
+        assert_eq!(
+            decode_access_mode(&unknown.finish().unwrap()),
+            Err(ObjectError::UnknownAccessMode(0x09))
+        );
+
+        let mut wrong_length = CanonicalStruct::new(ACCESS_MODE_TYPE_ID, ENCODING_VERSION);
+        wrong_length.field_bytes(1, [0x01, 0x02]).unwrap();
+        assert_eq!(
+            decode_access_mode(&wrong_length.finish().unwrap()),
+            Err(ObjectError::CanonicalDecoding(
+                CanonicalDecodingError::InvalidFieldLength {
+                    field_id: 1,
+                    expected: 1,
+                    actual: 2,
+                }
+            ))
         );
     }
 

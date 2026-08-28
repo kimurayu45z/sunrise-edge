@@ -92,9 +92,18 @@ cross-provider ingress milestones implemented through Phase 17:
   (`resolve_transaction_auth_profile` validates the whole configuration
   before returning, so a malformed configuration fails closed); it has no
   dependency on `crypto` or `objects` and performs no signature
-  verification. Strict `Transaction` decoding/dispatch that builds the
-  signing context from this profile and rejects any mismatch, and the owned
-  fast path itself, remain unimplemented.
+  verification. `execution::decode_transaction` is a strict, standalone
+  canonical decoder for `execution::Transaction` v1 (type/version, exact
+  field 1-10/12 plus optional field 11, unknown/missing/duplicate/
+  out-of-order field rejection, transaction-specific resource bounds applied
+  before copying attacker-controlled entrypoint/args/signature/manifest
+  entries, matching new decoders for `AccessManifest`/`AccessEntry`,
+  `ObjectRef`/`ObjectId`/`Address`/access mode, and `FeePayment`/`AssetId`,
+  duplicate-`ObjectId` and non-canonical `AccessManifest` layout rejection,
+  and a decode/re-encode byte-identity check). It performs no signature
+  verification and builds no `SignatureDomain`. Dispatch that builds the
+  signing context from the committed profile and rejects any mismatch, and
+  the owned fast path itself, remain unimplemented.
 - Versioned objects, object references, access manifests, and lazy migration.
 - Runtime traits and an in-memory runtime for deterministic tests.
 - A local durable SQLite transactional store using WAL, synchronous FULL,
