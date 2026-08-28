@@ -69,6 +69,32 @@ cross-provider ingress milestones implemented through Phase 17:
   validation for adapter ingress.
 - SHA-256 and SHA3-256 support with epoch-selected hash suites.
 - Self-describing digests and domain-separated hash/signature framing.
+- A ZIP-215-compliant Ed25519 `SignatureVerifier` in `crypto`, built on the
+  exact-pinned `ed25519-zebra` 4.2.0 crate (declared once in the workspace
+  root; the committed `Cargo.lock` pins its `curve25519-dalek` dependency at
+  4.1.3), and a committed `TransactionAuthProfile` in `protocol-config`
+  (`ProtocolConfig` field 15, encoding v3, required from protocol version 3
+  and absent for v1/v2) that selects the signature scheme and address
+  binding by configuration rather than per transaction. Profile ids are
+  committed protocol identifiers, not arbitrary non-zero `u16` labels:
+  `TransactionAuthProfile::new` and `TransactionAuthProfile::validate`
+  reject zero, any id other than the public
+  `ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID` (1), and any unsupported
+  scheme/binding, using the same rules. `crypto::SignatureSigner::sign_canonical`
+  and `SignatureVerifier::verify_canonical` reject a `SignatureDomain` whose
+  declared scheme does not match the signer's/verifier's own scheme before
+  any framing or cryptographic operation runs. Only Ed25519 with an
+  `AddressIsPublicKey` address binding is implemented today; no production
+  signer exists. `runtime::MemorySigner` is a public in-memory wiring
+  fixture used to compose test/local runtimes; it is deliberately
+  non-cryptographic and must never be used for protocol authentication.
+  `protocol-config` only commits and resolves this profile
+  (`resolve_transaction_auth_profile` validates the whole configuration
+  before returning, so a malformed configuration fails closed); it has no
+  dependency on `crypto` or `objects` and performs no signature
+  verification. Strict `Transaction` decoding/dispatch that builds the
+  signing context from this profile and rejects any mismatch, and the owned
+  fast path itself, remain unimplemented.
 - Versioned objects, object references, access manifests, and lazy migration.
 - Runtime traits and an in-memory runtime for deterministic tests.
 - A local durable SQLite transactional store using WAL, synchronous FULL,

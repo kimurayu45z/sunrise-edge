@@ -9,7 +9,11 @@ Sunrise Edge is designed as a deterministic state-transition system over authent
 - `protocol-types`: protocol identifiers, digest types, hash domains, and suite metadata.
 - `canonical-encoding`: deterministic framed serialization for protocol-critical payloads.
 - `hashing`: domain-separated hash framing, built-in hash implementations, and hash-suite resolution.
-- `crypto`: signature-domain framing and signer/verifier traits.
+- `crypto`: signature-domain framing and signer/verifier traits, plus a
+  ZIP-215-compliant Ed25519 `SignatureVerifier` implementation. No production
+  signer is implemented; `runtime::MemorySigner` is a public in-memory
+  wiring fixture, deliberately non-cryptographic, and must never be used for
+  protocol authentication.
 - `chain-ir`: versioned deterministic instruction program format for execution back-end neutrality.
 - `validator-set`: immutable epoch membership, public keys, explicit voting
   power, quorum calculation, and validator-set commitments.
@@ -72,6 +76,89 @@ activate or implement a cryptographic primitive.
 
 ## 8. Signature domain separation
 Signature framing is distinct from hash framing. Signed payloads include `ChainId`, `ProtocolVersion`, `Epoch`, `message_type`, `SignatureSchemeId`, and the canonical payload to prevent replay across chains, epochs, protocol versions, and message families.
+
+`crypto::Ed25519Verifier` implements `SignatureVerifier` against exactly
+32-byte verification keys and exactly 64-byte signatures using the pinned
+`ed25519-zebra` 4.2.0 crate; the committed `Cargo.lock` pins its
+`curve25519-dalek` dependency at 4.1.3. Dependabot may propose updates to
+either pin, but every such change stays review-gated per the repository's
+dependency-update policy, not auto-merged. Verification uses ZIP-215
+semantics as the consensus validation profile: the crate's cofactored
+equation accepts non-canonical point encodings and small-order points,
+giving an exact, specified accept/reject decision for edge cases
+[RFC 8032][rfc8032] leaves ambiguous, so every honest validator reaches the
+same result on the same bytes. The signature's `S` component is a separate,
+unambiguous requirement, not one of those edge cases: [RFC 8032][rfc8032]
+§5.1.7 itself already requires decoding `S` in the range `0 <= S < L` and
+states that `S` out of range makes the signature invalid, and
+[ZIP-215][zip215] likewise requires a canonically encoded `S` strictly less
+than the group order `l`. A non-canonical/out-of-range `S` is rejected,
+which this module's tests prove against the pinned implementation to guard
+against modulo-`l` signature malleability. `SignatureSigner::sign_canonical`
+and `SignatureVerifier::verify_canonical` (the trait default methods every
+caller uses) reject with `CryptoError::SignatureSchemeMismatch` before any
+framing or cryptographic operation if `domain.signature_scheme_id` does not
+equal the signer's/verifier's own `scheme_id()`, so a caller can never
+produce or accept a frame that claims a scheme it did not actually use.
+Callers always go through `frame_signature_message`/`verify_canonical`; no
+caller builds an ad hoc signed-byte layout. Only verification is
+implemented; no production signer exists in this crate. `runtime::MemorySigner`
+is a public in-memory wiring fixture used to compose test/local runtimes; it
+is deliberately non-cryptographic and must never be used for protocol
+authentication.
+
+[rfc8032]: https://www.rfc-editor.org/rfc/rfc8032
+[zip215]: https://github.com/zcash/zips/blob/master/zip-0215.rst
+
+A committed `protocol_config::TransactionAuthProfile` selects the active
+signature scheme and address binding by configuration, not per transaction.
+It is encoded as `ProtocolConfig` field 15 starting at encoding version 3,
+required from protocol version 3 onward and absent for versions 1-2, so
+historical v1/v2 bytes are unchanged. Profile ids are committed protocol
+identifiers, not arbitrary non-zero labels: the profile carries an explicit
+non-zero `u16 profile_id` that `TransactionAuthProfile::new` and
+`TransactionAuthProfile::validate` (the same rules, so any profile obtained
+from elsewhere in the crate can be re-checked, not merely trusted) check
+against the public `protocol_config::ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`
+constant (value 1) and reject every other id, a `SignatureSchemeId` (only
+`Ed25519` is implemented; `Secp256k1` is a reserved identifier that fails
+closed), and a closed `AddressBinding` enum whose only implemented variant,
+`AddressIsPublicKey`, treats a transaction's 32-byte address as its Ed25519
+verification key directly. `ProtocolConfig::validate` calls
+`TransactionAuthProfile::validate` on any committed profile rather than only
+rechecking a zero id, so a config carrying a structurally-invalid profile
+fails closed the same way a freshly constructed one would.
+`protocol_config::resolve_transaction_auth_profile` validates the whole
+configuration and resolves this committed profile; it fails closed for a
+premature profile, a missing required profile, or any other invalid
+configuration. `protocol-config` has no dependency on `crypto` or `objects`
+and performs no signature verification itself: it is the commitment and
+resolution layer, not the transaction authentication/execution layer. A
+later transaction-authentication boundary (targeting `execution::Transaction`
+v1) must construct the `SignatureDomain` from the resolved profile's
+committed scheme and the exact transaction-v1 message family, and must
+reject — not silently reconcile — any context a transaction presents that
+does not match that constructed domain. That boundary must also bound the
+canonical signable byte length before hashing or verifying it: an unbounded
+transaction body is an attacker-controlled input, and framing/verification
+must reject an oversized payload rather than hash or verify it, per the
+resource-bounding rule in `AGENTS.md`. A new profile id, and any
+address-binding scheme beyond `AddressIsPublicKey`, requires a new
+protocol/transaction version and an explicit accepted decision, not a
+silently added identifier or enum variant. This closes the
+signature-verification and committed-scheme-resolution primitives; strict
+`execution::Transaction` decoding/dispatch against this profile and the owned
+fast-path certificate flow remain separate follow-up work.
+
+**Hard activation constraint:** committing a `TransactionAuthProfile` and
+reaching protocol version 3 in `ProtocolConfig` is necessary but not
+sufficient for owned-transaction authentication to actually run. Protocol
+version 3 MUST NOT be activated on any live chain until the strict
+`execution::Transaction` v1 decoding and authentication-enforcement boundary
+described above lands and is wired into the transaction-processing path;
+activating version 3 first would commit a config that claims authentication
+is enforced while no code path actually verifies a transaction's signature
+against it.
 
 ## 9. Object lifecycle
 Objects are not implemented in Phase 1. Future object versions will reference self-describing digests so historical versions remain readable after hash-suite migration.
@@ -1336,3 +1423,71 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   mapping. Keep node-core object dispatch, fees, blob transfer verification,
   owned-object fast routing, schema migrations, and production fault/capacity/
   provider certification deferred.
+- DR-0065: Implement a real, consensus-deterministic Ed25519 verifier in
+  `crypto` using the exact-pinned `ed25519-zebra` 4.2.0 crate (declared once
+  in `[workspace.dependencies]` with default features disabled; the
+  committed `Cargo.lock` pins its `curve25519-dalek` dependency at 4.1.3, and
+  no unused direct dependency on `curve25519-dalek` is added — every future
+  Dependabot proposal for either pin stays review-gated per the existing
+  policy, not auto-merged), accepting only exactly-32-byte verification keys
+  and exactly-64-byte signatures and using ZIP-215 verification semantics
+  (accept non-canonical point encodings and small-order points) as the
+  consensus validation profile, so every validator reaches the same
+  accept/reject decision. `verify_framed` copies a length-checked signature
+  into an explicit `[u8; 64]` and builds `ed25519_zebra::Signature` through
+  its infallible fixed-size `From` constructor, so there is no
+  dead/mislabeled length-error mapping on an already-length-checked value.
+  Add no production signer. `runtime::MemorySigner` is a public in-memory
+  wiring fixture used to compose test/local runtimes; it is deliberately
+  non-cryptographic and must never be used for protocol authentication — it
+  is not gated behind a test-only compilation flag, so callers must not
+  infer safety from where it is used. `SignatureSigner::sign_canonical` and
+  `SignatureVerifier::verify_canonical` (the trait default methods) reject
+  with a typed `CryptoError::SignatureSchemeMismatch { expected, actual }`
+  before any framing or cryptographic operation if the caller-supplied
+  `SignatureDomain::signature_scheme_id` does not equal the signer's or
+  verifier's own `scheme_id()`; `frame_signature_message`'s byte format is
+  unchanged; only the trait default methods gained this precondition, and
+  tests prove a mismatched scheme is rejected without the underlying
+  operation running. Commit a `protocol_config::TransactionAuthProfile` as
+  `ProtocolConfig` field 15 at a new encoding version 3, required only from
+  protocol version 3 and absent for versions 1-2, leaving historical v1/v2
+  bytes unchanged; the profile carries an explicit non-zero `u16 profile_id`
+  (matching other stable protocol identifiers) that is itself a committed
+  protocol identifier, not an arbitrary non-zero label —
+  `TransactionAuthProfile::new` and the new `TransactionAuthProfile::validate`
+  (called by `new` and by `ProtocolConfig::validate` on any committed
+  profile, not only re-checking a zero id) apply the same rules: reject a
+  zero id, reject every id other than the public
+  `ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID` constant (value 1) with a typed
+  `UnsupportedTransactionAuthProfileId`, and only then validate the
+  scheme/binding combination — a `SignatureSchemeId` (Ed25519 only;
+  Secp256k1 is reserved and fails closed), and a closed `AddressBinding`
+  enum whose only implemented variant, `AddressIsPublicKey`, treats a
+  transaction's address bytes directly as its Ed25519 public key.
+  `ed25519_address_is_public_key()` takes no argument and always constructs
+  that one profile. Any new profile id, and any later address binding,
+  requires a new protocol/transaction version and an explicit accepted
+  decision, not a silently added identifier or enum variant. Add
+  `protocol_config::resolve_transaction_auth_profile` as the
+  commitment/resolution entry point: it validates the whole configuration
+  before returning, so a malformed configuration fails closed ahead of any
+  activation check, and it fails closed for a premature profile, a missing
+  required profile, or any other invalid configuration. `protocol-config`
+  performs no signature verification and has no dependency on `crypto` or
+  `objects`; it resolves committed configuration only. Actual transaction
+  authentication — constructing the `SignatureDomain` from the resolved
+  profile and the exact transaction-v1 message family, rejecting (not
+  reconciling) any mismatched context, verifying the signature, and bounding
+  the canonical signable byte length before hashing or verifying it — is a
+  separate boundary deferred to the PR that adds strict
+  `execution::Transaction` v1 decoding. The owned fast-path certificate flow
+  is likewise deferred, and protocol version 3 MUST NOT activate on any live
+  chain before that decoding/enforcement boundary lands (see the hard
+  activation constraint in §8). `Ed25519Verifier` test evidence includes a
+  fixed-bytes negative case for a 64-byte signature whose `S` component is
+  non-canonical (`S >= l`), rejected as `Ok(false)` per RFC 8032 §5.1.7's and
+  ZIP-215's shared, explicit `S < l` rule, alongside the existing RFC 8032
+  known-answer, ZIP-215 small-order/non-canonical-point acceptance, and
+  signature-domain-mismatch evidence; all fixed vectors were re-confirmed
+  against the `ed25519-zebra` 4.2.0 / `curve25519-dalek` 4.1.3 pins.

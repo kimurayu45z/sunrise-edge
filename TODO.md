@@ -1958,6 +1958,59 @@ Phase 15 As-Is scope:
   conflict rollback、read-only、bound domain、fence、deadline、object read-count bound、blob round-trip、replayを検証する
   （runtime/memory/PostgreSQL implemented As-Is;
   node-core object dispatchとprovider certification pending）。
+- owned transaction fast pathの認証基盤として、`crypto`にexact-pinned
+  `ed25519-zebra` 4.2.0（`[workspace.dependencies]`でdefault features無効を
+  一箇所宣言。committed `Cargo.lock`はその依存`curve25519-dalek`を4.1.3で
+  pinし、直接使わないunused dependencyとしては追加しない。Dependabotが
+  どちらかのpinへ更新を提案してもauto-mergeせず既存policyでreview-gateする）
+  によるZIP-215準拠のreal `Ed25519Verifier`を追加した（32-byte検証鍵・
+  64-byte署名のみを受理し、非canonical encodingとsmall-order pointを
+  受理するconsensus-deterministicな検証で、production signerは追加しない。
+  `verify_framed`はlength検証済みの署名を明示的な`[u8; 64]`へcopyしてから
+  infallibleなfixed-size `From`constructorで`Signature`を構築し、
+  すでにlength検証済みの値に対するdead/mislabeledなlength-error mappingを
+  持たない。`runtime::MemorySigner`はtest/local runtime合成用のpublicな
+  in-memory wiring fixtureであり、意図的にnon-cryptographicで、protocol
+  authenticationには絶対に使ってはならない。test-only compilation flagで
+  gateされているわけではない）。`SignatureSigner::sign_canonical`と
+  `SignatureVerifier::verify_canonical`（trait default method）は、
+  caller供給の`SignatureDomain::signature_scheme_id`がsigner/verifier自身の
+  `scheme_id()`と一致しない場合、framingや暗号操作を一切行う前に型付き
+  `CryptoError::SignatureSchemeMismatch { expected, actual }`でrejectする
+  （`frame_signature_message`自体のbyte formatは不変）。`protocol-config`には
+  committed `TransactionAuthProfile`をProtocolConfig field 15・encoding v3
+  として追加し、protocol version 3以降でのみ必須、v1/v2 historical bytesは
+  不変である。profileのprofile idはarbitraryなnon-zero labelではなく
+  committed protocol identifierであり、`TransactionAuthProfile::new`と
+  新設の`TransactionAuthProfile::validate`（`new`および
+  `ProtocolConfig::validate`から、zero idの再検証だけでなく呼ばれる）は
+  同じrulesを適用する: zeroを`ZeroTransactionAuthProfileId`でreject、
+  public定数`ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`（値1）以外の
+  全てのidを型付き`UnsupportedTransactionAuthProfileId(u16)`でreject
+  してからscheme/binding組み合わせを検証する。`ed25519_address_is_public_key()`
+  は引数を取らず常にこの1つのprofileだけを構築する。`SignatureSchemeId`
+  （Ed25519のみ実装、Secp256k1は予約でfail closed）、closed
+  `AddressBinding`（実装済みは`AddressIsPublicKey`のみ）を持つ。
+  `resolve_transaction_auth_profile`はcommitment/resolution層であり、
+  返す前に`ProtocolConfig::validate()`を必ず呼ぶため不正な設定は
+  activation判定より先にfail closedする。`protocol-config`は`crypto`にも
+  `objects`にも依存せず、署名検証は一切行わない（`crypto`/`protocol-config`
+  implemented As-Is; RFC 8032 known-answer、ZIP-215 small-order/non-canonical
+  point acceptance、RFC 8032 §5.1.7とZIP-215が共に要求するS<lルールに基づく
+  非canonical `S` rejection、signature scheme mismatch rejection、
+  premature/missing profile・unsupported profile id・unsupported scheme・
+  不正configのadversarial testを含み、`ed25519-zebra` 4.2.0 /
+  `curve25519-dalek` 4.1.3で再確認済み）。実際のtransaction authentication
+  （committed profileとexact transaction v1 message familyから
+  `SignatureDomain`を構築し、一致しないcontextをreconcileせずrejectし、
+  署名を検証し、hash/verify前にcanonical signable bytesを明示的にboundする層）
+  はstrict `execution::Transaction` decoding/dispatchを追加する次PRの範囲
+  であり、owned fast pathのcertificate flow自体も未実装のままである。
+  **hard activation constraint**: strict `execution::Transaction` v1
+  decoding/authentication enforcementが実装されるまで、protocol version 3を
+  いかなるlive chainでもactivateしてはならない。TransactionAuthProfileを
+  committedしてversion 3へ到達すること自体は、authenticationが実際に
+  enforceされていることを意味しない。
 - request pathのcommit直後deliveryはdomain-wide `claim_due_outbox`を流用しない。同じdomainのolder due workを
   今回requestと誤認しないよう、trusted `(domain, request_id, now, lease, expiry)`を持つexact-request claimを使う。
   memory conformanceはolder due rowが存在しても指定requestだけをclaimし、cross-request/domain lease reuseを拒否する
