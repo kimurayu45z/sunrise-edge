@@ -10,19 +10,23 @@
 //!   [`protocol_config::resolve_transaction_auth_profile`];
 //! * the concrete ZIP-215 [`crypto::Ed25519Verifier`].
 //!
-//! It performs no persistence, dispatch, or `NodeEvent` wiring: it accepts
-//! untrusted canonical bytes plus a caller-supplied [`TrustedTransactionContext`]
-//! and returns an [`AuthenticatedTransaction`] only once every check below
-//! succeeds. Nothing in this module constructs an `AuthenticatedTransaction`
-//! other than [`authenticate_transaction_bytes`].
+//! It performs no persistence, dispatch, or `NodeEvent` wiring itself: it
+//! accepts untrusted canonical bytes plus a caller-supplied
+//! [`TrustedTransactionContext`] and returns an [`AuthenticatedTransaction`]
+//! only once every check below succeeds. Nothing in this module constructs an
+//! `AuthenticatedTransaction` other than [`authenticate_transaction_bytes`].
 //!
-//! Committing a [`protocol_config::TransactionAuthProfile`] and reaching
-//! protocol version 3 is necessary but not sufficient for this boundary to
-//! actually run against live traffic: no `NodeEvent` or native HTTP route
-//! calls [`authenticate_transaction_bytes`] yet, and protocol version 3 must
-//! not be activated on any live chain until a real transaction-processing
-//! path invokes this boundary before any execution effects or storage
-//! mutation. See `ARCHITECTURE.md` for the accepted decision record.
+//! `native-http`'s structured durable route (`structured_durable_router`) is
+//! the first caller that wires this boundary to live `NodeEvent` traffic: it
+//! calls [`authenticate_transaction_bytes`] for every `SubmitTransaction`
+//! event, from a `ProtocolConfig` committed at router composition, before any
+//! application access-plan derivation, identity allocation, clock read used
+//! for storage, storage read/write, transition, outbox claim, or send. Every
+//! other native route rejects `SubmitTransaction` outright rather than
+//! processing it unauthenticated. Nonce accounting, fee debit, object
+//! dispatch/effects, and certificate publication remain unimplemented; do not
+//! activate protocol version 3 on any live chain until those are also in
+//! place. See `ARCHITECTURE.md` for the accepted decision record.
 
 use core::fmt;
 use std::error::Error;

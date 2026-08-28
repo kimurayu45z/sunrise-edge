@@ -736,10 +736,15 @@ dependencies = [
 name = "native-http"
 version = "0.1.0"
 dependencies = [
+ "abi",
  "axum",
  "canonical-encoding",
+ "crypto",
+ "ed25519-zebra",
+ "execution",
  "hashing",
  "node-core",
+ "objects",
  "protocol-config",
  "protocol-types",
  "runtime",

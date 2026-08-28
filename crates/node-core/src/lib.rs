@@ -12,7 +12,7 @@ use canonical_encoding::{
 };
 use core::fmt;
 use hashing::{HashSuiteResolver, HashingError};
-use protocol_config::{DomainPlacementManifest, ProtocolConfigError};
+use protocol_config::{DomainPlacementManifest, ProtocolConfig, ProtocolConfigError};
 use protocol_types::{
     ChainId, Digest32, Epoch, HashAlgorithmId, HashPurpose, ProtocolVersion, TypeError,
 };
@@ -193,6 +193,19 @@ pub enum NodeCoreError {
     DurableCommitIndeterminate(IndeterminateCommitReason),
     /// Committed domain-placement configuration rejected routing.
     ProtocolConfig(ProtocolConfigError),
+    /// Transaction authentication failed before any state-machine or storage work.
+    TransactionAuth(TransactionAuthError),
+    /// A generic handler received a transaction submission without an authenticated wrapper.
+    UnauthenticatedTransactionSubmission,
+    /// An authenticated transaction entrypoint received another node-event family.
+    ExpectedSubmitTransaction,
+    /// Ingress and committed protocol-version authorities disagreed.
+    ProtocolConfigVersionMismatch {
+        /// Version fixed by the node invocation configuration.
+        node_config: ProtocolVersion,
+        /// Version committed in protocol configuration.
+        protocol_config: ProtocolVersion,
+    },
     /// The application-specific state machine rejected the event.
     TransitionRejected(&'static str),
 }
@@ -341,6 +354,24 @@ impl fmt::Display for NodeCoreError {
             Self::ProtocolConfig(error) => {
                 write!(f, "protocol configuration rejected routing: {error}")
             }
+            Self::TransactionAuth(error) => {
+                write!(f, "transaction authentication failed: {error}")
+            }
+            Self::UnauthenticatedTransactionSubmission => {
+                f.write_str("SubmitTransaction requires an authenticated transaction entrypoint")
+            }
+            Self::ExpectedSubmitTransaction => {
+                f.write_str("authenticated transaction entrypoint requires SubmitTransaction")
+            }
+            Self::ProtocolConfigVersionMismatch {
+                node_config,
+                protocol_config,
+            } => write!(
+                f,
+                "node config protocol version {} does not match committed protocol version {}",
+                node_config.get(),
+                protocol_config.get()
+            ),
             Self::TransitionRejected(reason) => write!(f, "node transition rejected: {reason}"),
         }
     }
@@ -356,6 +387,7 @@ impl Error for NodeCoreError {
             Self::InvalidHashAlgorithm(error) => Some(error),
             Self::Runtime(error) => Some(error),
             Self::ProtocolConfig(error) => Some(error),
+            Self::TransactionAuth(error) => Some(error),
             _ => None,
         }
     }
@@ -400,6 +432,12 @@ impl From<DurableInvocationError> for NodeCoreError {
 impl From<ProtocolConfigError> for NodeCoreError {
     fn from(value: ProtocolConfigError) -> Self {
         Self::ProtocolConfig(value)
+    }
+}
+
+impl From<TransactionAuthError> for NodeCoreError {
+    fn from(value: TransactionAuthError) -> Self {
+        Self::TransactionAuth(value)
     }
 }
 
@@ -676,6 +714,77 @@ impl NodeConfig {
     pub fn state_key(&self) -> &[u8] {
         &self.state_key
     }
+}
+
+/// A `SubmitTransaction` event whose canonical inner transaction has been
+/// authenticated against the same trusted ingress and committed protocol
+/// configuration.
+///
+/// The fields are private and there is no public constructor. Callers must use
+/// [`authenticate_submit_transaction_event`], and durable processing consumes
+/// this wrapper through
+/// [`handle_authenticated_resolved_durable_submit_transaction`]. The committed
+/// placement is captured at authentication time so a caller cannot authenticate
+/// under one `ProtocolConfig` and route storage through another manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedSubmitTransaction {
+    event: NodeEvent,
+    transaction: AuthenticatedTransaction,
+    placement: DomainPlacementManifest,
+}
+
+impl AuthenticatedSubmitTransaction {
+    /// Returns the authenticated outer node event.
+    #[must_use]
+    pub const fn event(&self) -> &NodeEvent {
+        &self.event
+    }
+
+    /// Returns the strictly decoded and signature-verified transaction.
+    #[must_use]
+    pub const fn transaction(&self) -> &AuthenticatedTransaction {
+        &self.transaction
+    }
+}
+
+/// Authenticates one `SubmitTransaction` event before any machine or storage
+/// operation can begin.
+///
+/// The outer event is first matched against `NodeConfig`. Its protocol version
+/// must also equal the committed `ProtocolConfig` version. The inner canonical
+/// transaction is then authenticated with the outer trusted chain and epoch,
+/// while protocol-version and profile authority come only from
+/// `ProtocolConfig`. The returned wrapper captures that configuration's domain
+/// placement for the later durable commit.
+pub fn authenticate_submit_transaction_event(
+    event: NodeEvent,
+    config: &NodeConfig,
+    protocol_config: &ProtocolConfig,
+) -> Result<AuthenticatedSubmitTransaction, NodeCoreError> {
+    event.validate_context(config)?;
+    if event.kind() != NodeEventKind::SubmitTransaction {
+        return Err(NodeCoreError::ExpectedSubmitTransaction);
+    }
+    if config.protocol_version() != protocol_config.protocol_version {
+        return Err(NodeCoreError::ProtocolConfigVersionMismatch {
+            node_config: config.protocol_version(),
+            protocol_config: protocol_config.protocol_version,
+        });
+    }
+
+    let trusted_context =
+        TrustedTransactionContext::new(config.chain_id().clone(), config.epoch(), protocol_config);
+    let transaction = authenticate_transaction_bytes(event.payload(), &trusted_context)?;
+    let placement = protocol_config
+        .domain_placement
+        .clone()
+        .ok_or(ProtocolConfigError::MissingDomainPlacement)?;
+
+    Ok(AuthenticatedSubmitTransaction {
+        event,
+        transaction,
+        placement,
+    })
 }
 
 /// Stable status returned to the request adapter.
@@ -1536,6 +1645,14 @@ fn domain_transition_parts(
     Ok((reads, mutations))
 }
 
+fn validate_generic_event(event: &NodeEvent, config: &NodeConfig) -> Result<(), NodeCoreError> {
+    event.validate_context(config)?;
+    if event.kind() == NodeEventKind::SubmitTransaction {
+        return Err(NodeCoreError::UnauthenticatedTransactionSubmission);
+    }
+    Ok(())
+}
+
 /// Handles one event inside one explicit atomicity domain.
 ///
 /// This is the domain-aware successor to [`handle_transactional_event`]. Every
@@ -1553,7 +1670,7 @@ where
     R::State: DomainTransactionalStateStore,
     M: TransactionalNodeStateMachine,
 {
-    event.validate_context(config)?;
+    validate_generic_event(&event, config)?;
     let plan = machine.access_plan(&event)?;
     handle_domain_transactional_event_with_plan(runtime, domain, config, event, machine, plan)
 }
@@ -1574,7 +1691,7 @@ where
     R::State: DomainTransactionalStateStore,
     M: TransactionalNodeStateMachine,
 {
-    event.validate_context(config)?;
+    validate_generic_event(&event, config)?;
     let plan = machine.access_plan(&event)?;
     let domain = placement.resolve_domain(event.epoch(), plan.accesses().len())?;
     let output =
@@ -1638,7 +1755,7 @@ where
     R::State: TransactionalStateStore,
     M: TransactionalNodeStateMachine,
 {
-    event.validate_context(config)?;
+    validate_generic_event(&event, config)?;
     let plan = machine.access_plan(&event)?;
     let mut values = BTreeMap::new();
     for access in plan.accesses() {
@@ -1679,7 +1796,7 @@ where
     R::State: TransactionalStateStore,
     M: TransactionalNodeStateMachine,
 {
-    event.validate_context(config)?;
+    validate_generic_event(&event, config)?;
     let event_digest = event.digest(resolver)?;
     let layout = PersistenceLayout::new(config.chain_id.clone(), config.protocol_version);
     let request_bytes = *event.request_id.as_bytes();
@@ -1810,7 +1927,7 @@ where
     R::State: DomainTransactionalStateStore,
     M: TransactionalNodeStateMachine,
 {
-    event.validate_context(config)?;
+    validate_generic_event(&event, config)?;
     let plan = machine.access_plan(&event)?;
     handle_domain_idempotent_event_with_plan(
         runtime, domain, config, resolver, event, machine, plan,
@@ -1835,7 +1952,7 @@ where
     R::State: DomainTransactionalStateStore,
     M: TransactionalNodeStateMachine,
 {
-    event.validate_context(config)?;
+    validate_generic_event(&event, config)?;
     let plan = machine.access_plan(&event)?;
     let domain = placement.resolve_domain(event.epoch(), plan.accesses().len())?;
     let output = handle_domain_idempotent_event_with_plan(
@@ -1865,9 +1982,43 @@ where
     S: StructuredDurableDomainStateStore,
     M: TransactionalNodeStateMachine,
 {
-    event.validate_context(config)?;
+    validate_generic_event(&event, config)?;
     let plan = machine.access_plan(&event)?;
     let domain = placement.resolve_domain(event.epoch(), plan.accesses().len())?;
+    let output = handle_durable_idempotent_event_with_plan(
+        store, context, domain, resolver, event, machine, plan,
+    )?;
+    Ok(ResolvedNodeOutput::new(domain, output))
+}
+
+/// Commits one previously authenticated `SubmitTransaction` through the
+/// normalized durable boundary.
+///
+/// Unlike [`handle_resolved_durable_idempotent_event`], this entrypoint accepts
+/// only the unforgeable [`AuthenticatedSubmitTransaction`] wrapper. The access
+/// plan is derived only after authentication, and its logical domain comes from
+/// the same committed placement captured when the wrapper was constructed.
+/// Exact duplicates are still authenticated before receipt reconciliation.
+pub fn handle_authenticated_resolved_durable_submit_transaction<S, M>(
+    store: &S,
+    context: &DurableOperationContext,
+    resolver: &HashSuiteResolver,
+    submission: AuthenticatedSubmitTransaction,
+    machine: &M,
+) -> Result<ResolvedNodeOutput, NodeCoreError>
+where
+    S: StructuredDurableDomainStateStore,
+    M: TransactionalNodeStateMachine,
+{
+    let plan = machine.access_plan(submission.event())?;
+    let domain = submission
+        .placement
+        .resolve_domain(submission.event().epoch(), plan.accesses().len())?;
+    let AuthenticatedSubmitTransaction {
+        event,
+        transaction: _authenticated_transaction,
+        placement: _,
+    } = submission;
     let output = handle_durable_idempotent_event_with_plan(
         store, context, domain, resolver, event, machine, plan,
     )?;
@@ -2408,7 +2559,7 @@ where
     R: Runtime,
     M: NodeStateMachine,
 {
-    event.validate_context(config)?;
+    validate_generic_event(&event, config)?;
     let current = runtime.state_store().get(config.state_key())?;
     if let Some(bytes) = &current {
         validate_state(bytes)?;
@@ -2608,7 +2759,12 @@ fn take_nested_bytes<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol_types::{HashSuite, HashSuiteSchedule};
+    use abi::{AccessEntry, AccessManifest};
+    use ed25519_zebra::SigningKey;
+    use execution::{Transaction, encode_transaction, encode_transaction_signable};
+    use objects::{AccessMode, Address, ObjectId, ObjectRef};
+    use protocol_config::TransactionAuthProfile;
+    use protocol_types::{HashSuite, HashSuiteSchedule, SignatureSchemeId};
     use runtime::{
         DurableDomainStateStore, MemoryDurableStateStore, MemoryRuntime, StateRevision, StateStore,
         StorageCorrelationId, StorageDeadline, TransactionalStateStore, WriterFenceGeneration,
@@ -2656,13 +2812,25 @@ mod tests {
         event_value(chain, request_id, 9)
     }
 
-    fn event_value(chain: &str, request_id: RequestId, value: u64) -> NodeEvent {
+    fn submit_event(chain: &str, request_id: RequestId) -> NodeEvent {
         NodeEvent::new(
             ChainId::new(chain).unwrap(),
             ProtocolVersion::new(3),
             Epoch::new(7),
             request_id,
             NodeEventKind::SubmitTransaction,
+            canonical(TEST_PAYLOAD_TYPE_ID, 9),
+        )
+        .unwrap()
+    }
+
+    fn event_value(chain: &str, request_id: RequestId, value: u64) -> NodeEvent {
+        NodeEvent::new(
+            ChainId::new(chain).unwrap(),
+            ProtocolVersion::new(3),
+            Epoch::new(7),
+            request_id,
+            NodeEventKind::ReceiveVote,
             canonical(TEST_PAYLOAD_TYPE_ID, value),
         )
         .unwrap()
@@ -2688,6 +2856,85 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    /// A committed protocol configuration whose `protocol_version` matches
+    /// [`config`] and whose `transaction_auth_profile` is active, used to
+    /// authenticate a `SubmitTransaction` event.
+    fn active_protocol_config(byte: u8) -> ProtocolConfig {
+        let mut protocol_config = ProtocolConfig::genesis();
+        protocol_config.protocol_version = ProtocolVersion::new(3);
+        protocol_config.domain_placement =
+            Some(DomainPlacementManifest::single_domain(1, domain(byte), Epoch::new(0)).unwrap());
+        protocol_config.transaction_auth_profile =
+            Some(TransactionAuthProfile::ed25519_address_is_public_key());
+        protocol_config
+    }
+
+    /// A dev-only deterministic signer built directly on the exact-pinned
+    /// workspace `ed25519-zebra` `SigningKey`. Test infrastructure only,
+    /// mirroring `transaction_auth`'s own test-only signer.
+    fn dev_signing_key(seed: u8) -> SigningKey {
+        SigningKey::from([seed; 32])
+    }
+
+    fn dev_sender_address(signing_key: &SigningKey) -> Address {
+        let verification_key = ed25519_zebra::VerificationKey::from(signing_key);
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(verification_key.as_ref());
+        Address::new(bytes)
+    }
+
+    fn sample_object_ref(id_byte: u8) -> ObjectRef {
+        ObjectRef {
+            id: ObjectId::new([id_byte; 32]),
+            version: 1,
+            digest: Digest32::new(HashAlgorithmId::Sha2_256, [id_byte; 32]),
+        }
+    }
+
+    fn unsigned_transaction(sender: Address, chain: ChainId, epoch: Epoch) -> Transaction {
+        let mut manifest = AccessManifest::new();
+        manifest.push(AccessEntry {
+            object_ref: sample_object_ref(0x11),
+            mode: AccessMode::Read,
+        });
+
+        Transaction {
+            chain_id: chain,
+            protocol_version: ProtocolVersion::new(3),
+            epoch,
+            sender,
+            nonce: 7,
+            access_manifest: manifest,
+            module_ref: sample_object_ref(0xDD),
+            entrypoint: "transfer".to_string(),
+            args: vec![1, 2, 3, 4],
+            gas_limit: 100_000,
+            fee_payment: None,
+            signature: Vec::new(),
+        }
+    }
+
+    /// Signs `tx` under the exact production `SignatureDomain` that
+    /// `authenticate_transaction_bytes` itself builds (`tx.chain_id`,
+    /// protocol version 3, `tx.epoch`, message family `"transaction-v1"`,
+    /// Ed25519), matching `transaction_auth`'s own test-only signer, and
+    /// returns the fully encoded transaction bytes.
+    fn signed_transaction_bytes(signing_key: &SigningKey, tx: &Transaction) -> Vec<u8> {
+        let signable = encode_transaction_signable(tx).unwrap();
+        let domain = crypto::SignatureDomain {
+            chain_id: tx.chain_id.clone(),
+            protocol_version: ProtocolVersion::new(3),
+            epoch: tx.epoch,
+            message_type: crypto::SignatureMessageType::new("transaction-v1").unwrap(),
+            signature_scheme_id: SignatureSchemeId::Ed25519,
+        };
+        let framed = crypto::frame_signature_message(&domain, &signable).unwrap();
+        let signature = signing_key.sign(&framed);
+        let mut signed = tx.clone();
+        signed.signature = signature.to_bytes().to_vec();
+        encode_transaction(&signed).unwrap()
     }
 
     struct IncrementMachine;
@@ -2719,7 +2966,7 @@ mod tests {
 
     #[test]
     fn event_round_trip_has_stable_encoding() {
-        let event = event("sunrise-test", request(0x11));
+        let event = submit_event("sunrise-test", request(0x11));
         let encoded = event.encode().unwrap();
         let decoded = NodeEvent::decode(&encoded).unwrap();
 
@@ -2736,7 +2983,7 @@ mod tests {
 
     #[test]
     fn node_event_digest_is_stable_and_context_bound() {
-        let event = event("sunrise-test", request(0x12));
+        let event = submit_event("sunrise-test", request(0x12));
         let digest = event.digest(&resolver("sunrise-test")).unwrap();
 
         assert_eq!(digest.algorithm(), HashAlgorithmId::Sha2_256);
@@ -2898,6 +3145,240 @@ mod tests {
         );
         assert_eq!(output.responses().len(), 1);
         assert!(output.outbound_messages().is_empty());
+    }
+
+    #[test]
+    fn generic_handler_rejects_submit_before_transition_or_storage() {
+        let runtime = MemoryRuntime::new(runtime::ValidatorId::new([0x44; 32]));
+        let config = config("sunrise-test");
+        let error = handle_event(
+            &runtime,
+            &config,
+            submit_event("sunrise-test", request(0x34)),
+            &IncrementMachine,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::UnauthenticatedTransactionSubmission);
+        assert_eq!(runtime.state_store().get(config.state_key()).unwrap(), None);
+    }
+
+    #[test]
+    fn all_eight_generic_handlers_reject_submit_before_machine_or_storage_work() {
+        let runtime = MemoryRuntime::new(runtime::ValidatorId::new([0x44; 32]));
+        let config = config("sunrise-test");
+        let resolver = resolver("sunrise-test");
+        let event_domain = domain(0xD4);
+        let event_placement = placement(0xD4, 7);
+        let machine = CountingPlanMachine {
+            access_plans: AtomicUsize::new(0),
+        };
+
+        let domain_transactional_error = handle_domain_transactional_event(
+            &runtime,
+            event_domain,
+            &config,
+            submit_event("sunrise-test", request(0xB1)),
+            &machine,
+        )
+        .unwrap_err();
+        assert_eq!(
+            domain_transactional_error,
+            NodeCoreError::UnauthenticatedTransactionSubmission
+        );
+
+        let resolved_transactional_error = handle_resolved_transactional_event(
+            &runtime,
+            &event_placement,
+            &config,
+            submit_event("sunrise-test", request(0xB2)),
+            &machine,
+        )
+        .unwrap_err();
+        assert_eq!(
+            resolved_transactional_error,
+            NodeCoreError::UnauthenticatedTransactionSubmission
+        );
+
+        let transactional_error = handle_transactional_event(
+            &runtime,
+            &config,
+            submit_event("sunrise-test", request(0xB3)),
+            &machine,
+        )
+        .unwrap_err();
+        assert_eq!(
+            transactional_error,
+            NodeCoreError::UnauthenticatedTransactionSubmission
+        );
+
+        let idempotent_error = handle_idempotent_event(
+            &runtime,
+            &config,
+            &resolver,
+            submit_event("sunrise-test", request(0xB4)),
+            &machine,
+        )
+        .unwrap_err();
+        assert_eq!(
+            idempotent_error,
+            NodeCoreError::UnauthenticatedTransactionSubmission
+        );
+
+        let domain_idempotent_error = handle_domain_idempotent_event(
+            &runtime,
+            event_domain,
+            &config,
+            &resolver,
+            submit_event("sunrise-test", request(0xB5)),
+            &machine,
+        )
+        .unwrap_err();
+        assert_eq!(
+            domain_idempotent_error,
+            NodeCoreError::UnauthenticatedTransactionSubmission
+        );
+
+        let resolved_idempotent_error = handle_resolved_idempotent_event(
+            &runtime,
+            &event_placement,
+            &config,
+            &resolver,
+            submit_event("sunrise-test", request(0xB6)),
+            &machine,
+        )
+        .unwrap_err();
+        assert_eq!(
+            resolved_idempotent_error,
+            NodeCoreError::UnauthenticatedTransactionSubmission
+        );
+
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let resolved_durable_idempotent_error = handle_resolved_durable_idempotent_event(
+            &store,
+            &durable_context(),
+            &event_placement,
+            &config,
+            &resolver,
+            submit_event("sunrise-test", request(0xB7)),
+            &machine,
+        )
+        .unwrap_err();
+        assert_eq!(
+            resolved_durable_idempotent_error,
+            NodeCoreError::UnauthenticatedTransactionSubmission
+        );
+        assert!(store.commits.lock().unwrap().is_empty());
+        assert_eq!(store.state_reads.load(Ordering::SeqCst), 0);
+
+        let event_error = handle_event(
+            &runtime,
+            &config,
+            submit_event("sunrise-test", request(0xB8)),
+            &IncrementMachine,
+        )
+        .unwrap_err();
+        assert_eq!(
+            event_error,
+            NodeCoreError::UnauthenticatedTransactionSubmission
+        );
+
+        assert_eq!(machine.access_plans.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.state_store().get(config.state_key()).unwrap(), None);
+        assert_eq!(runtime.state_store().get(b"state/a").unwrap(), None);
+        assert_eq!(
+            runtime.state_store().get(b"state/idempotent").unwrap(),
+            None
+        );
+        assert!(
+            runtime
+                .state_store()
+                .get_versioned_in_domain(event_domain, b"state/a")
+                .unwrap()
+                .value()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn authenticate_submit_transaction_event_rejects_wrong_kind() {
+        let config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xD5);
+
+        let error = authenticate_submit_transaction_event(
+            event("sunrise-test", request(0xA1)),
+            &config,
+            &protocol_config,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::ExpectedSubmitTransaction);
+    }
+
+    #[test]
+    fn authenticate_submit_transaction_event_rejects_protocol_config_version_mismatch() {
+        let config = config("sunrise-test");
+        let mut protocol_config = active_protocol_config(0xD6);
+        protocol_config.protocol_version = ProtocolVersion::new(2);
+
+        let error = authenticate_submit_transaction_event(
+            submit_event("sunrise-test", request(0xA2)),
+            &config,
+            &protocol_config,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::ProtocolConfigVersionMismatch {
+                node_config: ProtocolVersion::new(3),
+                protocol_config: ProtocolVersion::new(2),
+            }
+        );
+    }
+
+    #[test]
+    fn authenticate_submit_transaction_event_happy_path_authenticates_transaction() {
+        let config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xD7);
+        let signing_key = dev_signing_key(0x71);
+        let sender = dev_sender_address(&signing_key);
+        let tx = unsigned_transaction(sender, ChainId::new("sunrise-test").unwrap(), Epoch::new(7));
+        let payload = signed_transaction_bytes(&signing_key, &tx);
+        let event = NodeEvent::new(
+            ChainId::new("sunrise-test").unwrap(),
+            ProtocolVersion::new(3),
+            Epoch::new(7),
+            request(0xA3),
+            NodeEventKind::SubmitTransaction,
+            payload,
+        )
+        .unwrap();
+
+        let authenticated =
+            authenticate_submit_transaction_event(event.clone(), &config, &protocol_config)
+                .unwrap();
+
+        assert_eq!(authenticated.event(), &event);
+        assert_eq!(authenticated.transaction().transaction().nonce, 7);
+
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        let resolved = handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            authenticated,
+            &machine,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.domain(), domain(0xD7));
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(store.state_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(store.commits.lock().unwrap().len(), 1);
     }
 
     #[test]

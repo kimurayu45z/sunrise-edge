@@ -10,10 +10,15 @@ canonical-encoding.workspace = true
 hashing.workspace = true
 node-core.workspace = true
 protocol-config.workspace = true
+protocol-types.workspace = true
 runtime.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-protocol-types.workspace = true
+abi.workspace = true
+crypto.workspace = true
+ed25519-zebra.workspace = true
+execution.workspace = true
+objects.workspace = true
 runtime-sqlite.workspace = true
 tower.workspace = true
