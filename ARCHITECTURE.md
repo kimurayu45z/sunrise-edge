@@ -646,16 +646,23 @@ the same atomic write set. A retry with the same request ID and event digest
 replays persisted responses without re-running the transition or returning the
 outbox again; the same request ID with different event bytes fails closed.
 Outbox presence makes committed messages recoverable and at-least-once, but no
-adapter uses this path yet.
+production deployment composition relies on this legacy path. The native
+adapter retains it for non-transaction events, while its structured route uses
+the normalized durable equivalent described below.
 
-`node-core` also carries a standalone Transaction v1 authentication boundary
-(`node_core::transaction_auth`, see Section 8) that composes the strict
+`node-core` carries the Transaction v1 authentication boundary described in
+Section 8 (`node_core::transaction_auth`). It composes the strict
 `execution::decode_transaction` decoder, the committed
 `protocol_config::TransactionAuthProfile`, and the concrete
-`crypto::Ed25519Verifier`. It is deliberately not wired to `NodeEvent` or any
-persistence/dispatch path here: no `NodeStateMachine`, `handle_event`, or
-`native-http` route calls it yet, and it performs no nonce, fee-debit,
-certificate, or object-dispatch handling.
+`crypto::Ed25519Verifier`. `authenticate_submit_transaction_event` now wires it
+to `NodeEvent`, and the structured durable native route requires the resulting
+private-field `AuthenticatedSubmitTransaction` before deriving an access plan
+or entering its persistence/dispatch path. Generic node-core handlers and the
+legacy native routes reject `SubmitTransaction`. The authenticated wrapper is
+still only an authority token around the outer event: persistent nonce
+equality, fee debit, typed module/object dispatch and effects, fast-path
+certificates, and authorization for every other externally accepted event
+family remain mandatory before live activation.
 
 The outbox delivery cursor (`0xE005`) advances one message at a time. A caller
 supplies a non-zero lease ID, an observed time, and a duration bounded to five
