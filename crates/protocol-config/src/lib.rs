@@ -6,7 +6,7 @@ use bonds::{
     BondAssetRegistry, BondError, ValidatorAdmissionPolicy, encode_bond_asset_registry,
     encode_validator_admission_policy,
 };
-use canonical_encoding::{CanonicalEncodingError, CanonicalStruct};
+use canonical_encoding::{CanonicalEncodingError, CanonicalStruct, encode_signature_scheme_id};
 use commitments::{CommitmentSchemeError, CommitmentSchemeId, encode_commitment_scheme_id};
 use consensus::{ConsensusError, ConsensusParameters, encode_consensus_parameters};
 use core::fmt;
@@ -14,7 +14,7 @@ use fees::{
     FeeAssetRegistry, FeeError, GasSchedule, encode_fee_asset_registry, encode_gas_schedule,
 };
 use governance::{GovernanceConfig, GovernanceError, encode_governance_config};
-use protocol_types::{AtomicityDomainId, Epoch, HashSuiteId, ProtocolVersion};
+use protocol_types::{AtomicityDomainId, Epoch, HashSuiteId, ProtocolVersion, SignatureSchemeId};
 use protocol_upgrades::{
     FeatureFlags, HashSuiteScheduleConfig, ProtocolUpgradeError, ProtocolUpgradeSchedule,
     encode_feature_flags, encode_hash_suite_schedule, encode_protocol_upgrade_schedule,
@@ -25,8 +25,13 @@ use system_modules::{SystemModuleError, SystemModuleRegistry, encode_system_modu
 const PROTOCOL_CONFIG_TYPE_ID: u16 = 0x5001;
 const DOMAIN_PLACEMENT_RULE_TYPE_ID: u16 = 0x500A;
 const DOMAIN_PLACEMENT_MANIFEST_TYPE_ID: u16 = 0x500B;
+const TRANSACTION_AUTH_PROFILE_TYPE_ID: u16 = 0x500C;
+const ADDRESS_BINDING_TYPE_ID: u16 = 0x500D;
 const ENCODING_VERSION: u16 = 1;
 const DOMAIN_PLACEMENT_CONFIG_ENCODING_VERSION: u16 = 2;
+const TRANSACTION_AUTH_PROFILE_CONFIG_ENCODING_VERSION: u16 = 3;
+/// First protocol version that requires a committed [`TransactionAuthProfile`].
+const TRANSACTION_AUTH_PROFILE_MIN_PROTOCOL_VERSION: u32 = 3;
 
 /// Errors returned by protocol configuration helpers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +64,26 @@ pub enum ProtocolConfigError {
         /// Source version declared by the first pending upgrade.
         scheduled_from: ProtocolVersion,
     },
+    /// Transaction-authentication profile identifiers must be explicitly
+    /// non-zero.
+    ZeroTransactionAuthProfileId,
+    /// The transaction-authentication profile id does not name a profile
+    /// this build implements. Profile ids are committed protocol
+    /// identifiers, not arbitrary non-zero labels; only
+    /// [`ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`] currently exists.
+    UnsupportedTransactionAuthProfileId(u16),
+    /// A transaction-authentication profile requires a signature scheme this
+    /// build implements; the profile's declared scheme is unsupported.
+    UnsupportedSignatureScheme(SignatureSchemeId),
+    /// Protocol versions below 3 must retain the historical configuration
+    /// encoding and must not carry a transaction-authentication profile.
+    TransactionAuthProfileRequiresProtocolVersion3,
+    /// Protocol version 3 and later require a committed
+    /// transaction-authentication profile.
+    MissingTransactionAuthProfile,
+    /// A transaction-authentication profile was resolved against a protocol
+    /// version below the minimum that activates it.
+    TransactionAuthProfileNotActive(ProtocolVersion),
     /// Commitment scheme encoding failed.
     CommitmentScheme(CommitmentSchemeError),
     /// Bond configuration is invalid.
@@ -115,6 +140,29 @@ impl fmt::Display for ProtocolConfigError {
                 "first pending upgrade starts from protocol version {}, active version is {}",
                 scheduled_from.get(),
                 active.get()
+            ),
+            Self::ZeroTransactionAuthProfileId => {
+                write!(f, "transaction-authentication profile id must be non-zero")
+            }
+            Self::UnsupportedTransactionAuthProfileId(profile_id) => write!(
+                f,
+                "transaction-authentication profile id {profile_id} is not implemented"
+            ),
+            Self::UnsupportedSignatureScheme(scheme) => {
+                write!(f, "signature scheme {} is not implemented", scheme.as_u16())
+            }
+            Self::TransactionAuthProfileRequiresProtocolVersion3 => write!(
+                f,
+                "transaction-authentication profile requires protocol version 3 or later"
+            ),
+            Self::MissingTransactionAuthProfile => write!(
+                f,
+                "protocol version 3 or later requires a transaction-authentication profile"
+            ),
+            Self::TransactionAuthProfileNotActive(protocol_version) => write!(
+                f,
+                "transaction-authentication profile is not active at protocol version {}",
+                protocol_version.get()
             ),
             Self::CommitmentScheme(error) => error.fmt(f),
             Self::Bond(error) => error.fmt(f),
@@ -292,6 +340,188 @@ pub fn encode_domain_placement_manifest(
     Ok(canonical.finish()?)
 }
 
+/// Closed rules binding a transaction's declared address to the key that
+/// must authenticate it.
+///
+/// New variants require a new canonical tag and an explicit implementation;
+/// adding a tag does not by itself activate a binding (see
+/// [`TransactionAuthProfile::new`]).
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressBinding {
+    /// The transaction's 32-byte address is the Ed25519 verification key
+    /// that must authenticate it.
+    AddressIsPublicKey = 0x0001,
+}
+
+impl AddressBinding {
+    /// Returns the stable canonical binding tag.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        self as u16
+    }
+}
+
+/// Encodes a closed address-binding rule.
+pub fn encode_address_binding(binding: AddressBinding) -> Result<Vec<u8>, ProtocolConfigError> {
+    let mut canonical = CanonicalStruct::new(ADDRESS_BINDING_TYPE_ID, ENCODING_VERSION);
+    canonical.field_u16(1, binding.as_u16())?;
+    Ok(canonical.finish()?)
+}
+
+/// The only implemented transaction-authentication profile id: Ed25519
+/// signatures where the transaction's address is directly the signer's
+/// Ed25519 public key (see [`AddressBinding::AddressIsPublicKey`]).
+///
+/// Profile ids are committed protocol identifiers, not arbitrary non-zero
+/// labels; [`TransactionAuthProfile::new`] rejects every id other than this
+/// one.
+pub const ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID: u16 = 1;
+
+/// Committed transaction-authentication profile, required from protocol
+/// version 3.
+///
+/// Selecting the signature scheme and address binding is a committed
+/// configuration decision, never a per-transaction choice: transaction bytes
+/// carry no scheme negotiation field, and callers must resolve the active
+/// profile from [`ProtocolConfig`] instead of accepting a caller-declared
+/// scheme.
+///
+/// This type is the commitment/resolution layer only: it carries no
+/// authentication or verification logic. A later transaction-authentication
+/// boundary (added alongside strict `execution::Transaction` v1 decoding)
+/// must construct the signing context (`crypto::SignatureDomain`) from the
+/// resolved profile's committed scheme and the exact transaction-v1 message
+/// family, and must reject — never silently reconcile — any context a
+/// transaction presents that does not match that constructed domain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransactionAuthProfile {
+    profile_id: u16,
+    signature_scheme_id: SignatureSchemeId,
+    address_binding: AddressBinding,
+}
+
+impl TransactionAuthProfile {
+    /// Creates a transaction-authentication profile.
+    ///
+    /// Fails closed for a zero profile id, for any profile id other than
+    /// [`ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`] (the only committed
+    /// profile id this build implements), or for a scheme/binding this
+    /// build does not implement. Ed25519 is currently the only implemented
+    /// signature scheme, and `AddressIsPublicKey` is currently the only
+    /// implemented address binding.
+    pub fn new(
+        profile_id: u16,
+        signature_scheme_id: SignatureSchemeId,
+        address_binding: AddressBinding,
+    ) -> Result<Self, ProtocolConfigError> {
+        let profile = Self {
+            profile_id,
+            signature_scheme_id,
+            address_binding,
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    /// Validates that this profile's id, signature scheme, and address
+    /// binding are all committed and implemented, using the exact same
+    /// rules as [`TransactionAuthProfile::new`].
+    ///
+    /// Because a `TransactionAuthProfile` can only be constructed through
+    /// [`TransactionAuthProfile::new`] or
+    /// [`TransactionAuthProfile::ed25519_address_is_public_key`], every
+    /// existing instance is already valid; this is defense in depth for
+    /// callers that hold a profile from elsewhere in this crate (for
+    /// example [`ProtocolConfig::validate`]) and must not assume it is
+    /// well-formed without checking.
+    pub fn validate(&self) -> Result<(), ProtocolConfigError> {
+        if self.profile_id == 0 {
+            return Err(ProtocolConfigError::ZeroTransactionAuthProfileId);
+        }
+        if self.profile_id != ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID {
+            return Err(ProtocolConfigError::UnsupportedTransactionAuthProfileId(
+                self.profile_id,
+            ));
+        }
+        if self.signature_scheme_id != SignatureSchemeId::Ed25519 {
+            return Err(ProtocolConfigError::UnsupportedSignatureScheme(
+                self.signature_scheme_id,
+            ));
+        }
+        match self.address_binding {
+            AddressBinding::AddressIsPublicKey => {}
+        }
+        Ok(())
+    }
+
+    /// Creates the only implemented profile
+    /// ([`ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`]): Ed25519 signatures
+    /// over an address that is directly the signer's public key.
+    #[must_use]
+    pub fn ed25519_address_is_public_key() -> Self {
+        Self {
+            profile_id: ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
+            signature_scheme_id: SignatureSchemeId::Ed25519,
+            address_binding: AddressBinding::AddressIsPublicKey,
+        }
+    }
+
+    /// Returns the explicit non-zero profile identifier.
+    #[must_use]
+    pub const fn profile_id(&self) -> u16 {
+        self.profile_id
+    }
+
+    /// Returns the committed signature scheme.
+    #[must_use]
+    pub const fn signature_scheme_id(&self) -> SignatureSchemeId {
+        self.signature_scheme_id
+    }
+
+    /// Returns the committed address binding.
+    #[must_use]
+    pub const fn address_binding(&self) -> AddressBinding {
+        self.address_binding
+    }
+}
+
+/// Encodes a transaction-authentication profile deterministically.
+pub fn encode_transaction_auth_profile(
+    profile: &TransactionAuthProfile,
+) -> Result<Vec<u8>, ProtocolConfigError> {
+    profile.validate()?;
+    let mut canonical = CanonicalStruct::new(TRANSACTION_AUTH_PROFILE_TYPE_ID, ENCODING_VERSION);
+    canonical.field_u16(1, profile.profile_id)?;
+    canonical.field_bytes(2, encode_signature_scheme_id(profile.signature_scheme_id)?)?;
+    canonical.field_bytes(3, encode_address_binding(profile.address_binding)?)?;
+    Ok(canonical.finish()?)
+}
+
+/// Validates a protocol configuration and resolves its committed
+/// [`TransactionAuthProfile`].
+///
+/// Validation runs before the activation check, so a malformed
+/// configuration (for example a missing domain-placement manifest, or a
+/// zero hash-suite id) fails closed with its own specific error rather than
+/// a misleading transaction-auth-specific one. This function only commits
+/// and resolves configuration; it performs no signature verification and
+/// has no opinion about a specific transaction.
+pub fn resolve_transaction_auth_profile(
+    config: &ProtocolConfig,
+) -> Result<&TransactionAuthProfile, ProtocolConfigError> {
+    config.validate()?;
+    if config.protocol_version.get() < TRANSACTION_AUTH_PROFILE_MIN_PROTOCOL_VERSION {
+        return Err(ProtocolConfigError::TransactionAuthProfileNotActive(
+            config.protocol_version,
+        ));
+    }
+    config
+        .transaction_auth_profile
+        .as_ref()
+        .ok_or(ProtocolConfigError::MissingTransactionAuthProfile)
+}
+
 /// Protocol configuration fields that affect cryptographic commitments today.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtocolConfig {
@@ -323,6 +553,9 @@ pub struct ProtocolConfig {
     pub consensus_parameters: ConsensusParameters,
     /// Logical state-domain routing, required from protocol version 2.
     pub domain_placement: Option<DomainPlacementManifest>,
+    /// Committed transaction-authentication profile, required from protocol
+    /// version 3.
+    pub transaction_auth_profile: Option<TransactionAuthProfile>,
 }
 
 impl ProtocolConfig {
@@ -344,6 +577,7 @@ impl ProtocolConfig {
             protocol_upgrades: ProtocolUpgradeSchedule::new(),
             consensus_parameters: ConsensusParameters::genesis(),
             domain_placement: None,
+            transaction_auth_profile: None,
         }
     }
 
@@ -383,6 +617,16 @@ impl ProtocolConfig {
             }
             _ => {}
         }
+        match (self.protocol_version.get(), &self.transaction_auth_profile) {
+            (version, Some(_)) if version < TRANSACTION_AUTH_PROFILE_MIN_PROTOCOL_VERSION => {
+                return Err(ProtocolConfigError::TransactionAuthProfileRequiresProtocolVersion3);
+            }
+            (version, None) if version >= TRANSACTION_AUTH_PROFILE_MIN_PROTOCOL_VERSION => {
+                return Err(ProtocolConfigError::MissingTransactionAuthProfile);
+            }
+            (_, Some(profile)) => profile.validate()?,
+            _ => {}
+        }
         if let Some(first) = self.protocol_upgrades.upgrades().first()
             && first.from_version != self.protocol_version
         {
@@ -404,7 +648,9 @@ impl ProtocolConfig {
 pub fn encode_protocol_config(config: &ProtocolConfig) -> Result<Vec<u8>, ProtocolConfigError> {
     config.validate()?;
 
-    let encoding_version = if config.domain_placement.is_some() {
+    let encoding_version = if config.transaction_auth_profile.is_some() {
+        TRANSACTION_AUTH_PROFILE_CONFIG_ENCODING_VERSION
+    } else if config.domain_placement.is_some() {
         DOMAIN_PLACEMENT_CONFIG_ENCODING_VERSION
     } else {
         ENCODING_VERSION
@@ -435,6 +681,9 @@ pub fn encode_protocol_config(config: &ProtocolConfig) -> Result<Vec<u8>, Protoc
     if let Some(manifest) = &config.domain_placement {
         canonical.field_bytes(14, encode_domain_placement_manifest(manifest)?)?;
     }
+    if let Some(profile) = &config.transaction_auth_profile {
+        canonical.field_bytes(15, encode_transaction_auth_profile(profile)?)?;
+    }
     Ok(canonical.finish()?)
 }
 
@@ -463,79 +712,116 @@ mod tests {
         .unwrap()
     }
 
+    fn hex_to_bytes(input: &str) -> Vec<u8> {
+        (0..input.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&input[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The complete historical `ProtocolConfig` encoding v1 (genesis, no
+    /// `domain_placement` or `transaction_auth_profile`) as fixed literal
+    /// bytes. This is the pre-existing pinned vector; `v2`/`v3` stable
+    /// vectors below are built by byte-editing a copy of it (patching only
+    /// the outer header and the fixed-width `protocol_version` field at its
+    /// known offset) and appending independently pinned field fragments, so
+    /// no test's "expected" side is ever produced by calling
+    /// `encode_protocol_config`.
+    const GENESIS_V1_HEX: &str = concat!(
+        // outer ProtocolConfig frame (field count 13)
+        "534e5245015001000d00",
+        "01000400000001000000",
+        "0200020000000100",
+        "03009f000000",
+        "534e5245013001000700",
+        "0100020000000100",
+        "0200170000007370617273652d6d65726b6c652d7368613235362d7631",
+        "030008000000736861322d323536",
+        "04001700000062696e6172792d7370617273652d6d65726b6c652d7631",
+        "05001100000063616e6f6e6963616c2d6c6561662d7631",
+        "06001100000063616e6f6e6963616c2d6e6f64652d7631",
+        "070011000000726f6c652d616e642d6c6576656c2d7631",
+        "04005e000000",
+        "534e5245057001000600",
+        "0100080000000000000000000000",
+        "0200080000000000000000000000",
+        "0300080000000000000000000000",
+        "0400080000000000000000000000",
+        "0500080000000000000000000000",
+        "0600080000000000000000000000",
+        "050014000000",
+        "534e5245047001000100",
+        "01000400000000000000",
+        "060014000000",
+        "534e5245038001000100",
+        "01000400000000000000",
+        "070012000000",
+        "534e5245018001000100",
+        "0100020000000100",
+        // governance_config field (field 8)
+        "08002c000000",
+        "534e524505900100030001000400000001000000020004000000020000000300080000000200000000000000",
+        // system_module_registry field (field 9)
+        "090012000000",
+        "534e524507b0010001000100020000000000",
+        // feature_flags field (field 10)
+        "0a0012000000",
+        "534e524501c0010001000100020000000000",
+        // hash_suite_schedule field (field 11)
+        "0b0088000000",
+        "534e524503c001000200",
+        "0100020000000100",
+        "020070000000",
+        "534e524502c001000200",
+        "010018000000534e52450701010001000100080000000000000000000000",
+        "020042000000",
+        "534e5245040101000700",
+        "0100020000000100",
+        "0200020000000100",
+        "0300020000000100",
+        "0400020000000100",
+        "0500020000000100",
+        "0600020000000100",
+        "0700020000000100",
+        // protocol_upgrade_schedule field (field 12)
+        "0c0012000000",
+        "534e524506c0010001000100020000000000",
+        // consensus_parameters field (field 13)
+        "0d002a000000",
+        "534e524505d001000300",
+        "0100020000000100",
+        "02000400000000040000",
+        "0300080000001027000000000000"
+    );
+
+    /// The complete pinned domain-placement manifest bytes (`domain =
+    /// 0x11...11`, `activation_epoch = 7`), matching the fixed literal
+    /// established by `domain_placement_manifest_has_a_stable_canonical_vector`.
+    const DOMAIN_PLACEMENT_MANIFEST_0X11_HEX: &str = concat!(
+        "534e52450b5001000400",
+        "01000400000001000000",
+        "020020000000",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "030012000000",
+        "534e52450a50010001000100020000000100",
+        "0400080000000700000000000000"
+    );
+
+    /// The complete pinned transaction-authentication profile bytes
+    /// (`profile_id = ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID` (1), Ed25519,
+    /// `AddressIsPublicKey`), matching the fixed literal established by
+    /// `transaction_auth_profile_has_a_stable_canonical_vector`.
+    const TRANSACTION_AUTH_PROFILE_1_HEX: &str = concat!(
+        "534e52450c500100030001000200000001000200120000",
+        "00534e52450801010001000100020000000100030012000000",
+        "534e52450d50010001000100020000000100"
+    );
+
     #[test]
     fn genesis_config_encodes_stably() {
         let bytes = encode_protocol_config(&ProtocolConfig::genesis()).unwrap();
 
-        assert_eq!(
-            hex(&bytes),
-            concat!(
-                // outer ProtocolConfig frame (field count 13)
-                "534e5245015001000d00",
-                "01000400000001000000",
-                "0200020000000100",
-                "03009f000000",
-                "534e5245013001000700",
-                "0100020000000100",
-                "0200170000007370617273652d6d65726b6c652d7368613235362d7631",
-                "030008000000736861322d323536",
-                "04001700000062696e6172792d7370617273652d6d65726b6c652d7631",
-                "05001100000063616e6f6e6963616c2d6c6561662d7631",
-                "06001100000063616e6f6e6963616c2d6e6f64652d7631",
-                "070011000000726f6c652d616e642d6c6576656c2d7631",
-                "04005e000000",
-                "534e5245057001000600",
-                "0100080000000000000000000000",
-                "0200080000000000000000000000",
-                "0300080000000000000000000000",
-                "0400080000000000000000000000",
-                "0500080000000000000000000000",
-                "0600080000000000000000000000",
-                "050014000000",
-                "534e5245047001000100",
-                "01000400000000000000",
-                "060014000000",
-                "534e5245038001000100",
-                "01000400000000000000",
-                "070012000000",
-                "534e5245018001000100",
-                "0100020000000100",
-                // governance_config field (field 8)
-                "08002c000000",
-                "534e524505900100030001000400000001000000020004000000020000000300080000000200000000000000",
-                // system_module_registry field (field 9)
-                "090012000000",
-                "534e524507b0010001000100020000000000",
-                // feature_flags field (field 10)
-                "0a0012000000",
-                "534e524501c0010001000100020000000000",
-                // hash_suite_schedule field (field 11)
-                "0b0088000000",
-                "534e524503c001000200",
-                "0100020000000100",
-                "020070000000",
-                "534e524502c001000200",
-                "010018000000534e52450701010001000100080000000000000000000000",
-                "020042000000",
-                "534e5245040101000700",
-                "0100020000000100",
-                "0200020000000100",
-                "0300020000000100",
-                "0400020000000100",
-                "0500020000000100",
-                "0600020000000100",
-                "0700020000000100",
-                // protocol_upgrade_schedule field (field 12)
-                "0c0012000000",
-                "534e524506c0010001000100020000000000",
-                // consensus_parameters field (field 13)
-                "0d002a000000",
-                "534e524505d001000300",
-                "0100020000000100",
-                "02000400000000040000",
-                "0300080000001027000000000000"
-            )
-        );
+        assert_eq!(hex(&bytes), GENESIS_V1_HEX);
     }
 
     #[test]
@@ -571,6 +857,7 @@ mod tests {
             protocol_upgrades: ProtocolUpgradeSchedule::new(),
             consensus_parameters: ConsensusParameters::genesis(),
             domain_placement: None,
+            transaction_auth_profile: None,
         })
         .unwrap_err();
 
@@ -594,6 +881,7 @@ mod tests {
             protocol_upgrades: ProtocolUpgradeSchedule::new(),
             consensus_parameters: ConsensusParameters::genesis(),
             domain_placement: None,
+            transaction_auth_profile: None,
         })
         .unwrap_err();
 
@@ -666,6 +954,81 @@ mod tests {
             encode_protocol_config(&missing).unwrap(),
             encode_protocol_config(&ProtocolConfig::genesis()).unwrap()
         );
+    }
+
+    #[test]
+    fn transaction_auth_profile_has_a_stable_canonical_vector() {
+        let profile = TransactionAuthProfile::ed25519_address_is_public_key();
+        assert_eq!(
+            profile.profile_id(),
+            ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID
+        );
+        assert_eq!(profile.signature_scheme_id(), SignatureSchemeId::Ed25519);
+        assert_eq!(
+            profile.address_binding(),
+            AddressBinding::AddressIsPublicKey
+        );
+
+        assert_eq!(
+            hex(&encode_address_binding(AddressBinding::AddressIsPublicKey).unwrap()),
+            "534e52450d50010001000100020000000100"
+        );
+        assert_eq!(
+            hex(&encode_transaction_auth_profile(&profile).unwrap()),
+            TRANSACTION_AUTH_PROFILE_1_HEX
+        );
+    }
+
+    /// Appends one outer-frame field (id + length-prefixed value) to `bytes`,
+    /// mirroring `CanonicalStruct::finish`'s field-header layout. `value_hex`
+    /// is an independently pinned literal, never the output of
+    /// `encode_protocol_config`.
+    fn append_field(bytes: &mut Vec<u8>, field_id: u16, value_hex: &str) {
+        let value = hex_to_bytes(value_hex);
+        bytes.extend_from_slice(&field_id.to_le_bytes());
+        bytes.extend_from_slice(&u32::try_from(value.len()).unwrap().to_le_bytes());
+        bytes.extend_from_slice(&value);
+    }
+
+    #[test]
+    fn protocol_config_v2_has_a_stable_canonical_vector() {
+        // Built by patching a copy of the pinned v1 vector's fixed-offset
+        // outer header (encoding version, field count) and fixed-width
+        // `protocol_version` field, then appending the independently pinned
+        // domain-placement-manifest fragment. `expected` is never produced
+        // by calling `encode_protocol_config`.
+        let mut expected = hex_to_bytes(GENESIS_V1_HEX);
+        expected[6..8].copy_from_slice(&DOMAIN_PLACEMENT_CONFIG_ENCODING_VERSION.to_le_bytes());
+        expected[8..10].copy_from_slice(&14u16.to_le_bytes());
+        expected[16..20].copy_from_slice(&2u32.to_le_bytes());
+        append_field(&mut expected, 14, DOMAIN_PLACEMENT_MANIFEST_0X11_HEX);
+
+        let mut config = ProtocolConfig::genesis();
+        config.protocol_version = ProtocolVersion::new(2);
+        config.domain_placement = Some(domain_manifest(0x11, 7));
+
+        assert_eq!(encode_protocol_config(&config).unwrap(), expected);
+    }
+
+    #[test]
+    fn protocol_config_v3_has_a_stable_canonical_vector() {
+        // Same technique as the v2 vector above, additionally appending the
+        // independently pinned transaction-auth-profile fragment.
+        let mut expected = hex_to_bytes(GENESIS_V1_HEX);
+        expected[6..8]
+            .copy_from_slice(&TRANSACTION_AUTH_PROFILE_CONFIG_ENCODING_VERSION.to_le_bytes());
+        expected[8..10].copy_from_slice(&15u16.to_le_bytes());
+        expected[16..20].copy_from_slice(&3u32.to_le_bytes());
+        append_field(&mut expected, 14, DOMAIN_PLACEMENT_MANIFEST_0X11_HEX);
+        append_field(&mut expected, 15, TRANSACTION_AUTH_PROFILE_1_HEX);
+
+        let mut config = ProtocolConfig::genesis();
+        config.protocol_version = ProtocolVersion::new(3);
+        config.domain_placement = Some(domain_manifest(0x11, 7));
+        config.transaction_auth_profile =
+            Some(TransactionAuthProfile::ed25519_address_is_public_key());
+
+        assert_eq!(encode_protocol_config(&config).unwrap(), expected);
     }
 
     #[test]
@@ -855,6 +1218,123 @@ mod tests {
                 active: ProtocolVersion::new(1),
                 scheduled_from: ProtocolVersion::new(2),
             })
+        );
+    }
+
+    #[test]
+    fn transaction_auth_profile_rejects_zero_id() {
+        assert_eq!(
+            TransactionAuthProfile::new(
+                0,
+                SignatureSchemeId::Ed25519,
+                AddressBinding::AddressIsPublicKey,
+            ),
+            Err(ProtocolConfigError::ZeroTransactionAuthProfileId)
+        );
+    }
+
+    #[test]
+    fn transaction_auth_profile_rejects_an_unsupported_profile_id() {
+        // Profile ids are committed protocol identifiers, not arbitrary
+        // non-zero labels: only ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID (1)
+        // is implemented, so id 2 must fail closed even though it is
+        // otherwise well-formed.
+        assert_eq!(
+            TransactionAuthProfile::new(
+                2,
+                SignatureSchemeId::Ed25519,
+                AddressBinding::AddressIsPublicKey,
+            ),
+            Err(ProtocolConfigError::UnsupportedTransactionAuthProfileId(2))
+        );
+    }
+
+    #[test]
+    fn transaction_auth_profile_rejects_unsupported_signature_scheme() {
+        assert_eq!(
+            TransactionAuthProfile::new(
+                ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
+                SignatureSchemeId::Secp256k1,
+                AddressBinding::AddressIsPublicKey,
+            ),
+            Err(ProtocolConfigError::UnsupportedSignatureScheme(
+                SignatureSchemeId::Secp256k1
+            ))
+        );
+    }
+
+    #[test]
+    fn transaction_auth_profile_has_an_explicit_protocol_config_version_boundary() {
+        let mut premature = ProtocolConfig::genesis();
+        premature.protocol_version = ProtocolVersion::new(2);
+        premature.domain_placement = Some(domain_manifest(0x33, 7));
+        premature.transaction_auth_profile =
+            Some(TransactionAuthProfile::ed25519_address_is_public_key());
+        assert_eq!(
+            premature.validate(),
+            Err(ProtocolConfigError::TransactionAuthProfileRequiresProtocolVersion3)
+        );
+
+        let mut missing = ProtocolConfig::genesis();
+        missing.protocol_version = ProtocolVersion::new(3);
+        missing.domain_placement = Some(domain_manifest(0x33, 7));
+        assert_eq!(
+            missing.validate(),
+            Err(ProtocolConfigError::MissingTransactionAuthProfile)
+        );
+
+        missing.transaction_auth_profile =
+            Some(TransactionAuthProfile::ed25519_address_is_public_key());
+        assert!(missing.validate().is_ok());
+    }
+
+    #[test]
+    fn resolve_transaction_auth_profile_fails_closed_below_activation() {
+        let genesis = ProtocolConfig::genesis();
+        assert_eq!(
+            resolve_transaction_auth_profile(&genesis),
+            Err(ProtocolConfigError::TransactionAuthProfileNotActive(
+                ProtocolVersion::new(1)
+            ))
+        );
+
+        let mut v2 = ProtocolConfig::genesis();
+        v2.protocol_version = ProtocolVersion::new(2);
+        v2.domain_placement = Some(domain_manifest(0x33, 7));
+        assert_eq!(
+            resolve_transaction_auth_profile(&v2),
+            Err(ProtocolConfigError::TransactionAuthProfileNotActive(
+                ProtocolVersion::new(2)
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_transaction_auth_profile_fails_closed_when_missing_at_or_above_activation() {
+        let mut v3 = ProtocolConfig::genesis();
+        v3.protocol_version = ProtocolVersion::new(3);
+        v3.domain_placement = Some(domain_manifest(0x33, 7));
+        assert_eq!(
+            resolve_transaction_auth_profile(&v3),
+            Err(ProtocolConfigError::MissingTransactionAuthProfile)
+        );
+    }
+
+    #[test]
+    fn resolve_transaction_auth_profile_fails_closed_for_an_invalid_config() {
+        // protocol_version 3 with a committed transaction_auth_profile but no
+        // domain_placement manifest: invalid for a reason unrelated to
+        // transaction authentication. Resolution must fail closed on that
+        // general `validate()` error rather than only checking
+        // transaction-auth-specific invariants.
+        let mut invalid = ProtocolConfig::genesis();
+        invalid.protocol_version = ProtocolVersion::new(3);
+        invalid.transaction_auth_profile =
+            Some(TransactionAuthProfile::ed25519_address_is_public_key());
+
+        assert_eq!(
+            resolve_transaction_auth_profile(&invalid),
+            Err(ProtocolConfigError::MissingDomainPlacement)
         );
     }
 }

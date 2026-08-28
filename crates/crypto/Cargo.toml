@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 canonical-encoding.workspace = true
 protocol-types.workspace = true
+ed25519-zebra.workspace = true

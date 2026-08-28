@@ -6,6 +6,10 @@ use canonical_encoding::{CanonicalEncodingError, CanonicalStruct};
 use protocol_types::{ChainId, Epoch, ProtocolVersion, SignatureSchemeId};
 use std::{error::Error, fmt};
 
+mod ed25519;
+
+pub use ed25519::Ed25519Verifier;
+
 const SIGNATURE_FRAME_TYPE_ID: u16 = 0x2001;
 const SIGNATURE_FRAME_VERSION: u16 = 1;
 
@@ -14,6 +18,24 @@ const SIGNATURE_FRAME_VERSION: u16 = 1;
 pub enum CryptoError {
     /// The signature message type was empty.
     EmptyMessageType,
+    /// A verification key had a length other than the scheme's exact size.
+    InvalidVerificationKeyLength(usize),
+    /// A verification key was the correct length but did not decode to a
+    /// valid curve point for the scheme.
+    MalformedVerificationKey,
+    /// A signature had a length other than the scheme's exact size.
+    InvalidSignatureLength(usize),
+    /// A `SignatureDomain` declared a scheme other than the signer's or
+    /// verifier's own scheme. Signing or verification is rejected before any
+    /// framing or cryptographic operation runs, so a caller can never
+    /// produce or accept a frame that claims a scheme it did not actually
+    /// use.
+    SignatureSchemeMismatch {
+        /// The signer's or verifier's own scheme.
+        expected: SignatureSchemeId,
+        /// The scheme declared by the `SignatureDomain` the caller supplied.
+        actual: SignatureSchemeId,
+    },
     /// Canonical framing failed.
     CanonicalEncoding(CanonicalEncodingError),
 }
@@ -22,6 +44,21 @@ impl fmt::Display for CryptoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyMessageType => write!(f, "signature message type must not be empty"),
+            Self::InvalidVerificationKeyLength(length) => {
+                write!(f, "verification key has an invalid length: {length} bytes")
+            }
+            Self::MalformedVerificationKey => {
+                write!(f, "verification key is not a valid curve point encoding")
+            }
+            Self::InvalidSignatureLength(length) => {
+                write!(f, "signature has an invalid length: {length} bytes")
+            }
+            Self::SignatureSchemeMismatch { expected, actual } => write!(
+                f,
+                "signature domain declares scheme {}, expected {}",
+                actual.as_u16(),
+                expected.as_u16()
+            ),
             Self::CanonicalEncoding(error) => error.fmt(f),
         }
     }
@@ -81,11 +118,23 @@ pub trait SignatureSigner {
     fn sign_framed(&self, framed_message: &[u8]) -> Result<Vec<u8>, CryptoError>;
 
     /// Frames and signs a canonical protocol payload.
+    ///
+    /// Rejects with [`CryptoError::SignatureSchemeMismatch`] before framing
+    /// or signing if `domain.signature_scheme_id` does not equal
+    /// [`SignatureSigner::scheme_id`], so this signer can never produce a
+    /// frame that claims a scheme it did not use.
     fn sign_canonical(
         &self,
         domain: &SignatureDomain,
         canonical_payload: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
+        let expected: SignatureSchemeId = self.scheme_id();
+        if domain.signature_scheme_id != expected {
+            return Err(CryptoError::SignatureSchemeMismatch {
+                expected,
+                actual: domain.signature_scheme_id,
+            });
+        }
         let framed = frame_signature_message(domain, canonical_payload)?;
         self.sign_framed(&framed)
     }
@@ -100,12 +149,24 @@ pub trait SignatureVerifier {
     fn verify_framed(&self, framed_message: &[u8], signature: &[u8]) -> Result<bool, CryptoError>;
 
     /// Frames and verifies a canonical protocol payload.
+    ///
+    /// Rejects with [`CryptoError::SignatureSchemeMismatch`] before framing
+    /// or verifying if `domain.signature_scheme_id` does not equal
+    /// [`SignatureVerifier::scheme_id`], so this verifier never attempts to
+    /// verify a signature under a scheme it does not implement.
     fn verify_canonical(
         &self,
         domain: &SignatureDomain,
         canonical_payload: &[u8],
         signature: &[u8],
     ) -> Result<bool, CryptoError> {
+        let expected: SignatureSchemeId = self.scheme_id();
+        if domain.signature_scheme_id != expected {
+            return Err(CryptoError::SignatureSchemeMismatch {
+                expected,
+                actual: domain.signature_scheme_id,
+            });
+        }
         let framed = frame_signature_message(domain, canonical_payload)?;
         self.verify_framed(&framed, signature)
     }
@@ -166,10 +227,66 @@ mod tests {
     }
 
     #[test]
+    fn signature_frames_change_across_epochs() {
+        let left = frame_signature_message(&domain("chain-a", 1, 7, "vote"), b"payload").unwrap();
+        let right = frame_signature_message(&domain("chain-a", 1, 8, "vote"), b"payload").unwrap();
+
+        assert_ne!(left, right);
+    }
+
+    #[test]
     fn message_type_must_not_be_empty() {
         assert_eq!(
             SignatureMessageType::new("  "),
             Err(CryptoError::EmptyMessageType)
+        );
+    }
+
+    fn domain_with_scheme(scheme: SignatureSchemeId) -> SignatureDomain {
+        SignatureDomain {
+            signature_scheme_id: scheme,
+            ..domain("chain-a", 1, 7, "tx")
+        }
+    }
+
+    /// A minimal test-only signer, not a production signer: it exists solely
+    /// to exercise `SignatureSigner::sign_canonical`'s default-method scheme
+    /// guard, symmetric to `SignatureVerifier::verify_canonical`'s (see
+    /// `ed25519::tests::verify_canonical_rejects_a_mismatched_scheme_without_verifying`).
+    struct TestSigner(SignatureSchemeId);
+
+    impl SignatureSigner for TestSigner {
+        fn scheme_id(&self) -> SignatureSchemeId {
+            self.0
+        }
+
+        fn sign_framed(&self, _framed_message: &[u8]) -> Result<Vec<u8>, CryptoError> {
+            Ok(vec![0u8; 64])
+        }
+    }
+
+    #[test]
+    fn sign_canonical_rejects_a_mismatched_scheme_before_framing_or_signing() {
+        let signer = TestSigner(SignatureSchemeId::Ed25519);
+        let mismatched = domain_with_scheme(SignatureSchemeId::Secp256k1);
+
+        assert_eq!(
+            signer.sign_canonical(&mismatched, b"payload"),
+            Err(CryptoError::SignatureSchemeMismatch {
+                expected: SignatureSchemeId::Ed25519,
+                actual: SignatureSchemeId::Secp256k1,
+            })
+        );
+    }
+
+    #[test]
+    fn sign_canonical_accepts_a_matching_scheme() {
+        let signer = TestSigner(SignatureSchemeId::Ed25519);
+        let matching = domain_with_scheme(SignatureSchemeId::Ed25519);
+
+        assert_eq!(
+            signer.sign_canonical(&matching, b"payload"),
+            Ok(vec![0u8; 64])
         );
     }
 }
