@@ -259,6 +259,17 @@ composed with the authenticated transaction. The generic application machine
 still consumes the outer event while the authenticated inner transaction is
 held as an authority token; typed object dispatch remains the next separate
 boundary. This change adds no canonical field, type ID, or encoding version.
+This constraint is not limited to `SubmitTransaction`: every externally
+accepted non-`SubmitTransaction` node-event family — especially certificate,
+protocol-upgrade, and validator-set-change events — needs an equivalent
+authenticated/authorized ingress boundary before live activation. Generic
+node-core handlers failing closed on `SubmitTransaction` says nothing about
+those other families, which remain accepted from untrusted ingress today.
+Separately, the outer `NodeEvent`'s `request_id` is unsigned; node-core's
+idempotency layer only detects replay against a persisted receipt for that
+exact identifier. Until per-transaction persistent nonce equality is
+enforced, resubmission under a fresh, never-before-seen `request_id` remains
+unsafe replay, independent of transaction-signature authentication.
 
 ## 9. Object lifecycle
 Objects are not implemented in Phase 1. Future object versions will reference self-describing digests so historical versions remain readable after hash-suite migration.

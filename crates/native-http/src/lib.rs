@@ -28,7 +28,7 @@ use node_core::{
     handle_idempotent_event, handle_resolved_durable_idempotent_event,
     handle_resolved_idempotent_event,
 };
-use protocol_config::{DomainPlacementManifest, ProtocolConfig};
+use protocol_config::{DomainPlacementManifest, ProtocolConfig, ProtocolConfigError};
 use protocol_types::ProtocolVersion;
 use runtime::{
     AtomicityDomainId, Clock, DomainTransactionalStateStore, DueOutboxClaimRequest,
@@ -624,7 +624,6 @@ struct ResolvedDomainNativeHttpState<R, M, L> {
 
 struct StructuredDurableNativeHttpState<S, M, T, C, I> {
     components: StructuredDurableNativeComponents<S, T, C, I>,
-    placement: DomainPlacementManifest,
     protocol_config: ProtocolConfig,
     authority: StructuredDurableRequestAuthority,
     config: NodeConfig,
@@ -833,13 +832,11 @@ where
             },
         );
     }
-    let placement = protocol_config
-        .domain_placement
-        .clone()
-        .ok_or(StructuredDurableRouterError::MissingDomainPlacement)?;
+    if protocol_config.domain_placement.is_none() {
+        return Err(StructuredDurableRouterError::MissingDomainPlacement);
+    }
     let state = Arc::new(StructuredDurableNativeHttpState {
         components,
-        placement,
         protocol_config,
         authority,
         config,
@@ -1622,6 +1619,13 @@ where
         } else {
             PreparedStructuredEvent::Generic(event)
         };
+    let placement: &DomainPlacementManifest = state
+        .protocol_config
+        .domain_placement
+        .as_ref()
+        .ok_or(ProtocolConfigError::MissingDomainPlacement)
+        .map_err(NodeCoreError::from)
+        .map_err(InvocationError::Node)?;
     let identity = state
         .components
         .identities
@@ -1665,7 +1669,7 @@ where
         PreparedStructuredEvent::Generic(event) => handle_resolved_durable_idempotent_event(
             state.components.store.as_ref(),
             &context,
-            &state.placement,
+            placement,
             &state.config,
             &state.resolver,
             event,
@@ -3534,6 +3538,78 @@ mod tests {
             premature_node_config,
             StatusCode::SERVICE_UNAVAILABLE,
             "transaction-auth-config-unavailable",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn structured_route_rejects_outer_event_context_mismatch_before_every_side_effect() {
+        let domain = AtomicityDomainId::new([0x8A; 32]).unwrap();
+        let protocol_config = active_protocol_config(domain);
+
+        let wrong_chain_event = NodeEvent::new(
+            ChainId::new("other-chain").unwrap(),
+            ProtocolVersion::new(3),
+            Epoch::new(7),
+            request_id(0x40),
+            NodeEventKind::SubmitTransaction,
+            canonical(TEST_PAYLOAD_TYPE_ID, 9),
+        )
+        .unwrap();
+        assert_submit_rejected_before_side_effects(
+            wrong_chain_event.encode().unwrap(),
+            protocol_config.clone(),
+            StatusCode::CONFLICT,
+            "state-or-context-conflict",
+        )
+        .await;
+
+        let wrong_version_event = NodeEvent::new(
+            ChainId::new("sunrise-test").unwrap(),
+            ProtocolVersion::new(2),
+            Epoch::new(7),
+            request_id(0x41),
+            NodeEventKind::SubmitTransaction,
+            canonical(TEST_PAYLOAD_TYPE_ID, 9),
+        )
+        .unwrap();
+        assert_submit_rejected_before_side_effects(
+            wrong_version_event.encode().unwrap(),
+            protocol_config.clone(),
+            StatusCode::CONFLICT,
+            "state-or-context-conflict",
+        )
+        .await;
+
+        let wrong_epoch_event = NodeEvent::new(
+            ChainId::new("sunrise-test").unwrap(),
+            ProtocolVersion::new(3),
+            Epoch::new(8),
+            request_id(0x42),
+            NodeEventKind::SubmitTransaction,
+            canonical(TEST_PAYLOAD_TYPE_ID, 9),
+        )
+        .unwrap();
+        assert_submit_rejected_before_side_effects(
+            wrong_epoch_event.encode().unwrap(),
+            protocol_config,
+            StatusCode::CONFLICT,
+            "state-or-context-conflict",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn structured_route_rejects_canonical_non_transaction_payload_before_every_side_effect() {
+        let domain = AtomicityDomainId::new([0x8B; 32]).unwrap();
+        let protocol_config = active_protocol_config(domain);
+        let event = submit_transaction_event(request_id(0x43), canonical(TEST_PAYLOAD_TYPE_ID, 9));
+
+        assert_submit_rejected_before_side_effects(
+            event.encode().unwrap(),
+            protocol_config,
+            StatusCode::BAD_REQUEST,
+            "invalid-transaction-bytes",
         )
         .await;
     }

@@ -2078,7 +2078,15 @@ Phase 15 As-Is scope:
   zeroで失敗するtestを持つ。nonce、fee debit、certificate、object dispatch、
   新しいwire field/type ID/encoding versionは追加していない。protocol version
   3のlive activationはnonce/fee/object/effect/FastCertificateのatomic composition
-  が完成するまで禁止する。
+  が完成するまで禁止する。**Hard activation constraint:** `SubmitTransaction`以外の
+  externally acceptedなnode-event family(特にcertificate、protocol upgrade、
+  validator-set change)も、live activationの前に同等のauthenticated/authorized
+  ingressを持たなければならない。generic node-core handlerが`SubmitTransaction`を
+  rejectすることは、それらの他のfamilyをunauthenticatedで受理してよいことを意味
+  しない。加えて、outer `NodeEvent`の`request_id`はunsignedであり、node-coreの
+  idempotency/dedup layerはpersisted receiptに対してのみreplayを検出する。
+  persistent nonce equalityがtransactionレベルで実装されるまで、fresh
+  (未使用)な`request_id`によるreplay/resubmissionはunsafeなままである。
 - request pathのcommit直後deliveryはdomain-wide `claim_due_outbox`を流用しない。同じdomainのolder due workを
   今回requestと誤認しないよう、trusted `(domain, request_id, now, lease, expiry)`を持つexact-request claimを使う。
   memory conformanceはolder due rowが存在しても指定requestだけをclaimし、cross-request/domain lease reuseを拒否する

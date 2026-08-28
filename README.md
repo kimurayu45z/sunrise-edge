@@ -130,7 +130,13 @@ cross-provider ingress milestones implemented through Phase 17:
   authenticate before receipt reconciliation. Nonce enforcement, fee debit,
   module/object dispatch and effects, FastVote/FastCertificate, and
   certificate publication remain unimplemented, so the owned fast path is
-  not yet safe to activate on a live chain.
+  not yet safe to activate on a live chain. The other externally accepted
+  node-event families, especially certificate, protocol-upgrade, and
+  validator-set-change events, still need their own authenticated and
+  authorized ingress boundaries before any live activation. The outer
+  `NodeEvent.request_id` is not signed, so a signed transaction can still be
+  resubmitted under a fresh request ID until persistent per-sender nonce
+  equality is enforced.
 - Versioned objects, object references, access manifests, and lazy migration.
 - Runtime traits and an in-memory runtime for deterministic tests.
 - A local durable SQLite transactional store using WAL, synchronous FULL,
