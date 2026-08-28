@@ -143,7 +143,20 @@ impl fmt::Display for TransactionAuthError {
     }
 }
 
-impl Error for TransactionAuthError {}
+impl Error for TransactionAuthError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Config(error) => Some(error),
+            Self::Decode(error) => Some(error),
+            Self::Crypto(error) => Some(error),
+            Self::ChainMismatch { .. }
+            | Self::ProtocolVersionMismatch { .. }
+            | Self::EpochMismatch { .. }
+            | Self::SignableTransactionTooLarge { .. }
+            | Self::InvalidTransactionSignature => None,
+        }
+    }
+}
 
 /// The explicit, caller-supplied trusted signing/replay context.
 ///
@@ -868,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn changing_any_signable_field_invalidates_authentication() {
+    fn changing_nonce_invalidates_authentication() {
         let config = active_protocol_config();
         let signing_key = dev_signing_key(0x0E);
         let sender = dev_sender_address(&signing_key);
@@ -876,8 +889,12 @@ mod tests {
         let bytes = signed_transaction_bytes(&signing_key, &tx);
         let mut signed = decode_transaction(&bytes).unwrap();
 
-        // Mutate a signable field (nonce) while keeping the original
-        // signature, then re-encode and re-check.
+        // Mutate one signable field (nonce) while keeping the original
+        // signature, then re-encode and re-check. Any other signable field
+        // (chain_id, protocol_version, epoch, sender, access_manifest,
+        // module_ref, entrypoint, args, gas_limit, fee_payment) would fail
+        // the same way, since none of them are excluded from
+        // `encode_transaction_signable`.
         signed.nonce = signed.nonce.wrapping_add(1);
         let tampered = encode_transaction(&signed).unwrap();
         let context = TrustedTransactionContext::new(chain_id(), Epoch::new(5), &config);
@@ -886,5 +903,101 @@ mod tests {
             authenticate_transaction_bytes(&tampered, &context),
             Err(TransactionAuthError::InvalidTransactionSignature)
         );
+    }
+
+    // ── stable vector: pin the externally signed Transaction v1 byte layout ──
+    //
+    // Every other test above signs and authenticates within the same test
+    // run, so a change to `encode_transaction_signable`,
+    // `crypto::frame_signature_message`, or `production_domain` that shifted
+    // the exact signed byte layout would still pass them. These vectors pin
+    // the layout an *external* signer must independently reproduce.
+
+    /// Fixed deterministic seed for the stable-vector Ed25519 keypair.
+    /// Test-only; not a production key.
+    const STABLE_VECTOR_SEED: u8 = 0xAB;
+
+    /// Exact `crypto::frame_signature_message(production_domain, encode_transaction_signable(tx))`
+    /// bytes for [`stable_vector_transaction`] signed by [`STABLE_VECTOR_SEED`].
+    const STABLE_VECTOR_FRAME_HEX: &str = "534e524501200100060001000e00000073756e726973652d6465766e657402000400000003000000030008000000050000000000000004000e0000007472616e73616374696f6e2d76310500020000000100060037010000534e5245016001000a0001000e00000073756e726973652d6465766e6574020004000000030000000300080000000500000000000000040020000000248acbdbaf9e050196de704bea2d68770e519150d103b587dae2d9cad53dd9300500080000000100000000000000060014000000534e52450250010001000100040000000000000007008c000000534e5245044001000300010030000000534e524501400100010001002000000000000000000000000000000000000000000000000000000000000000000000000200080000000100000000000000030038000000534e5245030101000200010002000000010002002000000000000000000000000000000000000000000000000000000000000000000000000800040000006e6f6f700900030000000102030a0008000000e803000000000000";
+
+    /// Exact canonical-encoded, signed [`stable_vector_transaction`] bytes
+    /// (real deterministic Ed25519 signature over [`STABLE_VECTOR_FRAME_HEX`]
+    /// included).
+    const STABLE_VECTOR_SIGNED_TX_HEX: &str = "534e5245016001000b0001000e00000073756e726973652d6465766e6574020004000000030000000300080000000500000000000000040020000000248acbdbaf9e050196de704bea2d68770e519150d103b587dae2d9cad53dd9300500080000000100000000000000060014000000534e52450250010001000100040000000000000007008c000000534e5245044001000300010030000000534e524501400100010001002000000000000000000000000000000000000000000000000000000000000000000000000200080000000100000000000000030038000000534e5245030101000200010002000000010002002000000000000000000000000000000000000000000000000000000000000000000000000800040000006e6f6f700900030000000102030a0008000000e8030000000000000c0040000000480cbb90e331345d311713e86e5b1fc3087e6bd800f3efac6cf47e3486f00f935bd13b5ae5cccc4a00af614a24c7fc045b6754316ea9bbbea65546ad80ad320b";
+
+    fn hex_to_bytes(hex: &str) -> Vec<u8> {
+        assert_eq!(hex.len() % 2, 0, "hex literal must have an even length");
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn bytes_to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// Small, compact stable-vector transaction: empty access manifest, no
+    /// fee payment, and short args, so the pinned hex literals above stay
+    /// readable.
+    fn stable_vector_transaction(sender: Address) -> Transaction {
+        Transaction {
+            chain_id: chain_id(),
+            protocol_version: ProtocolVersion::new(3),
+            epoch: Epoch::new(5),
+            sender,
+            nonce: 1,
+            access_manifest: AccessManifest::new(),
+            module_ref: ObjectRef {
+                id: ObjectId::new([0u8; 32]),
+                version: 1,
+                digest: Digest32::new(HashAlgorithmId::Sha2_256, [0u8; 32]),
+            },
+            entrypoint: "noop".to_string(),
+            args: vec![1, 2, 3],
+            gas_limit: 1_000,
+            fee_payment: None,
+            signature: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn stable_vector_frame_bytes_match_pinned_hex() {
+        let signing_key = dev_signing_key(STABLE_VECTOR_SEED);
+        let sender = dev_sender_address(&signing_key);
+        let tx = stable_vector_transaction(sender);
+
+        let signable = encode_transaction_signable(&tx).unwrap();
+        let domain = production_domain(tx.chain_id.clone(), tx.epoch);
+        let framed = crypto::frame_signature_message(&domain, &signable).unwrap();
+
+        assert_eq!(bytes_to_hex(&framed), STABLE_VECTOR_FRAME_HEX);
+    }
+
+    #[test]
+    fn stable_vector_signed_transaction_authenticates_from_pinned_bytes() {
+        // `signing_key` derives only the expected `sender` below for
+        // assertions; the bytes actually authenticated come exclusively
+        // from decoding `STABLE_VECTOR_SIGNED_TX_HEX`, never regenerated.
+        let signing_key = dev_signing_key(STABLE_VECTOR_SEED);
+        let sender = dev_sender_address(&signing_key);
+
+        let config = active_protocol_config();
+        let context = TrustedTransactionContext::new(chain_id(), Epoch::new(5), &config);
+        let vector_bytes = hex_to_bytes(STABLE_VECTOR_SIGNED_TX_HEX);
+
+        let authenticated = authenticate_transaction_bytes(&vector_bytes, &context).unwrap();
+
+        assert_eq!(authenticated.transaction().chain_id, chain_id());
+        assert_eq!(
+            authenticated.transaction().protocol_version,
+            ProtocolVersion::new(3)
+        );
+        assert_eq!(authenticated.transaction().epoch, Epoch::new(5));
+        assert_eq!(authenticated.transaction().sender, sender);
+        assert_eq!(authenticated.transaction().nonce, 1);
+        assert_eq!(authenticated.transaction().entrypoint, "noop");
+        assert_eq!(authenticated.transaction().args, vec![1, 2, 3]);
     }
 }

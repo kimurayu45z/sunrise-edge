@@ -29,7 +29,7 @@ use runtime::{
 use std::collections::BTreeMap;
 use std::error::Error;
 
-mod transaction_auth;
+pub mod transaction_auth;
 
 pub use transaction_auth::{
     AuthenticatedTransaction, MAX_TRANSACTION_SIGNABLE_BYTES, TransactionAuthError,

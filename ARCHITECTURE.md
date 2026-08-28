@@ -215,6 +215,26 @@ per-transaction choice: the boundary always builds the verifier from the
 resolved profile, and today that profile can only ever resolve to Ed25519
 profile 1 (`AddressIsPublicKey`).
 
+Two admissibility questions stay explicitly open for future work rather than
+being decided by this PR. First, a future `TransactionAuthProfile` that keeps
+`SignatureSchemeId::Ed25519` but changes any other signed input this boundary
+treats as implicit and stable (the `"transaction-v1"` message family, the
+canonical `encode_transaction_signable` layout, or how the address binds to
+the key) must introduce an explicit transaction/signature-domain version
+boundary rather than silently reinterpreting bytes an old profile already
+committed to signing; profile identity alone is not that boundary. Second,
+`crypto::Ed25519Verifier` uses ZIP-215 semantics (see Section 8's own
+signature-domain discussion above), which by design also accepts small-order
+and other non-canonical verification-key encodings; combined with
+`AddressIsPublicKey` binding a transaction's address directly to its
+verification key, this means some addresses accepted by this boundary as
+*authenticable* are not necessarily *safe to hold value at*. This PR does not
+change `Ed25519Verifier`'s verification semantics, and does not add a
+key/address admissibility policy (for example rejecting small-order or
+identity-point addresses at the object/asset layer); that decision belongs to
+whichever object/asset layer first lets an address hold value, and must be
+made explicitly before it does.
+
 **Hard activation constraint:** committing a `TransactionAuthProfile` and
 reaching protocol version 3 in `ProtocolConfig` is necessary but not
 sufficient for owned-transaction authentication to actually run. Protocol
