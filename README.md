@@ -101,9 +101,31 @@ cross-provider ingress milestones implemented through Phase 17:
   `ObjectRef`/`ObjectId`/`Address`/access mode, and `FeePayment`/`AssetId`,
   duplicate-`ObjectId` and non-canonical `AccessManifest` layout rejection,
   and a decode/re-encode byte-identity check). It performs no signature
-  verification and builds no `SignatureDomain`. Dispatch that builds the
-  signing context from the committed profile and rejects any mismatch, and
-  the owned fast path itself, remain unimplemented.
+  verification and builds no `SignatureDomain`. `node-core` now adds a
+  standalone, fail-closed `transaction_auth` boundary (workspace
+  dependencies on `execution` and `crypto`; `protocol-config` itself still
+  depends on neither) that composes this decoder, the committed profile, and
+  the concrete Ed25519 verifier. Its `authenticate_transaction_bytes` takes
+  untrusted canonical bytes plus an explicit `TrustedTransactionContext`
+  (caller-supplied `ChainId`/`Epoch`, with protocol-version authority taken
+  only from the referenced `ProtocolConfig`, never a separate caller value),
+  rejects a chain/protocol-version/epoch mismatch before any cryptographic
+  work, builds `SignatureDomain` from the trusted context and profile using
+  the exact stable message family `"transaction-v1"`, bounds the canonical
+  signable payload before framing or verifying it, and returns the new
+  `AuthenticatedTransaction` — a private-field wrapper with no public
+  constructor other than a successful call — only once the committed
+  Ed25519 verifier confirms the signature. It distinguishes a malformed
+  key/signature `CryptoError` from a well-formed but invalid signature.
+  Signature-algorithm agility remains committed configuration resolved at a
+  protocol-version/profile boundary, not per-transaction negotiation; only
+  Ed25519 profile 1 (`AddressIsPublicKey`) is implemented. This boundary is
+  standalone: no `NodeEvent`, `NodeStateMachine`, or native HTTP route calls
+  it yet, and it performs no nonce, fee-debit, certificate, or
+  object-dispatch handling, so the owned fast path itself remains
+  unimplemented and protocol version 3 still must not be activated on any
+  live chain until a real transaction-processing path invokes this boundary
+  before any execution effects or storage mutation.
 - Versioned objects, object references, access manifests, and lazy migration.
 - Runtime traits and an in-memory runtime for deterministic tests.
 - A local durable SQLite transactional store using WAL, synchronous FULL,
