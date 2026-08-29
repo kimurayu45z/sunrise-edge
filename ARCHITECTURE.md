@@ -1701,8 +1701,9 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   reads are allowed. Write/consume modes, shared/system owners, blob-backed
   bodies, absent/tombstoned objects, and adapters without normalized object
   storage fail closed. Match the signed self-describing version/digest and
-  cross-check record identity, schema version, and any owner projection before
-  authorization. Do not recompute historical object digests until their
+  cross-check record identity and schema version, and require the current
+  inline head's owner projection to exist and exactly match the typed owner
+  before authorization. Do not recompute historical object digests until their
   creating chain/version provenance is available. Cap this pre-activation
   fan-out at 32 entries before object I/O without changing committed domain
   placement semantics. Append every exact observed head as a mutation-free
