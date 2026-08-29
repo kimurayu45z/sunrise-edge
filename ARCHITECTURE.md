@@ -274,8 +274,11 @@ submissions: future-nonce pipelining and queueing are intentionally unsupported.
 At `u64::MAX`, checked increment fails closed and the sender cannot submit again
 until epoch rollover. Retention/pruning is safe in principle only after the
 corresponding epoch can no longer be accepted; production pruning policy is
-deferred. An indeterminate commit must be reconciled with the original request
-ID rather than retried under a fresh ID. This uses the existing generic
+deferred. A retained tombstone for an epoch that may still be accepted fails as
+a persistence invariant and never resets the expected nonce to zero. Physical
+reclamation must preserve that rule until the epoch is permanently
+unacceptable. An indeterminate commit must be reconciled with the original
+request ID rather than retried under a fresh ID. This uses the existing generic
 normalized state table and changes no database schema generation or
 Transaction wire field/version, but it allocates persisted record type ID
 `0xE006`.
@@ -1668,9 +1671,13 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   length only. Clients must serialize exact next-nonce submissions; no future
   nonce queue or pipelining is introduced. Epoch and protocol-version rollover
   create a fresh namespace, with trusted monotonically advancing node epoch and
-  signed epoch providing the replay boundary. Pruning after an epoch becomes
-  permanently unacceptable is safe in principle but remains operationally
-  deferred. Exhausting `u64::MAX` bricks that sender until epoch rollover.
+  signed epoch providing the replay boundary. A non-initial tombstone fails
+  closed rather than resetting an accepted epoch to zero. Pruning after an
+  epoch becomes permanently unacceptable is safe in principle but remains
+  operationally deferred. Exhausting `u64::MAX` bricks that sender until epoch
+  rollover. Until fee debit and a bounded retention policy are composed, valid
+  new senders can grow nonce state without economic metering; this As-Is route
+  must not be exposed as activated live transaction ingress.
   Reuse the generic normalized state schema, so no database schema generation
   or Transaction wire/schema version changes; historical Transaction bytes are
   unchanged. Live protocol-version-3 activation remains blocked on atomic fee,

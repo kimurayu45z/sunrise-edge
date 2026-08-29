@@ -22,10 +22,10 @@ use runtime::{
     DurableCommitRejection, DurableInvocationError, DurableInvocationTransaction,
     DurableObjectChanges, DurableOperationContext, DurableOutboxBatch, DurableOutboxMessage,
     DurableReadError, DurableRequestId, DurableRequestReceipt, DurableStateTransaction,
-    IndeterminateCommitReason, MAX_ATOMIC_STATE_WRITES, MAX_STATE_KEY_BYTES, PersistenceLayout,
-    Runtime, RuntimeError, StateMutation, StateMutationEntry, StateReadAssertion, StateRevision,
-    StateStore, StateWrite, StructuredDurableDomainStateStore, TransactionalStateStore,
-    VersionedStateValue,
+    IndeterminateCommitReason, MAX_ATOMIC_STATE_READS, MAX_ATOMIC_STATE_WRITES,
+    MAX_STATE_KEY_BYTES, PersistenceLayout, Runtime, RuntimeError, StateMutation,
+    StateMutationEntry, StateReadAssertion, StateRevision, StateStore, StateWrite,
+    StructuredDurableDomainStateStore, TransactionalStateStore, VersionedStateValue,
 };
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -1764,6 +1764,19 @@ fn validate_generic_event(event: &NodeEvent, config: &NodeConfig) -> Result<(), 
     Ok(())
 }
 
+fn validate_sender_nonce_namespace(
+    plan: &NodeStateAccessPlan,
+    layout: &PersistenceLayout,
+) -> Result<(), NodeCoreError> {
+    let nonce_prefix = layout.sender_nonce_prefix();
+    for access in plan.accesses() {
+        if access.key().starts_with(nonce_prefix.as_slice()) {
+            return Err(NodeCoreError::ReservedStateAccess(access.key().to_vec()));
+        }
+    }
+    Ok(())
+}
+
 /// Handles one event inside one explicit atomicity domain.
 ///
 /// This is the domain-aware successor to [`handle_transactional_event`]. Every
@@ -1823,6 +1836,8 @@ where
     R::State: DomainTransactionalStateStore,
     M: TransactionalNodeStateMachine,
 {
+    let layout = PersistenceLayout::new(config.chain_id.clone(), config.protocol_version);
+    validate_sender_nonce_namespace(&plan, &layout)?;
     let mut values = BTreeMap::new();
     for access in plan.accesses() {
         let observed = runtime
@@ -1868,6 +1883,8 @@ where
 {
     validate_generic_event(&event, config)?;
     let plan = machine.access_plan(&event)?;
+    let layout = PersistenceLayout::new(config.chain_id.clone(), config.protocol_version);
+    validate_sender_nonce_namespace(&plan, &layout)?;
     let mut values = BTreeMap::new();
     for access in plan.accesses() {
         let observed = runtime.state_store().get_versioned(access.key())?;
@@ -1916,7 +1933,9 @@ where
     let delivery_key = layout.outbox_delivery_key(request_bytes);
 
     let plan = machine.access_plan(&event)?;
-    let maximum_application_accesses = MAX_ATOMIC_STATE_WRITES - 3;
+    validate_sender_nonce_namespace(&plan, &layout)?;
+    let maximum_application_accesses =
+        core::cmp::min(MAX_ATOMIC_STATE_READS, MAX_ATOMIC_STATE_WRITES).saturating_sub(3);
     if plan.accesses.len() > maximum_application_accesses {
         return Err(NodeCoreError::TooManyStateAccesses {
             count: plan.accesses.len(),
@@ -2176,15 +2195,12 @@ where
     // family, including exact receipt replays: application state machines
     // must never claim the sender-nonce namespace.
     let layout = PersistenceLayout::new(event.chain_id().clone(), event.protocol_version());
+    validate_sender_nonce_namespace(&plan, &layout)?;
     let nonce_prefix = layout.sender_nonce_prefix();
-    for access in plan.accesses() {
-        if access.key().starts_with(nonce_prefix.as_slice()) {
-            return Err(NodeCoreError::ReservedStateAccess(access.key().to_vec()));
-        }
-    }
 
     if reservation.is_some() {
-        let maximum_application_accesses = MAX_ATOMIC_STATE_WRITES - 1;
+        let maximum_application_accesses =
+            core::cmp::min(MAX_ATOMIC_STATE_READS, MAX_ATOMIC_STATE_WRITES).saturating_sub(1);
         if plan.accesses().len() > maximum_application_accesses {
             return Err(NodeCoreError::TooManyStateAccesses {
                 count: plan.accesses().len(),
@@ -2226,7 +2242,9 @@ where
             let observed = store.get_versioned_durable(context, domain, &nonce_key)?;
             let expected_next_nonce = match observed.value() {
                 Some(bytes) => {
-                    let record = SenderNonceRecord::decode(bytes)?;
+                    let record = SenderNonceRecord::decode(bytes).map_err(|_| {
+                        NodeCoreError::PersistenceInvariant("invalid persisted sender nonce record")
+                    })?;
                     if record.sender != reservation.sender || record.epoch != reservation.epoch {
                         return Err(NodeCoreError::PersistenceInvariant(
                             "persisted sender nonce record does not match its key's sender/epoch",
@@ -2234,7 +2252,12 @@ where
                     }
                     record.next_nonce
                 }
-                None => 0,
+                None if observed.revision() == StateRevision::INITIAL => 0,
+                None => {
+                    return Err(NodeCoreError::PersistenceInvariant(
+                        "persisted sender nonce record was deleted while its epoch may be accepted",
+                    ));
+                }
             };
             if reservation.nonce != expected_next_nonce {
                 return Err(NodeCoreError::SenderNonceMismatch {
@@ -2354,7 +2377,9 @@ where
     let outbox_key = layout.outbox_batch_key(request_bytes);
     let delivery_key = layout.outbox_delivery_key(request_bytes);
 
-    let maximum_application_accesses = MAX_ATOMIC_STATE_WRITES - 3;
+    validate_sender_nonce_namespace(&plan, &layout)?;
+    let maximum_application_accesses =
+        core::cmp::min(MAX_ATOMIC_STATE_READS, MAX_ATOMIC_STATE_WRITES).saturating_sub(3);
     if plan.accesses.len() > maximum_application_accesses {
         return Err(NodeCoreError::TooManyStateAccesses {
             count: plan.accesses.len(),
@@ -4243,7 +4268,51 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(error, NodeCoreError::CanonicalDecoding(_)));
+        assert_eq!(
+            error,
+            NodeCoreError::PersistenceInvariant("invalid persisted sender nonce record")
+        );
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn nonce_tombstone_never_resets_an_accepted_epoch_to_zero() {
+        let config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xED);
+        let signing_key = dev_signing_key(0x9D);
+        let sender_bytes = *dev_sender_address(&signing_key).as_bytes();
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let nonce_key = sender_nonce_key_for("sunrise-test", sender_bytes, Epoch::new(7));
+        store.preload_tombstone(nonce_key, StateRevision::new(2));
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        let submission = authenticated_submission(
+            "sunrise-test",
+            request(0xCD),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            &config,
+            &protocol_config,
+        );
+
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &machine,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::PersistenceInvariant(
+                "persisted sender nonce record was deleted while its epoch may be accepted"
+            )
+        );
         assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
         assert!(store.commits.lock().unwrap().is_empty());
     }
@@ -4354,6 +4423,56 @@ mod tests {
         assert!(matches!(error, NodeCoreError::ReservedStateAccess(_)));
         assert!(store.commits.lock().unwrap().is_empty());
         assert_eq!(store.state_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn legacy_transactional_handlers_also_reject_sender_nonce_prefix() {
+        let runtime = MemoryRuntime::new(runtime::ValidatorId::new([0x44; 32]));
+        let config = config("sunrise-test");
+        let resolver = resolver("sunrise-test");
+        let key = sender_nonce_key_for("sunrise-test", [0x78; 32], Epoch::new(9));
+        let machine = PrefixClaimingMachine { key };
+
+        let errors = [
+            handle_transactional_event(
+                &runtime,
+                &config,
+                event("sunrise-test", request(0xB0)),
+                &machine,
+            )
+            .unwrap_err(),
+            handle_idempotent_event(
+                &runtime,
+                &config,
+                &resolver,
+                event("sunrise-test", request(0xB1)),
+                &machine,
+            )
+            .unwrap_err(),
+            handle_domain_transactional_event(
+                &runtime,
+                domain(0xB2),
+                &config,
+                event("sunrise-test", request(0xB2)),
+                &machine,
+            )
+            .unwrap_err(),
+            handle_domain_idempotent_event(
+                &runtime,
+                domain(0xB3),
+                &config,
+                &resolver,
+                event("sunrise-test", request(0xB3)),
+                &machine,
+            )
+            .unwrap_err(),
+        ];
+
+        assert!(
+            errors
+                .iter()
+                .all(|error| matches!(error, NodeCoreError::ReservedStateAccess(_)))
+        );
     }
 
     struct RejectingMachine;
@@ -4850,7 +4969,7 @@ mod tests {
         }
     }
 
-    type ScriptedStateReads = BTreeMap<Vec<u8>, (StateRevision, Vec<u8>)>;
+    type ScriptedStateReads = BTreeMap<Vec<u8>, (StateRevision, Option<Vec<u8>>)>;
 
     struct ScriptedDurableStore {
         receipt: Mutex<Option<DurableRequestReceipt>>,
@@ -4877,7 +4996,11 @@ mod tests {
             self.preloaded
                 .lock()
                 .unwrap()
-                .insert(key, (revision, value));
+                .insert(key, (revision, Some(value)));
+        }
+
+        fn preload_tombstone(&self, key: Vec<u8>, revision: StateRevision) {
+            self.preloaded.lock().unwrap().insert(key, (revision, None));
         }
     }
 
@@ -4891,7 +5014,7 @@ mod tests {
             self.state_reads.fetch_add(1, Ordering::SeqCst);
             match self.preloaded.lock().unwrap().get(key) {
                 Some((revision, value)) => {
-                    VersionedStateValue::from_persisted_parts(*revision, Some(value.clone()))
+                    VersionedStateValue::from_persisted_parts(*revision, value.clone())
                         .map_err(DurableReadError::InvalidRequest)
                 }
                 None => VersionedStateValue::from_persisted_parts(StateRevision::INITIAL, None)

@@ -2109,8 +2109,12 @@ Phase 15 As-Is scope:
   `NodeConfig.epoch`とsigned epochをreplay boundaryとする。`u64::MAX`到達senderは
   epoch rolloverまで送信不能。indeterminate commitはfresh request IDに変えず
   original request IDでreconcileする。generic normalized state tableを再利用し、
-  DB schema generationとTransaction wire/schema versionは不変。epoch pruningの
-  production policyはdeferred。fee/object/effect/FastCertificateおよび他event
+  tombstone revisionを持つabsenceはexpected zeroへresetせずpersistence invariant
+  でfail closedする。DB schema generationとTransaction wire/schema versionは
+  不変。epoch pruningのproduction policyはdeferredであり、fee debitとbounded
+  retentionがない間はnew senderによるstate growthがeconomic meteringされない。
+  このAs-Is routeをlive transaction ingressとして公開してはならない。
+  fee/object/effect/FastCertificateおよび他event
   familyのauthenticated/authorized ingressが残るためlive activationは引き続き
   禁止する（runtime/node-core/native implemented As-Is）。
 - request pathのcommit直後deliveryはdomain-wide `claim_due_outbox`を流用しない。同じdomainのolder due workを
