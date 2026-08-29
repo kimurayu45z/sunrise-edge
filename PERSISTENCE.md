@@ -157,7 +157,7 @@ operations. Names below describe responsibilities, not yet-stable SQL names.
 | --- | --- | --- |
 | `storage_metadata` | validator and domain | Schema generation, writer fencing generation, migration state, and last verified checkpoint. |
 | `state_records` | domain, record kind, binary key | Small versioned protocol/configuration records with canonical bytes, schema/type version, monotonic revision, and tombstone state. No text-path parsing for correctness. |
-| `object_versions` | domain, object ID, object version | Immutable canonical object version or verified content-addressed blob reference, object digest, and creation checkpoint. |
+| `object_versions` | domain, object ID, object version | Immutable canonical object version or verified content-addressed blob reference, object digest, creating chain/protocol-version provenance (`DurableObjectProvenance`, DR-0068), and creation checkpoint. |
 | `object_heads` | domain, object ID | Current version/digest pointer, ownership/routing projection, revision, and tombstone. Updated atomically with the new immutable version. |
 | `request_receipts` | domain, request ID | Event digest, terminal outcome, canonical response, commit sequence, and retention watermark. Unique request identity rejects conflicting reuse. |
 | `outbox_batches` | domain, request ID | Immutable batch identity and event digest committed with state and receipt. |

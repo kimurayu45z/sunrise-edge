@@ -237,7 +237,15 @@ The authenticated structured durable path now loads every signed read-only
 manifest entry through its exact head and immutable inline version, matches the
 typed owner to the verified sender, and commits the complete head assertions.
 Write/Consume, Shared/System ownership, blob bodies, module loading, and object
-effects remain fail-closed. A shared memory/PostgreSQL conformance suite now
+effects remain fail-closed. Every immutable object version now carries its
+creating chain/protocol-version provenance (`DurableObjectProvenance`,
+DR-0068), and node-core independently recomputes and verifies each
+authenticated object's digest from that provenance and the stored `Digest32`
+algorithm before authorizing it, under bounded inline-body budgets — node-core
+no longer trusts the storage adapter for object-body integrity. PostgreSQL
+generation one was redefined in place under schema identity v2
+(bootstrap-only; an old v1 database fails closed) to add the provenance
+columns. A shared memory/PostgreSQL conformance suite now
 covers bound-domain/fence/deadline rejection, the object read-count bound,
 typed object create/update/delete/recreate ABA, conflict rollback, inline/blob
 mapping and blob round-trip, exact-boundary deadlines, complete-read races,

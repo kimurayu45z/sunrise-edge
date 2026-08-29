@@ -134,7 +134,13 @@ cross-provider ingress milestones implemented through Phase 17:
   authenticated durable path now loads every signed read-only manifest entry
   through its exact head and immutable inline version, authorizes the typed
   owner against the verified sender, and commits the complete head assertions
-  atomically. Mutating/consuming access, shared/system ownership, blob bodies,
+  atomically. Every immutable object version now carries its creating
+  chain/protocol-version provenance, and node-core independently recomputes
+  and verifies each authenticated object's digest from that provenance and
+  the self-describing stored digest algorithm — never the reader's epoch hash
+  suite — under bounded inline-body budgets, so it no longer trusts the
+  storage adapter for object-body integrity (see `ARCHITECTURE.md` DR-0068).
+  Mutating/consuming access, shared/system ownership, blob bodies,
   module loading, fee debit, object effects, FastVote/FastCertificate, and
   certificate publication remain unimplemented, so the owned fast path is not
   yet safe to activate on a live chain. The other externally accepted

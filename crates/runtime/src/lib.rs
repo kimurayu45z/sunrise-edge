@@ -1139,6 +1139,41 @@ impl DurableObjectPayload {
     }
 }
 
+/// Creating protocol context of one immutable object version, sufficient to
+/// re-derive its object digest without trusting the storage adapter.
+///
+/// This is a required field, not `Option`: the schema this is persisted under
+/// is redefined in place (§5.1 of DR-0068), so there are no legacy rows and
+/// absence of provenance is unrepresentable rather than a fail-closed branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableObjectProvenance {
+    chain_id: ChainId,
+    protocol_version: ProtocolVersion,
+}
+
+impl DurableObjectProvenance {
+    /// Builds the creating protocol context of one object version.
+    #[must_use]
+    pub const fn new(chain_id: ChainId, protocol_version: ProtocolVersion) -> Self {
+        Self {
+            chain_id,
+            protocol_version,
+        }
+    }
+
+    /// Returns the chain that created this object version.
+    #[must_use]
+    pub const fn chain_id(&self) -> &ChainId {
+        &self.chain_id
+    }
+
+    /// Returns the protocol version active when this object version was created.
+    #[must_use]
+    pub const fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_version
+    }
+}
+
 /// Complete generation-one immutable object-version row projection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DurableObjectVersionRecord {
@@ -1146,6 +1181,7 @@ pub struct DurableObjectVersionRecord {
     object_version: DurableObjectVersion,
     digest: Digest32,
     schema_version: u32,
+    provenance: DurableObjectProvenance,
     created_checkpoint: u64,
     payload: DurableObjectPayload,
 }
@@ -1155,10 +1191,12 @@ impl DurableObjectVersionRecord {
     ///
     /// The digest is supplied by the trusted execution layer after hashing with
     /// its configured object-digest suite; storage does not select or recompute
-    /// protocol hashes.
+    /// protocol hashes. `node-core` independently recomputes it from the stored
+    /// `provenance` before trusting a loaded object body.
     pub fn from_inline_object(
         object: Object,
         digest: Digest32,
+        provenance: DurableObjectProvenance,
         created_checkpoint: u64,
     ) -> Result<Self, DurableInvocationError> {
         let object_version: DurableObjectVersion = DurableObjectVersion::new(object.version)
@@ -1172,6 +1210,7 @@ impl DurableObjectVersionRecord {
             object_version,
             digest,
             schema_version,
+            provenance,
             created_checkpoint,
             payload,
         })
@@ -1181,6 +1220,7 @@ impl DurableObjectVersionRecord {
     pub fn from_inline_canonical_bytes(
         canonical_bytes: Vec<u8>,
         digest: Digest32,
+        provenance: DurableObjectProvenance,
         created_checkpoint: u64,
     ) -> Result<Self, DurableInvocationError> {
         let inline: DurableInlineObject =
@@ -1193,6 +1233,7 @@ impl DurableObjectVersionRecord {
             object_version,
             digest,
             schema_version: object.schema_version,
+            provenance,
             created_checkpoint,
             payload: DurableObjectPayload::Inline(inline),
         })
@@ -1205,11 +1246,12 @@ impl DurableObjectVersionRecord {
     /// object digest. Storage persists the self-describing reference and does
     /// not fetch blobs or select a protocol hash suite during commit.
     #[must_use]
-    pub const fn from_blob_reference(
+    pub fn from_blob_reference(
         object_id: ObjectId,
         object_version: DurableObjectVersion,
         digest: Digest32,
         schema_version: u32,
+        provenance: DurableObjectProvenance,
         created_checkpoint: u64,
         blob_digest: Digest32,
     ) -> Self {
@@ -1218,6 +1260,7 @@ impl DurableObjectVersionRecord {
             object_version,
             digest,
             schema_version,
+            provenance,
             created_checkpoint,
             payload: DurableObjectPayload::BlobReference(blob_digest),
         }
@@ -1245,6 +1288,13 @@ impl DurableObjectVersionRecord {
     #[must_use]
     pub const fn schema_version(&self) -> u32 {
         self.schema_version
+    }
+
+    /// Returns the creating chain/protocol-version context of this object
+    /// version, sufficient to re-derive its object digest.
+    #[must_use]
+    pub const fn provenance(&self) -> &DurableObjectProvenance {
+        &self.provenance
     }
 
     /// Returns the generation-one canonical record type projection.
@@ -1850,6 +1900,11 @@ fn represented_object_version_bytes(
             .saturating_add(2 * size_of::<u32>())
             .saturating_add(size_of::<u16>() + 32)
             .saturating_add(1),
+    )?;
+    let bytes: usize = checked_object_bytes(bytes, size_of::<u32>())?;
+    let bytes: usize = checked_object_bytes(
+        bytes,
+        size_of::<u32>().saturating_add(version.provenance().chain_id().as_str().len()),
     )?;
     match version.payload() {
         DurableObjectPayload::Inline(inline) => checked_object_bytes(
@@ -4935,15 +4990,15 @@ mod tests {
             data: vec![byte.wrapping_add(3)],
         };
         let canonical: Vec<u8> = encode_object(&object).unwrap();
+        let chain_id: ChainId = ChainId::new("sunrise-runtime-tests").unwrap();
+        let protocol_version: ProtocolVersion = ProtocolVersion::new(1);
         let digest: Digest32 = BuiltinHashFunction::new(HashAlgorithmId::Sha2_256)
-            .hash(
-                HashPurpose::Object,
-                ProtocolVersion::new(1),
-                &ChainId::new("sunrise-runtime-tests").unwrap(),
-                &canonical,
-            )
+            .hash(HashPurpose::Object, protocol_version, &chain_id, &canonical)
             .unwrap();
-        DurableObjectVersionRecord::from_inline_object(object, digest, u64::from(byte)).unwrap()
+        let provenance: DurableObjectProvenance =
+            DurableObjectProvenance::new(chain_id, protocol_version);
+        DurableObjectVersionRecord::from_inline_object(object, digest, provenance, u64::from(byte))
+            .unwrap()
     }
 
     fn test_create_mutation(version: u64, byte: u8) -> DurableObjectMutation {
@@ -5257,6 +5312,10 @@ mod tests {
             DurableObjectVersionRecord::from_inline_canonical_bytes(
                 vec![0; MAX_DURABLE_INLINE_OBJECT_BYTES + 1],
                 Digest32::new(HashAlgorithmId::Sha2_256, [0x01; 32]),
+                DurableObjectProvenance::new(
+                    ChainId::new("sunrise-runtime-tests").unwrap(),
+                    ProtocolVersion::new(1),
+                ),
                 1,
             ),
             Err(DurableInvocationError::ObjectBodyTooLarge {
@@ -5294,6 +5353,10 @@ mod tests {
                 DurableObjectVersion::FIRST,
                 Digest32::new(HashAlgorithmId::Sha2_256, [0x31; 32]),
                 7,
+                DurableObjectProvenance::new(
+                    ChainId::new("sunrise-runtime-tests").unwrap(),
+                    ProtocolVersion::new(1),
+                ),
                 8,
                 Digest32::new(HashAlgorithmId::Sha3_256, [0x32; 32]),
             );
@@ -5473,6 +5536,10 @@ mod tests {
             DurableObjectVersionRecord::from_inline_object(
                 maximum_object,
                 Digest32::new(HashAlgorithmId::Sha2_256, [0x45; 32]),
+                DurableObjectProvenance::new(
+                    ChainId::new("sunrise-runtime-tests").unwrap(),
+                    ProtocolVersion::new(1),
+                ),
                 4,
             )
             .unwrap();
@@ -5509,6 +5576,92 @@ mod tests {
                 )],
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn durable_object_provenance_round_trips_and_grows_represented_bytes() {
+        let chain_id: ChainId = ChainId::new("sunrise-runtime-tests").unwrap();
+        let protocol_version: ProtocolVersion = ProtocolVersion::new(1);
+        let provenance: DurableObjectProvenance =
+            DurableObjectProvenance::new(chain_id.clone(), protocol_version);
+        assert_eq!(provenance.chain_id(), &chain_id);
+        assert_eq!(provenance.protocol_version(), protocol_version);
+
+        let short_version: DurableObjectVersionRecord = test_object_version(1, 0x51);
+        assert_eq!(short_version.provenance().chain_id(), &chain_id);
+        assert_eq!(
+            short_version.provenance().protocol_version(),
+            protocol_version
+        );
+
+        fn object_with_id(byte: u8) -> Object {
+            Object {
+                id: ObjectId::new([byte; 32]),
+                version: 1,
+                owner: Owner::Address(objects::Address::new([byte.wrapping_add(1); 32])),
+                type_hash: Digest32::new(HashAlgorithmId::Sha2_256, [byte.wrapping_add(2); 32]),
+                schema_version: 1,
+                data: vec![byte.wrapping_add(3)],
+            }
+        }
+        let long_chain_id: ChainId =
+            ChainId::new("sunrise-runtime-tests-with-a-much-longer-chain-identifier").unwrap();
+        let canonical: Vec<u8> = encode_object(&object_with_id(0x51)).unwrap();
+        let long_digest: Digest32 = BuiltinHashFunction::new(HashAlgorithmId::Sha2_256)
+            .hash(
+                HashPurpose::Object,
+                protocol_version,
+                &long_chain_id,
+                &canonical,
+            )
+            .unwrap();
+        let long_version: DurableObjectVersionRecord =
+            DurableObjectVersionRecord::from_inline_object(
+                object_with_id(0x51),
+                long_digest,
+                DurableObjectProvenance::new(long_chain_id.clone(), protocol_version),
+                1,
+            )
+            .unwrap();
+
+        let short_bytes: usize = represented_object_version_bytes(0, &short_version).unwrap();
+        let long_bytes: usize = represented_object_version_bytes(0, &long_version).unwrap();
+        assert_eq!(
+            long_bytes - short_bytes,
+            long_chain_id.as_str().len() - chain_id.as_str().len()
+        );
+
+        let mut differing_provenance: DurableObjectVersionRecord = short_version.clone();
+        differing_provenance.provenance = DurableObjectProvenance::new(
+            ChainId::new("sunrise-runtime-tests-other").unwrap(),
+            protocol_version,
+        );
+        assert_ne!(short_version, differing_provenance);
+
+        let maximum_chain_id: ChainId = ChainId::new("x".repeat(128)).unwrap();
+        let maximum_provenance: DurableObjectProvenance =
+            DurableObjectProvenance::new(maximum_chain_id.clone(), protocol_version);
+        let bounded_canonical: Vec<u8> = encode_object(&object_with_id(0x59)).unwrap();
+        let bounded_digest: Digest32 = BuiltinHashFunction::new(HashAlgorithmId::Sha2_256)
+            .hash(
+                HashPurpose::Object,
+                protocol_version,
+                &maximum_chain_id,
+                &bounded_canonical,
+            )
+            .unwrap();
+        let bounded_version: DurableObjectVersionRecord =
+            DurableObjectVersionRecord::from_inline_object(
+                object_with_id(0x59),
+                bounded_digest,
+                maximum_provenance,
+                1,
+            )
+            .unwrap();
+        assert!(
+            represented_object_version_bytes(0, &bounded_version).unwrap()
+                <= MAX_DURABLE_OBJECT_CHANGES_BYTES
         );
     }
 

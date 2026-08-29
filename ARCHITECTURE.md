@@ -1703,17 +1703,51 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   storage fail closed. Match the signed self-describing version/digest and
   cross-check record identity and schema version, and require the current
   inline head's owner projection to exist and exactly match the typed owner
-  before authorization. Do not recompute historical object digests until their
-  creating chain/version provenance is available. Cap this pre-activation
-  fan-out at 32 entries before object I/O without changing committed domain
-  placement semantics. Append every exact observed head as a mutation-free
-  `DurableObjectChanges` read assertion after the pure application transition,
-  so the machine cannot influence it and any concurrent head change rejects
-  the whole state/nonce/receipt/outbox commit. Preserve exact replay and stale
-  nonce short-circuits before object reads. Map object-head conflicts as a
-  retryable 409 without consuming the nonce. Add no canonical wire type, type
-  ID, database schema, asset balance representation, or object mutation.
-  Protocol version 3 remains inactive pending module loading, fee debit,
-  mutating/consuming effects, shared-object consensus routing, blob
-  fetch/content verification, digest provenance, fast certificates, and the
-  other externally accepted event-family authorization boundaries.
+  before authorization. Object digest recomputation is now performed in
+  node-core using the object version's own stored provenance (DR-0068); it is
+  no longer withheld pending that provenance's availability. Cap this
+  pre-activation fan-out at 32 entries before object I/O without changing
+  committed domain placement semantics. Append every exact observed head as a
+  mutation-free `DurableObjectChanges` read assertion after the pure
+  application transition, so the machine cannot influence it and any
+  concurrent head change rejects the whole state/nonce/receipt/outbox commit.
+  Preserve exact replay and stale nonce short-circuits before object reads.
+  Map object-head conflicts as a retryable 409 without consuming the nonce.
+  Add no canonical wire type, type ID, database schema, asset balance
+  representation, or object mutation. Protocol version 3 remains inactive
+  pending module loading, fee debit, mutating/consuming effects,
+  shared-object consensus routing, blob fetch/content verification, fast
+  certificates, and the other externally accepted event-family authorization
+  boundaries.
+- DR-0068: Persist the creating `chain_id`/`protocol_version` (as
+  `DurableObjectProvenance`) on every immutable object-version record, as a
+  required field — the schema is redefined in place so there are no legacy
+  rows and absence is unrepresentable. `node-core` independently recomputes
+  and verifies each authenticated object's digest in
+  `load_and_authorize_objects`, after the inline payload and identity/schema
+  cross-checks and before the owner-projection cross-check, using
+  `hashing::verify_digest` with the algorithm self-describingly recorded in
+  the stored `Digest32` and the record's own provenance — never
+  `HashSuiteResolver::hash_for_purpose`, which would select the algorithm from
+  the reader's epoch suite and misjudge a legitimate object created under a
+  different suite or protocol version. The record's provenance `chain_id`
+  must equal the trusted event chain (objects never migrate chains); no
+  equivalent check applies to `protocol_version`, since an older object must
+  still verify. Inline bodies are bounded before hashing:
+  `MAX_AUTHENTICATED_OBJECT_BODY_BYTES` (1 MiB) per object and
+  `MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES` (8 MiB) aggregate per
+  invocation — pre-activation admission budgets, not measured capacity
+  limits, stricter than the 32 MiB storage-side `MAX_DURABLE_INLINE_OBJECT_BYTES`.
+  `runtime` stores provenance as inert data and does not verify it itself (it
+  depends on `hashing` only as an optional/dev dependency). PostgreSQL
+  generation one is redefined in place under schema identity
+  `POSTGRES_SCHEMA_IDENTITY` v2 (bootstrap only, `POSTGRES_SCHEMA_GENERATION`
+  stays `1`), adding `created_chain_id_bytes`/`created_protocol_version`
+  columns to `object_versions` with a `CHECK (created_chain_id_bytes =
+  chain_id_bytes)` invariant; an existing v1 database fails closed with
+  `SchemaMismatch` on bootstrap, inspection, and every request-path metadata
+  read, with no tolerance, alias, or fallback identity. This discharges the
+  DR-0067 "digest provenance" pending item. Still deferred: module loading,
+  fee debit, mutating/consuming effects, shared/system owners, blob-backed
+  body verification, and a future `HASH_DOMAIN_VERSION` bump (which is itself
+  protocol-critical and would need its own provenance).

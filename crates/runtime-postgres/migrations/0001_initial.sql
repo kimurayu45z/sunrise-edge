@@ -73,6 +73,11 @@ CREATE TABLE sunrise_edge.object_versions (
     digest_bytes BYTEA NOT NULL CHECK (octet_length(digest_bytes) = 32),
     schema_version BIGINT NOT NULL CHECK (schema_version BETWEEN 0 AND 4294967295),
     type_id BIGINT NOT NULL CHECK (type_id BETWEEN 0 AND 4294967295),
+    created_chain_id_bytes BYTEA NOT NULL
+        CHECK (octet_length(created_chain_id_bytes) BETWEEN 1 AND 128),
+    created_protocol_version BIGINT NOT NULL
+        CONSTRAINT object_versions_created_protocol_version_range
+        CHECK (created_protocol_version BETWEEN 0 AND 4294967295),
     created_checkpoint NUMERIC(20, 0) NOT NULL
         CHECK (created_checkpoint BETWEEN 0 AND 18446744073709551615),
     inline_canonical_bytes BYTEA NULL CHECK (
@@ -99,7 +104,9 @@ CREATE TABLE sunrise_edge.object_versions (
         (inline_canonical_bytes IS NOT NULL)::INTEGER
         + (blob_digest_bytes IS NOT NULL)::INTEGER = 1
     ),
-    CHECK ((blob_digest_algorithm_id IS NULL) = (blob_digest_bytes IS NULL))
+    CHECK ((blob_digest_algorithm_id IS NULL) = (blob_digest_bytes IS NULL)),
+    CONSTRAINT object_versions_created_chain_matches_chain
+        CHECK (created_chain_id_bytes = chain_id_bytes)
 );
 
 CREATE TABLE sunrise_edge.object_heads (

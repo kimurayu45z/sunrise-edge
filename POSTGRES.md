@@ -2,7 +2,13 @@
 
 Status: accepted implementation design. The runtime structured envelope,
 node-core/native wiring, and explicit generation-one schema migration/bootstrap
-exist As-Is. A bounded synchronous pool now implements fenced state/object/
+exist As-Is. Generation-one schema identity was redefined in place to `v2`
+(DR-0068) to add `object_versions` provenance columns (`created_chain_id_bytes`,
+`created_protocol_version`); this was an authorized pre-production in-place
+redefinition, applied by bootstrap only, not a migration precedent — no
+migration/backfill/verify/activate operation was added, and an existing `v1`
+database fails closed with `SchemaMismatch` rather than being silently
+accepted. A bounded synchronous pool now implements fenced state/object/
 receipt reads and serializable structured state/object/receipt/outbox commit with transaction-
 local deadlines, bounded unchanged-envelope serialization retry, and typed
 outcomes. Indexed exact-request/due outbox claim and acknowledgement now use
@@ -130,13 +136,29 @@ typed state section must expand these projections explicitly.
 Identity: `(namespace, object_id, object_version)`.
 
 Immutable object body or verified blob reference, digest algorithm/digest,
-schema/type version, and creation checkpoint. Exactly one of inline canonical
-bytes or content-addressed blob identity is present. A blob reference is
-publishable only after durable upload and digest verification.
+schema/type version, creating chain/protocol-version provenance, and creation
+checkpoint. Exactly one of inline canonical bytes or content-addressed blob
+identity is present. A blob reference is publishable only after durable
+upload and digest verification.
+
+`created_chain_id_bytes` (`BYTEA`, 1-128 octets) and `created_protocol_version`
+(`BIGINT`, `0..=4294967295`) are the object version's creating
+`chain_id`/`protocol_version` (`DurableObjectProvenance`, DR-0068), required
+on every row since generation one was redefined in place rather than
+migrated — there are no legacy rows without them. They are the exact frame
+inputs `node-core` needs to independently recompute the object digest with
+`hashing::verify_digest`, using the algorithm self-describingly recorded in
+`digest_algorithm_id`/`digest_bytes`, without trusting this adapter's own
+integrity or the reader's current epoch hash suite. A table-level
+`CHECK (created_chain_id_bytes = chain_id_bytes)` enforces that objects never
+migrate chains; `created_protocol_version` has no equivalent equality check,
+since a version legitimately created under an older protocol version must
+still verify. Neither column is a lookup key or index.
 
 Head reconstruction selects only this row's bounded metadata, representation
-presence/inline length, and blob digest. Full inline bytes are selected and
-canonically decoded only by the separate immutable-version read.
+presence/inline length, and blob digest — it does not select provenance.
+Full inline bytes and provenance are selected and canonically decoded only by
+the separate immutable-version read.
 
 ### `object_heads`
 

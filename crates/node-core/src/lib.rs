@@ -67,6 +67,20 @@ pub const MAX_OUTBOX_LEASE_MILLIS: u64 = 5 * 60 * 1_000;
 /// design note on the `MAX_TRANSACTION_MANIFEST_ENTRIES`/
 /// `MAX_DURABLE_OBJECT_READS` envelope.
 const MAX_AUTHENTICATED_OBJECT_READS: usize = 32;
+/// Per-object inline body bound applied before any hashing work.
+///
+/// Pre-activation admission budget, not a measured capacity limit: hashing is
+/// attacker-influenced work over up to `MAX_STATE_VALUE_BYTES` (32 MiB) per
+/// entry times the `MAX_AUTHENTICATED_OBJECT_READS` fan-out. Raising this
+/// bound requires capacity evidence and a decision record.
+pub const MAX_AUTHENTICATED_OBJECT_BODY_BYTES: usize = 1024 * 1024;
+/// Aggregate inline body budget for one authenticated invocation.
+///
+/// Pre-activation admission budget: bounds worst-case per-request hashing
+/// work to 8 MiB, below the 16 MiB HTTP body limit already accepted by
+/// `native-http`. Raising this bound requires capacity evidence and a
+/// decision record.
+pub const MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Errors returned by node-core validation, transition, and persistence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,6 +333,33 @@ pub enum NodeCoreError {
         /// Object identifier.
         object_id: ObjectId,
     },
+    /// The object's stored digest algorithm is not implemented, so this node
+    /// cannot verify the body it was handed.
+    ObjectDigestUnverifiable {
+        /// Object identifier.
+        object_id: ObjectId,
+        /// Unimplemented digest algorithm recorded on the stored digest.
+        algorithm: HashAlgorithmId,
+    },
+    /// The stored canonical body does not hash to the digest recorded for it.
+    ObjectBodyDigestMismatch {
+        /// Object identifier.
+        object_id: ObjectId,
+    },
+    /// The version record's creating chain does not match the trusted event chain.
+    ObjectProvenanceMismatch {
+        /// Object identifier.
+        object_id: ObjectId,
+    },
+    /// One inline body exceeded the pre-activation verification bound.
+    ObjectBodyTooLarge {
+        /// Object identifier.
+        object_id: ObjectId,
+        /// Actual inline body length in bytes.
+        actual: usize,
+        /// Maximum accepted inline body length in bytes.
+        maximum: usize,
+    },
 }
 
 impl fmt::Display for NodeCoreError {
@@ -551,6 +592,29 @@ impl fmt::Display for NodeCoreError {
             Self::ObjectRecordMismatch { object_id } => write!(
                 f,
                 "object {object_id} version record disagreed with its head"
+            ),
+            Self::ObjectDigestUnverifiable {
+                object_id,
+                algorithm,
+            } => write!(
+                f,
+                "object {object_id} digest algorithm {algorithm} is not implemented by this node"
+            ),
+            Self::ObjectBodyDigestMismatch { object_id } => write!(
+                f,
+                "object {object_id} stored body does not hash to its recorded digest"
+            ),
+            Self::ObjectProvenanceMismatch { object_id } => write!(
+                f,
+                "object {object_id} version provenance chain does not match the event chain"
+            ),
+            Self::ObjectBodyTooLarge {
+                object_id,
+                actual,
+                maximum,
+            } => write!(
+                f,
+                "object {object_id} inline body is {actual} bytes, maximum is {maximum}"
             ),
         }
     }
@@ -2554,7 +2618,9 @@ where
     // interface is unchanged and receives no object data at all, so nothing
     // here can be influenced by `machine.transition` below.
     let object_reads: Vec<DurableObjectHeadRead> = match &dispatch {
-        Some(dispatch) => load_and_authorize_objects(store, context, domain, dispatch)?,
+        Some(dispatch) => {
+            load_and_authorize_objects(store, context, domain, event.chain_id(), dispatch)?
+        }
         None => Vec::new(),
     };
 
@@ -2645,21 +2711,27 @@ where
 ///   version record, or an inline object that disagrees with its own version
 ///   record, is treated as storage corruption distinct from authorization
 ///   failure;
-/// * object digest recomputation is deliberately not attempted here — the
-///   digest is bound to the creating `chain_id`/`protocol_version`, which are
-///   not available on the version row, so this slice trusts the storage
-///   adapter's own integrity cross-check instead of misjudging historical
-///   objects under the current event's context.
+/// * the record's own stored provenance must name the trusted event `chain_id`
+///   — a mismatch means a misbound namespace, a cross-chain body transplant,
+///   or adapter corruption, never a legitimate historical object;
+/// * this node independently recomputes the object digest from the record's
+///   own stored provenance and canonical body using [`hashing::verify_digest`],
+///   which selects the algorithm recorded self-describingly in the digest
+///   itself. It never uses the reader's epoch-selected hash suite, which
+///   would misjudge a legitimate object created under a different suite or
+///   protocol version; inline bodies are bounded before hashing.
 fn load_and_authorize_objects<S>(
     store: &S,
     context: &DurableOperationContext,
     domain: AtomicityDomainId,
+    chain_id: &ChainId,
     dispatch: &AuthenticatedObjectDispatch,
 ) -> Result<Vec<DurableObjectHeadRead>, NodeCoreError>
 where
     S: StructuredDurableDomainStateStore,
 {
     let mut reads: Vec<DurableObjectHeadRead> = Vec::with_capacity(dispatch.accesses.len());
+    let mut total_body_bytes: usize = 0;
     for access in &dispatch.accesses {
         let object_id: ObjectId = access.object_ref.id;
         let head: DurableObjectHead = store.get_object_head(context, domain, object_id)?;
@@ -2711,6 +2783,59 @@ where
             || record.schema_version() != object.schema_version
         {
             return Err(NodeCoreError::ObjectRecordMismatch { object_id });
+        }
+
+        // Objects never migrate chains: the event chain is already validated
+        // trusted input, so a mismatch here means a misbound namespace, a
+        // cross-chain body transplant, or adapter corruption, never a
+        // legitimate object. No equivalent check exists for the recorded
+        // protocol version: a legitimately older object must still verify.
+        if record.provenance().chain_id() != chain_id {
+            return Err(NodeCoreError::ObjectProvenanceMismatch { object_id });
+        }
+
+        let body_length: usize = inline.canonical_bytes().len();
+        if body_length > MAX_AUTHENTICATED_OBJECT_BODY_BYTES {
+            return Err(NodeCoreError::ObjectBodyTooLarge {
+                object_id,
+                actual: body_length,
+                maximum: MAX_AUTHENTICATED_OBJECT_BODY_BYTES,
+            });
+        }
+        total_body_bytes =
+            total_body_bytes
+                .checked_add(body_length)
+                .ok_or(NodeCoreError::ObjectBodyTooLarge {
+                    object_id,
+                    actual: usize::MAX,
+                    maximum: MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES,
+                })?;
+        if total_body_bytes > MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES {
+            return Err(NodeCoreError::ObjectBodyTooLarge {
+                object_id,
+                actual: total_body_bytes,
+                maximum: MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES,
+            });
+        }
+
+        let verified: bool = hashing::verify_digest(
+            &record.digest(),
+            HashPurpose::Object,
+            record.provenance().protocol_version(),
+            record.provenance().chain_id(),
+            inline.canonical_bytes(),
+        )
+        .map_err(|error| match error {
+            HashingError::UnsupportedAlgorithm(algorithm) => {
+                NodeCoreError::ObjectDigestUnverifiable {
+                    object_id,
+                    algorithm,
+                }
+            }
+            other => NodeCoreError::Hashing(other),
+        })?;
+        if !verified {
+            return Err(NodeCoreError::ObjectBodyDigestMismatch { object_id });
         }
 
         // Corruption guard, not authorization: mirrors
@@ -3398,9 +3523,9 @@ mod tests {
     use protocol_config::TransactionAuthProfile;
     use protocol_types::{HashSuite, HashSuiteSchedule, SignatureSchemeId};
     use runtime::{
-        DurableDomainStateStore, DurableObjectRoutingProjection, MemoryDurableStateStore,
-        MemoryRuntime, StateRevision, StateStore, StorageCorrelationId, StorageDeadline,
-        TransactionalStateStore, WriterFenceGeneration,
+        DurableDomainStateStore, DurableObjectProvenance, DurableObjectRoutingProjection,
+        MemoryDurableStateStore, MemoryRuntime, StateRevision, StateStore, StorageCorrelationId,
+        StorageDeadline, TransactionalStateStore, WriterFenceGeneration,
     };
     use std::sync::{
         Arc, Barrier, Mutex,
@@ -3545,17 +3670,36 @@ mod tests {
         chain: &str,
         checkpoint: u64,
     ) -> (DurableObjectVersionRecord, Digest32) {
+        hashed_object_version_with_protocol_version(
+            object,
+            chain,
+            ProtocolVersion::new(3),
+            checkpoint,
+        )
+    }
+
+    /// Same as [`hashed_object_version`] but with an explicit creating
+    /// protocol version, for exercising cross-version provenance.
+    fn hashed_object_version_with_protocol_version(
+        object: Object,
+        chain: &str,
+        protocol_version: ProtocolVersion,
+        checkpoint: u64,
+    ) -> (DurableObjectVersionRecord, Digest32) {
         let canonical_bytes = encode_object(&object).unwrap();
+        let chain_id = ChainId::new(chain).unwrap();
         let digest = BuiltinHashFunction::new(HashAlgorithmId::Sha2_256)
             .hash(
                 HashPurpose::Object,
-                ProtocolVersion::new(3),
-                &ChainId::new(chain).unwrap(),
+                protocol_version,
+                &chain_id,
                 &canonical_bytes,
             )
             .unwrap();
+        let provenance = DurableObjectProvenance::new(chain_id, protocol_version);
         (
-            DurableObjectVersionRecord::from_inline_object(object, digest, checkpoint).unwrap(),
+            DurableObjectVersionRecord::from_inline_object(object, digest, provenance, checkpoint)
+                .unwrap(),
             digest,
         )
     }
@@ -6041,6 +6185,10 @@ mod tests {
                             DurableObjectVersion::FIRST,
                             blob_digest,
                             1,
+                            DurableObjectProvenance::new(
+                                ChainId::new("sunrise-test").unwrap(),
+                                ProtocolVersion::new(3),
+                            ),
                             1,
                             Digest32::new(HashAlgorithmId::Sha3_256, [0x46; 32]),
                         );
@@ -6163,6 +6311,175 @@ mod tests {
                 }),
                 false,
             ),
+            (
+                "object body substitution",
+                Box::new(move || {
+                    let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+                    let object_id = ObjectId::new([0x61; 32]);
+                    let genuine_object = test_object(object_id, 1, Owner::Address(sender), 0x61);
+                    let (_, digest) =
+                        hashed_object_version(genuine_object.clone(), "sunrise-test", 1);
+                    let mut substituted_object = genuine_object;
+                    substituted_object.data = vec![0xFF; 4];
+                    let provenance = DurableObjectProvenance::new(
+                        ChainId::new("sunrise-test").unwrap(),
+                        ProtocolVersion::new(3),
+                    );
+                    let tampered_record = DurableObjectVersionRecord::from_inline_object(
+                        substituted_object,
+                        digest,
+                        provenance,
+                        1,
+                    )
+                    .unwrap();
+                    let head = DurableObjectHead::Current {
+                        head_revision: runtime::ObjectHeadRevision::FIRST,
+                        object_version: DurableObjectVersion::FIRST,
+                        digest,
+                        owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Address(
+                            sender,
+                        ))
+                        .unwrap(),
+                        routing_projection: DurableObjectRoutingProjection::default(),
+                    };
+                    store.preload_object(object_id, head, Some(tampered_record));
+                    let manifest = manifest_with(vec![AccessEntry {
+                        object_ref: ObjectRef {
+                            id: object_id,
+                            version: 1,
+                            digest,
+                        },
+                        mode: AccessMode::Read,
+                    }]);
+                    (
+                        store,
+                        manifest,
+                        NodeCoreError::ObjectBodyDigestMismatch { object_id },
+                    )
+                }),
+                false,
+            ),
+            (
+                "object provenance chain mismatch",
+                Box::new(move || {
+                    let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+                    let object_id = ObjectId::new([0x64; 32]);
+                    let object = test_object(object_id, 1, Owner::Address(sender), 0x64);
+                    let (record, digest) = hashed_object_version(object, "sunrise-other-chain", 1);
+                    let head = DurableObjectHead::Current {
+                        head_revision: runtime::ObjectHeadRevision::FIRST,
+                        object_version: DurableObjectVersion::FIRST,
+                        digest,
+                        owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Address(
+                            sender,
+                        ))
+                        .unwrap(),
+                        routing_projection: DurableObjectRoutingProjection::default(),
+                    };
+                    store.preload_object(object_id, head, Some(record));
+                    let manifest = manifest_with(vec![AccessEntry {
+                        object_ref: ObjectRef {
+                            id: object_id,
+                            version: 1,
+                            digest,
+                        },
+                        mode: AccessMode::Read,
+                    }]);
+                    (
+                        store,
+                        manifest,
+                        NodeCoreError::ObjectProvenanceMismatch { object_id },
+                    )
+                }),
+                false,
+            ),
+            (
+                "unsupported digest algorithm",
+                Box::new(move || {
+                    let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+                    let object_id = ObjectId::new([0x65; 32]);
+                    let object = test_object(object_id, 1, Owner::Address(sender), 0x65);
+                    let digest = Digest32::new(HashAlgorithmId::Blake3_256, [0x66; 32]);
+                    let provenance = DurableObjectProvenance::new(
+                        ChainId::new("sunrise-test").unwrap(),
+                        ProtocolVersion::new(3),
+                    );
+                    let record = DurableObjectVersionRecord::from_inline_object(
+                        object, digest, provenance, 1,
+                    )
+                    .unwrap();
+                    let head = DurableObjectHead::Current {
+                        head_revision: runtime::ObjectHeadRevision::FIRST,
+                        object_version: DurableObjectVersion::FIRST,
+                        digest,
+                        owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Address(
+                            sender,
+                        ))
+                        .unwrap(),
+                        routing_projection: DurableObjectRoutingProjection::default(),
+                    };
+                    store.preload_object(object_id, head, Some(record));
+                    let manifest = manifest_with(vec![AccessEntry {
+                        object_ref: ObjectRef {
+                            id: object_id,
+                            version: 1,
+                            digest,
+                        },
+                        mode: AccessMode::Read,
+                    }]);
+                    (
+                        store,
+                        manifest,
+                        NodeCoreError::ObjectDigestUnverifiable {
+                            object_id,
+                            algorithm: HashAlgorithmId::Blake3_256,
+                        },
+                    )
+                }),
+                false,
+            ),
+            (
+                "object body over per-object bound",
+                Box::new(move || {
+                    let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+                    let object_id = ObjectId::new([0x67; 32]);
+                    let mut object = test_object(object_id, 1, Owner::Address(sender), 0x67);
+                    object.data = Vec::new();
+                    let empty_length = encode_object(&object).unwrap().len();
+                    object.data = vec![0; MAX_AUTHENTICATED_OBJECT_BODY_BYTES + 1 - empty_length];
+                    let body_length = encode_object(&object).unwrap().len();
+                    let (record, digest) = hashed_object_version(object, "sunrise-test", 1);
+                    let head = DurableObjectHead::Current {
+                        head_revision: runtime::ObjectHeadRevision::FIRST,
+                        object_version: DurableObjectVersion::FIRST,
+                        digest,
+                        owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Address(
+                            sender,
+                        ))
+                        .unwrap(),
+                        routing_projection: DurableObjectRoutingProjection::default(),
+                    };
+                    store.preload_object(object_id, head, Some(record));
+                    let manifest = manifest_with(vec![AccessEntry {
+                        object_ref: ObjectRef {
+                            id: object_id,
+                            version: 1,
+                            digest,
+                        },
+                        mode: AccessMode::Read,
+                    }]);
+                    (
+                        store,
+                        manifest,
+                        NodeCoreError::ObjectBodyTooLarge {
+                            object_id,
+                            actual: body_length,
+                            maximum: MAX_AUTHENTICATED_OBJECT_BODY_BYTES,
+                        },
+                    )
+                }),
+                false,
+            ),
         ];
 
         for (index, (name, build, expect_zero_object_io)) in cases.into_iter().enumerate() {
@@ -6199,6 +6516,207 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An object created under a different protocol version than the current
+    /// event still verifies, because node-core recomputes with the record's
+    /// own stored provenance and never with the reader's epoch-selected hash
+    /// suite. This is the regression test that forbids reintroducing
+    /// `HashSuiteResolver`-based digest recomputation.
+    #[test]
+    fn object_created_under_an_older_protocol_version_still_verifies() {
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xF5);
+        let signing_key = dev_signing_key(0xB5);
+        let sender: Address = dev_sender_address(&signing_key);
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let object_id = ObjectId::new([0x62; 32]);
+        let object = test_object(object_id, 1, Owner::Address(sender), 0x62);
+        let (record, digest) = hashed_object_version_with_protocol_version(
+            object,
+            "sunrise-test",
+            ProtocolVersion::new(2),
+            1,
+        );
+        let head = DurableObjectHead::Current {
+            head_revision: runtime::ObjectHeadRevision::FIRST,
+            object_version: DurableObjectVersion::FIRST,
+            digest,
+            owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Address(sender))
+                .unwrap(),
+            routing_projection: DurableObjectRoutingProjection::default(),
+        };
+        store.preload_object(object_id, head, Some(record));
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref: ObjectRef {
+                id: object_id,
+                version: 1,
+                digest,
+            },
+            mode: AccessMode::Read,
+        }]);
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            authenticated_submission_with_manifest(
+                "sunrise-test",
+                request(0xE1),
+                &signing_key,
+                Epoch::new(7),
+                0,
+                manifest,
+                &node_config,
+                &protocol_config,
+            ),
+            &machine,
+        )
+        .unwrap();
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(store.commits.lock().unwrap().len(), 1);
+    }
+
+    /// A stored digest whose algorithm differs from the reader's active epoch
+    /// suite still verifies, because the algorithm comes from the
+    /// self-describing stored digest, not the epoch suite.
+    #[test]
+    fn object_digest_algorithm_differing_from_reader_epoch_suite_still_verifies() {
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xF6);
+        let signing_key = dev_signing_key(0xB6);
+        let sender: Address = dev_sender_address(&signing_key);
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let object_id = ObjectId::new([0x63; 32]);
+        let object = test_object(object_id, 1, Owner::Address(sender), 0x63);
+        let canonical_bytes = encode_object(&object).unwrap();
+        let chain_id = ChainId::new("sunrise-test").unwrap();
+        let protocol_version = ProtocolVersion::new(3);
+        let digest = BuiltinHashFunction::new(HashAlgorithmId::Sha3_256)
+            .hash(
+                HashPurpose::Object,
+                protocol_version,
+                &chain_id,
+                &canonical_bytes,
+            )
+            .unwrap();
+        let provenance = DurableObjectProvenance::new(chain_id, protocol_version);
+        let record =
+            DurableObjectVersionRecord::from_inline_object(object, digest, provenance, 1).unwrap();
+        let head = DurableObjectHead::Current {
+            head_revision: runtime::ObjectHeadRevision::FIRST,
+            object_version: DurableObjectVersion::FIRST,
+            digest,
+            owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Address(sender))
+                .unwrap(),
+            routing_projection: DurableObjectRoutingProjection::default(),
+        };
+        store.preload_object(object_id, head, Some(record));
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref: ObjectRef {
+                id: object_id,
+                version: 1,
+                digest,
+            },
+            mode: AccessMode::Read,
+        }]);
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            authenticated_submission_with_manifest(
+                "sunrise-test",
+                request(0xE2),
+                &signing_key,
+                Epoch::new(7),
+                0,
+                manifest,
+                &node_config,
+                &protocol_config,
+            ),
+            &machine,
+        )
+        .unwrap();
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 32 entries individually under the per-object bound whose sum crosses
+    /// the aggregate bound are rejected without ever reaching the transition.
+    #[test]
+    fn object_bodies_over_aggregate_bound_reject_before_transition_or_commit() {
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xFA);
+        let signing_key = dev_signing_key(0xBA);
+        let sender: Address = dev_sender_address(&signing_key);
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        const PER_OBJECT_BYTES: usize = 300_000;
+        const _: () = assert!(PER_OBJECT_BYTES < MAX_AUTHENTICATED_OBJECT_BODY_BYTES);
+        const _: () = assert!(
+            MAX_AUTHENTICATED_OBJECT_READS * PER_OBJECT_BYTES
+                > MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES
+        );
+        let mut entries: Vec<AccessEntry> = Vec::with_capacity(MAX_AUTHENTICATED_OBJECT_READS);
+        for index in 0..MAX_AUTHENTICATED_OBJECT_READS {
+            let byte = u8::try_from(index).unwrap();
+            let object_id = ObjectId::new([byte; 32]);
+            let mut object = test_object(object_id, 1, Owner::Address(sender), byte);
+            object.data = Vec::new();
+            let empty_length = encode_object(&object).unwrap().len();
+            object.data = vec![0; PER_OBJECT_BYTES - empty_length];
+            let (record, digest) = hashed_object_version(object, "sunrise-test", 1);
+            let head = DurableObjectHead::Current {
+                head_revision: runtime::ObjectHeadRevision::FIRST,
+                object_version: DurableObjectVersion::FIRST,
+                digest,
+                owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Address(sender))
+                    .unwrap(),
+                routing_projection: DurableObjectRoutingProjection::default(),
+            };
+            store.preload_object(object_id, head, Some(record));
+            entries.push(AccessEntry {
+                object_ref: ObjectRef {
+                    id: object_id,
+                    version: 1,
+                    digest,
+                },
+                mode: AccessMode::Read,
+            });
+        }
+        let manifest = manifest_with(entries);
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            authenticated_submission_with_manifest(
+                "sunrise-test",
+                request(0xE6),
+                &signing_key,
+                Epoch::new(7),
+                0,
+                manifest,
+                &node_config,
+                &protocol_config,
+            ),
+            &machine,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            NodeCoreError::ObjectBodyTooLarge {
+                maximum: MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES,
+                ..
+            }
+        ));
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+        assert!(store.commits.lock().unwrap().is_empty());
     }
 
     #[test]

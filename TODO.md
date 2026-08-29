@@ -1953,6 +1953,26 @@ Phase 15 As-Is scope:
   memoryとPostgreSQLはstate/object/receipt/outboxを同一atomic boundaryで実装済みである。authenticated
   structured durable pathはsigned read-only manifestをexact head/immutable inline versionからloadし、verified
   senderに対するtyped owner authorizationと完全なhead assertionを同一commitへ接続した（implemented As-Is）。
+  すべてのimmutable object versionはcreating chain/protocol version provenance
+  （`DurableObjectProvenance`、DR-0068、required field、schema redefinition済みなので
+  legacy行は存在しない）を保持し、node-coreは`load_and_authorize_objects`内で
+  inline payload/identity/schemaのcross-checkの後・owner-projection cross-checkの前に、
+  stored `Digest32`のself-describing algorithmとそのprovenanceを使い
+  `hashing::verify_digest`でdigestを独立に再計算・検証する
+  （reader epochのhash suite resolverは使わない。使うとlegitimateなhistorical objectを
+  誤ってrejectしてしまう）。record provenanceのchain_idはtrusted event chainと
+  一致しなければならないが、protocol_versionには同等のcheckはない
+  （olderなobjectも引き続きverifyできなければならないため）。inline bodyは
+  hashing前に`MAX_AUTHENTICATED_OBJECT_BODY_BYTES`（1MiB/object）と
+  `MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES`（8MiB/invocation）でbound済みである
+  （pre-activation admission budgetであり測定済みcapacity limitではない）。
+  PostgreSQLはgeneration oneをschema identity v2へin-place redefinitionし
+  （bootstrap-only、`POSTGRES_SCHEMA_GENERATION`は1のまま）、`object_versions`に
+  `created_chain_id_bytes`/`created_protocol_version`と
+  `CHECK (created_chain_id_bytes = chain_id_bytes)`を追加した。既存のv1 schemaは
+  bootstrap/inspection/request-path metadata readのすべてでfail closed
+  （`SchemaMismatch`）する（object digest provenance/recomputation implemented As-Is;
+  DR-0067の該当pending itemを解消した）。
   Write/Consume、Shared/System owner、blob body、module load、object effects、fee debit、owned fast pathは未実装である。
   node-core additive handlerはmanifest domainをI/O前にresolveし、typed receipt replayをstate readより先に行い、
   read-only assertionを含むstate/receipt/outboxをこのenvelopeへ構築する。definite commitまたはexact replay以外では
