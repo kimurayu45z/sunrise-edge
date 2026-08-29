@@ -2096,6 +2096,45 @@ fn node_error_response(error: &NodeCoreError) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             "protocol-config-unavailable",
         ),
+        NodeCoreError::DurableRead(runtime::DurableReadError::InvalidRequest(
+            runtime::RuntimeError::UnsupportedObjectStorage,
+        )) => (StatusCode::NOT_IMPLEMENTED, "object-storage-unsupported"),
+        NodeCoreError::ObjectNotFound { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "object-not-found")
+        }
+        NodeCoreError::ObjectVersionMismatch { .. } => {
+            (StatusCode::CONFLICT, "object-version-mismatch")
+        }
+        NodeCoreError::ObjectDigestMismatch { .. } => {
+            (StatusCode::CONFLICT, "object-digest-mismatch")
+        }
+        NodeCoreError::ObjectOwnerMismatch { .. } => {
+            (StatusCode::FORBIDDEN, "object-owner-mismatch")
+        }
+        NodeCoreError::ObjectAccessModeUnsupported { .. } => (
+            StatusCode::NOT_IMPLEMENTED,
+            "object-mutating-access-unsupported",
+        ),
+        NodeCoreError::ObjectOwnerKindUnsupported { .. } => {
+            (StatusCode::NOT_IMPLEMENTED, "object-owner-kind-unsupported")
+        }
+        NodeCoreError::ObjectBodyUnavailable { .. } => {
+            (StatusCode::NOT_IMPLEMENTED, "object-blob-body-unsupported")
+        }
+        NodeCoreError::ObjectManifestTooLarge { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "object-manifest-too-large",
+        ),
+        NodeCoreError::DuplicateObjectAccess { .. } => {
+            (StatusCode::BAD_REQUEST, "object-manifest-duplicate")
+        }
+        NodeCoreError::InvalidObjectVersion { .. } => {
+            (StatusCode::BAD_REQUEST, "object-version-invalid")
+        }
+        NodeCoreError::ObjectConflict { .. } => (StatusCode::CONFLICT, "object-head-conflict"),
+        NodeCoreError::ObjectRecordMissing { .. } | NodeCoreError::ObjectRecordMismatch { .. } => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "invalid-node-output")
+        }
         NodeCoreError::ResponseRequestMismatch { .. }
         | NodeCoreError::StateTooLarge(_)
         | NodeCoreError::TooManyOutputItems { .. }
@@ -2204,7 +2243,7 @@ mod tests {
         NodeStateAccessPlan, NodeStateSnapshot, NodeStateUpdate, OutboundMessage,
         TransactionalNodeTransition,
     };
-    use objects::{Address, ObjectId, ObjectRef};
+    use objects::{AccessMode, Address, ObjectId, ObjectRef};
     use protocol_config::TransactionAuthProfile;
     use protocol_types::{
         ChainId, Digest32, Epoch, HashAlgorithmId, HashSuite, HashSuiteSchedule, ProtocolVersion,
@@ -3491,6 +3530,113 @@ mod tests {
             to_bytes(overflow.into_body(), 128).await.unwrap(),
             "sender-nonce-overflow"
         );
+    }
+
+    #[tokio::test]
+    async fn native_error_mapping_covers_every_authenticated_object_dispatch_variant() {
+        let object_id = ObjectId::new([0x61; 32]);
+        let digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x62; 32]);
+        let cases: Vec<(NodeCoreError, StatusCode, &str)> = vec![
+            (
+                NodeCoreError::DurableRead(DurableReadError::InvalidRequest(
+                    RuntimeError::UnsupportedObjectStorage,
+                )),
+                StatusCode::NOT_IMPLEMENTED,
+                "object-storage-unsupported",
+            ),
+            (
+                NodeCoreError::ObjectNotFound { object_id },
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "object-not-found",
+            ),
+            (
+                NodeCoreError::ObjectVersionMismatch {
+                    object_id,
+                    expected: 1,
+                    actual: 2,
+                },
+                StatusCode::CONFLICT,
+                "object-version-mismatch",
+            ),
+            (
+                NodeCoreError::ObjectDigestMismatch {
+                    object_id,
+                    expected: digest,
+                    actual: digest,
+                },
+                StatusCode::CONFLICT,
+                "object-digest-mismatch",
+            ),
+            (
+                NodeCoreError::ObjectOwnerMismatch { object_id },
+                StatusCode::FORBIDDEN,
+                "object-owner-mismatch",
+            ),
+            (
+                NodeCoreError::ObjectAccessModeUnsupported {
+                    object_id,
+                    mode: AccessMode::Write,
+                },
+                StatusCode::NOT_IMPLEMENTED,
+                "object-mutating-access-unsupported",
+            ),
+            (
+                NodeCoreError::ObjectOwnerKindUnsupported { object_id },
+                StatusCode::NOT_IMPLEMENTED,
+                "object-owner-kind-unsupported",
+            ),
+            (
+                NodeCoreError::ObjectBodyUnavailable { object_id },
+                StatusCode::NOT_IMPLEMENTED,
+                "object-blob-body-unsupported",
+            ),
+            (
+                NodeCoreError::ObjectManifestTooLarge {
+                    count: 33,
+                    maximum: 32,
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "object-manifest-too-large",
+            ),
+            (
+                NodeCoreError::DuplicateObjectAccess { object_id },
+                StatusCode::BAD_REQUEST,
+                "object-manifest-duplicate",
+            ),
+            (
+                NodeCoreError::InvalidObjectVersion {
+                    object_id,
+                    version: 0,
+                },
+                StatusCode::BAD_REQUEST,
+                "object-version-invalid",
+            ),
+            (
+                NodeCoreError::ObjectConflict { object_id },
+                StatusCode::CONFLICT,
+                "object-head-conflict",
+            ),
+            (
+                NodeCoreError::ObjectRecordMissing { object_id },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid-node-output",
+            ),
+            (
+                NodeCoreError::ObjectRecordMismatch { object_id },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid-node-output",
+            ),
+        ];
+
+        for (error, expected_status, expected_code) in cases {
+            let response = node_error_response(&error);
+            assert_eq!(response.status(), expected_status, "error: {error:?}");
+            assert_eq!(
+                to_bytes(response.into_body(), 128).await.unwrap(),
+                expected_code,
+                "error: {error:?}"
+            );
+        }
     }
 
     #[tokio::test]

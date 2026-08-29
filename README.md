@@ -130,10 +130,14 @@ cross-provider ingress milestones implemented through Phase 17:
   authenticate before receipt reconciliation. A fresh request must now equal
   the persisted per-sender, per-epoch next nonce; its read assertion and
   checked increment commit atomically with application state, receipt, and
-  outbox. Application plans cannot claim the reserved nonce prefix. Fee debit,
-  module/object dispatch and effects, FastVote/FastCertificate, and certificate
-  publication remain unimplemented, so the owned fast path is not yet safe to
-  activate on a live chain. The other externally accepted
+  outbox. Application plans cannot claim the reserved nonce prefix. The same
+  authenticated durable path now loads every signed read-only manifest entry
+  through its exact head and immutable inline version, authorizes the typed
+  owner against the verified sender, and commits the complete head assertions
+  atomically. Mutating/consuming access, shared/system ownership, blob bodies,
+  module loading, fee debit, object effects, FastVote/FastCertificate, and
+  certificate publication remain unimplemented, so the owned fast path is not
+  yet safe to activate on a live chain. The other externally accepted
   node-event families, especially certificate, protocol-upgrade, and
   validator-set-change events, still need their own authenticated and
   authorized ingress boundaries before any live activation. The outer
@@ -232,8 +236,9 @@ cross-provider ingress milestones implemented through Phase 17:
   validates atomic state/object/receipt/outbox publication, bound domains,
   trusted time, fencing, conflicts, lifecycle ABA safety, the object read-count
   bound, blob round-trip, and exact replay. PostgreSQL now
-  implements the same object boundary As-Is; node-core object dispatch and
-  blob upload/fetch verification remain deferred.
+  implements the same object boundary As-Is. Node-core now consumes it for
+  authenticated read-only manifest authorization; object mutations/effects
+  and blob upload/fetch verification remain deferred.
 - An additive indexed durable-outbox repository contract that claims at most
   one due message in stable availability/request order, installs a bounded
   restart-safe lease atomically, and makes same-lease claim and acknowledgement

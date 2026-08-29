@@ -55,9 +55,11 @@ digest. The SQL `type_id` is the stable canonical Object record identifier,
 not `Object::type_hash`, which remains inside the canonical Object bytes.
 Inline owner projections are derived with `objects::encode_owner` at write
 construction; blob upload, fetch, and digest/content verification remain
-upstream/deferred. Node-core does
-not yet dispatch object mutations, but memory and PostgreSQL consume the typed
-section directly and never hide object writes in generic state.
+upstream/deferred. Node-core now loads authenticated read-only manifest entries
+from exact heads and immutable inline versions, authorizes the typed owner, and
+commits their complete head assertions. It does not yet dispatch object
+mutations; memory and PostgreSQL consume the typed section directly and never
+hide object writes in generic state.
 
 ## 2. Namespace and exact SQL representations
 

@@ -231,8 +231,10 @@ version/digest to the head, decode an inline Object, and compare typed owner;
 blob-backed execution fails closed until fetch/content verification. The SQL
 `type_id` is the canonical Object record identifier,
 not the logical type hash retained in canonical Object bytes. Memory and
-PostgreSQL implement this section atomically with state, receipt, and outbox;
-node-core object dispatch and blob upload/fetch verification remain deferred.
+PostgreSQL implement this section atomically with state, receipt, and outbox.
+Node-core now loads and authorizes authenticated read-only manifest entries and
+commits their complete head assertions through this section; mutating/consuming
+effects and blob upload/fetch verification remain deferred.
 Indexed repositories refine this structured store boundary. Node-core constructs the envelope after one
 manifest resolution and one pure transition, checks typed receipts before
 state reads, preserves read-only assertions, and withholds output for rejected
