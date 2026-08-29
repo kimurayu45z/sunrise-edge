@@ -251,25 +251,53 @@ Generic node-core handlers and the legacy native routers fail closed on
 `SubmitTransaction`; non-transaction event behavior is unchanged.
 
 **Hard activation constraint:** this closes the strict authentication-to-
-durable-routing gap, but it does not complete the owned fast path. Protocol
-version 3 MUST NOT be activated on any live chain until persistent nonce
-equality, fee debit, module/object access and effects validation, FastVote/
-FastCertificate, and certificate publication are implemented and atomically
-composed with the authenticated transaction. The generic application machine
-still consumes the outer event while the authenticated inner transaction is
-held as an authority token; typed object dispatch remains the next separate
-boundary. This change adds no canonical field, type ID, or encoding version.
+durable-routing gap and the persistent transaction-nonce replay gap, but it
+does not complete the owned fast path. For every fresh request, the structured
+durable handler derives a private reservation only from the authenticated
+transaction, loads the canonical sender-and-epoch-bound next-nonce record
+(`0xE006`) before application state, requires exact equality, and atomically
+commits its checked increment with application state, receipt, and outbox. A
+completed exact-request receipt is reconciled before reading the nonce, so a
+retry returns its persisted response without consuming twice. Application
+plans are always excluded from the versioned sender-nonce prefix, including
+non-transaction event families and exact replays. Concurrent absent-record and
+existing-record submissions are serialized by the same complete read assertion
+and atomic write set. A committed deterministic `Rejected` response consumes
+the nonce; authentication, pre-commit, or transition failure does not.
+
+Nonce records are keyed by `(chain_id, protocol_version, sender, epoch)`.
+Missing means expected nonce zero; epoch or protocol-version rollover therefore
+starts a new sequence without rewriting historical state. The trusted,
+monotonically advancing `NodeConfig.epoch` prevents old-epoch ingress, while
+the signed epoch prevents cross-epoch replay. Clients must serialize
+submissions: future-nonce pipelining and queueing are intentionally unsupported.
+At `u64::MAX`, checked increment fails closed and the sender cannot submit again
+until epoch rollover. Retention/pruning is safe in principle only after the
+corresponding epoch can no longer be accepted; production pruning policy is
+deferred. A retained tombstone for an epoch that may still be accepted fails as
+a persistence invariant and never resets the expected nonce to zero. Physical
+reclamation must preserve that rule until the epoch is permanently
+unacceptable. An indeterminate commit must be reconciled with the original
+request ID rather than retried under a fresh ID. This uses the existing generic
+normalized state table and changes no database schema generation or
+Transaction wire field/version, but it allocates persisted record type ID
+`0xE006`.
+
+Protocol version 3 MUST NOT be activated on any live chain until fee debit,
+module/object access and effects validation, FastVote/FastCertificate, and
+certificate publication are implemented and atomically composed with the
+authenticated transaction. The generic application machine still consumes the
+outer event while the authenticated inner transaction is held as an authority
+token; typed object dispatch remains the next separate boundary.
 This constraint is not limited to `SubmitTransaction`: every externally
 accepted non-`SubmitTransaction` node-event family — especially certificate,
 protocol-upgrade, and validator-set-change events — needs an equivalent
 authenticated/authorized ingress boundary before live activation. Generic
 node-core handlers failing closed on `SubmitTransaction` says nothing about
 those other families, which remain accepted from untrusted ingress today.
-Separately, the outer `NodeEvent`'s `request_id` is unsigned; node-core's
-idempotency layer only detects replay against a persisted receipt for that
-exact identifier. Until per-transaction persistent nonce equality is
-enforced, resubmission under a fresh, never-before-seen `request_id` remains
-unsafe replay, independent of transaction-signature authentication.
+Separately, the outer `NodeEvent`'s `request_id` remains unsigned and serves
+only as the receipt-reconciliation identity. A fresh identifier cannot bypass
+the signed persistent nonce sequence.
 
 ## 9. Object lifecycle
 Objects are not implemented in Phase 1. Future object versions will reference self-describing digests so historical versions remain readable after hash-suite migration.
@@ -658,11 +686,12 @@ Section 8 (`node_core::transaction_auth`). It composes the strict
 to `NodeEvent`, and the structured durable native route requires the resulting
 private-field `AuthenticatedSubmitTransaction` before deriving an access plan
 or entering its persistence/dispatch path. Generic node-core handlers and the
-legacy native routes reject `SubmitTransaction`. The authenticated wrapper is
-still only an authority token around the outer event: persistent nonce
-equality, fee debit, typed module/object dispatch and effects, fast-path
-certificates, and authorization for every other externally accepted event
-family remain mandatory before live activation.
+legacy native routes reject `SubmitTransaction`. The authenticated wrapper also
+derives the private sender-nonce reservation. Exact next-nonce equality and its
+checked increment now commit atomically with the structured invocation; fee
+debit, typed module/object dispatch and effects, fast-path certificates, and
+authorization for every other externally accepted event family remain
+mandatory before live activation.
 
 The outbox delivery cursor (`0xE005`) advances one message at a time. A caller
 supplies a non-zero lease ID, an observed time, and a duration bounded to five
@@ -1618,3 +1647,39 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   known-answer, ZIP-215 small-order/non-canonical-point acceptance, and
   signature-domain-mismatch evidence; all fixed vectors were re-confirmed
   against the `ed25519-zebra` 4.2.0 / `curve25519-dalek` 4.1.3 pins.
+- DR-0066: Enforce strict persistent sender nonce equality only on the
+  authenticated structured durable `SubmitTransaction` path. Derive a private
+  reservation from the verified inner transaction's exact sender, epoch, and
+  nonce; callers cannot construct or override it. Persist canonical next-nonce
+  record `0xE006`, whose bytes redundantly bind sender and epoch for strict
+  key/value cross-checking, under the deterministic `PersistenceLayout`
+  namespace keyed by chain, protocol version, sender, and epoch. Missing means
+  zero, equality is exact, and increment uses checked `u64` arithmetic. Reconcile
+  a matching completed receipt before reading the nonce; otherwise read and
+  validate the nonce before any application state or transition, then include
+  its revision assertion and increment in the same normalized invocation as
+  application state, receipt, and outbox. This makes absent-record and
+  existing-record races conflict atomically. A committed `Accepted` or
+  deterministic `Rejected` response consumes the nonce; authentication,
+  transition, or pre-commit rejection does not. An indeterminate commit must be
+  reconciled under the original request ID. Return typed mismatch and overflow
+  errors, mapped by native HTTP to `409 sender-nonce-mismatch` and
+  `422 sender-nonce-overflow`. Reserve one atomic state-write slot and reject
+  every application plan key under the complete nonce prefix for every event
+  family, with the same post-transition defense; do not branch this namespace
+  protection on event kind. Placement continues to use the application plan
+  length only. Clients must serialize exact next-nonce submissions; no future
+  nonce queue or pipelining is introduced. Epoch and protocol-version rollover
+  create a fresh namespace, with trusted monotonically advancing node epoch and
+  signed epoch providing the replay boundary. A non-initial tombstone fails
+  closed rather than resetting an accepted epoch to zero. Pruning after an
+  epoch becomes permanently unacceptable is safe in principle but remains
+  operationally deferred. Exhausting `u64::MAX` bricks that sender until epoch
+  rollover. Until fee debit and a bounded retention policy are composed, valid
+  new senders can grow nonce state without economic metering; this As-Is route
+  must not be exposed as activated live transaction ingress.
+  Reuse the generic normalized state schema, so no database schema generation
+  or Transaction wire/schema version changes; historical Transaction bytes are
+  unchanged. Live protocol-version-3 activation remains blocked on atomic fee,
+  typed object/effect, certificate, and non-transaction ingress authorization
+  work.

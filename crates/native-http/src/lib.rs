@@ -2056,6 +2056,12 @@ fn node_error_response(error: &NodeCoreError) -> Response {
             "protocol-config-authority-mismatch",
         ),
         NodeCoreError::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "payload-too-large"),
+        NodeCoreError::SenderNonceMismatch { .. } => {
+            (StatusCode::CONFLICT, "sender-nonce-mismatch")
+        }
+        NodeCoreError::SenderNonceOverflow { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "sender-nonce-overflow")
+        }
         NodeCoreError::ChainMismatch { .. }
         | NodeCoreError::ProtocolVersionMismatch { .. }
         | NodeCoreError::EpochMismatch { .. }
@@ -3368,7 +3374,7 @@ mod tests {
         )
         .unwrap();
         let signing_key = dev_signing_key(0x31);
-        let event = signed_submit_transaction_event(&signing_key, request_id(0x36), 1);
+        let event = signed_submit_transaction_event(&signing_key, request_id(0x36), 0);
         let body = event.encode().unwrap();
 
         let first = app
@@ -3412,6 +3418,79 @@ mod tests {
         assert_eq!(identities.calls.load(Ordering::SeqCst), 2);
         assert_eq!(clock.calls.load(Ordering::SeqCst), 2);
         assert_eq!(transport.drain_outbound().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn structured_route_maps_fresh_request_nonce_mismatch_without_transition_or_send() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let clock = Arc::new(CountingClock::new(10_000));
+        let identities = Arc::new(CountingIndexedIdentities::default());
+        let config = config();
+        let machine = Arc::new(CountingMachine::new(config.state_key()));
+        let domain = AtomicityDomainId::new([0x96; 32]).unwrap();
+        let app = structured_durable_router(
+            StructuredDurableNativeComponents::new(
+                Arc::clone(&store),
+                Arc::clone(&transport),
+                Arc::clone(&clock),
+                Arc::clone(&identities),
+            ),
+            active_protocol_config(domain),
+            structured_request_authority(),
+            config,
+            resolver(),
+            Arc::clone(&machine),
+            NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+        )
+        .unwrap();
+        let signing_key = dev_signing_key(0x41);
+        let event = signed_submit_transaction_event(&signing_key, request_id(0x46), 1);
+
+        let response = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event.encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "sender-nonce-mismatch"
+        );
+        assert_eq!(machine.access_plan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(machine.transition_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(identities.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(clock.calls.load(Ordering::SeqCst), 1);
+        assert!(transport.drain_outbound().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_error_mapping_keeps_nonce_overflow_distinct_from_conflict() {
+        let sender = [0x55; 32];
+        let mismatch = node_error_response(&NodeCoreError::SenderNonceMismatch {
+            sender,
+            expected: 3,
+            actual: 2,
+        });
+        assert_eq!(mismatch.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            to_bytes(mismatch.into_body(), 128).await.unwrap(),
+            "sender-nonce-mismatch"
+        );
+
+        let overflow = node_error_response(&NodeCoreError::SenderNonceOverflow { sender });
+        assert_eq!(overflow.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            to_bytes(overflow.into_body(), 128).await.unwrap(),
+            "sender-nonce-overflow"
+        );
     }
 
     #[tokio::test]

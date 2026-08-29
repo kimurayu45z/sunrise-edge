@@ -23,7 +23,10 @@
 //! application access-plan derivation, identity allocation, clock read used
 //! for storage, storage read/write, transition, outbox claim, or send. Every
 //! other native route rejects `SubmitTransaction` outright rather than
-//! processing it unauthenticated. Nonce accounting, fee debit, object
+//! processing it unauthenticated. The authenticated wrapper is also the sole
+//! source of the structured durable handler's private per-sender, per-epoch
+//! nonce reservation; exact next-nonce equality and its checked increment are
+//! committed atomically with the invocation. Fee debit, object
 //! dispatch/effects, and certificate publication remain unimplemented; do not
 //! activate protocol version 3 on any live chain until those are also in
 //! place. See `ARCHITECTURE.md` for the accepted decision record.
