@@ -1950,14 +1950,16 @@ Phase 15 As-Is scope:
   inline bytesをSELECTせず、immutable row metadataとinline presence/lengthのみを検証する。headのowner/routing projectionは
   routing hintでありauthorizationではない。executionは別途exact versionを読み、head version/digestとの一致、inline Object decode、
   typed owner一致を検証しなければならず、blob-backed executionはfetch/content verification実装までfail closedとする。
-  memoryとPostgreSQLはstate/object/receipt/outboxを同一atomic boundaryで実装済みだが、node-core object dispatch、
-  fee debit、blob upload/fetch verification、owned fast pathは未実装である。
+  memoryとPostgreSQLはstate/object/receipt/outboxを同一atomic boundaryで実装済みである。authenticated
+  structured durable pathはsigned read-only manifestをexact head/immutable inline versionからloadし、verified
+  senderに対するtyped owner authorizationと完全なhead assertionを同一commitへ接続した（implemented As-Is）。
+  Write/Consume、Shared/System owner、blob body、module load、object effects、fee debit、owned fast pathは未実装である。
   node-core additive handlerはmanifest domainをI/O前にresolveし、typed receipt replayをstate readより先に行い、
   read-only assertionを含むstate/receipt/outboxをこのenvelopeへ構築する。definite commitまたはexact replay以外では
   outputを返さない。single-lock memoryとnormalized PostgreSQL conformance storeでatomic publication、object lifecycle/ABA、
   conflict rollback、read-only、bound domain、fence、deadline、object read-count bound、blob round-trip、replayを検証する
-  （runtime/memory/PostgreSQL implemented As-Is;
-  node-core object dispatchとprovider certification pending）。
+  （runtime/memory/PostgreSQLとnode-core authenticated read-only object authorization implemented As-Is;
+  object effectsとprovider certification pending）。
 - owned transaction fast pathの認証基盤として、`crypto`にexact-pinned
   `ed25519-zebra` 4.2.0（`[workspace.dependencies]`でdefault features無効を
   一箇所宣言。committed `Cargo.lock`はその依存`curve25519-dalek`を4.1.3で
@@ -2003,7 +2005,7 @@ Phase 15 As-Is scope:
   `curve25519-dalek` 4.1.3で再確認済み）。strict transaction authentication
   とproduction-oriented structured durable native routeの接続もimplemented
   As-Is（下記bullet）。persistent sender nonceもimplemented As-Is（下記bullet）。
-  ただしfee/object dispatch/FastCertificateは引き続き未実装であり、protocol
+  ただしfee、module/object effects、FastCertificateは引き続き未実装であり、protocol
   version 3のlive activationは禁止する。
 - `execution::decode_transaction`はexecution::Transaction v1の厳密な
   standalone canonical decoderを追加した：type id/encoding version 1を要求し、
@@ -2077,7 +2079,7 @@ Phase 15 As-Is scope:
   invalid signature、inner/outer chain/version/epoch mismatch、missing profile、
   trailing/non-canonical bytesはmachine/identity/clock/storage/sendのcall count
   zeroで失敗するtestを持つ。transaction wire field/encoding versionは追加して
-  いない。protocol version 3のlive activationはfee/object/effect/
+  いない。protocol version 3のlive activationはfee/module/object effect/
   FastCertificateのatomic compositionが完成するまで禁止する。
   **Hard activation constraint:** `SubmitTransaction`以外の
   externally acceptedなnode-event family(特にcertificate、protocol upgrade、

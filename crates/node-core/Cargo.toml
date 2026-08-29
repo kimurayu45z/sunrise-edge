@@ -5,15 +5,15 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+abi.workspace = true
 canonical-encoding.workspace = true
 crypto.workspace = true
 execution.workspace = true
 hashing.workspace = true
+objects.workspace = true
 protocol-config.workspace = true
 protocol-types.workspace = true
 runtime.workspace = true
 
 [dev-dependencies]
-abi.workspace = true
 ed25519-zebra.workspace = true
-objects.workspace = true

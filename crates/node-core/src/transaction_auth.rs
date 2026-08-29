@@ -26,9 +26,12 @@
 //! processing it unauthenticated. The authenticated wrapper is also the sole
 //! source of the structured durable handler's private per-sender, per-epoch
 //! nonce reservation; exact next-nonce equality and its checked increment are
-//! committed atomically with the invocation. Fee debit, object
-//! dispatch/effects, and certificate publication remain unimplemented; do not
-//! activate protocol version 3 on any live chain until those are also in
+//! committed atomically with the invocation. The authenticated durable path
+//! also loads and authorizes signed read-only object manifest entries through
+//! exact inline versions and commits complete head assertions. Fee debit,
+//! module loading, mutating/consuming object effects, shared-object ordering,
+//! blob verification, and certificate publication remain unimplemented; do
+//! not activate protocol version 3 on any live chain until those are also in
 //! place. See `ARCHITECTURE.md` for the accepted decision record.
 
 use core::fmt;

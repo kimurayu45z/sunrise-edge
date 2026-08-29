@@ -232,11 +232,13 @@ state/body-free object-head/immutable object-version/receipt reads,
 serializable state/object/receipt/outbox commit, and indexed
 claim/ack with retained attempt history As-Is. Object-head reads validate
 strict immutable metadata and inline presence/length without selecting inline
-bodies. Head owner/routing projections are routing data, never authorization;
-execution must separately load and match the linked version, decode inline
-objects, and compare typed owner, while blob execution remains fail-closed
-until fetch/content verification. A shared memory/PostgreSQL conformance suite
-now covers bound-domain/fence/deadline rejection, the object read-count bound,
+bodies. Head owner/routing projections are routing data, never authorization.
+The authenticated structured durable path now loads every signed read-only
+manifest entry through its exact head and immutable inline version, matches the
+typed owner to the verified sender, and commits the complete head assertions.
+Write/Consume, Shared/System ownership, blob bodies, module loading, and object
+effects remain fail-closed. A shared memory/PostgreSQL conformance suite now
+covers bound-domain/fence/deadline rejection, the object read-count bound,
 typed object create/update/delete/recreate ABA, conflict rollback, inline/blob
 mapping and blob round-trip, exact-boundary deadlines, complete-read races,
 definite contention classification, lease/writer fencing, and PostgreSQL-only
@@ -257,8 +259,8 @@ afterward. This shows the backend acknowledged commit before the driver lost
 it, not crash durability under abrupt process/power loss, and it says nothing
 about TLS-path loss. Native structured requests now support
 explicit cancellation only before first storage dispatch; node-core object
-dispatch, fees, blob transfer verification, owned fast routing, and production
-object migrations remain deferred. Started work, client
+mutations/effects, fees, blob transfer verification, owned fast routing, and
+production object migrations remain deferred. Started work, client
 disconnect, and shutdown budgets remain uncancellable. Next, implement
 abrupt process/power fault, disk-full/WAL exhaustion, TLS-path connection loss,
 backup/restore, capacity/load/soak, real writer failover, and provider

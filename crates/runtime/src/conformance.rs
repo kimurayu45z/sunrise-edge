@@ -1706,6 +1706,97 @@ pub fn run_durable_object_conformance<F: DurableStoreFixture>(fixture: &F) -> Co
             &blob_head,
         ));
     }
+
+    // A mutation-free object section still carries a complete head assertion.
+    // Build it from one observed head, advance that head independently, and
+    // prove the stale read-only invocation rejects without publishing a receipt.
+    let read_only_object_id: ObjectId = ObjectId::new([0x5B; 32]);
+    let (read_only_owner_one, read_only_routing_one) = object_projections(CASE, 0x5B)?;
+    let read_only_create: DurableInvocationTransaction = object_invocation(
+        CASE,
+        domain,
+        0x5B,
+        None,
+        object_changes(
+            CASE,
+            read_only_object_id,
+            DurableObjectHead::Absent,
+            DurableObjectMutation::Create {
+                version: object_version(CASE, read_only_object_id, 1, 0x5B, 15)?,
+                owner_projection: read_only_owner_one,
+                routing_projection: read_only_routing_one,
+            },
+        )?,
+        None,
+    )?;
+    if store.commit_invocation(&context, read_only_create) != DurableCommitOutcome::Committed {
+        return Err(ConformanceFailure::new(
+            CASE,
+            "read-only assertion setup create failed",
+        ));
+    }
+    let read_only_observed: DurableObjectHead = store
+        .get_object_head(&context, domain, read_only_object_id)
+        .map_err(|error| mismatch(CASE, "read-only assertion head read failed", &error))?;
+    let read_only_changes: DurableObjectChanges = DurableObjectChanges::new(
+        vec![DurableObjectHeadRead::new(
+            read_only_object_id,
+            read_only_observed.clone(),
+        )],
+        Vec::new(),
+    )
+    .map_err(|error| ConformanceFailure::new(CASE, error.to_string()))?;
+    let stale_read_only: DurableInvocationTransaction =
+        object_invocation(CASE, domain, 0x5C, None, read_only_changes, None)?;
+    let (read_only_owner_two, read_only_routing_two) = object_projections(CASE, 0x5D)?;
+    let read_only_advance: DurableInvocationTransaction = object_invocation(
+        CASE,
+        domain,
+        0x5D,
+        None,
+        object_changes(
+            CASE,
+            read_only_object_id,
+            read_only_observed,
+            DurableObjectMutation::Update {
+                version: object_version(CASE, read_only_object_id, 2, 0x5D, 16)?,
+                owner_projection: read_only_owner_two,
+                routing_projection: read_only_routing_two,
+            },
+        )?,
+        None,
+    )?;
+    if store.commit_invocation(&context, read_only_advance) != DurableCommitOutcome::Committed {
+        return Err(ConformanceFailure::new(
+            CASE,
+            "read-only assertion setup update failed",
+        ));
+    }
+    let stale_read_only_outcome: DurableCommitOutcome =
+        store.commit_invocation(&context, stale_read_only);
+    if !matches!(
+        stale_read_only_outcome,
+        DurableCommitOutcome::Rejected(DurableCommitRejection::ObjectConflict {
+            object_id: conflicting_id,
+            current: DurableObjectHeadSummary::Current { .. },
+        }) if conflicting_id == read_only_object_id
+    ) {
+        return Err(mismatch(
+            CASE,
+            "stale read-only object assertion must conflict",
+            &stale_read_only_outcome,
+        ));
+    }
+    let stale_read_only_receipt: Option<DurableRequestReceipt> = store
+        .get_request_receipt(&context, domain, request_id(CASE, 0x5C)?)
+        .map_err(|error| mismatch(CASE, "stale read-only receipt read failed", &error))?;
+    if stale_read_only_receipt.is_some() {
+        return Err(mismatch(
+            CASE,
+            "stale read-only object assertion leaked a receipt",
+            &stale_read_only_receipt,
+        ));
+    }
     Ok(())
 }
 

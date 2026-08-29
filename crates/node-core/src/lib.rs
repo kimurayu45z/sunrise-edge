@@ -7,11 +7,13 @@
 //! state with compare-and-swap. It deliberately does not sign, send, schedule,
 //! spawn, retry, or keep process-local protocol state.
 
+use abi::AccessEntry;
 use canonical_encoding::{
     CanonicalDecodingError, CanonicalEncodingError, CanonicalStruct, decode_canonical_frame,
 };
 use core::fmt;
 use hashing::{HashSuiteResolver, HashingError};
+use objects::{AccessMode, Address, Object, ObjectId, ObjectRef, Owner};
 use protocol_config::{DomainPlacementManifest, ProtocolConfig, ProtocolConfigError};
 use protocol_types::{
     ChainId, Digest32, Epoch, HashAlgorithmId, HashPurpose, ProtocolVersion, TypeError,
@@ -19,8 +21,10 @@ use protocol_types::{
 use runtime::{
     AtomicStateMutationSet, AtomicStateReadSet, AtomicStateTransaction, AtomicStateWriteResult,
     AtomicStateWriteSet, AtomicityDomainId, DomainTransactionalStateStore, DurableCommitOutcome,
-    DurableCommitRejection, DurableInvocationError, DurableInvocationTransaction,
-    DurableObjectChanges, DurableOperationContext, DurableOutboxBatch, DurableOutboxMessage,
+    DurableCommitRejection, DurableInlineObject, DurableInvocationError,
+    DurableInvocationTransaction, DurableObjectChanges, DurableObjectHead, DurableObjectHeadRead,
+    DurableObjectOwnerProjection, DurableObjectPayload, DurableObjectVersion,
+    DurableObjectVersionRecord, DurableOperationContext, DurableOutboxBatch, DurableOutboxMessage,
     DurableReadError, DurableRequestId, DurableRequestReceipt, DurableStateTransaction,
     IndeterminateCommitReason, MAX_ATOMIC_STATE_READS, MAX_ATOMIC_STATE_WRITES,
     MAX_STATE_KEY_BYTES, PersistenceLayout, Runtime, RuntimeError, StateMutation,
@@ -56,6 +60,13 @@ pub const MAX_NODE_OUTPUT_ITEMS: usize = 1_024;
 pub const MAX_NODE_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum lease duration for one outbound delivery attempt.
 pub const MAX_OUTBOX_LEASE_MILLIS: u64 = 5 * 60 * 1_000;
+/// Pre-activation cap on authenticated object reads in one invocation.
+///
+/// Each entry costs two durable round-trips (head then version). Raising this
+/// bound requires measured evidence and a decision record; see the PR83
+/// design note on the `MAX_TRANSACTION_MANIFEST_ENTRIES`/
+/// `MAX_DURABLE_OBJECT_READS` envelope.
+const MAX_AUTHENTICATED_OBJECT_READS: usize = 32;
 
 /// Errors returned by node-core validation, transition, and persistence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +234,90 @@ pub enum NodeCoreError {
     SenderNonceOverflow {
         /// Sender address bytes.
         sender: [u8; 32],
+    },
+    /// A signed object reference named an object absent (or tombstoned) in
+    /// the resolved domain.
+    ObjectNotFound {
+        /// Object identifier that could not be found.
+        object_id: ObjectId,
+    },
+    /// The current object version did not match the signed reference.
+    ObjectVersionMismatch {
+        /// Object identifier.
+        object_id: ObjectId,
+        /// Version declared by the signed reference.
+        expected: u64,
+        /// Version observed on the current head.
+        actual: u64,
+    },
+    /// The current object digest did not match the signed reference.
+    ObjectDigestMismatch {
+        /// Object identifier.
+        object_id: ObjectId,
+        /// Digest declared by the signed reference.
+        expected: Digest32,
+        /// Digest observed on the current head.
+        actual: Digest32,
+    },
+    /// The object's typed owner did not authorize the transaction sender.
+    ObjectOwnerMismatch {
+        /// Object identifier.
+        object_id: ObjectId,
+    },
+    /// A manifest entry requested an access mode this slice cannot honor.
+    ObjectAccessModeUnsupported {
+        /// Object identifier.
+        object_id: ObjectId,
+        /// Requested access mode.
+        mode: AccessMode,
+    },
+    /// A manifest entry named a shared or system-owned object.
+    ObjectOwnerKindUnsupported {
+        /// Object identifier.
+        object_id: ObjectId,
+    },
+    /// A manifest entry resolved to a blob-backed payload this slice cannot read.
+    ObjectBodyUnavailable {
+        /// Object identifier.
+        object_id: ObjectId,
+    },
+    /// An authenticated transaction declared more object accesses than the
+    /// pre-activation resource bound.
+    ObjectManifestTooLarge {
+        /// Declared access count.
+        count: usize,
+        /// Maximum accepted access count.
+        maximum: usize,
+    },
+    /// An authenticated transaction's manifest declared the same object twice.
+    DuplicateObjectAccess {
+        /// Duplicated object identifier.
+        object_id: ObjectId,
+    },
+    /// A manifest entry declared an object version that cannot be non-zero.
+    InvalidObjectVersion {
+        /// Object identifier.
+        object_id: ObjectId,
+        /// Declared version.
+        version: u64,
+    },
+    /// Durable storage proved that an object-head assertion no longer
+    /// matched and the commit did not apply.
+    ObjectConflict {
+        /// First conflicting object in canonical identifier order.
+        object_id: ObjectId,
+    },
+    /// A current object head pointed at an immutable version record that
+    /// storage does not have.
+    ObjectRecordMissing {
+        /// Object identifier.
+        object_id: ObjectId,
+    },
+    /// A persisted immutable object-version record disagreed with its own
+    /// head, or an inline object disagreed with its own version record.
+    ObjectRecordMismatch {
+        /// Object identifier.
+        object_id: ObjectId,
     },
 }
 
@@ -401,6 +496,62 @@ impl fmt::Display for NodeCoreError {
             Self::SenderNonceOverflow { sender } => {
                 write!(f, "sender {} next nonce overflowed", hex32(*sender))
             }
+            Self::ObjectNotFound { object_id } => {
+                write!(f, "object {object_id} was not found")
+            }
+            Self::ObjectVersionMismatch {
+                object_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "object {object_id} version mismatch: expected {expected}, got {actual}"
+            ),
+            Self::ObjectDigestMismatch {
+                object_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "object {object_id} digest mismatch: expected {expected}, got {actual}"
+            ),
+            Self::ObjectOwnerMismatch { object_id } => {
+                write!(f, "object {object_id} owner did not authorize the sender")
+            }
+            Self::ObjectAccessModeUnsupported { object_id, mode } => write!(
+                f,
+                "object {object_id} requested unsupported access mode {mode:?}"
+            ),
+            Self::ObjectOwnerKindUnsupported { object_id } => write!(
+                f,
+                "object {object_id} owner kind is not supported by this slice"
+            ),
+            Self::ObjectBodyUnavailable { object_id } => {
+                write!(f, "object {object_id} payload is not locally available")
+            }
+            Self::ObjectManifestTooLarge { count, maximum } => write!(
+                f,
+                "authenticated object manifest has {count} entries, maximum is {maximum}"
+            ),
+            Self::DuplicateObjectAccess { object_id } => write!(
+                f,
+                "authenticated object manifest declared object {object_id} twice"
+            ),
+            Self::InvalidObjectVersion { object_id, version } => {
+                write!(f, "object {object_id} declared invalid version {version}")
+            }
+            Self::ObjectConflict { object_id } => write!(
+                f,
+                "object {object_id} head changed before the conditional write"
+            ),
+            Self::ObjectRecordMissing { object_id } => write!(
+                f,
+                "object {object_id} head referenced a missing version record"
+            ),
+            Self::ObjectRecordMismatch { object_id } => write!(
+                f,
+                "object {object_id} version record disagreed with its head"
+            ),
         }
     }
 }
@@ -840,6 +991,111 @@ impl SenderNonceReservation {
             nonce: inner.nonce,
         }
     }
+}
+
+/// One read-only object access declared by a signed transaction manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AuthenticatedObjectAccess {
+    object_ref: ObjectRef,
+    mode: AccessMode,
+}
+
+/// Authenticated, pre-I/O-validated object dispatch input for one durable
+/// submit-transaction invocation.
+///
+/// The fields are private and there is no public constructor. The only way to
+/// obtain a value is [`Self::from_authenticated_transaction`], so a caller can
+/// never authorize an object access against an authority or manifest it did
+/// not cryptographically authenticate. `accesses` is sorted by
+/// [`ObjectId`] and deduplicated, and every entry's version and access mode
+/// have already been validated, so later per-entry storage I/O never needs to
+/// re-check them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AuthenticatedObjectDispatch {
+    authority: Address,
+    accesses: Vec<AuthenticatedObjectAccess>,
+}
+
+impl AuthenticatedObjectDispatch {
+    /// Derives and validates the dispatch descriptor from the authenticated
+    /// inner transaction's sender and declared object-access manifest.
+    ///
+    /// Every check here is pure and requires zero storage I/O: bounding the
+    /// declared access count, sorting and rejecting a duplicate object
+    /// identifier, requiring a non-zero object version, and rejecting any
+    /// access mode other than [`AccessMode::Read`] (`Write` and `Consume`
+    /// mutations are unimplemented in this slice and must fail closed rather
+    /// than silently downgrade).
+    fn from_authenticated_transaction(
+        transaction: &AuthenticatedTransaction,
+    ) -> Result<Self, NodeCoreError> {
+        let inner = transaction.transaction();
+        let authority: Address = inner.sender;
+        let accesses = validate_object_entries(inner.access_manifest.entries.as_slice())?;
+        Ok(Self {
+            authority,
+            accesses,
+        })
+    }
+}
+
+/// Pure, zero-I/O validation of one declared object-access manifest.
+///
+/// Bounds the declared access count, sorts and rejects a duplicate object
+/// identifier, requires a non-zero object version, and rejects any access
+/// mode other than [`AccessMode::Read`] (`Write` and `Consume` mutations are
+/// unimplemented in this slice and must fail closed rather than silently
+/// downgrade).
+///
+/// Split out of [`AuthenticatedObjectDispatch::from_authenticated_transaction`]
+/// so it can be exercised directly with hand-built entries: the authenticated
+/// decode path already rejects a duplicate `ObjectId` in
+/// [`abi::decode_access_manifest`] before a manifest ever reaches here, so the
+/// duplicate defense in this function is otherwise unreachable through the
+/// full authenticated submission path.
+fn validate_object_entries(
+    entries: &[AccessEntry],
+) -> Result<Vec<AuthenticatedObjectAccess>, NodeCoreError> {
+    if entries.len() > MAX_AUTHENTICATED_OBJECT_READS {
+        return Err(NodeCoreError::ObjectManifestTooLarge {
+            count: entries.len(),
+            maximum: MAX_AUTHENTICATED_OBJECT_READS,
+        });
+    }
+
+    let mut accesses: Vec<AuthenticatedObjectAccess> = entries
+        .iter()
+        .map(|entry: &AccessEntry| AuthenticatedObjectAccess {
+            object_ref: entry.object_ref.clone(),
+            mode: entry.mode,
+        })
+        .collect();
+    accesses.sort_by_key(|access: &AuthenticatedObjectAccess| access.object_ref.id);
+    if let Some(pair) = accesses
+        .windows(2)
+        .find(|pair| pair[0].object_ref.id == pair[1].object_ref.id)
+    {
+        return Err(NodeCoreError::DuplicateObjectAccess {
+            object_id: pair[0].object_ref.id,
+        });
+    }
+
+    for access in &accesses {
+        if DurableObjectVersion::new(access.object_ref.version).is_none() {
+            return Err(NodeCoreError::InvalidObjectVersion {
+                object_id: access.object_ref.id,
+                version: access.object_ref.version,
+            });
+        }
+        if access.mode != AccessMode::Read {
+            return Err(NodeCoreError::ObjectAccessModeUnsupported {
+                object_id: access.object_ref.id,
+                mode: access.mode,
+            });
+        }
+    }
+
+    Ok(accesses)
 }
 
 const SENDER_NONCE_RECORD_TYPE_ID: u16 = 0xE006;
@@ -2116,7 +2372,7 @@ where
     let plan = machine.access_plan(&event)?;
     let domain = placement.resolve_domain(event.epoch(), plan.accesses().len())?;
     let output = handle_durable_idempotent_event_with_plan(
-        store, context, domain, resolver, event, machine, plan, None,
+        store, context, domain, resolver, event, machine, plan, None, None,
     )?;
     Ok(ResolvedNodeOutput::new(domain, output))
 }
@@ -2131,7 +2387,13 @@ where
 /// Exact duplicates are still authenticated before receipt reconciliation. A
 /// fresh request must match the persisted per-sender, per-epoch next nonce; its
 /// checked increment commits atomically with the application state, receipt,
-/// and outbox.
+/// and outbox. The transaction's signed object-access manifest is loaded and
+/// authorized against the same authenticated sender: every declared entry
+/// must resolve, through its exact current head and immutable version, to a
+/// typed object whose owner is that sender's address or is immutable, and the
+/// resulting head-read assertions commit atomically alongside everything
+/// else. `Write`/`Consume` access, shared/system owners, and blob payloads
+/// fail closed rather than silently downgrade.
 pub fn handle_authenticated_resolved_durable_submit_transaction<S, M>(
     store: &S,
     context: &DurableOperationContext,
@@ -2149,6 +2411,8 @@ where
         .resolve_domain(submission.event().epoch(), plan.accesses().len())?;
     let reservation =
         SenderNonceReservation::from_authenticated_transaction(&submission.transaction);
+    let dispatch =
+        AuthenticatedObjectDispatch::from_authenticated_transaction(&submission.transaction)?;
     let AuthenticatedSubmitTransaction {
         event,
         transaction: _authenticated_transaction,
@@ -2163,6 +2427,7 @@ where
         machine,
         plan,
         Some(reservation),
+        Some(dispatch),
     )?;
     Ok(ResolvedNodeOutput::new(domain, output))
 }
@@ -2185,6 +2450,7 @@ fn handle_durable_idempotent_event_with_plan<S, M>(
     machine: &M,
     plan: NodeStateAccessPlan,
     reservation: Option<SenderNonceReservation>,
+    dispatch: Option<AuthenticatedObjectDispatch>,
 ) -> Result<NodeOutput, NodeCoreError>
 where
     S: StructuredDurableDomainStateStore,
@@ -2282,6 +2548,16 @@ where
         None => None,
     };
 
+    // Object reads happen only after the receipt and nonce checks above, so a
+    // stale or replayed request never spends the fan-out cost of the
+    // per-entry head/version storage round-trips. The application-machine
+    // interface is unchanged and receives no object data at all, so nothing
+    // here can be influenced by `machine.transition` below.
+    let object_reads: Vec<DurableObjectHeadRead> = match &dispatch {
+        Some(dispatch) => load_and_authorize_objects(store, context, domain, dispatch)?,
+        None => Vec::new(),
+    };
+
     let mut values = BTreeMap::new();
     for access in plan.accesses() {
         let observed = store.get_versioned_durable(context, domain, access.key())?;
@@ -2335,13 +2611,9 @@ where
         )?);
     }
     let state = DurableStateTransaction::new(domain, AtomicStateReadSet::new(reads)?, mutations)?;
-    let invocation = DurableInvocationTransaction::new(
-        domain,
-        Some(state),
-        DurableObjectChanges::empty(),
-        receipt,
-        outbox,
-    )?;
+    let objects = DurableObjectChanges::new(object_reads, Vec::new())?;
+    let invocation =
+        DurableInvocationTransaction::new(domain, Some(state), objects, receipt, outbox)?;
 
     match store.commit_invocation(context, invocation) {
         DurableCommitOutcome::Committed => Ok(transition.output),
@@ -2349,11 +2621,124 @@ where
             DurableCommitRejection::Conflict { .. }
             | DurableCommitRejection::RequestAlreadyCommitted,
         ) => Err(NodeCoreError::StateConflict),
+        DurableCommitOutcome::Rejected(DurableCommitRejection::ObjectConflict {
+            object_id,
+            ..
+        }) => Err(NodeCoreError::ObjectConflict { object_id }),
         DurableCommitOutcome::Rejected(reason) => Err(NodeCoreError::DurableCommitRejected(reason)),
         DurableCommitOutcome::Indeterminate(reason) => {
             Err(NodeCoreError::DurableCommitIndeterminate(reason))
         }
     }
+}
+
+/// Loads and authorizes every entry in `dispatch.accesses` against
+/// `dispatch.authority`, returning one exact [`DurableObjectHeadRead`] per
+/// entry in the same canonical order.
+///
+/// Every check fails closed:
+///
+/// * an absent or tombstoned head, a version/digest disagreement with the
+///   signed reference, a blob-backed payload, or an unauthorized owner all
+///   reject before any assertion is recorded;
+/// * a current head that points at a missing or disagreeing immutable
+///   version record, or an inline object that disagrees with its own version
+///   record, is treated as storage corruption distinct from authorization
+///   failure;
+/// * object digest recomputation is deliberately not attempted here — the
+///   digest is bound to the creating `chain_id`/`protocol_version`, which are
+///   not available on the version row, so this slice trusts the storage
+///   adapter's own integrity cross-check instead of misjudging historical
+///   objects under the current event's context.
+fn load_and_authorize_objects<S>(
+    store: &S,
+    context: &DurableOperationContext,
+    domain: AtomicityDomainId,
+    dispatch: &AuthenticatedObjectDispatch,
+) -> Result<Vec<DurableObjectHeadRead>, NodeCoreError>
+where
+    S: StructuredDurableDomainStateStore,
+{
+    let mut reads: Vec<DurableObjectHeadRead> = Vec::with_capacity(dispatch.accesses.len());
+    for access in &dispatch.accesses {
+        let object_id: ObjectId = access.object_ref.id;
+        let head: DurableObjectHead = store.get_object_head(context, domain, object_id)?;
+        let (object_version, digest): (DurableObjectVersion, Digest32) = match &head {
+            DurableObjectHead::Absent | DurableObjectHead::Tombstoned { .. } => {
+                return Err(NodeCoreError::ObjectNotFound { object_id });
+            }
+            DurableObjectHead::Current {
+                object_version,
+                digest,
+                ..
+            } => (*object_version, *digest),
+        };
+
+        if object_version.get() != access.object_ref.version {
+            return Err(NodeCoreError::ObjectVersionMismatch {
+                object_id,
+                expected: access.object_ref.version,
+                actual: object_version.get(),
+            });
+        }
+        if digest != access.object_ref.digest {
+            return Err(NodeCoreError::ObjectDigestMismatch {
+                object_id,
+                expected: access.object_ref.digest,
+                actual: digest,
+            });
+        }
+
+        let record: DurableObjectVersionRecord = store
+            .get_object_version(context, domain, object_id, object_version)?
+            .ok_or(NodeCoreError::ObjectRecordMissing { object_id })?;
+        if record.object_id() != object_id
+            || record.object_version() != object_version
+            || record.digest() != digest
+        {
+            return Err(NodeCoreError::ObjectRecordMismatch { object_id });
+        }
+
+        let inline: &DurableInlineObject = match record.payload() {
+            DurableObjectPayload::BlobReference(_) => {
+                return Err(NodeCoreError::ObjectBodyUnavailable { object_id });
+            }
+            DurableObjectPayload::Inline(inline) => inline,
+        };
+        let object: &Object = inline.object();
+        if object.id != object_id
+            || object.version != access.object_ref.version
+            || record.schema_version() != object.schema_version
+        {
+            return Err(NodeCoreError::ObjectRecordMismatch { object_id });
+        }
+
+        // Corruption guard, not authorization: mirrors
+        // `validate_object_transition`'s owner-projection cross-check. An
+        // absent projection is corruption, not a trust-the-inline fallback.
+        if head
+            .owner_projection()
+            .and_then(DurableObjectOwnerProjection::owner)
+            != Some(&object.owner)
+        {
+            return Err(NodeCoreError::ObjectRecordMismatch { object_id });
+        }
+
+        match &object.owner {
+            Owner::Address(owner_address) => {
+                if *owner_address != dispatch.authority {
+                    return Err(NodeCoreError::ObjectOwnerMismatch { object_id });
+                }
+            }
+            Owner::Immutable => {}
+            Owner::Shared | Owner::System => {
+                return Err(NodeCoreError::ObjectOwnerKindUnsupported { object_id });
+            }
+        }
+
+        reads.push(DurableObjectHeadRead::new(object_id, head));
+    }
+    Ok(reads)
 }
 
 fn handle_domain_idempotent_event_with_plan<R, M>(
@@ -3008,12 +3393,14 @@ mod tests {
     use abi::{AccessEntry, AccessManifest};
     use ed25519_zebra::SigningKey;
     use execution::{Transaction, encode_transaction, encode_transaction_signable};
-    use objects::{AccessMode, Address, ObjectId, ObjectRef};
+    use hashing::{BuiltinHashFunction, HashFunction};
+    use objects::{AccessMode, Address, ObjectId, ObjectRef, encode_object};
     use protocol_config::TransactionAuthProfile;
     use protocol_types::{HashSuite, HashSuiteSchedule, SignatureSchemeId};
     use runtime::{
-        DurableDomainStateStore, MemoryDurableStateStore, MemoryRuntime, StateRevision, StateStore,
-        StorageCorrelationId, StorageDeadline, TransactionalStateStore, WriterFenceGeneration,
+        DurableDomainStateStore, DurableObjectRoutingProjection, MemoryDurableStateStore,
+        MemoryRuntime, StateRevision, StateStore, StorageCorrelationId, StorageDeadline,
+        TransactionalStateStore, WriterFenceGeneration,
     };
     use std::sync::{
         Arc, Barrier, Mutex,
@@ -3139,25 +3526,75 @@ mod tests {
         }
     }
 
+    fn test_object(id: ObjectId, version: u64, owner: Owner, byte: u8) -> Object {
+        Object {
+            id,
+            version,
+            owner,
+            type_hash: Digest32::new(HashAlgorithmId::Sha2_256, [byte.wrapping_add(1); 32]),
+            schema_version: u32::from(byte),
+            data: vec![byte],
+        }
+    }
+
+    /// Hashes `object`'s canonical bytes with the production object-digest
+    /// suite, returning the version record ready to commit alongside the
+    /// exact digest a signed [`ObjectRef`] must declare to match it.
+    fn hashed_object_version(
+        object: Object,
+        chain: &str,
+        checkpoint: u64,
+    ) -> (DurableObjectVersionRecord, Digest32) {
+        let canonical_bytes = encode_object(&object).unwrap();
+        let digest = BuiltinHashFunction::new(HashAlgorithmId::Sha2_256)
+            .hash(
+                HashPurpose::Object,
+                ProtocolVersion::new(3),
+                &ChainId::new(chain).unwrap(),
+                &canonical_bytes,
+            )
+            .unwrap();
+        (
+            DurableObjectVersionRecord::from_inline_object(object, digest, checkpoint).unwrap(),
+            digest,
+        )
+    }
+
+    fn manifest_with(entries: Vec<AccessEntry>) -> AccessManifest {
+        let mut manifest = AccessManifest::new();
+        for entry in entries {
+            manifest.push(entry);
+        }
+        manifest
+    }
+
+    /// Builds an unsigned transaction with an empty object-access manifest,
+    /// so tests that only exercise nonce/replay/idempotency semantics are not
+    /// also subject to object-dispatch authorization. Tests that specifically
+    /// exercise object dispatch use [`unsigned_transaction_with_manifest`].
     fn unsigned_transaction(
         sender: Address,
         chain: ChainId,
         epoch: Epoch,
         nonce: u64,
     ) -> Transaction {
-        let mut manifest = AccessManifest::new();
-        manifest.push(AccessEntry {
-            object_ref: sample_object_ref(0x11),
-            mode: AccessMode::Read,
-        });
+        unsigned_transaction_with_manifest(sender, chain, epoch, nonce, AccessManifest::new())
+    }
 
+    fn unsigned_transaction_with_manifest(
+        sender: Address,
+        chain: ChainId,
+        epoch: Epoch,
+        nonce: u64,
+        access_manifest: AccessManifest,
+    ) -> Transaction {
         Transaction {
             chain_id: chain,
             protocol_version: ProtocolVersion::new(3),
             epoch,
             sender,
             nonce,
-            access_manifest: manifest,
+            access_manifest,
             module_ref: sample_object_ref(0xDD),
             entrypoint: "transfer".to_string(),
             args: vec![1, 2, 3, 4],
@@ -3180,6 +3617,59 @@ mod tests {
     ) -> AuthenticatedSubmitTransaction {
         let sender = dev_sender_address(signing_key);
         let tx = unsigned_transaction(sender, ChainId::new(chain).unwrap(), epoch, nonce);
+        authenticated_submission_from_transaction(
+            chain,
+            request_id,
+            signing_key,
+            epoch,
+            tx,
+            config,
+            protocol_config,
+        )
+    }
+
+    /// Same as [`authenticated_submission`], but with an explicit
+    /// object-access manifest, for tests that exercise object dispatch.
+    #[allow(clippy::too_many_arguments)]
+    fn authenticated_submission_with_manifest(
+        chain: &str,
+        request_id: RequestId,
+        signing_key: &SigningKey,
+        epoch: Epoch,
+        nonce: u64,
+        access_manifest: AccessManifest,
+        config: &NodeConfig,
+        protocol_config: &ProtocolConfig,
+    ) -> AuthenticatedSubmitTransaction {
+        let sender = dev_sender_address(signing_key);
+        let tx = unsigned_transaction_with_manifest(
+            sender,
+            ChainId::new(chain).unwrap(),
+            epoch,
+            nonce,
+            access_manifest,
+        );
+        authenticated_submission_from_transaction(
+            chain,
+            request_id,
+            signing_key,
+            epoch,
+            tx,
+            config,
+            protocol_config,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn authenticated_submission_from_transaction(
+        chain: &str,
+        request_id: RequestId,
+        signing_key: &SigningKey,
+        epoch: Epoch,
+        tx: Transaction,
+        config: &NodeConfig,
+        protocol_config: &ProtocolConfig,
+    ) -> AuthenticatedSubmitTransaction {
         let payload = signed_transaction_bytes(signing_key, &tx);
         let event = NodeEvent::new(
             ChainId::new(chain).unwrap(),
@@ -4975,6 +5465,9 @@ mod tests {
         receipt: Mutex<Option<DurableRequestReceipt>>,
         commits: Mutex<Vec<DurableInvocationTransaction>>,
         state_reads: AtomicUsize,
+        object_head_reads: AtomicUsize,
+        object_heads: Mutex<BTreeMap<ObjectId, DurableObjectHead>>,
+        object_versions: Mutex<BTreeMap<(ObjectId, u64), DurableObjectVersionRecord>>,
         commit_outcome: DurableCommitOutcome,
         preloaded: Mutex<ScriptedStateReads>,
     }
@@ -4985,6 +5478,9 @@ mod tests {
                 receipt: Mutex::new(None),
                 commits: Mutex::new(Vec::new()),
                 state_reads: AtomicUsize::new(0),
+                object_head_reads: AtomicUsize::new(0),
+                object_heads: Mutex::new(BTreeMap::new()),
+                object_versions: Mutex::new(BTreeMap::new()),
                 commit_outcome,
                 preloaded: Mutex::new(BTreeMap::new()),
             }
@@ -5001,6 +5497,21 @@ mod tests {
 
         fn preload_tombstone(&self, key: Vec<u8>, revision: StateRevision) {
             self.preloaded.lock().unwrap().insert(key, (revision, None));
+        }
+
+        fn preload_object(
+            &self,
+            object_id: ObjectId,
+            head: DurableObjectHead,
+            version: Option<DurableObjectVersionRecord>,
+        ) {
+            self.object_heads.lock().unwrap().insert(object_id, head);
+            if let Some(version) = version {
+                self.object_versions
+                    .lock()
+                    .unwrap()
+                    .insert((object_id, version.object_version().get()), version);
+            }
         }
     }
 
@@ -5049,6 +5560,1099 @@ mod tests {
             self.commits.lock().unwrap().push(transaction);
             self.commit_outcome.clone()
         }
+
+        fn get_object_head(
+            &self,
+            _context: &DurableOperationContext,
+            _domain: AtomicityDomainId,
+            object_id: ObjectId,
+        ) -> Result<DurableObjectHead, DurableReadError> {
+            self.object_head_reads.fetch_add(1, Ordering::SeqCst);
+            self.object_heads
+                .lock()
+                .unwrap()
+                .get(&object_id)
+                .cloned()
+                .ok_or(DurableReadError::InvalidRequest(
+                    RuntimeError::UnsupportedObjectStorage,
+                ))
+        }
+
+        fn get_object_version(
+            &self,
+            _context: &DurableOperationContext,
+            _domain: AtomicityDomainId,
+            object_id: ObjectId,
+            object_version: DurableObjectVersion,
+        ) -> Result<Option<DurableObjectVersionRecord>, DurableReadError> {
+            Ok(self
+                .object_versions
+                .lock()
+                .unwrap()
+                .get(&(object_id, object_version.get()))
+                .cloned())
+        }
+    }
+
+    fn preload_inline_object(
+        store: &ScriptedDurableStore,
+        chain: &str,
+        object_id: ObjectId,
+        owner: Owner,
+        byte: u8,
+    ) -> (ObjectRef, DurableObjectHead) {
+        let object: Object = test_object(object_id, 1, owner.clone(), byte);
+        let (record, digest): (DurableObjectVersionRecord, Digest32) =
+            hashed_object_version(object, chain, 1);
+        let head: DurableObjectHead = DurableObjectHead::Current {
+            head_revision: runtime::ObjectHeadRevision::FIRST,
+            object_version: DurableObjectVersion::FIRST,
+            digest,
+            owner_projection: DurableObjectOwnerProjection::from_owner(owner).unwrap(),
+            routing_projection: DurableObjectRoutingProjection::default(),
+        };
+        store.preload_object(object_id, head.clone(), Some(record));
+        (
+            ObjectRef {
+                id: object_id,
+                version: 1,
+                digest,
+            },
+            head,
+        )
+    }
+
+    #[test]
+    fn authenticated_read_only_manifest_commits_sorted_exact_head_assertions() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xF1);
+        let signing_key = dev_signing_key(0xB1);
+        let sender: Address = dev_sender_address(&signing_key);
+        let higher_id: ObjectId = ObjectId::new([0x31; 32]);
+        let lower_id: ObjectId = ObjectId::new([0x21; 32]);
+        let (higher_ref, higher_head): (ObjectRef, DurableObjectHead) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            higher_id,
+            Owner::Address(sender),
+            0x31,
+        );
+        let (lower_ref, lower_head): (ObjectRef, DurableObjectHead) =
+            preload_inline_object(&store, "sunrise-test", lower_id, Owner::Immutable, 0x21);
+        let manifest: AccessManifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: higher_ref,
+                mode: AccessMode::Read,
+            },
+            AccessEntry {
+                object_ref: lower_ref,
+                mode: AccessMode::Read,
+            },
+        ]);
+        let submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xD1),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &machine,
+        )
+        .unwrap();
+
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(store.object_head_reads.load(Ordering::SeqCst), 2);
+        let commits = store.commits.lock().unwrap();
+        let object_changes: &DurableObjectChanges = commits[0].object_changes();
+        assert!(object_changes.mutations().is_empty());
+        assert_eq!(
+            object_changes.reads(),
+            &[
+                DurableObjectHeadRead::new(lower_id, lower_head),
+                DurableObjectHeadRead::new(higher_id, higher_head),
+            ]
+        );
+    }
+
+    /// Every pure, zero-I/O rejection in [`validate_object_entries`]. The
+    /// duplicate-`ObjectId` branch is otherwise unreachable through
+    /// [`authenticated_submission_with_manifest`], since
+    /// [`abi::decode_access_manifest`] already rejects a duplicate id while
+    /// decoding the authenticated transaction, so it is exercised directly
+    /// against the extracted validator here.
+    #[test]
+    fn validate_object_entries_rejects_every_pure_branch() {
+        fn entry(byte: u8, version: u64, mode: AccessMode) -> AccessEntry {
+            AccessEntry {
+                object_ref: ObjectRef {
+                    id: ObjectId::new([byte; 32]),
+                    version,
+                    digest: Digest32::new(HashAlgorithmId::Sha2_256, [byte; 32]),
+                },
+                mode,
+            }
+        }
+
+        let accepted: Vec<AccessEntry> = (0..32u8)
+            .map(|byte| entry(byte, 1, AccessMode::Read))
+            .collect();
+        let accesses = validate_object_entries(&accepted).unwrap();
+        assert_eq!(accesses.len(), 32);
+        assert!(
+            accesses
+                .windows(2)
+                .all(|pair| pair[0].object_ref.id < pair[1].object_ref.id)
+        );
+
+        let too_many: Vec<AccessEntry> = (0..33u8)
+            .map(|byte| entry(byte, 1, AccessMode::Read))
+            .collect();
+        assert_eq!(
+            validate_object_entries(&too_many).unwrap_err(),
+            NodeCoreError::ObjectManifestTooLarge {
+                count: 33,
+                maximum: MAX_AUTHENTICATED_OBJECT_READS,
+            }
+        );
+
+        let duplicate_id = ObjectId::new([0x09; 32]);
+        let duplicate = vec![
+            AccessEntry {
+                object_ref: ObjectRef {
+                    id: duplicate_id,
+                    version: 1,
+                    digest: Digest32::new(HashAlgorithmId::Sha2_256, [0x01; 32]),
+                },
+                mode: AccessMode::Read,
+            },
+            AccessEntry {
+                object_ref: ObjectRef {
+                    id: duplicate_id,
+                    version: 2,
+                    digest: Digest32::new(HashAlgorithmId::Sha2_256, [0x02; 32]),
+                },
+                mode: AccessMode::Read,
+            },
+        ];
+        assert_eq!(
+            validate_object_entries(&duplicate).unwrap_err(),
+            NodeCoreError::DuplicateObjectAccess {
+                object_id: duplicate_id
+            }
+        );
+
+        let zero_version_id = ObjectId::new([0x0A; 32]);
+        assert_eq!(
+            validate_object_entries(&[entry(0x0A, 0, AccessMode::Read)]).unwrap_err(),
+            NodeCoreError::InvalidObjectVersion {
+                object_id: zero_version_id,
+                version: 0,
+            }
+        );
+
+        for mode in [AccessMode::Write, AccessMode::Consume] {
+            let object_id = ObjectId::new([0x0B; 32]);
+            assert_eq!(
+                validate_object_entries(&[entry(0x0B, 1, mode)]).unwrap_err(),
+                NodeCoreError::ObjectAccessModeUnsupported { object_id, mode }
+            );
+        }
+    }
+
+    /// Every storage-facing branch of `load_and_authorize_objects` that only
+    /// runs once the pure manifest validation above has already passed:
+    /// unsupported access modes, absence, tombstones, version/digest
+    /// disagreement with the signed reference, unsupported owner kinds,
+    /// unreadable blob bodies, a missing immutable version record, and every
+    /// distinct shape of storage corruption the corruption guard must catch
+    /// — including an owner projection that disagreed with the inline
+    /// object's owner and one that was absent entirely.
+    #[test]
+    fn authenticated_object_dispatch_fails_closed_for_every_pure_and_storage_branch() {
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xF2);
+        let signing_key = dev_signing_key(0xB2);
+        let sender: Address = dev_sender_address(&signing_key);
+
+        // `expect_zero_object_io`: true only for manifest entries rejected by
+        // the pure, zero-I/O `validate_object_entries` stage, before
+        // `load_and_authorize_objects` ever calls `get_object_head`.
+        type DispatchCase = (
+            &'static str,
+            Box<dyn Fn() -> (ScriptedDurableStore, AccessManifest, NodeCoreError)>,
+            bool,
+        );
+
+        fn current_head_with_owner_projection(
+            head: DurableObjectHead,
+            owner_projection: DurableObjectOwnerProjection,
+        ) -> DurableObjectHead {
+            match head {
+                DurableObjectHead::Current {
+                    head_revision,
+                    object_version,
+                    digest,
+                    routing_projection,
+                    ..
+                } => DurableObjectHead::Current {
+                    head_revision,
+                    object_version,
+                    digest,
+                    owner_projection,
+                    routing_projection,
+                },
+                other => panic!("expected current head, got {other:?}"),
+            }
+        }
+
+        let cases: Vec<DispatchCase> = vec![
+            (
+                "write mode unsupported",
+                Box::new(move || {
+                    let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+                    let object_ref = sample_object_ref(0x41);
+                    let object_id = object_ref.id;
+                    let manifest = manifest_with(vec![AccessEntry {
+                        object_ref,
+                        mode: AccessMode::Write,
+                    }]);
+                    (
+                        store,
+                        manifest,
+                        NodeCoreError::ObjectAccessModeUnsupported {
+                            object_id,
+                            mode: AccessMode::Write,
+                        },
+                    )
+                }),
+                true,
+            ),
+            (
+                "consume mode unsupported",
+                Box::new(move || {
+                    let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+                    let object_ref = sample_object_ref(0x4A);
+                    let object_id = object_ref.id;
+                    let manifest = manifest_with(vec![AccessEntry {
+                        object_ref,
+                        mode: AccessMode::Consume,
+                    }]);
+                    (
+                        store,
+                        manifest,
+                        NodeCoreError::ObjectAccessModeUnsupported {
+                            object_id,
+                            mode: AccessMode::Consume,
+                        },
+                    )
+                }),
+                true,
+            ),
+            (
+                "absent object",
+                Box::new(move || {
+                    let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+                    let object_id = ObjectId::new([0x42; 32]);
+                    store.preload_object(object_id, DurableObjectHead::Absent, None);
+                    let manifest = manifest_with(vec![AccessEntry {
+                        object_ref: sample_object_ref(0x42),
+                        mode: AccessMode::Read,
+                    }]);
+                    (store, manifest, NodeCoreError::ObjectNotFound { object_id })
+                }),
+                false,
+            ),
+            (
+                "tombstoned object",
+                Box::new(move || {
+                    let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+                    let object_id = ObjectId::new([0x48; 32]);
+                    store.preload_object(
+                        object_id,
+                        DurableObjectHead::Tombstoned {
+                            head_revision: runtime::ObjectHeadRevision::FIRST,
+                            last_object_version: DurableObjectVersion::FIRST,
+                        },
+                        None,
+                    );
+                    let manifest = manifest_with(vec![AccessEntry {
+                        object_ref: sample_object_ref(0x48),
+                        mode: AccessMode::Read,
+                    }]);
+                    (store, manifest, NodeCoreError::ObjectNotFound { object_id })
+                }),
+                false,
+            ),
+            (
+                "object version mismatch",
+                Box::new(move || {
+                    let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+                    let object_id = ObjectId::new([0x49; 32]);
+                    let (mut object_ref, _head) = preload_inline_object(
+                        &store,
+                        "sunrise-test",
+                        object_id,
+                        Owner::Address(sender),
+                        0x49,
+                    );
+                    object_ref.version = 2;
+                    let manifest = manifest_with(vec![AccessEntry {
+                        object_ref,
+                        mode: AccessMode::Read,
+                    }]);
+                    (
+                        store,
+                        manifest,
+                        NodeCoreError::ObjectVersionMismatch {
+                            object_id,
+                            expected: 2,
+                            actual: 1,
+                        },
+                    )
+                }),
+                false,
+            ),
+            (
+                "object digest mismatch",
+                Box::new(move || {
+                    let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+                    let object_id = ObjectId::new([0x4B; 32]);
+                    let (mut object_ref, _head) = preload_inline_object(
+                        &store,
+                        "sunrise-test",
+                        object_id,
+                        Owner::Address(sender),
+                        0x4B,
+                    );
+                    let actual_digest = object_ref.digest;
+                    let wrong_digest = Digest32::new(HashAlgorithmId::Sha2_256, [0xFE; 32]);
+                    object_ref.digest = wrong_digest;
+                    let manifest = manifest_with(vec![AccessEntry {
+                        object_ref,
+                        mode: AccessMode::Read,
+                    }]);
+                    (
+                        store,
+                        manifest,
+                        NodeCoreError::ObjectDigestMismatch {
+                            object_id,
+                            expected: wrong_digest,
+                            actual: actual_digest,
+                        },
+                    )
+                }),
+                false,
+            ),
+            (
+                "owner mismatch",
+                Box::new(move || {
+                    let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+                    let object_id = ObjectId::new([0x43; 32]);
+                    let (object_ref, _head) = preload_inline_object(
+                        &store,
+                        "sunrise-test",
+                        object_id,
+                        Owner::Address(Address::new([0xEE; 32])),
+                        0x43,
+                    );
+                    let manifest = manifest_with(vec![AccessEntry {
+                        object_ref,
+                        mode: AccessMode::Read,
+                    }]);
+                    (
+                        store,
+                        manifest,
+                        NodeCoreError::ObjectOwnerMismatch { object_id },
+                    )
+                }),
+                false,
+            ),
+            (
+                "shared owner rejected",
+                Box::new(move || {
+                    let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+                    let object_id = ObjectId::new([0x4C; 32]);
+                    let (object_ref, _head) = preload_inline_object(
+                        &store,
+                        "sunrise-test",
+                        object_id,
+                        Owner::Shared,
+                        0x4C,
+                    );
+                    let manifest = manifest_with(vec![AccessEntry {
+                        object_ref,
+                        mode: AccessMode::Read,
+                    }]);
+                    (
+                        store,
+                        manifest,
+                        NodeCoreError::ObjectOwnerKindUnsupported { object_id },
+                    )
+                }),
+                false,
+            ),
+            (
+                "system owner rejected",
+                Box::new(move || {
+                    let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+                    let object_id = ObjectId::new([0x4D; 32]);
+                    let (object_ref, _head) = preload_inline_object(
+                        &store,
+                        "sunrise-test",
+                        object_id,
+                        Owner::System,
+                        0x4D,
+                    );
+                    let manifest = manifest_with(vec![AccessEntry {
+                        object_ref,
+                        mode: AccessMode::Read,
+                    }]);
+                    (
+                        store,
+                        manifest,
+                        NodeCoreError::ObjectOwnerKindUnsupported { object_id },
+                    )
+                }),
+                false,
+            ),
+            (
+                "blob body unavailable",
+                Box::new(move || {
+                    let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+                    let object_id = ObjectId::new([0x44; 32]);
+                    let blob_digest: Digest32 =
+                        Digest32::new(HashAlgorithmId::Sha2_256, [0x45; 32]);
+                    let blob_record: DurableObjectVersionRecord =
+                        DurableObjectVersionRecord::from_blob_reference(
+                            object_id,
+                            DurableObjectVersion::FIRST,
+                            blob_digest,
+                            1,
+                            1,
+                            Digest32::new(HashAlgorithmId::Sha3_256, [0x46; 32]),
+                        );
+                    let blob_head: DurableObjectHead = DurableObjectHead::Current {
+                        head_revision: runtime::ObjectHeadRevision::FIRST,
+                        object_version: DurableObjectVersion::FIRST,
+                        digest: blob_digest,
+                        owner_projection: DurableObjectOwnerProjection::default(),
+                        routing_projection: DurableObjectRoutingProjection::default(),
+                    };
+                    store.preload_object(object_id, blob_head, Some(blob_record));
+                    let manifest = manifest_with(vec![AccessEntry {
+                        object_ref: ObjectRef {
+                            id: object_id,
+                            version: 1,
+                            digest: blob_digest,
+                        },
+                        mode: AccessMode::Read,
+                    }]);
+                    (
+                        store,
+                        manifest,
+                        NodeCoreError::ObjectBodyUnavailable { object_id },
+                    )
+                }),
+                false,
+            ),
+            (
+                "missing version record",
+                Box::new(move || {
+                    let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+                    let object_id = ObjectId::new([0x4E; 32]);
+                    let object = test_object(object_id, 1, Owner::Address(sender), 0x4E);
+                    let (_, digest) = hashed_object_version(object, "sunrise-test", 1);
+                    let head = DurableObjectHead::Current {
+                        head_revision: runtime::ObjectHeadRevision::FIRST,
+                        object_version: DurableObjectVersion::FIRST,
+                        digest,
+                        owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Address(
+                            sender,
+                        ))
+                        .unwrap(),
+                        routing_projection: DurableObjectRoutingProjection::default(),
+                    };
+                    store.preload_object(object_id, head, None);
+                    let manifest = manifest_with(vec![AccessEntry {
+                        object_ref: ObjectRef {
+                            id: object_id,
+                            version: 1,
+                            digest,
+                        },
+                        mode: AccessMode::Read,
+                    }]);
+                    (
+                        store,
+                        manifest,
+                        NodeCoreError::ObjectRecordMissing { object_id },
+                    )
+                }),
+                false,
+            ),
+            (
+                "record identity disagrees with owner projection",
+                Box::new(move || {
+                    let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+                    let object_id = ObjectId::new([0x47; 32]);
+                    let (object_ref, head) = preload_inline_object(
+                        &store,
+                        "sunrise-test",
+                        object_id,
+                        Owner::Address(sender),
+                        0x47,
+                    );
+                    let corrupt_head = current_head_with_owner_projection(
+                        head,
+                        DurableObjectOwnerProjection::from_owner(Owner::Address(Address::new(
+                            [0xEF; 32],
+                        )))
+                        .unwrap(),
+                    );
+                    store.preload_object(object_id, corrupt_head, None);
+                    let manifest = manifest_with(vec![AccessEntry {
+                        object_ref,
+                        mode: AccessMode::Read,
+                    }]);
+                    (
+                        store,
+                        manifest,
+                        NodeCoreError::ObjectRecordMismatch { object_id },
+                    )
+                }),
+                false,
+            ),
+            (
+                "absent owner projection",
+                Box::new(move || {
+                    let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+                    let object_id = ObjectId::new([0x4F; 32]);
+                    let (object_ref, head) = preload_inline_object(
+                        &store,
+                        "sunrise-test",
+                        object_id,
+                        Owner::Address(sender),
+                        0x4F,
+                    );
+                    let corrupt_head = current_head_with_owner_projection(
+                        head,
+                        DurableObjectOwnerProjection::default(),
+                    );
+                    store.preload_object(object_id, corrupt_head, None);
+                    let manifest = manifest_with(vec![AccessEntry {
+                        object_ref,
+                        mode: AccessMode::Read,
+                    }]);
+                    (
+                        store,
+                        manifest,
+                        NodeCoreError::ObjectRecordMismatch { object_id },
+                    )
+                }),
+                false,
+            ),
+        ];
+
+        for (index, (name, build, expect_zero_object_io)) in cases.into_iter().enumerate() {
+            let (store, manifest, expected_error) = build();
+            let machine = IdempotentMachine {
+                calls: AtomicUsize::new(0),
+            };
+            let request_byte = 0xD2u8.wrapping_add(u8::try_from(index).unwrap());
+            let error = handle_authenticated_resolved_durable_submit_transaction(
+                &store,
+                &durable_context(),
+                &resolver("sunrise-test"),
+                authenticated_submission_with_manifest(
+                    "sunrise-test",
+                    request(request_byte),
+                    &signing_key,
+                    Epoch::new(7),
+                    0,
+                    manifest,
+                    &node_config,
+                    &protocol_config,
+                ),
+                &machine,
+            )
+            .unwrap_err();
+            assert_eq!(error, expected_error, "case: {name}");
+            assert_eq!(machine.calls.load(Ordering::SeqCst), 0, "case: {name}");
+            if expect_zero_object_io {
+                assert_eq!(store.state_reads.load(Ordering::SeqCst), 0, "case: {name}");
+                assert_eq!(
+                    store.object_head_reads.load(Ordering::SeqCst),
+                    0,
+                    "case: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn receipt_and_nonce_short_circuit_before_authenticated_object_reads() {
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xF3);
+        let signing_key = dev_signing_key(0xB3);
+        let manifest: AccessManifest = manifest_with(vec![AccessEntry {
+            object_ref: sample_object_ref(0x51),
+            mode: AccessMode::Read,
+        }]);
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        let stale_store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let stale_submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xD7),
+            &signing_key,
+            Epoch::new(7),
+            1,
+            manifest.clone(),
+            &node_config,
+            &protocol_config,
+        );
+        assert!(matches!(
+            handle_authenticated_resolved_durable_submit_transaction(
+                &stale_store,
+                &durable_context(),
+                &resolver("sunrise-test"),
+                stale_submission,
+                &machine,
+            ),
+            Err(NodeCoreError::SenderNonceMismatch { .. })
+        ));
+        assert_eq!(stale_store.object_head_reads.load(Ordering::SeqCst), 0);
+
+        let replay_store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let replay_submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xD8),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        let event_digest: Digest32 = replay_submission
+            .event()
+            .digest(&resolver("sunrise-test"))
+            .unwrap();
+        let response: NodeResponse = NodeResponse::new(
+            replay_submission.event().request_id(),
+            NodeResponseStatus::Accepted,
+            None,
+        )
+        .unwrap();
+        let record: NodeDedupRecord = NodeDedupRecord::new(
+            replay_submission.event().request_id(),
+            event_digest,
+            vec![response],
+        )
+        .unwrap();
+        replay_store.receipt.lock().unwrap().replace(
+            DurableRequestReceipt::new(
+                DurableRequestId::new(*replay_submission.event().request_id().as_bytes()).unwrap(),
+                event_digest,
+                record.encode().unwrap(),
+            )
+            .unwrap(),
+        );
+        let replay = handle_authenticated_resolved_durable_submit_transaction(
+            &replay_store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            replay_submission,
+            &machine,
+        )
+        .unwrap();
+        assert_eq!(replay.output().responses().len(), 1);
+        assert_eq!(replay_store.state_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(replay_store.object_head_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn authenticated_object_head_conflict_is_retryable_and_distinct() {
+        let object_id: ObjectId = ObjectId::new([0x61; 32]);
+        let conflict = DurableCommitRejection::ObjectConflict {
+            object_id,
+            current: runtime::DurableObjectHeadSummary::Absent,
+        };
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Rejected(conflict));
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xF4);
+        let signing_key = dev_signing_key(0xB4);
+        let sender: Address = dev_sender_address(&signing_key);
+        let (object_ref, _): (ObjectRef, DurableObjectHead) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            object_id,
+            Owner::Address(sender),
+            0x61,
+        );
+        let submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xD9),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest_with(vec![AccessEntry {
+                object_ref,
+                mode: AccessMode::Read,
+            }]),
+            &node_config,
+            &protocol_config,
+        );
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &machine,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::ObjectConflict { object_id });
+        assert_eq!(store.commits.lock().unwrap().len(), 1);
+        assert!(store.receipt.lock().unwrap().is_none());
+    }
+
+    /// Commits an object directly against a real [`MemoryDurableStateStore`]
+    /// (bypassing node-core, which does not implement object writes), then
+    /// authorizes and commits a non-empty read-only manifest referencing it
+    /// through the full authenticated submit-transaction path.
+    #[test]
+    fn memory_store_authenticated_read_only_manifest_commits_against_real_object_store() {
+        let store = MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xF7);
+        let signing_key = dev_signing_key(0xC7);
+        let sender: Address = dev_sender_address(&signing_key);
+        let context = durable_context();
+        let resolver = resolver("sunrise-test");
+        let object_domain = domain(0xF7);
+        let object_id = ObjectId::new([0x81; 32]);
+
+        let object = test_object(object_id, 1, Owner::Address(sender), 0x81);
+        let (record, digest) = hashed_object_version(object, "sunrise-test", 1);
+        let create_mutation = runtime::DurableObjectMutation::Create {
+            version: record,
+            owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Address(sender))
+                .unwrap(),
+            routing_projection: DurableObjectRoutingProjection::default(),
+        };
+        let create_changes = DurableObjectChanges::new(
+            vec![DurableObjectHeadRead::new(
+                object_id,
+                DurableObjectHead::Absent,
+            )],
+            vec![runtime::DurableObjectMutationEntry::new(
+                object_id,
+                create_mutation,
+            )],
+        )
+        .unwrap();
+        let create_receipt = DurableRequestReceipt::new(
+            DurableRequestId::new([0x21; 32]).unwrap(),
+            Digest32::new(HashAlgorithmId::Sha2_256, [0x22; 32]),
+            vec![0x23],
+        )
+        .unwrap();
+        let create_invocation = DurableInvocationTransaction::new(
+            object_domain,
+            None,
+            create_changes,
+            create_receipt,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            store.commit_invocation(&context, create_invocation),
+            DurableCommitOutcome::Committed
+        );
+
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref: ObjectRef {
+                id: object_id,
+                version: 1,
+                digest,
+            },
+            mode: AccessMode::Read,
+        }]);
+        let submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xE5),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        let resolved = handle_authenticated_resolved_durable_submit_transaction(
+            &store, &context, &resolver, submission, &machine,
+        )
+        .unwrap();
+
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resolved.domain(), object_domain);
+        assert_eq!(resolved.output().responses().len(), 1);
+
+        let nonce_key = sender_nonce_key_for("sunrise-test", *sender.as_bytes(), Epoch::new(7));
+        let persisted_nonce = store
+            .get_versioned_durable(&context, object_domain, &nonce_key)
+            .unwrap();
+        let nonce_record = SenderNonceRecord::decode(persisted_nonce.value().unwrap()).unwrap();
+        assert_eq!(nonce_record.next_nonce, 1);
+    }
+
+    /// One machine implementation used only to inject a genuine, deterministic
+    /// TOCTOU race into a single-threaded test: `transition()` runs strictly
+    /// after `load_and_authorize_objects` has already captured its object-head
+    /// snapshot (see the ordering documented on
+    /// `handle_durable_idempotent_event_with_plan`) and strictly before the
+    /// outer invocation commits, so committing a competing update to the same
+    /// object here reproduces a real stale-head race without threads.
+    struct StaleHeadRaceMachine<'a> {
+        store: &'a MemoryDurableStateStore,
+        context: DurableOperationContext,
+        racing_invocation: Mutex<Option<DurableInvocationTransaction>>,
+        calls: AtomicUsize,
+    }
+
+    impl TransactionalNodeStateMachine for StaleHeadRaceMachine<'_> {
+        fn access_plan(&self, _event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            NodeStateAccessPlan::new(vec![NodeStateAccess::new(
+                b"state/stale-head-race".to_vec(),
+                NodeStateAccessMode::ReadOnly,
+            )?])
+        }
+
+        fn transition(
+            &self,
+            _state: &NodeStateSnapshot,
+            event: &NodeEvent,
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let racing_invocation = self
+                .racing_invocation
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the racing invocation commits exactly once");
+            assert_eq!(
+                self.store
+                    .commit_invocation(&self.context, racing_invocation),
+                DurableCommitOutcome::Committed
+            );
+            Ok(TransactionalNodeTransition::read_only(NodeOutput::new(
+                vec![NodeResponse::new(
+                    event.request_id(),
+                    NodeResponseStatus::Accepted,
+                    None,
+                )?],
+                Vec::new(),
+            )?))
+        }
+    }
+
+    #[test]
+    fn memory_store_stale_head_race_yields_object_conflict_without_consuming_nonce_then_retries() {
+        let store = MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xF8);
+        let signing_key = dev_signing_key(0xC8);
+        let sender: Address = dev_sender_address(&signing_key);
+        let context = durable_context();
+        let resolver = resolver("sunrise-test");
+        let object_domain = domain(0xF8);
+        let object_id = ObjectId::new([0x82; 32]);
+
+        let object_v1 = test_object(object_id, 1, Owner::Address(sender), 0x82);
+        let (record_v1, digest_v1) = hashed_object_version(object_v1, "sunrise-test", 1);
+        let owner_projection =
+            DurableObjectOwnerProjection::from_owner(Owner::Address(sender)).unwrap();
+        let create_mutation = runtime::DurableObjectMutation::Create {
+            version: record_v1,
+            owner_projection: owner_projection.clone(),
+            routing_projection: DurableObjectRoutingProjection::default(),
+        };
+        let create_changes = DurableObjectChanges::new(
+            vec![DurableObjectHeadRead::new(
+                object_id,
+                DurableObjectHead::Absent,
+            )],
+            vec![runtime::DurableObjectMutationEntry::new(
+                object_id,
+                create_mutation,
+            )],
+        )
+        .unwrap();
+        let create_receipt = DurableRequestReceipt::new(
+            DurableRequestId::new([0x24; 32]).unwrap(),
+            Digest32::new(HashAlgorithmId::Sha2_256, [0x25; 32]),
+            vec![0x26],
+        )
+        .unwrap();
+        let create_invocation = DurableInvocationTransaction::new(
+            object_domain,
+            None,
+            create_changes,
+            create_receipt,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            store.commit_invocation(&context, create_invocation),
+            DurableCommitOutcome::Committed
+        );
+        let head_v1 = store
+            .get_object_head(&context, object_domain, object_id)
+            .unwrap();
+
+        let object_v2 = test_object(object_id, 2, Owner::Address(sender), 0x83);
+        let (record_v2, digest_v2) = hashed_object_version(object_v2, "sunrise-test", 2);
+        let racing_mutation = runtime::DurableObjectMutation::Update {
+            version: record_v2,
+            owner_projection,
+            routing_projection: DurableObjectRoutingProjection::default(),
+        };
+        let racing_changes = DurableObjectChanges::new(
+            vec![DurableObjectHeadRead::new(object_id, head_v1)],
+            vec![runtime::DurableObjectMutationEntry::new(
+                object_id,
+                racing_mutation,
+            )],
+        )
+        .unwrap();
+        let racing_receipt = DurableRequestReceipt::new(
+            DurableRequestId::new([0x27; 32]).unwrap(),
+            Digest32::new(HashAlgorithmId::Sha2_256, [0x28; 32]),
+            vec![0x29],
+        )
+        .unwrap();
+        let racing_invocation = DurableInvocationTransaction::new(
+            object_domain,
+            None,
+            racing_changes,
+            racing_receipt,
+            None,
+        )
+        .unwrap();
+
+        let racing_machine = StaleHeadRaceMachine {
+            store: &store,
+            context,
+            racing_invocation: Mutex::new(Some(racing_invocation)),
+            calls: AtomicUsize::new(0),
+        };
+        let stale_manifest = manifest_with(vec![AccessEntry {
+            object_ref: ObjectRef {
+                id: object_id,
+                version: 1,
+                digest: digest_v1,
+            },
+            mode: AccessMode::Read,
+        }]);
+        let stale_submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xE6),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            stale_manifest,
+            &node_config,
+            &protocol_config,
+        );
+
+        let race_error = handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &context,
+            &resolver,
+            stale_submission,
+            &racing_machine,
+        )
+        .unwrap_err();
+        assert_eq!(race_error, NodeCoreError::ObjectConflict { object_id });
+        assert_eq!(racing_machine.calls.load(Ordering::SeqCst), 1);
+
+        // The outer commit was rejected atomically, so the racing write's own
+        // (state-free) invocation is the only thing that committed: the
+        // sender-nonce key was never written and the same nonce is still
+        // expected next.
+        let nonce_key = sender_nonce_key_for("sunrise-test", *sender.as_bytes(), Epoch::new(7));
+        let nonce_after_conflict = store
+            .get_versioned_durable(&context, object_domain, &nonce_key)
+            .unwrap();
+        assert!(nonce_after_conflict.value().is_none());
+
+        let head_v2 = store
+            .get_object_head(&context, object_domain, object_id)
+            .unwrap();
+        assert_eq!(head_v2.object_version(), DurableObjectVersion::new(2));
+
+        let retry_manifest = manifest_with(vec![AccessEntry {
+            object_ref: ObjectRef {
+                id: object_id,
+                version: 2,
+                digest: digest_v2,
+            },
+            mode: AccessMode::Read,
+        }]);
+        let retry_submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xE7),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            retry_manifest,
+            &node_config,
+            &protocol_config,
+        );
+        let retry_machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        let resolved = handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &context,
+            &resolver,
+            retry_submission,
+            &retry_machine,
+        )
+        .unwrap();
+        assert_eq!(retry_machine.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resolved.output().responses().len(), 1);
+
+        let nonce_after_retry = store
+            .get_versioned_durable(&context, object_domain, &nonce_key)
+            .unwrap();
+        let nonce_record = SenderNonceRecord::decode(nonce_after_retry.value().unwrap()).unwrap();
+        assert_eq!(nonce_record.next_nonce, 1);
     }
 
     #[test]

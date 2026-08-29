@@ -284,11 +284,14 @@ Transaction wire field/version, but it allocates persisted record type ID
 `0xE006`.
 
 Protocol version 3 MUST NOT be activated on any live chain until fee debit,
-module/object access and effects validation, FastVote/FastCertificate, and
-certificate publication are implemented and atomically composed with the
-authenticated transaction. The generic application machine still consumes the
-outer event while the authenticated inner transaction is held as an authority
-token; typed object dispatch remains the next separate boundary.
+module access, mutating/consuming object effects, shared-object ordering,
+FastVote/FastCertificate, and certificate publication are implemented and
+atomically composed with the authenticated transaction. The structured durable
+path now derives read-only object authority only from the authenticated inner
+transaction, loads exact heads and immutable inline versions, authorizes typed
+owners, and commits complete head assertions. The generic application machine
+still consumes the outer event and cannot inspect or influence those object
+reads; effects composition remains a separate boundary.
 This constraint is not limited to `SubmitTransaction`: every externally
 accepted non-`SubmitTransaction` node-event family — especially certificate,
 protocol-upgrade, and validator-set-change events — needs an equivalent
@@ -688,10 +691,12 @@ private-field `AuthenticatedSubmitTransaction` before deriving an access plan
 or entering its persistence/dispatch path. Generic node-core handlers and the
 legacy native routes reject `SubmitTransaction`. The authenticated wrapper also
 derives the private sender-nonce reservation. Exact next-nonce equality and its
-checked increment now commit atomically with the structured invocation; fee
-debit, typed module/object dispatch and effects, fast-path certificates, and
-authorization for every other externally accepted event family remain
-mandatory before live activation.
+checked increment now commit atomically with the structured invocation. Signed
+read-only object manifests are loaded from exact heads and immutable inline
+versions, authorized against the verified sender, and asserted in that same
+invocation. Fee debit, module loading, mutating/consuming object effects,
+shared-object ordering, fast-path certificates, and authorization for every
+other externally accepted event family remain mandatory before live activation.
 
 The outbox delivery cursor (`0xE005`) advances one message at a time. A caller
 supplies a non-zero lease ID, an observed time, and a duration bounded to five
@@ -1123,7 +1128,9 @@ The generation-one SQL `type_id` is the stable
 canonical Object record ID rather than the logical `Object::type_hash` retained
 inside canonical bytes. Memory and PostgreSQL apply object/state/receipt/outbox
 sections atomically, preventing an adapter from hiding object writes in generic
-state. Node-core object dispatch remains deferred. Indexed outbox
+state. Node-core now uses the object section for authenticated read-only
+manifest authorization and exact head assertions; object mutations/effects
+remain deferred. Indexed outbox
 repositories now refine the structured store trait so one implementation owns
 initial commit and later delivery state. An additive node-core handler now
 resolves the manifest domain before I/O, checks the typed receipt before state
@@ -1683,3 +1690,30 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   unchanged. Live protocol-version-3 activation remains blocked on atomic fee,
   typed object/effect, certificate, and non-transaction ingress authorization
   work.
+- DR-0067: Before fee debit or object effects, authorize the signed read-only
+  `AccessManifest` on the authenticated structured durable path. Derive the
+  sole authority from the verified inner transaction sender; never re-decode
+  the outer event or authorize from a body-free head projection. Reconcile an
+  exact receipt first, enforce and reserve the sender nonce second, then load
+  each bounded manifest entry in canonical object-ID order through exact head,
+  exact immutable version, inline canonical Object, and typed owner. Address
+  ownership must match the authenticated sender even for reads; immutable
+  reads are allowed. Write/consume modes, shared/system owners, blob-backed
+  bodies, absent/tombstoned objects, and adapters without normalized object
+  storage fail closed. Match the signed self-describing version/digest and
+  cross-check record identity and schema version, and require the current
+  inline head's owner projection to exist and exactly match the typed owner
+  before authorization. Do not recompute historical object digests until their
+  creating chain/version provenance is available. Cap this pre-activation
+  fan-out at 32 entries before object I/O without changing committed domain
+  placement semantics. Append every exact observed head as a mutation-free
+  `DurableObjectChanges` read assertion after the pure application transition,
+  so the machine cannot influence it and any concurrent head change rejects
+  the whole state/nonce/receipt/outbox commit. Preserve exact replay and stale
+  nonce short-circuits before object reads. Map object-head conflicts as a
+  retryable 409 without consuming the nonce. Add no canonical wire type, type
+  ID, database schema, asset balance representation, or object mutation.
+  Protocol version 3 remains inactive pending module loading, fee debit,
+  mutating/consuming effects, shared-object consensus routing, blob
+  fetch/content verification, digest provenance, fast certificates, and the
+  other externally accepted event-family authorization boundaries.
