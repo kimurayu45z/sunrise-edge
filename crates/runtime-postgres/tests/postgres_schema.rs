@@ -4,7 +4,9 @@ use postgres::{
     config::{Host, SslMode},
     error::SqlState,
 };
-use protocol_types::{AtomicityDomainId, ChainId, Digest32, HashAlgorithmId, ValidatorId};
+use protocol_types::{
+    AtomicityDomainId, ChainId, Digest32, HashAlgorithmId, ProtocolVersion, ValidatorId,
+};
 use r2d2_postgres::{PostgresConnectionManager, r2d2::Pool};
 use runtime::{
     AtomicStateMutationSet, AtomicStateReadSet, AtomicStateTransaction, DueOutboxClaimRequest,
@@ -602,6 +604,18 @@ fn commit_loss_proxied_config(database_url: &str, proxy_addr: SocketAddr) -> Con
     proxied
 }
 
+/// Reconstructs the exact [`ChainId`] a [`PostgresNamespace`] was built from,
+/// so conformance fixtures expose their authoritative provenance chain
+/// instead of a chain literal copied elsewhere. `PostgresNamespace::new`
+/// already guarantees these bytes came from a valid, non-empty UTF-8
+/// `ChainId`, so this can only fail if the namespace itself is corrupt.
+fn namespace_chain_id(namespace: &PostgresNamespace) -> ConformanceResult<ChainId> {
+    let text: String = String::from_utf8(namespace.chain_id_bytes().to_vec())
+        .map_err(|error| ConformanceFailure::new("postgres-fixture", error.to_string()))?;
+    ChainId::new(text)
+        .map_err(|error| ConformanceFailure::new("postgres-fixture", error.to_string()))
+}
+
 struct CommitLossPostgresFixture {
     store: Arc<PostgresDurableStore<TestPostgresManager>>,
     namespace: PostgresNamespace,
@@ -673,6 +687,10 @@ impl DurableStoreFixture for CommitLossPostgresFixture {
             ));
         }
         Ok(())
+    }
+
+    fn object_provenance_chain_id(&self) -> ConformanceResult<ChainId> {
+        namespace_chain_id(&self.namespace)
     }
 }
 
@@ -760,6 +778,10 @@ impl DurableStoreFixture for PostgresConformanceFixture {
             ));
         }
         Ok(())
+    }
+
+    fn object_provenance_chain_id(&self) -> ConformanceResult<ChainId> {
+        namespace_chain_id(&self.namespace)
     }
 }
 
@@ -1062,8 +1084,9 @@ fn postgres_schema_and_durable_store_conformance() {
             "INSERT INTO sunrise_edge.object_versions (
                  chain_id_bytes, validator_id, atomicity_domain_id, object_id,
                  object_version, digest_algorithm_id, digest_bytes, schema_version,
-                 type_id, created_checkpoint, inline_canonical_bytes
-             ) VALUES ($1, $2, $3, $4, 1, 1, $5, 1, 1, 0, $6)",
+                 type_id, created_chain_id_bytes, created_protocol_version,
+                 created_checkpoint, inline_canonical_bytes
+             ) VALUES ($1, $2, $3, $4, 1, 1, $5, 1, 1, $1, 1, 0, $6)",
             &[
                 &namespace.chain_id_bytes(),
                 &&namespace.validator_id().as_bytes()[..],
@@ -2531,10 +2554,12 @@ fn postgres_schema_and_durable_store_conformance() {
                 "INSERT INTO sunrise_edge.object_versions (
                      chain_id_bytes, validator_id, atomicity_domain_id, object_id,
                      object_version, digest_algorithm_id, digest_bytes,
-                     schema_version, type_id, created_checkpoint,
+                     schema_version, type_id,
+                     created_chain_id_bytes, created_protocol_version,
+                     created_checkpoint,
                      inline_canonical_bytes,
                      blob_digest_algorithm_id, blob_digest_bytes
-                 ) VALUES ($1, $2, $3, $4, 4, $5, $6, $7, $8, 13, $9, NULL, NULL)",
+                 ) VALUES ($1, $2, $3, $4, 4, $5, $6, $7, $8, $1, 1, 13, $9, NULL, NULL)",
                 &[
                     &object_fixture.namespace.chain_id_bytes(),
                     &&object_fixture.namespace.validator_id().as_bytes()[..],
@@ -2618,6 +2643,10 @@ fn postgres_schema_and_durable_store_conformance() {
         DurableObjectVersion::FIRST,
         Digest32::new(HashAlgorithmId::Sha2_256, [0x62; 32]),
         9,
+        runtime::DurableObjectProvenance::new(
+            namespace_chain_id(&object_fixture.namespace).unwrap(),
+            ProtocolVersion::new(1),
+        ),
         10,
         Digest32::new(HashAlgorithmId::Sha3_256, [0x63; 32]),
     );
@@ -2862,6 +2891,275 @@ fn postgres_schema_and_durable_store_conformance() {
     }
     schema_fixture.restore_supported_schema().unwrap();
     run_schema_skew_conformance(&schema_fixture).unwrap();
+
+    // DR-0068 §5.2: an old generation-one schema identity (`v1`) must never be
+    // tolerated, aliased, or silently accepted now that generation one has
+    // been redefined in place under identity `v2`. Exercise the exact
+    // marker a real pre-upgrade database would still have on disk.
+    const OLD_V1_SCHEMA_IDENTITY: [u8; 32] = *b"sunrise-edge/postgres/schema/v1\0";
+    {
+        let mut schema_operator = schema_fixture.operator.lock().unwrap();
+        let updated_migration: u64 = schema_operator
+            .execute(
+                "UPDATE sunrise_edge.schema_migrations SET schema_identity = $1 WHERE migration_id = 1",
+                &[&&OLD_V1_SCHEMA_IDENTITY[..]],
+            )
+            .unwrap();
+        assert_eq!(updated_migration, 1);
+        assert!(matches!(
+            verify_initial_schema(&mut *schema_operator),
+            Err(PostgresSchemaError::SchemaMismatch)
+        ));
+        assert!(matches!(
+            apply_initial_schema(&mut schema_operator),
+            Err(PostgresSchemaError::SchemaMismatch)
+        ));
+        assert!(matches!(
+            bootstrap_namespace(
+                &mut schema_operator,
+                &schema_fixture.namespace,
+                POSTGRES_SCHEMA_GENERATION,
+                WriterFenceGeneration::new(41).unwrap(),
+            ),
+            Err(PostgresSchemaError::SchemaMismatch)
+        ));
+        let updated_namespace: u64 = schema_operator
+            .execute(
+                "UPDATE sunrise_edge.storage_metadata SET schema_identity = $1
+                 WHERE chain_id_bytes = $2 AND validator_id = $3 AND atomicity_domain_id = $4",
+                &[
+                    &&OLD_V1_SCHEMA_IDENTITY[..],
+                    &schema_fixture.namespace.chain_id_bytes(),
+                    &&schema_fixture.namespace.validator_id().as_bytes()[..],
+                    &&schema_fixture.namespace.domain().as_bytes()[..],
+                ],
+            )
+            .unwrap();
+        assert_eq!(updated_namespace, 1);
+        let identity_skew_context = schema_fixture
+            .live_context(
+                WriterFenceGeneration::new(41).unwrap(),
+                0xA9,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(
+            schema_fixture.store.get_versioned_durable(
+                &identity_skew_context,
+                schema_fixture.namespace.domain(),
+                b"identity-skew",
+            ),
+            Err(DurableReadError::SchemaMismatch)
+        );
+        let restored_migration: u64 = schema_operator
+            .execute(
+                "UPDATE sunrise_edge.schema_migrations SET schema_identity = $1 WHERE migration_id = 1",
+                &[&&runtime_postgres::POSTGRES_SCHEMA_IDENTITY[..]],
+            )
+            .unwrap();
+        assert_eq!(restored_migration, 1);
+        let restored_namespace: u64 = schema_operator
+            .execute(
+                "UPDATE sunrise_edge.storage_metadata SET schema_identity = $1
+                 WHERE chain_id_bytes = $2 AND validator_id = $3 AND atomicity_domain_id = $4",
+                &[
+                    &&runtime_postgres::POSTGRES_SCHEMA_IDENTITY[..],
+                    &schema_fixture.namespace.chain_id_bytes(),
+                    &&schema_fixture.namespace.validator_id().as_bytes()[..],
+                    &&schema_fixture.namespace.domain().as_bytes()[..],
+                ],
+            )
+            .unwrap();
+        assert_eq!(restored_namespace, 1);
+    }
+    schema_fixture.restore_supported_schema().unwrap();
+
+    // DR-0068 §7.4: provenance CHECK/parsing adversarial coverage. Each
+    // constraint dropped below is table-global, not namespace-scoped, so this
+    // section runs serially (no concurrent fixture may run against this
+    // database while a constraint is dropped) and restores every constraint
+    // before any later fixture in this test runs. The corrupt rows
+    // themselves are isolated to this dedicated namespace and deleted before
+    // restoration, so they cannot leak into another fixture's reads. None of
+    // this weakens production DDL, which never drops these constraints.
+    let provenance_namespace = PostgresNamespace::new(
+        &ChainId::new("postgres-object-provenance-corruption").unwrap(),
+        ValidatorId::new([0xA8; 32]),
+        AtomicityDomainId::new([0xA9; 32]).unwrap(),
+    )
+    .unwrap();
+    let provenance_fence = WriterFenceGeneration::new(61).unwrap();
+    bootstrap_namespace(
+        &mut client,
+        &provenance_namespace,
+        POSTGRES_SCHEMA_GENERATION,
+        provenance_fence,
+    )
+    .unwrap();
+    let provenance_store = Arc::new(PostgresDurableStore::new(
+        conformance_pool.clone(),
+        provenance_namespace.clone(),
+        PostgresTransactionPolicy::new(NonZeroU32::new(1).unwrap()).unwrap(),
+    ));
+    let provenance_now: u64 = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let provenance_context = DurableOperationContext::new(
+        provenance_fence,
+        StorageDeadline::new(provenance_now.checked_add(60_000).unwrap()).unwrap(),
+        StorageCorrelationId::new([0xAA; 16]).unwrap(),
+    );
+
+    // 1. `CHECK (created_chain_id_bytes = chain_id_bytes)` rejects a
+    // mismatched insert outright; no constraint needs to move for this case.
+    let mismatched_object_id = ObjectId::new([0x72; 32]);
+    let mismatched_chain_bytes: &[u8] = b"postgres-object-provenance-corruption-wrong";
+    let mismatched_insert = client.execute(
+        "INSERT INTO sunrise_edge.object_versions (
+             chain_id_bytes, validator_id, atomicity_domain_id, object_id,
+             object_version, digest_algorithm_id, digest_bytes,
+             schema_version, type_id,
+             created_chain_id_bytes, created_protocol_version,
+             created_checkpoint, inline_canonical_bytes
+         ) VALUES ($1, $2, $3, $4, 1, 1, $5, 1, 1, $6, 1, 0, $7)",
+        &[
+            &provenance_namespace.chain_id_bytes(),
+            &&provenance_namespace.validator_id().as_bytes()[..],
+            &&provenance_namespace.domain().as_bytes()[..],
+            &&mismatched_object_id.as_bytes()[..],
+            &&[0x73_u8; 32][..],
+            &mismatched_chain_bytes,
+            &b"object".as_slice(),
+        ],
+    );
+    assert_eq!(
+        mismatched_insert.unwrap_err().code(),
+        Some(&SqlState::CHECK_VIOLATION)
+    );
+
+    // 2. A non-UTF-8 `created_chain_id_bytes` is only reachable by
+    // temporarily dropping the chain-equality CHECK, since it would otherwise
+    // never equal a real (always-UTF-8) `chain_id_bytes`.
+    client
+        .batch_execute(
+            "ALTER TABLE sunrise_edge.object_versions
+             DROP CONSTRAINT object_versions_created_chain_matches_chain",
+        )
+        .unwrap();
+    let non_utf8_object_id = ObjectId::new([0x74; 32]);
+    let non_utf8_chain_bytes: &[u8] = &[0xFF, 0xFE, 0xFD];
+    client
+        .execute(
+            "INSERT INTO sunrise_edge.object_versions (
+                 chain_id_bytes, validator_id, atomicity_domain_id, object_id,
+                 object_version, digest_algorithm_id, digest_bytes,
+                 schema_version, type_id,
+                 created_chain_id_bytes, created_protocol_version,
+                 created_checkpoint, inline_canonical_bytes
+             ) VALUES ($1, $2, $3, $4, 1, 1, $5, 1, 1, $6, 1, 0, $7)",
+            &[
+                &provenance_namespace.chain_id_bytes(),
+                &&provenance_namespace.validator_id().as_bytes()[..],
+                &&provenance_namespace.domain().as_bytes()[..],
+                &&non_utf8_object_id.as_bytes()[..],
+                &&[0x75_u8; 32][..],
+                &non_utf8_chain_bytes,
+                &b"object".as_slice(),
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        provenance_store.get_object_version(
+            &provenance_context,
+            provenance_namespace.domain(),
+            non_utf8_object_id,
+            DurableObjectVersion::FIRST,
+        ),
+        Err(DurableReadError::InvalidPersistedState)
+    );
+    client
+        .execute(
+            "DELETE FROM sunrise_edge.object_versions
+             WHERE chain_id_bytes = $1 AND validator_id = $2
+               AND atomicity_domain_id = $3 AND object_id = $4",
+            &[
+                &provenance_namespace.chain_id_bytes(),
+                &&provenance_namespace.validator_id().as_bytes()[..],
+                &&provenance_namespace.domain().as_bytes()[..],
+                &&non_utf8_object_id.as_bytes()[..],
+            ],
+        )
+        .unwrap();
+    client
+        .batch_execute(
+            "ALTER TABLE sunrise_edge.object_versions
+             ADD CONSTRAINT object_versions_created_chain_matches_chain
+             CHECK (created_chain_id_bytes = chain_id_bytes)",
+        )
+        .unwrap();
+
+    // 3. An out-of-`u32`-range `created_protocol_version` is only reachable
+    // by temporarily dropping its range CHECK.
+    client
+        .batch_execute(
+            "ALTER TABLE sunrise_edge.object_versions
+             DROP CONSTRAINT object_versions_created_protocol_version_range",
+        )
+        .unwrap();
+    let out_of_range_object_id = ObjectId::new([0x76; 32]);
+    client
+        .execute(
+            "INSERT INTO sunrise_edge.object_versions (
+                 chain_id_bytes, validator_id, atomicity_domain_id, object_id,
+                 object_version, digest_algorithm_id, digest_bytes,
+                 schema_version, type_id,
+                 created_chain_id_bytes, created_protocol_version,
+                 created_checkpoint, inline_canonical_bytes
+             ) VALUES ($1, $2, $3, $4, 1, 1, $5, 1, 1, $1, $6, 0, $7)",
+            &[
+                &provenance_namespace.chain_id_bytes(),
+                &&provenance_namespace.validator_id().as_bytes()[..],
+                &&provenance_namespace.domain().as_bytes()[..],
+                &&out_of_range_object_id.as_bytes()[..],
+                &&[0x77_u8; 32][..],
+                &4_294_967_296_i64,
+                &b"object".as_slice(),
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        provenance_store.get_object_version(
+            &provenance_context,
+            provenance_namespace.domain(),
+            out_of_range_object_id,
+            DurableObjectVersion::FIRST,
+        ),
+        Err(DurableReadError::InvalidPersistedState)
+    );
+    client
+        .execute(
+            "DELETE FROM sunrise_edge.object_versions
+             WHERE chain_id_bytes = $1 AND validator_id = $2
+               AND atomicity_domain_id = $3 AND object_id = $4",
+            &[
+                &provenance_namespace.chain_id_bytes(),
+                &&provenance_namespace.validator_id().as_bytes()[..],
+                &&provenance_namespace.domain().as_bytes()[..],
+                &&out_of_range_object_id.as_bytes()[..],
+            ],
+        )
+        .unwrap();
+    client
+        .batch_execute(
+            "ALTER TABLE sunrise_edge.object_versions
+             ADD CONSTRAINT object_versions_created_protocol_version_range
+             CHECK (created_protocol_version BETWEEN 0 AND 4294967295)",
+        )
+        .unwrap();
 
     let serialization_namespace = PostgresNamespace::new(
         &ChainId::new("postgres-serialization-exhaustion").unwrap(),

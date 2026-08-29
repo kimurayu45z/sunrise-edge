@@ -12,7 +12,9 @@ use postgres::{
     Client, Config, GenericClient, IsolationLevel, Socket,
     tls::{MakeTlsConnect, TlsConnect},
 };
-use protocol_types::{AtomicityDomainId, ChainId, Digest32, HashAlgorithmId, ValidatorId};
+use protocol_types::{
+    AtomicityDomainId, ChainId, Digest32, HashAlgorithmId, ProtocolVersion, ValidatorId,
+};
 use r2d2_postgres::{
     PostgresConnectionManager,
     r2d2::{ManageConnection, Pool},
@@ -22,11 +24,12 @@ use runtime::{
     DurableCommitOutcome, DurableCommitRejection, DurableDomainStateStore,
     DurableInvocationTransaction, DurableObjectChanges, DurableObjectHead, DurableObjectHeadRead,
     DurableObjectHeadSummary, DurableObjectMutation, DurableObjectOwnerProjection,
-    DurableObjectPayload, DurableObjectRoutingProjection, DurableObjectVersion,
-    DurableObjectVersionRecord, DurableOperationContext, DurableOutboxAcknowledgement,
-    DurableOutboxAcknowledgementOutcome, DurableOutboxAcknowledgementRejection, DurableOutboxClaim,
-    DurableOutboxClaimOutcome, DurableOutboxClaimRejection, DurableOutboxLeaseId, DurableReadError,
-    DurableRequestId, DurableRequestReceipt, IndeterminateCommitReason, IndexedOutboxRepository,
+    DurableObjectPayload, DurableObjectProvenance, DurableObjectRoutingProjection,
+    DurableObjectVersion, DurableObjectVersionRecord, DurableOperationContext,
+    DurableOutboxAcknowledgement, DurableOutboxAcknowledgementOutcome,
+    DurableOutboxAcknowledgementRejection, DurableOutboxClaim, DurableOutboxClaimOutcome,
+    DurableOutboxClaimRejection, DurableOutboxLeaseId, DurableReadError, DurableRequestId,
+    DurableRequestReceipt, IndeterminateCommitReason, IndexedOutboxRepository,
     MAX_DURABLE_INLINE_OBJECT_BYTES, ObjectHeadRevision, ObjectId, OutboxRequestId,
     RequestOutboxClaimRequest, StateMutation, StateMutationEntry, StateReadAssertion,
     StateRevision, StructuredDurableDomainStateStore, VersionedStateValue, WriterFenceGeneration,
@@ -42,7 +45,12 @@ use std::{
 pub const INITIAL_MIGRATION_SQL: &str = include_str!("../migrations/0001_initial.sql");
 
 /// Stable identity of the normalized PostgreSQL schema generation one.
-pub const POSTGRES_SCHEMA_IDENTITY: [u8; 32] = *b"sunrise-edge/postgres/schema/v1\0";
+///
+/// This is `v2`: generation one is redefined in place (not advanced) to add
+/// object-version provenance columns, an authorized pre-production bootstrap-
+/// only change (see `ARCHITECTURE.md` DR-0068). An existing `v1` database
+/// fails closed with `SchemaMismatch` rather than being silently accepted.
+pub const POSTGRES_SCHEMA_IDENTITY: [u8; 32] = *b"sunrise-edge/postgres/schema/v2\0";
 
 /// First supported schema generation.
 pub const POSTGRES_SCHEMA_GENERATION: SchemaGeneration = SchemaGeneration(NonZeroU64::MIN);
@@ -958,7 +966,9 @@ fn load_object_version(
     let sql: &str = if lock {
         "SELECT object_version::TEXT,
                 digest_algorithm_id, digest_bytes,
-                schema_version, type_id, created_checkpoint::TEXT,
+                schema_version, type_id,
+                created_chain_id_bytes, created_protocol_version,
+                created_checkpoint::TEXT,
                 inline_canonical_bytes,
                 blob_digest_algorithm_id, blob_digest_bytes
          FROM sunrise_edge.object_versions
@@ -971,7 +981,9 @@ fn load_object_version(
     } else {
         "SELECT object_version::TEXT,
                 digest_algorithm_id, digest_bytes,
-                schema_version, type_id, created_checkpoint::TEXT,
+                schema_version, type_id,
+                created_chain_id_bytes, created_protocol_version,
+                created_checkpoint::TEXT,
                 inline_canonical_bytes,
                 blob_digest_algorithm_id, blob_digest_bytes
          FROM sunrise_edge.object_versions
@@ -1017,15 +1029,32 @@ fn load_object_version(
     if type_id != DURABLE_OBJECT_CANONICAL_RECORD_TYPE_ID {
         return Err(PreCommitFailure::InvalidPersistedState);
     }
-    let created_checkpoint: u64 = parse_database_u64(&row, 5)?;
-    let inline_bytes: Option<Vec<u8>> = row
+    let created_chain_id_bytes: Vec<u8> = row
+        .try_get(5)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let created_chain_id_text: String = String::from_utf8(created_chain_id_bytes)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let created_chain_id: ChainId =
+        ChainId::new(created_chain_id_text).map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let created_protocol_version_value: i64 = row
         .try_get(6)
         .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
-    let blob_digest: Option<Digest32> = parse_optional_digest(&row, 7, 8)?;
+    let created_protocol_version: ProtocolVersion = ProtocolVersion::new(
+        u32::try_from(created_protocol_version_value)
+            .map_err(|_| PreCommitFailure::InvalidPersistedState)?,
+    );
+    let provenance: DurableObjectProvenance =
+        DurableObjectProvenance::new(created_chain_id, created_protocol_version);
+    let created_checkpoint: u64 = parse_database_u64(&row, 7)?;
+    let inline_bytes: Option<Vec<u8>> = row
+        .try_get(8)
+        .map_err(|_| PreCommitFailure::InvalidPersistedState)?;
+    let blob_digest: Option<Digest32> = parse_optional_digest(&row, 9, 10)?;
     let record: DurableObjectVersionRecord = match (inline_bytes, blob_digest) {
         (Some(canonical_bytes), None) => DurableObjectVersionRecord::from_inline_canonical_bytes(
             canonical_bytes,
             digest,
+            provenance.clone(),
             created_checkpoint,
         )
         .map_err(|_| PreCommitFailure::InvalidPersistedState)?,
@@ -1034,6 +1063,7 @@ fn load_object_version(
             object_version,
             digest,
             schema_version,
+            provenance.clone(),
             created_checkpoint,
             blob_digest,
         ),
@@ -1045,6 +1075,7 @@ fn load_object_version(
         || record.object_version() != object_version
         || record.schema_version() != schema_version
         || record.canonical_record_type_id() != type_id
+        || record.provenance() != &provenance
     {
         return Err(PreCommitFailure::InvalidPersistedState);
     }
@@ -1555,19 +1586,25 @@ fn insert_object_version(
         ),
     };
     let digest: Digest32 = version.digest();
+    let created_chain_id_bytes: &[u8] = version.provenance().chain_id().as_str().as_bytes();
+    let created_protocol_version: i64 = i64::from(version.provenance().protocol_version().get());
     let inserted: u64 = transaction
         .execute(
             "INSERT INTO sunrise_edge.object_versions (
                  chain_id_bytes, validator_id, atomicity_domain_id,
                  object_id, object_version,
                  digest_algorithm_id, digest_bytes,
-                 schema_version, type_id, created_checkpoint,
+                 schema_version, type_id,
+                 created_chain_id_bytes, created_protocol_version,
+                 created_checkpoint,
                  inline_canonical_bytes,
                  blob_digest_algorithm_id, blob_digest_bytes
              ) VALUES (
                  $1, $2, $3, $4, CAST(CAST($5 AS TEXT) AS NUMERIC),
-                 $6, $7, $8, $9, CAST(CAST($10 AS TEXT) AS NUMERIC),
-                 $11, $12, $13
+                 $6, $7, $8, $9,
+                 $10, $11,
+                 CAST(CAST($12 AS TEXT) AS NUMERIC),
+                 $13, $14, $15
              )",
             &[
                 &namespace.chain_id_bytes(),
@@ -1579,6 +1616,8 @@ fn insert_object_version(
                 &&digest.bytes()[..],
                 &i64::from(version.schema_version()),
                 &i64::from(version.canonical_record_type_id()),
+                &created_chain_id_bytes,
+                &created_protocol_version,
                 &version.created_checkpoint().to_string(),
                 &inline_bytes,
                 &blob_algorithm_id,
@@ -3394,10 +3433,17 @@ mod tests {
 
     #[test]
     fn schema_identity_is_exact_and_generation_is_non_zero() {
+        assert_eq!(
+            POSTGRES_SCHEMA_IDENTITY,
+            *b"sunrise-edge/postgres/schema/v2\0"
+        );
         assert_eq!(POSTGRES_SCHEMA_IDENTITY.len(), 32);
         assert_eq!(POSTGRES_SCHEMA_GENERATION.get(), 1);
         assert!(INITIAL_MIGRATION_SQL.contains("CREATE TABLE sunrise_edge.state_records"));
         assert!(INITIAL_MIGRATION_SQL.contains("CREATE INDEX outbox_delivery_due"));
+        assert!(INITIAL_MIGRATION_SQL.contains("created_chain_id_bytes BYTEA NOT NULL"));
+        assert!(INITIAL_MIGRATION_SQL.contains("created_protocol_version BIGINT NOT NULL"));
+        assert!(INITIAL_MIGRATION_SQL.contains("CHECK (created_chain_id_bytes = chain_id_bytes)"));
     }
 
     #[test]

@@ -2132,8 +2132,18 @@ fn node_error_response(error: &NodeCoreError) -> Response {
             (StatusCode::BAD_REQUEST, "object-version-invalid")
         }
         NodeCoreError::ObjectConflict { .. } => (StatusCode::CONFLICT, "object-head-conflict"),
-        NodeCoreError::ObjectRecordMissing { .. } | NodeCoreError::ObjectRecordMismatch { .. } => {
+        NodeCoreError::ObjectRecordMissing { .. }
+        | NodeCoreError::ObjectRecordMismatch { .. }
+        | NodeCoreError::ObjectBodyDigestMismatch { .. }
+        | NodeCoreError::ObjectProvenanceMismatch { .. } => {
             (StatusCode::INTERNAL_SERVER_ERROR, "invalid-node-output")
+        }
+        NodeCoreError::ObjectDigestUnverifiable { .. } => (
+            StatusCode::NOT_IMPLEMENTED,
+            "object-digest-algorithm-unsupported",
+        ),
+        NodeCoreError::ObjectBodyTooLarge { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "object-body-too-large")
         }
         NodeCoreError::ResponseRequestMismatch { .. }
         | NodeCoreError::StateTooLarge(_)
@@ -3625,6 +3635,33 @@ mod tests {
                 NodeCoreError::ObjectRecordMismatch { object_id },
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "invalid-node-output",
+            ),
+            (
+                NodeCoreError::ObjectBodyDigestMismatch { object_id },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid-node-output",
+            ),
+            (
+                NodeCoreError::ObjectProvenanceMismatch { object_id },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid-node-output",
+            ),
+            (
+                NodeCoreError::ObjectDigestUnverifiable {
+                    object_id,
+                    algorithm: HashAlgorithmId::Blake3_256,
+                },
+                StatusCode::NOT_IMPLEMENTED,
+                "object-digest-algorithm-unsupported",
+            ),
+            (
+                NodeCoreError::ObjectBodyTooLarge {
+                    object_id,
+                    actual: 2 * 1024 * 1024,
+                    maximum: 1024 * 1024,
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "object-body-too-large",
             ),
         ];
 

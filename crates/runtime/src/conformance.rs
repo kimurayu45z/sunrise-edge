@@ -102,6 +102,19 @@ pub trait DurableStoreFixture {
         expected: WriterFenceGeneration,
         next: WriterFenceGeneration,
     ) -> ConformanceResult<()>;
+
+    /// Returns the exact chain identity every conformance object version
+    /// created against this fixture must carry as its
+    /// [`DurableObjectProvenance`] `chain_id`.
+    ///
+    /// A backend that namespaces storage by chain (PostgreSQL's
+    /// `object_versions.chain_id_bytes`, checked equal to
+    /// `created_chain_id_bytes`) rejects any object created under a
+    /// different chain. Deriving every conformance object and blob record
+    /// from this single authoritative source — rather than a chain literal
+    /// copied into the shared helper — is what keeps memory and PostgreSQL
+    /// conformance from drifting apart on this point.
+    fn object_provenance_chain_id(&self) -> ConformanceResult<ChainId>;
 }
 
 /// Optional persisted-schema skew capability for durable adapter fixtures.
@@ -260,10 +273,32 @@ fn invocation(
 #[cfg(any(test, feature = "durable-conformance"))]
 fn object_version(
     case: &'static str,
+    chain_id: &ChainId,
     object_id: ObjectId,
     version: u64,
     byte: u8,
     checkpoint: u64,
+) -> ConformanceResult<DurableObjectVersionRecord> {
+    object_version_with_protocol_version(
+        case,
+        chain_id,
+        object_id,
+        version,
+        byte,
+        checkpoint,
+        ProtocolVersion::new(1),
+    )
+}
+
+#[cfg(any(test, feature = "durable-conformance"))]
+fn object_version_with_protocol_version(
+    case: &'static str,
+    chain_id: &ChainId,
+    object_id: ObjectId,
+    version: u64,
+    byte: u8,
+    checkpoint: u64,
+    protocol_version: ProtocolVersion,
 ) -> ConformanceResult<DurableObjectVersionRecord> {
     let object: Object = Object {
         id: object_id,
@@ -278,17 +313,17 @@ fn object_version(
     };
     let canonical_bytes: Vec<u8> =
         encode_object(&object).map_err(|error| ConformanceFailure::new(case, error.to_string()))?;
-    let chain_id: ChainId = ChainId::new("sunrise-runtime-conformance")
-        .map_err(|error| ConformanceFailure::new(case, error.to_string()))?;
     let digest: Digest32 = BuiltinHashFunction::new(protocol_types::HashAlgorithmId::Sha2_256)
         .hash(
             protocol_types::HashPurpose::Object,
-            ProtocolVersion::new(1),
-            &chain_id,
+            protocol_version,
+            chain_id,
             &canonical_bytes,
         )
         .map_err(|error| ConformanceFailure::new(case, error.to_string()))?;
-    DurableObjectVersionRecord::from_inline_object(object, digest, checkpoint)
+    let provenance: DurableObjectProvenance =
+        DurableObjectProvenance::new(chain_id.clone(), protocol_version);
+    DurableObjectVersionRecord::from_inline_object(object, digest, provenance, checkpoint)
         .map_err(|error| ConformanceFailure::new(case, error.to_string()))
 }
 
@@ -1186,6 +1221,7 @@ pub fn run_durable_object_conformance<F: DurableStoreFixture>(fixture: &F) -> Co
     let domain: AtomicityDomainId = fixture.domain();
     let fence: WriterFenceGeneration = fixture.initial_writer_fence();
     let context: DurableOperationContext = build_context(fixture, fence, 0x51)?;
+    let chain_id: ChainId = fixture.object_provenance_chain_id()?;
 
     // Count bounds are constructor invariants rather than backend behavior,
     // but keeping this case in the shared suite proves both fixtures consume
@@ -1237,7 +1273,7 @@ pub fn run_durable_object_conformance<F: DurableStoreFixture>(fixture: &F) -> Co
             authority_object_id,
             DurableObjectHead::Absent,
             DurableObjectMutation::Create {
-                version: object_version(CASE, authority_object_id, 1, 0x41, 1)?,
+                version: object_version(CASE, &chain_id, authority_object_id, 1, 0x41, 1)?,
                 owner_projection: authority_owner,
                 routing_projection: authority_routing,
             },
@@ -1290,7 +1326,7 @@ pub fn run_durable_object_conformance<F: DurableStoreFixture>(fixture: &F) -> Co
             stale_object_id,
             DurableObjectHead::Absent,
             DurableObjectMutation::Create {
-                version: object_version(CASE, stale_object_id, 1, 0x42, 2)?,
+                version: object_version(CASE, &chain_id, stale_object_id, 1, 0x42, 2)?,
                 owner_projection: stale_owner,
                 routing_projection: stale_routing,
             },
@@ -1332,7 +1368,7 @@ pub fn run_durable_object_conformance<F: DurableStoreFixture>(fixture: &F) -> Co
             expired_object_id,
             DurableObjectHead::Absent,
             DurableObjectMutation::Create {
-                version: object_version(CASE, expired_object_id, 1, 0x43, 3)?,
+                version: object_version(CASE, &chain_id, expired_object_id, 1, 0x43, 3)?,
                 owner_projection: expired_owner,
                 routing_projection: expired_routing,
             },
@@ -1374,7 +1410,7 @@ pub fn run_durable_object_conformance<F: DurableStoreFixture>(fixture: &F) -> Co
 
     let (owner_one, routing_one) = object_projections(CASE, 0x11)?;
     let create_mutation: DurableObjectMutation = DurableObjectMutation::Create {
-        version: object_version(CASE, object_id, 1, 0x11, 10)?,
+        version: object_version(CASE, &chain_id, object_id, 1, 0x11, 10)?,
         owner_projection: owner_one,
         routing_projection: routing_one,
     };
@@ -1418,9 +1454,29 @@ pub fn run_durable_object_conformance<F: DurableStoreFixture>(fixture: &F) -> Co
             &stored_one,
         ));
     }
+    if stored_one.provenance().chain_id() != &chain_id
+        || stored_one.provenance().protocol_version() != ProtocolVersion::new(1)
+    {
+        return Err(mismatch(
+            CASE,
+            "created version provenance was not preserved",
+            &stored_one,
+        ));
+    }
 
     let (owner_two, routing_two) = object_projections(CASE, 0x22)?;
-    let update_version: DurableObjectVersionRecord = object_version(CASE, object_id, 2, 0x22, 11)?;
+    // Written under a different protocol version than version one, so the
+    // cross-version read-back below proves version one's provenance is not
+    // overwritten or reinterpreted under a later version's context.
+    let update_version: DurableObjectVersionRecord = object_version_with_protocol_version(
+        CASE,
+        &chain_id,
+        object_id,
+        2,
+        0x22,
+        11,
+        ProtocolVersion::new(2),
+    )?;
     let update_digest: Digest32 = update_version.digest();
     let update_mutation: DurableObjectMutation = DurableObjectMutation::Update {
         version: update_version,
@@ -1446,6 +1502,38 @@ pub fn run_durable_object_conformance<F: DurableStoreFixture>(fixture: &F) -> Co
         || current_two.digest() != Some(update_digest)
     {
         return Err(mismatch(CASE, "update installed wrong head", &current_two));
+    }
+    let version_two: DurableObjectVersion = DurableObjectVersion::new(2)
+        .ok_or_else(|| ConformanceFailure::new(CASE, "version two is invalid"))?;
+    let stored_two: DurableObjectVersionRecord = store
+        .get_object_version(&context, domain, object_id, version_two)
+        .map_err(|error| mismatch(CASE, "updated version read must succeed", &error))?
+        .ok_or_else(|| ConformanceFailure::new(CASE, "updated version is missing"))?;
+    if stored_two.provenance().chain_id() != &chain_id
+        || stored_two.provenance().protocol_version() != ProtocolVersion::new(2)
+    {
+        return Err(mismatch(
+            CASE,
+            "updated version provenance was not preserved",
+            &stored_two,
+        ));
+    }
+    // Naive digest recomputation under the reader's current protocol version
+    // would misjudge this untouched historical version, so re-reading it
+    // after a later version was written under a different protocol version
+    // proves its own provenance is unaffected.
+    let restored_one: DurableObjectVersionRecord = store
+        .get_object_version(&context, domain, object_id, DurableObjectVersion::FIRST)
+        .map_err(|error| mismatch(CASE, "re-read of version one must succeed", &error))?
+        .ok_or_else(|| ConformanceFailure::new(CASE, "version one disappeared after update"))?;
+    if restored_one.provenance().chain_id() != &chain_id
+        || restored_one.provenance().protocol_version() != ProtocolVersion::new(1)
+    {
+        return Err(mismatch(
+            CASE,
+            "version one provenance changed after a later version was written",
+            &restored_one,
+        ));
     }
 
     let delete: DurableInvocationTransaction = object_invocation(
@@ -1475,7 +1563,7 @@ pub fn run_durable_object_conformance<F: DurableStoreFixture>(fixture: &F) -> Co
 
     let (owner_three, routing_three) = object_projections(CASE, 0x33)?;
     let recreate_mutation: DurableObjectMutation = DurableObjectMutation::Create {
-        version: object_version(CASE, object_id, 3, 0x33, 12)?,
+        version: object_version(CASE, &chain_id, object_id, 3, 0x33, 12)?,
         owner_projection: owner_three.clone(),
         routing_projection: routing_three.clone(),
     };
@@ -1502,6 +1590,21 @@ pub fn run_durable_object_conformance<F: DurableStoreFixture>(fixture: &F) -> Co
         || current_three.object_version() != DurableObjectVersion::new(3)
     {
         return Err(mismatch(CASE, "recreate permitted ABA", &current_three));
+    }
+    let version_three: DurableObjectVersion = DurableObjectVersion::new(3)
+        .ok_or_else(|| ConformanceFailure::new(CASE, "version three is invalid"))?;
+    let stored_three: DurableObjectVersionRecord = store
+        .get_object_version(&context, domain, object_id, version_three)
+        .map_err(|error| mismatch(CASE, "recreated version read must succeed", &error))?
+        .ok_or_else(|| ConformanceFailure::new(CASE, "recreated version is missing"))?;
+    if stored_three.provenance().chain_id() != &chain_id
+        || stored_three.provenance().protocol_version() != ProtocolVersion::new(1)
+    {
+        return Err(mismatch(
+            CASE,
+            "recreated version provenance was not preserved",
+            &stored_three,
+        ));
     }
 
     let replay: DurableInvocationTransaction = object_invocation(
@@ -1555,7 +1658,7 @@ pub fn run_durable_object_conformance<F: DurableStoreFixture>(fixture: &F) -> Co
 
     let (owner_four, routing_four) = object_projections(CASE, 0x44)?;
     let stale_update: DurableObjectMutation = DurableObjectMutation::Update {
-        version: object_version(CASE, object_id, 4, 0x44, 13)?,
+        version: object_version(CASE, &chain_id, object_id, 4, 0x44, 13)?,
         owner_projection: owner_four,
         routing_projection: routing_four,
     };
@@ -1647,6 +1750,7 @@ pub fn run_durable_object_conformance<F: DurableStoreFixture>(fixture: &F) -> Co
         DurableObjectVersion::FIRST,
         Digest32::new(protocol_types::HashAlgorithmId::Sha2_256, [0x59; 32]),
         9,
+        DurableObjectProvenance::new(chain_id.clone(), ProtocolVersion::new(1)),
         14,
         Digest32::new(protocol_types::HashAlgorithmId::Sha3_256, [0x5A; 32]),
     );
@@ -1722,7 +1826,7 @@ pub fn run_durable_object_conformance<F: DurableStoreFixture>(fixture: &F) -> Co
             read_only_object_id,
             DurableObjectHead::Absent,
             DurableObjectMutation::Create {
-                version: object_version(CASE, read_only_object_id, 1, 0x5B, 15)?,
+                version: object_version(CASE, &chain_id, read_only_object_id, 1, 0x5B, 15)?,
                 owner_projection: read_only_owner_one,
                 routing_projection: read_only_routing_one,
             },
@@ -1759,7 +1863,7 @@ pub fn run_durable_object_conformance<F: DurableStoreFixture>(fixture: &F) -> Co
             read_only_object_id,
             read_only_observed,
             DurableObjectMutation::Update {
-                version: object_version(CASE, read_only_object_id, 2, 0x5D, 16)?,
+                version: object_version(CASE, &chain_id, read_only_object_id, 2, 0x5D, 16)?,
                 owner_projection: read_only_owner_two,
                 routing_projection: read_only_routing_two,
             },
@@ -2478,6 +2582,14 @@ mod tests {
             }
             self.store.set_active_writer_fence(next);
             Ok(())
+        }
+
+        fn object_provenance_chain_id(&self) -> ConformanceResult<ChainId> {
+            // `MemoryDurableStateStore` has no chain namespace to derive
+            // this from (unlike PostgreSQL's `object_versions.chain_id_bytes`),
+            // so this fixture's sole source of truth is this one literal.
+            ChainId::new("sunrise-runtime-conformance")
+                .map_err(|error| ConformanceFailure::new("memory-fixture", error.to_string()))
         }
     }
 
