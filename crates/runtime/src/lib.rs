@@ -4774,6 +4774,22 @@ impl PersistenceLayout {
         ))
     }
 
+    /// Returns the binary prefix shared by every persisted sender-nonce record.
+    #[must_use]
+    pub fn sender_nonce_prefix(&self) -> Vec<u8> {
+        self.prefixed("sender-nonces/")
+    }
+
+    /// Returns the persisted next-nonce record key for one sender in one epoch.
+    #[must_use]
+    pub fn sender_nonce_key(&self, sender: [u8; 32], epoch: Epoch) -> Vec<u8> {
+        self.prefixed(&format!(
+            "sender-nonces/{}/{:020}",
+            hex32(sender),
+            epoch.get()
+        ))
+    }
+
     fn prefixed(&self, suffix: &str) -> Vec<u8> {
         format!(
             "se/{}/v{}/{}",
@@ -6390,6 +6406,51 @@ mod tests {
                 .unwrap()
                 .contains("protocol/migrations/sha2-256-")
         );
+    }
+
+    #[test]
+    fn sender_nonce_key_matches_exact_stable_vector() {
+        let chain_id = ChainId::new("sunrise-devnet").unwrap();
+        let layout = PersistenceLayout::new(chain_id, ProtocolVersion::new(3));
+
+        let key = layout.sender_nonce_key([0x11; 32], Epoch::new(7));
+        let expected = b"se/sunrise-devnet/v3/sender-nonces/\
+1111111111111111111111111111111111111111111111111111111111111111\
+/00000000000000000007"
+            .to_vec();
+        assert_eq!(key, expected);
+
+        let prefix = layout.sender_nonce_prefix();
+        assert_eq!(prefix, b"se/sunrise-devnet/v3/sender-nonces/".to_vec());
+        assert!(key.starts_with(&prefix));
+    }
+
+    #[test]
+    fn sender_nonce_key_is_deterministic_and_namespaced_per_sender_epoch_chain() {
+        let chain_id = ChainId::new("sunrise-devnet").unwrap();
+        let layout = PersistenceLayout::new(chain_id, ProtocolVersion::new(3));
+
+        let key1 = layout.sender_nonce_key([0x11; 32], Epoch::new(7));
+        let key2 = layout.sender_nonce_key([0x11; 32], Epoch::new(7));
+        assert_eq!(key1, key2);
+
+        let different_sender = layout.sender_nonce_key([0x22; 32], Epoch::new(7));
+        assert_ne!(key1, different_sender);
+
+        let different_epoch = layout.sender_nonce_key([0x11; 32], Epoch::new(8));
+        assert_ne!(key1, different_epoch);
+
+        let other_layout = PersistenceLayout::new(
+            ChainId::new("other-chain").unwrap(),
+            ProtocolVersion::new(3),
+        );
+        assert_ne!(
+            key1,
+            other_layout.sender_nonce_key([0x11; 32], Epoch::new(7))
+        );
+
+        assert!(key1.starts_with(&layout.sender_nonce_prefix()));
+        assert!(!different_sender.starts_with(&other_layout.sender_nonce_prefix()));
     }
 
     #[test]

@@ -2002,8 +2002,9 @@ Phase 15 As-Is scope:
   不正configのadversarial testを含み、`ed25519-zebra` 4.2.0 /
   `curve25519-dalek` 4.1.3で再確認済み）。strict transaction authentication
   とproduction-oriented structured durable native routeの接続もimplemented
-  As-Is（下記bullet）。ただしnonce/fee/object dispatch/FastCertificateは
-  引き続き未実装であり、protocol version 3のlive activationは禁止する。
+  As-Is（下記bullet）。persistent sender nonceもimplemented As-Is（下記bullet）。
+  ただしfee/object dispatch/FastCertificateは引き続き未実装であり、protocol
+  version 3のlive activationは禁止する。
 - `execution::decode_transaction`はexecution::Transaction v1の厳密な
   standalone canonical decoderを追加した：type id/encoding version 1を要求し、
   field 1-10と12を必須、field 11（`fee_payment`）のみoptionalとして
@@ -2075,18 +2076,43 @@ Phase 15 As-Is scope:
   `SubmitTransaction`を型付きでrejectし、unauthenticated bypassを残さない。
   invalid signature、inner/outer chain/version/epoch mismatch、missing profile、
   trailing/non-canonical bytesはmachine/identity/clock/storage/sendのcall count
-  zeroで失敗するtestを持つ。nonce、fee debit、certificate、object dispatch、
-  新しいwire field/type ID/encoding versionは追加していない。protocol version
-  3のlive activationはnonce/fee/object/effect/FastCertificateのatomic composition
-  が完成するまで禁止する。**Hard activation constraint:** `SubmitTransaction`以外の
+  zeroで失敗するtestを持つ。transaction wire field/encoding versionは追加して
+  いない。protocol version 3のlive activationはfee/object/effect/
+  FastCertificateのatomic compositionが完成するまで禁止する。
+  **Hard activation constraint:** `SubmitTransaction`以外の
   externally acceptedなnode-event family(特にcertificate、protocol upgrade、
   validator-set change)も、live activationの前に同等のauthenticated/authorized
   ingressを持たなければならない。generic node-core handlerが`SubmitTransaction`を
   rejectすることは、それらの他のfamilyをunauthenticatedで受理してよいことを意味
-  しない。加えて、outer `NodeEvent`の`request_id`はunsignedであり、node-coreの
-  idempotency/dedup layerはpersisted receiptに対してのみreplayを検出する。
-  persistent nonce equalityがtransactionレベルで実装されるまで、fresh
-  (未使用)な`request_id`によるreplay/resubmissionはunsafeなままである。
+  しない。outer `NodeEvent`の`request_id`はunsignedのidempotency identityの
+  ままであり、fresh request IDのreplay protectionは下記のsigned persistent
+  nonceが担う。
+- authenticated structured durable `SubmitTransaction` pathは、verified inner
+  transactionからのみprivateな`(sender, epoch, nonce)` reservationを導出し、
+  `PersistenceLayout`のchain/protocol-version/sender/epoch namespaceにcanonical
+  next-nonce record type `0xE006`を保存する。record自身もsender/epochをbindし、
+  key/value mismatchやcorrupt bytesはfail closedする。missingはexpected zero、
+  exact equalityのみを受理し、checked incrementをapplication state/receipt/
+  outboxと同じnormalized durable invocationに含める。exact receipt replayは
+  nonce readより先にreconcileして二重消費しない。fresh requestはnonceを
+  application stateより先に読み、stale/skipped nonceをtransition/commit前に
+  型付き`SenderNonceMismatch`でrejectする。`u64::MAX`はwrapせず
+  `SenderNonceOverflow`でrejectする。native HTTPはそれぞれ409
+  `sender-nonce-mismatch`、422 `sender-nonce-overflow`へ分離してmappingする。
+  absent/existing nonce raceはread revision assertionにより片方のみatomic commit
+  できる。committed Accepted/Rejectedはnonceを消費し、authentication/
+  transition/pre-commit failureは消費しない。application planは全event familyで
+  nonce prefixをclaimできず、authenticated pathはatomic state write slotを1つ
+  reserveする。domain placement countにnonceは含めない。client-side future nonce
+  queue/pipeliningは実装せず、exact next nonceを直列送信する。epoch/protocol-
+  version rolloverでnamespaceを分離し、古いepochを受理しないtrusted
+  `NodeConfig.epoch`とsigned epochをreplay boundaryとする。`u64::MAX`到達senderは
+  epoch rolloverまで送信不能。indeterminate commitはfresh request IDに変えず
+  original request IDでreconcileする。generic normalized state tableを再利用し、
+  DB schema generationとTransaction wire/schema versionは不変。epoch pruningの
+  production policyはdeferred。fee/object/effect/FastCertificateおよび他event
+  familyのauthenticated/authorized ingressが残るためlive activationは引き続き
+  禁止する（runtime/node-core/native implemented As-Is）。
 - request pathのcommit直後deliveryはdomain-wide `claim_due_outbox`を流用しない。同じdomainのolder due workを
   今回requestと誤認しないよう、trusted `(domain, request_id, now, lease, expiry)`を持つexact-request claimを使う。
   memory conformanceはolder due rowが存在しても指定requestだけをclaimし、cross-request/domain lease reuseを拒否する

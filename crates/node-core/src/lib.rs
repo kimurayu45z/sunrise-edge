@@ -23,8 +23,9 @@ use runtime::{
     DurableObjectChanges, DurableOperationContext, DurableOutboxBatch, DurableOutboxMessage,
     DurableReadError, DurableRequestId, DurableRequestReceipt, DurableStateTransaction,
     IndeterminateCommitReason, MAX_ATOMIC_STATE_WRITES, MAX_STATE_KEY_BYTES, PersistenceLayout,
-    Runtime, RuntimeError, StateMutation, StateMutationEntry, StateReadAssertion, StateStore,
-    StateWrite, StructuredDurableDomainStateStore, TransactionalStateStore, VersionedStateValue,
+    Runtime, RuntimeError, StateMutation, StateMutationEntry, StateReadAssertion, StateRevision,
+    StateStore, StateWrite, StructuredDurableDomainStateStore, TransactionalStateStore,
+    VersionedStateValue,
 };
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -208,6 +209,21 @@ pub enum NodeCoreError {
     },
     /// The application-specific state machine rejected the event.
     TransitionRejected(&'static str),
+    /// A submitted transaction's declared nonce did not match the persisted
+    /// next expected nonce for its sender and epoch.
+    SenderNonceMismatch {
+        /// Sender address bytes.
+        sender: [u8; 32],
+        /// Persisted next expected nonce.
+        expected: u64,
+        /// Nonce declared by the submitted transaction.
+        actual: u64,
+    },
+    /// Incrementing a sender's persisted next nonce would overflow.
+    SenderNonceOverflow {
+        /// Sender address bytes.
+        sender: [u8; 32],
+    },
 }
 
 impl fmt::Display for NodeCoreError {
@@ -373,6 +389,18 @@ impl fmt::Display for NodeCoreError {
                 protocol_config.get()
             ),
             Self::TransitionRejected(reason) => write!(f, "node transition rejected: {reason}"),
+            Self::SenderNonceMismatch {
+                sender,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "sender {} nonce mismatch: expected {expected}, got {actual}",
+                hex32(*sender)
+            ),
+            Self::SenderNonceOverflow { sender } => {
+                write!(f, "sender {} next nonce overflowed", hex32(*sender))
+            }
         }
     }
 }
@@ -785,6 +813,89 @@ pub fn authenticate_submit_transaction_event(
         transaction,
         placement,
     })
+}
+
+/// Sender-nonce enforcement input for one durable submit-transaction
+/// invocation.
+///
+/// The fields are private and there is no public constructor. The only way to
+/// obtain a value is [`Self::from_authenticated_transaction`], so a caller can
+/// never assert a nonce reservation for a sender or nonce it did not
+/// cryptographically authenticate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SenderNonceReservation {
+    sender: [u8; 32],
+    epoch: Epoch,
+    nonce: u64,
+}
+
+impl SenderNonceReservation {
+    /// Derives the reservation directly from the authenticated inner
+    /// transaction's sender, epoch, and declared nonce.
+    fn from_authenticated_transaction(transaction: &AuthenticatedTransaction) -> Self {
+        let inner = transaction.transaction();
+        Self {
+            sender: *inner.sender.as_bytes(),
+            epoch: inner.epoch,
+            nonce: inner.nonce,
+        }
+    }
+}
+
+const SENDER_NONCE_RECORD_TYPE_ID: u16 = 0xE006;
+
+/// Canonical persisted next-nonce record bound to one exact sender and epoch.
+///
+/// Binding `sender` and `epoch` inside the record, not only in the derived
+/// storage key, lets a reader cross-check the persisted bytes against the
+/// key that addressed them and fail closed on a corrupt or misbound record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SenderNonceRecord {
+    sender: [u8; 32],
+    epoch: Epoch,
+    next_nonce: u64,
+}
+
+impl SenderNonceRecord {
+    fn new(sender: [u8; 32], epoch: Epoch, next_nonce: u64) -> Self {
+        Self {
+            sender,
+            epoch,
+            next_nonce,
+        }
+    }
+
+    /// Encodes the record canonically.
+    fn encode(&self) -> Result<Vec<u8>, NodeCoreError> {
+        let mut frame = CanonicalStruct::new(SENDER_NONCE_RECORD_TYPE_ID, ENCODING_VERSION);
+        frame.field_bytes(1, self.sender.to_vec())?;
+        frame.field_u64(2, self.epoch.get())?;
+        frame.field_u64(3, self.next_nonce)?;
+        Ok(frame.finish()?)
+    }
+
+    /// Decodes and strictly validates one persisted next-nonce record.
+    fn decode(bytes: &[u8]) -> Result<Self, NodeCoreError> {
+        let frame = decode_canonical_frame(bytes)?;
+        frame.require_type(SENDER_NONCE_RECORD_TYPE_ID)?;
+        frame.require_version(ENCODING_VERSION)?;
+        frame.require_only_fields(&[1, 2, 3])?;
+
+        let sender_bytes = frame.required_field(1)?;
+        let sender: [u8; 32] =
+            sender_bytes
+                .try_into()
+                .map_err(|_| CanonicalDecodingError::InvalidFieldLength {
+                    field_id: 1,
+                    expected: 32,
+                    actual: sender_bytes.len(),
+                })?;
+        Ok(Self::new(
+            sender,
+            Epoch::new(frame.required_u64(2)?),
+            frame.required_u64(3)?,
+        ))
+    }
 }
 
 /// Stable status returned to the request adapter.
@@ -1986,7 +2097,7 @@ where
     let plan = machine.access_plan(&event)?;
     let domain = placement.resolve_domain(event.epoch(), plan.accesses().len())?;
     let output = handle_durable_idempotent_event_with_plan(
-        store, context, domain, resolver, event, machine, plan,
+        store, context, domain, resolver, event, machine, plan, None,
     )?;
     Ok(ResolvedNodeOutput::new(domain, output))
 }
@@ -1998,7 +2109,10 @@ where
 /// only the unforgeable [`AuthenticatedSubmitTransaction`] wrapper. The access
 /// plan is derived only after authentication, and its logical domain comes from
 /// the same committed placement captured when the wrapper was constructed.
-/// Exact duplicates are still authenticated before receipt reconciliation.
+/// Exact duplicates are still authenticated before receipt reconciliation. A
+/// fresh request must match the persisted per-sender, per-epoch next nonce; its
+/// checked increment commits atomically with the application state, receipt,
+/// and outbox.
 pub fn handle_authenticated_resolved_durable_submit_transaction<S, M>(
     store: &S,
     context: &DurableOperationContext,
@@ -2014,17 +2128,35 @@ where
     let domain = submission
         .placement
         .resolve_domain(submission.event().epoch(), plan.accesses().len())?;
+    let reservation =
+        SenderNonceReservation::from_authenticated_transaction(&submission.transaction);
     let AuthenticatedSubmitTransaction {
         event,
         transaction: _authenticated_transaction,
         placement: _,
     } = submission;
     let output = handle_durable_idempotent_event_with_plan(
-        store, context, domain, resolver, event, machine, plan,
+        store,
+        context,
+        domain,
+        resolver,
+        event,
+        machine,
+        plan,
+        Some(reservation),
     )?;
     Ok(ResolvedNodeOutput::new(domain, output))
 }
 
+/// One pending sender-nonce read assertion and canonical next-nonce write,
+/// merged into the same [`DurableStateTransaction`] as the application state.
+struct PendingSenderNonceWrite {
+    key: Vec<u8>,
+    read_revision: StateRevision,
+    record: SenderNonceRecord,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_durable_idempotent_event_with_plan<S, M>(
     store: &S,
     context: &DurableOperationContext,
@@ -2033,11 +2165,34 @@ fn handle_durable_idempotent_event_with_plan<S, M>(
     event: NodeEvent,
     machine: &M,
     plan: NodeStateAccessPlan,
+    reservation: Option<SenderNonceReservation>,
 ) -> Result<NodeOutput, NodeCoreError>
 where
     S: StructuredDurableDomainStateStore,
     M: TransactionalNodeStateMachine,
 {
+    // Constructed from the validated event's own chain/version. Every
+    // application plan key is rejected under this prefix for every event
+    // family, including exact receipt replays: application state machines
+    // must never claim the sender-nonce namespace.
+    let layout = PersistenceLayout::new(event.chain_id().clone(), event.protocol_version());
+    let nonce_prefix = layout.sender_nonce_prefix();
+    for access in plan.accesses() {
+        if access.key().starts_with(nonce_prefix.as_slice()) {
+            return Err(NodeCoreError::ReservedStateAccess(access.key().to_vec()));
+        }
+    }
+
+    if reservation.is_some() {
+        let maximum_application_accesses = MAX_ATOMIC_STATE_WRITES - 1;
+        if plan.accesses().len() > maximum_application_accesses {
+            return Err(NodeCoreError::TooManyStateAccesses {
+                count: plan.accesses().len(),
+                maximum: maximum_application_accesses,
+            });
+        }
+    }
+
     let event_digest = event.digest(resolver)?;
     let request_id = DurableRequestId::new(*event.request_id().as_bytes()).map_err(|_| {
         NodeCoreError::PersistenceInvariant("validated request id failed durable projection")
@@ -2061,6 +2216,48 @@ where
         }
         return NodeOutput::new(record.responses().to_vec(), Vec::new());
     }
+
+    // A new request reads only the sender-nonce record, before any
+    // application state, so a stale or replayed nonce fails before any app
+    // state read, transition, or commit attempt.
+    let pending_nonce = match reservation {
+        Some(reservation) => {
+            let nonce_key = layout.sender_nonce_key(reservation.sender, reservation.epoch);
+            let observed = store.get_versioned_durable(context, domain, &nonce_key)?;
+            let expected_next_nonce = match observed.value() {
+                Some(bytes) => {
+                    let record = SenderNonceRecord::decode(bytes)?;
+                    if record.sender != reservation.sender || record.epoch != reservation.epoch {
+                        return Err(NodeCoreError::PersistenceInvariant(
+                            "persisted sender nonce record does not match its key's sender/epoch",
+                        ));
+                    }
+                    record.next_nonce
+                }
+                None => 0,
+            };
+            if reservation.nonce != expected_next_nonce {
+                return Err(NodeCoreError::SenderNonceMismatch {
+                    sender: reservation.sender,
+                    expected: expected_next_nonce,
+                    actual: reservation.nonce,
+                });
+            }
+            let next_nonce =
+                reservation
+                    .nonce
+                    .checked_add(1)
+                    .ok_or(NodeCoreError::SenderNonceOverflow {
+                        sender: reservation.sender,
+                    })?;
+            Some(PendingSenderNonceWrite {
+                key: nonce_key,
+                read_revision: observed.revision(),
+                record: SenderNonceRecord::new(reservation.sender, reservation.epoch, next_nonce),
+            })
+        }
+        None => None,
+    };
 
     let mut values = BTreeMap::new();
     for access in plan.accesses() {
@@ -2097,7 +2294,23 @@ where
             .collect::<Result<Vec<_>, NodeCoreError>>()?;
         Some(DurableOutboxBatch::new(request_id, event_digest, messages)?)
     };
-    let (reads, mutations) = domain_transition_parts(&plan, &snapshot, transition.updates)?;
+    let (mut reads, mut mutations) = domain_transition_parts(&plan, &snapshot, transition.updates)?;
+    if let Some(mutation) = mutations
+        .iter()
+        .find(|mutation| mutation.key().starts_with(nonce_prefix.as_slice()))
+    {
+        return Err(NodeCoreError::ReservedStateAccess(mutation.key().to_vec()));
+    }
+    if let Some(pending) = pending_nonce {
+        reads.push(StateReadAssertion::new(
+            pending.key.clone(),
+            pending.read_revision,
+        )?);
+        mutations.push(StateMutationEntry::new(
+            pending.key,
+            StateMutation::Put(pending.record.encode()?),
+        )?);
+    }
     let state = DurableStateTransaction::new(domain, AtomicStateReadSet::new(reads)?, mutations)?;
     let invocation = DurableInvocationTransaction::new(
         domain,
@@ -2664,6 +2877,14 @@ fn validate_transactional_state_key(key: &[u8]) -> Result<(), NodeCoreError> {
     Ok(())
 }
 
+fn hex32(bytes: [u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 fn decode_request_id(bytes: &[u8]) -> Result<RequestId, NodeCoreError> {
     let array: [u8; 32] = bytes
         .try_into()
@@ -2770,7 +2991,7 @@ mod tests {
         StorageCorrelationId, StorageDeadline, TransactionalStateStore, WriterFenceGeneration,
     };
     use std::sync::{
-        Mutex,
+        Arc, Barrier, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
@@ -2893,7 +3114,12 @@ mod tests {
         }
     }
 
-    fn unsigned_transaction(sender: Address, chain: ChainId, epoch: Epoch) -> Transaction {
+    fn unsigned_transaction(
+        sender: Address,
+        chain: ChainId,
+        epoch: Epoch,
+        nonce: u64,
+    ) -> Transaction {
         let mut manifest = AccessManifest::new();
         manifest.push(AccessEntry {
             object_ref: sample_object_ref(0x11),
@@ -2905,7 +3131,7 @@ mod tests {
             protocol_version: ProtocolVersion::new(3),
             epoch,
             sender,
-            nonce: 7,
+            nonce,
             access_manifest: manifest,
             module_ref: sample_object_ref(0xDD),
             entrypoint: "transfer".to_string(),
@@ -2914,6 +3140,32 @@ mod tests {
             fee_payment: None,
             signature: Vec::new(),
         }
+    }
+
+    /// Builds and authenticates one `SubmitTransaction` event for `sender` at
+    /// `nonce` under the shared test chain/epoch/protocol-config fixtures.
+    fn authenticated_submission(
+        chain: &str,
+        request_id: RequestId,
+        signing_key: &SigningKey,
+        epoch: Epoch,
+        nonce: u64,
+        config: &NodeConfig,
+        protocol_config: &ProtocolConfig,
+    ) -> AuthenticatedSubmitTransaction {
+        let sender = dev_sender_address(signing_key);
+        let tx = unsigned_transaction(sender, ChainId::new(chain).unwrap(), epoch, nonce);
+        let payload = signed_transaction_bytes(signing_key, &tx);
+        let event = NodeEvent::new(
+            ChainId::new(chain).unwrap(),
+            ProtocolVersion::new(3),
+            epoch,
+            request_id,
+            NodeEventKind::SubmitTransaction,
+            payload,
+        )
+        .unwrap();
+        authenticate_submit_transaction_event(event, config, protocol_config).unwrap()
     }
 
     /// Signs `tx` under the exact production `SignatureDomain` that
@@ -3051,6 +3303,55 @@ mod tests {
                 "05000400000000000000"
             )
         );
+    }
+
+    #[test]
+    fn sender_nonce_record_has_stable_canonical_vector_and_key_cross_check() {
+        let sender = [0x33; 32];
+        let record = SenderNonceRecord::new(sender, Epoch::new(7), 9);
+        let bytes = record.encode().unwrap();
+        assert_eq!(SenderNonceRecord::decode(&bytes).unwrap(), record);
+        assert_eq!(
+            hex(&bytes),
+            concat!(
+                "534e524506e001000300010020000000",
+                "3333333333333333333333333333333333333333333333333333333333333333",
+                "0200080000000700000000000000",
+                "0300080000000900000000000000"
+            )
+        );
+
+        // The persisted key derived for this exact sender/epoch is the one a
+        // reader must use to address this record.
+        let key = sender_nonce_key_for("sunrise-test", sender, Epoch::new(7));
+        assert!(
+            key.starts_with(
+                PersistenceLayout::new(
+                    ChainId::new("sunrise-test").unwrap(),
+                    ProtocolVersion::new(3)
+                )
+                .sender_nonce_prefix()
+                .as_slice()
+            )
+        );
+
+        let mut wrong_type = CanonicalStruct::new(0xDEAD, ENCODING_VERSION);
+        wrong_type.field_bytes(1, sender.to_vec()).unwrap();
+        wrong_type.field_u64(2, 7).unwrap();
+        wrong_type.field_u64(3, 9).unwrap();
+        assert!(matches!(
+            SenderNonceRecord::decode(&wrong_type.finish().unwrap()).unwrap_err(),
+            NodeCoreError::CanonicalDecoding(_)
+        ));
+
+        let mut short_sender = CanonicalStruct::new(SENDER_NONCE_RECORD_TYPE_ID, ENCODING_VERSION);
+        short_sender.field_bytes(1, vec![0x01; 31]).unwrap();
+        short_sender.field_u64(2, 7).unwrap();
+        short_sender.field_u64(3, 9).unwrap();
+        assert!(matches!(
+            SenderNonceRecord::decode(&short_sender.finish().unwrap()).unwrap_err(),
+            NodeCoreError::CanonicalDecoding(_)
+        ));
     }
 
     #[test]
@@ -3343,7 +3644,12 @@ mod tests {
         let protocol_config = active_protocol_config(0xD7);
         let signing_key = dev_signing_key(0x71);
         let sender = dev_sender_address(&signing_key);
-        let tx = unsigned_transaction(sender, ChainId::new("sunrise-test").unwrap(), Epoch::new(7));
+        let tx = unsigned_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+        );
         let payload = signed_transaction_bytes(&signing_key, &tx);
         let event = NodeEvent::new(
             ChainId::new("sunrise-test").unwrap(),
@@ -3360,7 +3666,7 @@ mod tests {
                 .unwrap();
 
         assert_eq!(authenticated.event(), &event);
-        assert_eq!(authenticated.transaction().transaction().nonce, 7);
+        assert_eq!(authenticated.transaction().transaction().nonce, 0);
 
         let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
         let machine = IdempotentMachine {
@@ -3377,8 +3683,909 @@ mod tests {
 
         assert_eq!(resolved.domain(), domain(0xD7));
         assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        // One read for the sender-nonce record and one for the machine's
+        // single declared application state key.
+        assert_eq!(store.state_reads.load(Ordering::SeqCst), 2);
+        let commits = store.commits.lock().unwrap();
+        assert_eq!(commits.len(), 1);
+        let state = commits[0].state().unwrap();
+        let sender_bytes = *dev_sender_address(&signing_key).as_bytes();
+        let nonce_key = PersistenceLayout::new(
+            ChainId::new("sunrise-test").unwrap(),
+            ProtocolVersion::new(3),
+        )
+        .sender_nonce_key(sender_bytes, Epoch::new(7));
+        let nonce_mutation = state
+            .mutations()
+            .iter()
+            .find(|mutation| mutation.key() == nonce_key.as_slice())
+            .expect("sender nonce mutation is committed alongside app state");
+        match nonce_mutation.mutation() {
+            StateMutation::Put(bytes) => {
+                let record = SenderNonceRecord::decode(bytes).unwrap();
+                assert_eq!(record.sender, sender_bytes);
+                assert_eq!(record.epoch, Epoch::new(7));
+                assert_eq!(record.next_nonce, 1);
+            }
+            other => panic!("expected a nonce put mutation, got {other:?}"),
+        }
+    }
+
+    fn sender_nonce_key_for(chain: &str, sender: [u8; 32], epoch: Epoch) -> Vec<u8> {
+        PersistenceLayout::new(ChainId::new(chain).unwrap(), ProtocolVersion::new(3))
+            .sender_nonce_key(sender, epoch)
+    }
+
+    #[test]
+    fn sender_nonce_sequential_submissions_advance_persisted_next_nonce() {
+        let store = MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xE1);
+        let signing_key = dev_signing_key(0x91);
+        let sender_bytes = *dev_sender_address(&signing_key).as_bytes();
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        let context = durable_context();
+        let resolver = resolver("sunrise-test");
+
+        let first = authenticated_submission(
+            "sunrise-test",
+            request(0xC0),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            &config,
+            &protocol_config,
+        );
+        handle_authenticated_resolved_durable_submit_transaction(
+            &store, &context, &resolver, first, &machine,
+        )
+        .unwrap();
+
+        let second = authenticated_submission(
+            "sunrise-test",
+            request(0xC1),
+            &signing_key,
+            Epoch::new(7),
+            1,
+            &config,
+            &protocol_config,
+        );
+        handle_authenticated_resolved_durable_submit_transaction(
+            &store, &context, &resolver, second, &machine,
+        )
+        .unwrap();
+
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 2);
+        let nonce_key = sender_nonce_key_for("sunrise-test", sender_bytes, Epoch::new(7));
+        let persisted = store
+            .get_versioned_durable(&context, domain(0xE1), &nonce_key)
+            .unwrap();
+        let record = SenderNonceRecord::decode(persisted.value().unwrap()).unwrap();
+        assert_eq!(record.next_nonce, 2);
+    }
+
+    #[test]
+    fn sender_nonce_sequence_isolated_by_epoch() {
+        let store = MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let protocol_config = active_protocol_config(0xEE);
+        let signing_key = dev_signing_key(0x9E);
+        let sender_bytes = *dev_sender_address(&signing_key).as_bytes();
+        let epoch_seven_config = config("sunrise-test");
+        let epoch_eight_config = NodeConfig::new(
+            ChainId::new("sunrise-test").unwrap(),
+            ProtocolVersion::new(3),
+            Epoch::new(8),
+            b"node/state".to_vec(),
+        )
+        .unwrap();
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        let context = durable_context();
+        let resolver = resolver("sunrise-test");
+
+        for (request_id, epoch, config) in [
+            (request(0xCE), Epoch::new(7), &epoch_seven_config),
+            (request(0xCF), Epoch::new(8), &epoch_eight_config),
+        ] {
+            let submission = authenticated_submission(
+                "sunrise-test",
+                request_id,
+                &signing_key,
+                epoch,
+                0,
+                config,
+                &protocol_config,
+            );
+            handle_authenticated_resolved_durable_submit_transaction(
+                &store, &context, &resolver, submission, &machine,
+            )
+            .unwrap();
+        }
+
+        for epoch in [Epoch::new(7), Epoch::new(8)] {
+            let nonce_key = sender_nonce_key_for("sunrise-test", sender_bytes, epoch);
+            let persisted = store
+                .get_versioned_durable(&context, domain(0xEE), &nonce_key)
+                .unwrap();
+            let record = SenderNonceRecord::decode(persisted.value().unwrap()).unwrap();
+            assert_eq!(record.epoch, epoch);
+            assert_eq!(record.next_nonce, 1);
+        }
+    }
+
+    struct ConcurrentNonceMachine {
+        barrier: Arc<Barrier>,
+    }
+
+    impl TransactionalNodeStateMachine for ConcurrentNonceMachine {
+        fn access_plan(&self, _event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            NodeStateAccessPlan::new(vec![NodeStateAccess::new(
+                b"state/concurrent-nonce".to_vec(),
+                NodeStateAccessMode::ReadOnly,
+            )?])
+        }
+
+        fn transition(
+            &self,
+            _state: &NodeStateSnapshot,
+            event: &NodeEvent,
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            self.barrier.wait();
+            Ok(TransactionalNodeTransition::read_only(NodeOutput::new(
+                vec![NodeResponse::new(
+                    event.request_id(),
+                    NodeResponseStatus::Accepted,
+                    None,
+                )?],
+                Vec::new(),
+            )?))
+        }
+    }
+
+    fn run_concurrent_nonce_submissions(
+        store: Arc<MemoryDurableStateStore>,
+        resolver: HashSuiteResolver,
+        context: DurableOperationContext,
+        first: AuthenticatedSubmitTransaction,
+        second: AuthenticatedSubmitTransaction,
+        machine: Arc<ConcurrentNonceMachine>,
+    ) -> [Result<ResolvedNodeOutput, NodeCoreError>; 2] {
+        let first_handle = {
+            let store = Arc::clone(&store);
+            let machine = Arc::clone(&machine);
+            let resolver = resolver.clone();
+            std::thread::spawn(move || {
+                handle_authenticated_resolved_durable_submit_transaction(
+                    store.as_ref(),
+                    &context,
+                    &resolver,
+                    first,
+                    machine.as_ref(),
+                )
+            })
+        };
+        let second_handle = {
+            let store = Arc::clone(&store);
+            let machine = Arc::clone(&machine);
+            std::thread::spawn(move || {
+                handle_authenticated_resolved_durable_submit_transaction(
+                    store.as_ref(),
+                    &context,
+                    &resolver,
+                    second,
+                    machine.as_ref(),
+                )
+            })
+        };
+
+        [first_handle.join().unwrap(), second_handle.join().unwrap()]
+    }
+
+    fn assert_one_nonce_commit_and_one_conflict(
+        results: &[Result<ResolvedNodeOutput, NodeCoreError>; 2],
+    ) {
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(NodeCoreError::StateConflict)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_first_nonce_submissions_commit_at_most_once() {
+        let store = Arc::new(MemoryDurableStateStore::new(
+            WriterFenceGeneration::new(1).unwrap(),
+        ));
+        store.set_time(100);
+        let config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xEF);
+        let signing_key = dev_signing_key(0x9F);
+        let sender_bytes = *dev_sender_address(&signing_key).as_bytes();
+        let first = authenticated_submission(
+            "sunrise-test",
+            request(0xD0),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            &config,
+            &protocol_config,
+        );
+        let second = authenticated_submission(
+            "sunrise-test",
+            request(0xD1),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            &config,
+            &protocol_config,
+        );
+        let machine = Arc::new(ConcurrentNonceMachine {
+            barrier: Arc::new(Barrier::new(2)),
+        });
+        let resolver = resolver("sunrise-test");
+        let context = durable_context();
+
+        let results = run_concurrent_nonce_submissions(
+            Arc::clone(&store),
+            resolver,
+            context,
+            first,
+            second,
+            machine,
+        );
+        assert_one_nonce_commit_and_one_conflict(&results);
+
+        let nonce_key = sender_nonce_key_for("sunrise-test", sender_bytes, Epoch::new(7));
+        let persisted = store
+            .get_versioned_durable(&durable_context(), domain(0xEF), &nonce_key)
+            .unwrap();
+        let record = SenderNonceRecord::decode(persisted.value().unwrap()).unwrap();
+        assert_eq!(record.next_nonce, 1);
+    }
+
+    #[test]
+    fn concurrent_existing_nonce_submissions_commit_at_most_once() {
+        let store = Arc::new(MemoryDurableStateStore::new(
+            WriterFenceGeneration::new(1).unwrap(),
+        ));
+        store.set_time(100);
+        let config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xF0);
+        let signing_key = dev_signing_key(0xA0);
+        let sender_bytes = *dev_sender_address(&signing_key).as_bytes();
+        let resolver = resolver("sunrise-test");
+        let context = durable_context();
+
+        let initial = authenticated_submission(
+            "sunrise-test",
+            request(0xD2),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            &config,
+            &protocol_config,
+        );
+        handle_authenticated_resolved_durable_submit_transaction(
+            store.as_ref(),
+            &context,
+            &resolver,
+            initial,
+            &IdempotentMachine {
+                calls: AtomicUsize::new(0),
+            },
+        )
+        .unwrap();
+
+        let first = authenticated_submission(
+            "sunrise-test",
+            request(0xD3),
+            &signing_key,
+            Epoch::new(7),
+            1,
+            &config,
+            &protocol_config,
+        );
+        let second = authenticated_submission(
+            "sunrise-test",
+            request(0xD4),
+            &signing_key,
+            Epoch::new(7),
+            1,
+            &config,
+            &protocol_config,
+        );
+        let machine = Arc::new(ConcurrentNonceMachine {
+            barrier: Arc::new(Barrier::new(2)),
+        });
+        let results = run_concurrent_nonce_submissions(
+            Arc::clone(&store),
+            resolver,
+            context,
+            first,
+            second,
+            machine,
+        );
+        assert_one_nonce_commit_and_one_conflict(&results);
+
+        let nonce_key = sender_nonce_key_for("sunrise-test", sender_bytes, Epoch::new(7));
+        let persisted = store
+            .get_versioned_durable(&durable_context(), domain(0xF0), &nonce_key)
+            .unwrap();
+        let record = SenderNonceRecord::decode(persisted.value().unwrap()).unwrap();
+        assert_eq!(record.next_nonce, 2);
+    }
+
+    #[test]
+    fn stale_nonce_on_fresh_request_id_rejects_before_app_state_read_transition_or_commit() {
+        let config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xE2);
+        let signing_key = dev_signing_key(0x92);
+        let sender_bytes = *dev_sender_address(&signing_key).as_bytes();
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        let submission = authenticated_submission(
+            "sunrise-test",
+            request(0xC2),
+            &signing_key,
+            Epoch::new(7),
+            1,
+            &config,
+            &protocol_config,
+        );
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &machine,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::SenderNonceMismatch {
+                sender: sender_bytes,
+                expected: 0,
+                actual: 1,
+            }
+        );
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+        assert!(store.commits.lock().unwrap().is_empty());
+        // Only the sender-nonce record is read before the mismatch is
+        // detected; the machine's declared application state key is never
+        // touched.
         assert_eq!(store.state_reads.load(Ordering::SeqCst), 1);
-        assert_eq!(store.commits.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn exact_request_replay_returns_persisted_output_without_reconsuming_nonce() {
+        let store = MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xE3);
+        let signing_key = dev_signing_key(0x93);
+        let sender_bytes = *dev_sender_address(&signing_key).as_bytes();
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        let context = durable_context();
+        let resolver = resolver("sunrise-test");
+
+        let first_submission = authenticated_submission(
+            "sunrise-test",
+            request(0xC3),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            &config,
+            &protocol_config,
+        );
+        let first = handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &context,
+            &resolver,
+            first_submission,
+            &machine,
+        )
+        .unwrap();
+
+        let replay_submission = authenticated_submission(
+            "sunrise-test",
+            request(0xC3),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            &config,
+            &protocol_config,
+        );
+        let replay = handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &context,
+            &resolver,
+            replay_submission,
+            &machine,
+        )
+        .unwrap();
+
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first.output().responses(), replay.output().responses());
+
+        let nonce_key = sender_nonce_key_for("sunrise-test", sender_bytes, Epoch::new(7));
+        let persisted = store
+            .get_versioned_durable(&context, domain(0xE3), &nonce_key)
+            .unwrap();
+        let record = SenderNonceRecord::decode(persisted.value().unwrap()).unwrap();
+        assert_eq!(record.next_nonce, 1);
+    }
+
+    #[test]
+    fn skipped_nonce_rejects_with_exact_expected_and_actual() {
+        let store = MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xE4);
+        let signing_key = dev_signing_key(0x94);
+        let sender_bytes = *dev_sender_address(&signing_key).as_bytes();
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        let submission = authenticated_submission(
+            "sunrise-test",
+            request(0xC4),
+            &signing_key,
+            Epoch::new(7),
+            5,
+            &config,
+            &protocol_config,
+        );
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &machine,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::SenderNonceMismatch {
+                sender: sender_bytes,
+                expected: 0,
+                actual: 5,
+            }
+        );
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn nonce_at_u64_max_overflows_instead_of_wrapping() {
+        let config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xE5);
+        let signing_key = dev_signing_key(0x95);
+        let sender_bytes = *dev_sender_address(&signing_key).as_bytes();
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let nonce_key = sender_nonce_key_for("sunrise-test", sender_bytes, Epoch::new(7));
+        let record = SenderNonceRecord::new(sender_bytes, Epoch::new(7), u64::MAX);
+        store.preload(nonce_key, StateRevision::new(1), record.encode().unwrap());
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        let submission = authenticated_submission(
+            "sunrise-test",
+            request(0xC5),
+            &signing_key,
+            Epoch::new(7),
+            u64::MAX,
+            &config,
+            &protocol_config,
+        );
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &machine,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::SenderNonceOverflow {
+                sender: sender_bytes,
+            }
+        );
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn corrupt_nonce_record_bytes_reject_before_app_state_or_commit() {
+        let config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xE6);
+        let signing_key = dev_signing_key(0x96);
+        let sender_bytes = *dev_sender_address(&signing_key).as_bytes();
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let nonce_key = sender_nonce_key_for("sunrise-test", sender_bytes, Epoch::new(7));
+        store.preload(nonce_key, StateRevision::new(1), vec![0xFF, 0x00, 0x01]);
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        let submission = authenticated_submission(
+            "sunrise-test",
+            request(0xC6),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            &config,
+            &protocol_config,
+        );
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &machine,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, NodeCoreError::CanonicalDecoding(_)));
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn misbound_nonce_record_sender_rejects_as_persistence_invariant() {
+        let config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xE7);
+        let signing_key = dev_signing_key(0x97);
+        let sender_bytes = *dev_sender_address(&signing_key).as_bytes();
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let nonce_key = sender_nonce_key_for("sunrise-test", sender_bytes, Epoch::new(7));
+        // A record correctly addressed by this sender/epoch's key, but whose
+        // own bound fields describe a different sender: corruption or a
+        // storage-layer misbinding bug, not an ordinary nonce mismatch.
+        let misbound = SenderNonceRecord::new([0xAA; 32], Epoch::new(7), 0);
+        store.preload(nonce_key, StateRevision::new(1), misbound.encode().unwrap());
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        let submission = authenticated_submission(
+            "sunrise-test",
+            request(0xC7),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            &config,
+            &protocol_config,
+        );
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &machine,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::PersistenceInvariant(
+                "persisted sender nonce record does not match its key's sender/epoch"
+            )
+        );
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    struct PrefixClaimingMachine {
+        key: Vec<u8>,
+    }
+
+    impl TransactionalNodeStateMachine for PrefixClaimingMachine {
+        fn access_plan(&self, _event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            NodeStateAccessPlan::new(vec![NodeStateAccess::new(
+                self.key.clone(),
+                NodeStateAccessMode::ReadWrite,
+            )?])
+        }
+
+        fn transition(
+            &self,
+            _state: &NodeStateSnapshot,
+            event: &NodeEvent,
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            TransactionalNodeTransition::new(
+                vec![NodeStateUpdate::put(
+                    self.key.clone(),
+                    canonical(TEST_STATE_TYPE_ID, 1),
+                )?],
+                NodeOutput::new(
+                    vec![NodeResponse::new(
+                        event.request_id(),
+                        NodeResponseStatus::Accepted,
+                        None,
+                    )?],
+                    Vec::new(),
+                )?,
+            )
+        }
+    }
+
+    #[test]
+    fn app_plan_key_under_sender_nonce_prefix_is_rejected_for_non_submit_event_kind() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let victim_sender = [0x77; 32];
+        // A different epoch than the event's own epoch (7): the prefix
+        // rejection must not depend on matching the reservation-less caller
+        // to any particular sender or epoch.
+        let key = sender_nonce_key_for("sunrise-test", victim_sender, Epoch::new(9));
+        let machine = PrefixClaimingMachine { key };
+        // `event(..)` builds a `ReceiveVote` event: a non-`SubmitTransaction`
+        // family, proving the shared helper does not branch on event kind.
+        let input = event("sunrise-test", request(0xC8));
+
+        let error = handle_resolved_durable_idempotent_event(
+            &store,
+            &durable_context(),
+            &placement(0xE8, 7),
+            &config("sunrise-test"),
+            &resolver("sunrise-test"),
+            input,
+            &machine,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, NodeCoreError::ReservedStateAccess(_)));
+        assert!(store.commits.lock().unwrap().is_empty());
+        assert_eq!(store.state_reads.load(Ordering::SeqCst), 0);
+    }
+
+    struct RejectingMachine;
+
+    impl TransactionalNodeStateMachine for RejectingMachine {
+        fn access_plan(&self, _event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            NodeStateAccessPlan::new(vec![NodeStateAccess::new(
+                b"state/reject".to_vec(),
+                NodeStateAccessMode::ReadWrite,
+            )?])
+        }
+
+        fn transition(
+            &self,
+            _state: &NodeStateSnapshot,
+            event: &NodeEvent,
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            let response =
+                NodeResponse::new(event.request_id(), NodeResponseStatus::Rejected, None)?;
+            TransactionalNodeTransition::new(
+                vec![NodeStateUpdate::put(
+                    b"state/reject".to_vec(),
+                    canonical(TEST_STATE_TYPE_ID, 0),
+                )?],
+                NodeOutput::new(vec![response], Vec::new())?,
+            )
+        }
+    }
+
+    #[test]
+    fn committed_deterministic_rejection_still_consumes_the_nonce() {
+        let store = MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xE9);
+        let signing_key = dev_signing_key(0x99);
+        let sender_bytes = *dev_sender_address(&signing_key).as_bytes();
+        let context = durable_context();
+
+        let submission = authenticated_submission(
+            "sunrise-test",
+            request(0xC9),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            &config,
+            &protocol_config,
+        );
+        let resolved = handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &context,
+            &resolver("sunrise-test"),
+            submission,
+            &RejectingMachine,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.output().responses()[0].status(),
+            NodeResponseStatus::Rejected
+        );
+        let nonce_key = sender_nonce_key_for("sunrise-test", sender_bytes, Epoch::new(7));
+        let persisted = store
+            .get_versioned_durable(&context, domain(0xE9), &nonce_key)
+            .unwrap();
+        let record = SenderNonceRecord::decode(persisted.value().unwrap()).unwrap();
+        assert_eq!(record.next_nonce, 1);
+    }
+
+    struct ErrMachine;
+
+    impl TransactionalNodeStateMachine for ErrMachine {
+        fn access_plan(&self, _event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            NodeStateAccessPlan::new(vec![NodeStateAccess::new(
+                b"state/err".to_vec(),
+                NodeStateAccessMode::ReadOnly,
+            )?])
+        }
+
+        fn transition(
+            &self,
+            _state: &NodeStateSnapshot,
+            _event: &NodeEvent,
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            Err(NodeCoreError::TransitionRejected("test rejection"))
+        }
+    }
+
+    #[test]
+    fn transition_error_does_not_consume_the_nonce() {
+        let store = MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xEA);
+        let signing_key = dev_signing_key(0x9A);
+        let sender_bytes = *dev_sender_address(&signing_key).as_bytes();
+        let context = durable_context();
+        let resolver = resolver("sunrise-test");
+
+        let submission = authenticated_submission(
+            "sunrise-test",
+            request(0xCA),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            &config,
+            &protocol_config,
+        );
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &context,
+            &resolver,
+            submission,
+            &ErrMachine,
+        )
+        .unwrap_err();
+        assert_eq!(error, NodeCoreError::TransitionRejected("test rejection"));
+
+        let nonce_key = sender_nonce_key_for("sunrise-test", sender_bytes, Epoch::new(7));
+        let persisted = store
+            .get_versioned_durable(&context, domain(0xEA), &nonce_key)
+            .unwrap();
+        assert!(persisted.value().is_none());
+
+        // The still-expected nonce 0 now succeeds for a fresh request.
+        let retry = authenticated_submission(
+            "sunrise-test",
+            request(0xCB),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            &config,
+            &protocol_config,
+        );
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        handle_authenticated_resolved_durable_submit_transaction(
+            &store, &context, &resolver, retry, &machine,
+        )
+        .unwrap();
+    }
+
+    struct WideMachine {
+        count: usize,
+    }
+
+    impl TransactionalNodeStateMachine for WideMachine {
+        fn access_plan(&self, _event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            let accesses = (0..self.count)
+                .map(|index| {
+                    NodeStateAccess::new(
+                        format!("state/wide/{index:05}").into_bytes(),
+                        NodeStateAccessMode::ReadOnly,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            NodeStateAccessPlan::new(accesses)
+        }
+
+        fn transition(
+            &self,
+            _state: &NodeStateSnapshot,
+            event: &NodeEvent,
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            Ok(TransactionalNodeTransition::read_only(NodeOutput::new(
+                vec![NodeResponse::new(
+                    event.request_id(),
+                    NodeResponseStatus::Accepted,
+                    None,
+                )?],
+                Vec::new(),
+            )?))
+        }
+    }
+
+    #[test]
+    fn app_plan_at_max_atomic_state_writes_exceeds_reserved_nonce_capacity() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xEB);
+        let signing_key = dev_signing_key(0x9B);
+        let machine = WideMachine {
+            count: MAX_ATOMIC_STATE_WRITES,
+        };
+
+        let submission = authenticated_submission(
+            "sunrise-test",
+            request(0xCC),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            &config,
+            &protocol_config,
+        );
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &machine,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::TooManyStateAccesses {
+                count: MAX_ATOMIC_STATE_WRITES,
+                maximum: MAX_ATOMIC_STATE_WRITES - 1,
+            }
+        );
+        assert_eq!(store.state_reads.load(Ordering::SeqCst), 0);
+        assert!(store.commits.lock().unwrap().is_empty());
+
+        // The identical plan is accepted by the generic durable caller, which
+        // passes no reservation and therefore does not reserve nonce write
+        // capacity.
+        let generic_store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let generic_machine = WideMachine {
+            count: MAX_ATOMIC_STATE_WRITES,
+        };
+        let output = handle_resolved_durable_idempotent_event(
+            &generic_store,
+            &durable_context(),
+            &placement(0xEC, 7),
+            &config,
+            &resolver("sunrise-test"),
+            event("sunrise-test", request(0xCD)),
+            &generic_machine,
+        )
+        .unwrap();
+        assert_eq!(output.output().responses().len(), 1);
     }
 
     #[test]
@@ -3643,11 +4850,14 @@ mod tests {
         }
     }
 
+    type ScriptedStateReads = BTreeMap<Vec<u8>, (StateRevision, Vec<u8>)>;
+
     struct ScriptedDurableStore {
         receipt: Mutex<Option<DurableRequestReceipt>>,
         commits: Mutex<Vec<DurableInvocationTransaction>>,
         state_reads: AtomicUsize,
         commit_outcome: DurableCommitOutcome,
+        preloaded: Mutex<ScriptedStateReads>,
     }
 
     impl ScriptedDurableStore {
@@ -3657,7 +4867,17 @@ mod tests {
                 commits: Mutex::new(Vec::new()),
                 state_reads: AtomicUsize::new(0),
                 commit_outcome,
+                preloaded: Mutex::new(BTreeMap::new()),
             }
+        }
+
+        /// Scripts a fixed read response for one exact key, overriding the
+        /// default absent/`INITIAL` response used by every other key.
+        fn preload(&self, key: Vec<u8>, revision: StateRevision, value: Vec<u8>) {
+            self.preloaded
+                .lock()
+                .unwrap()
+                .insert(key, (revision, value));
         }
     }
 
@@ -3666,11 +4886,17 @@ mod tests {
             &self,
             _context: &DurableOperationContext,
             _domain: AtomicityDomainId,
-            _key: &[u8],
+            key: &[u8],
         ) -> Result<VersionedStateValue, DurableReadError> {
             self.state_reads.fetch_add(1, Ordering::SeqCst);
-            VersionedStateValue::from_persisted_parts(StateRevision::INITIAL, None)
-                .map_err(DurableReadError::InvalidRequest)
+            match self.preloaded.lock().unwrap().get(key) {
+                Some((revision, value)) => {
+                    VersionedStateValue::from_persisted_parts(*revision, Some(value.clone()))
+                        .map_err(DurableReadError::InvalidRequest)
+                }
+                None => VersionedStateValue::from_persisted_parts(StateRevision::INITIAL, None)
+                    .map_err(DurableReadError::InvalidRequest),
+            }
         }
 
         fn commit_durable(

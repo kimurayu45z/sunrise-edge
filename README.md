@@ -127,16 +127,20 @@ cross-provider ingress milestones implemented through Phase 17:
   access-plan derivation, transition, outbox claim, or send. Generic
   node-core handlers and legacy native routes reject `SubmitTransaction`
   rather than processing it unauthenticated. Exact durable replays still
-  authenticate before receipt reconciliation. Nonce enforcement, fee debit,
-  module/object dispatch and effects, FastVote/FastCertificate, and
-  certificate publication remain unimplemented, so the owned fast path is
-  not yet safe to activate on a live chain. The other externally accepted
+  authenticate before receipt reconciliation. A fresh request must now equal
+  the persisted per-sender, per-epoch next nonce; its read assertion and
+  checked increment commit atomically with application state, receipt, and
+  outbox. Application plans cannot claim the reserved nonce prefix. Fee debit,
+  module/object dispatch and effects, FastVote/FastCertificate, and certificate
+  publication remain unimplemented, so the owned fast path is not yet safe to
+  activate on a live chain. The other externally accepted
   node-event families, especially certificate, protocol-upgrade, and
   validator-set-change events, still need their own authenticated and
   authorized ingress boundaries before any live activation. The outer
-  `NodeEvent.request_id` is not signed, so a signed transaction can still be
-  resubmitted under a fresh request ID until persistent per-sender nonce
-  equality is enforced.
+  `NodeEvent.request_id` remains unsigned and is only an idempotency identity;
+  replay protection for fresh request IDs now comes from the signed nonce.
+  Clients must submit one exact next nonce at a time: pipelining or queued
+  future nonces is not supported.
 - Versioned objects, object references, access manifests, and lazy migration.
 - Runtime traits and an in-memory runtime for deterministic tests.
 - A local durable SQLite transactional store using WAL, synchronous FULL,
