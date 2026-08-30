@@ -24,7 +24,7 @@
 //! TLS-path connection loss, real writer failover, provider certification,
 //! or production readiness.
 
-use postgres::{Client, NoTls};
+use postgres::{Client, Config, NoTls};
 use protocol_types::{AtomicityDomainId, ChainId, Digest32, HashAlgorithmId, ValidatorId};
 use r2d2_postgres::PostgresConnectionManager;
 use runtime::{
@@ -66,6 +66,14 @@ const BOUNDED_TABLESPACE_LOCATION: &str = "/bounded/ts";
 /// filesystem actually in effect, not some larger inherited mount.
 const BOUNDED_TMPFS_MIN_TOTAL_KIB: u64 = 60_000;
 const BOUNDED_TMPFS_MAX_TOTAL_KIB: u64 = 65_536;
+
+/// Lower/upper bound, in KiB, that `df -P -k` on `SHOW data_directory` must
+/// report as total capacity: proof the 512 MiB tmpfs cap this scenario
+/// configures for PGDATA is the filesystem actually in effect, not some
+/// larger inherited mount. Symmetric in kind with the `/bounded` assertion
+/// above, scaled to the configured 512 MiB (524,288 KiB) PGDATA tmpfs.
+const PGDATA_TMPFS_MIN_TOTAL_KIB: u64 = 500_000;
+const PGDATA_TMPFS_MAX_TOTAL_KIB: u64 = 524_288;
 
 /// Upper bound, in KiB, on `/bounded` available space immediately after the
 /// filler write: headroom for tmpfs bookkeeping, not a measured budget.
@@ -129,6 +137,48 @@ fn data_directory(client: &mut Client) -> String {
     client.query_one("SHOW data_directory", &[]).unwrap().get(0)
 }
 
+/// Connect timeout applied to every direct probe/DDL client this scenario
+/// opens against its own disposable container.
+const DIRECT_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// TCP-level user timeout mirrored onto every direct probe/DDL client, so a
+/// connection that stalls after the TCP handshake against the disposable
+/// container is bounded the same way as a slow connect.
+const DIRECT_CLIENT_TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Session `statement_timeout` applied to every direct probe/DDL client.
+/// Generous relative to this scenario's own bounded work (tablespace/database
+/// DDL, small catalog probes, and the multi-megabyte filler insert), but far
+/// below the outer test process's own deadline, so a wedged connection to the
+/// disposable container fails loudly instead of hanging the test.
+const DIRECT_CLIENT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Builds a bounded [`Config`] for a direct probe/DDL client against this
+/// scenario's disposable container: an explicit connect timeout, TCP user
+/// timeout, and session `statement_timeout`, so no direct query this scenario
+/// issues can inherit the driver's unbounded defaults.
+fn bounded_direct_client_config(url: &str) -> Config {
+    let mut config: Config = url.parse().unwrap_or_else(|error| {
+        panic!("failed to parse disposable-container database URL: {error}")
+    });
+    let statement_timeout_millis: u64 =
+        u64::try_from(DIRECT_CLIENT_STATEMENT_TIMEOUT.as_millis()).unwrap();
+    config.connect_timeout(DIRECT_CLIENT_CONNECT_TIMEOUT);
+    config.tcp_user_timeout(DIRECT_CLIENT_TCP_USER_TIMEOUT);
+    config.options(&format!("-c statement_timeout={statement_timeout_millis}"));
+    config
+}
+
+/// Connects a direct probe/DDL client through [`bounded_direct_client_config`].
+/// `label` identifies the target database in a failure message only; it never
+/// includes the URL itself, since the URL carries the generated container
+/// password.
+fn connect_bounded(url: &str, label: &str) -> Client {
+    bounded_direct_client_config(url)
+        .connect(NoTls)
+        .unwrap_or_else(|error| panic!("bounded connect to {label} failed: {error}"))
+}
+
 #[test]
 fn postgres_disk_full_bounded_tablespace_enospc() {
     let image = match support::resolve_disk_full_scenario() {
@@ -163,7 +213,7 @@ fn postgres_disk_full_bounded_tablespace_enospc() {
         .exec(&["touch", &format!("/bounded/{identity_file}")])
         .unwrap_or_else(|error| panic!("touch identity marker failed: {error}"));
 
-    let mut admin_client = Client::connect(&container.url("postgres"), NoTls).unwrap();
+    let mut admin_client = connect_bounded(&container.url("postgres"), "postgres (admin)");
     admin_client
         .execute(
             &format!(
@@ -180,7 +230,7 @@ fn postgres_disk_full_bounded_tablespace_enospc() {
         .unwrap();
     drop(admin_client);
 
-    let mut client = Client::connect(&container.url(DISK_FULL_DATABASE), NoTls).unwrap();
+    let mut client = connect_bounded(&container.url(DISK_FULL_DATABASE), DISK_FULL_DATABASE);
 
     // --- Phase 0: identity, before any fault ---------------------------------
 
@@ -259,6 +309,17 @@ fn postgres_disk_full_bounded_tablespace_enospc() {
         (BOUNDED_TMPFS_MIN_TOTAL_KIB..=BOUNDED_TMPFS_MAX_TOTAL_KIB).contains(&bounded_total_kib),
         "expected /bounded total capacity in [{BOUNDED_TMPFS_MIN_TOTAL_KIB}, \
          {BOUNDED_TMPFS_MAX_TOTAL_KIB}] KiB, got {bounded_total_kib} KiB"
+    );
+
+    let (pgdata_total_kib, _pgdata_available_kib) = support::parse_df_kib(
+        &container
+            .exec(&["df", "-P", "-k", &pgdata])
+            .unwrap_or_else(|error| panic!("df -P -k {pgdata} failed: {error}")),
+    );
+    assert!(
+        (PGDATA_TMPFS_MIN_TOTAL_KIB..=PGDATA_TMPFS_MAX_TOTAL_KIB).contains(&pgdata_total_kib),
+        "expected {pgdata} total capacity in [{PGDATA_TMPFS_MIN_TOTAL_KIB}, \
+         {PGDATA_TMPFS_MAX_TOTAL_KIB}] KiB, got {pgdata_total_kib} KiB"
     );
 
     apply_initial_schema(&mut client).unwrap();

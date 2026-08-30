@@ -1800,9 +1800,11 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   rather than skipping. This proves PostgreSQL database-process SIGKILL and
   WAL recovery on a live host with a live page cache; it does not prove
   abrupt host/power loss, storage write-cache flush/torn-write/media/
-  filesystem faults, disk-full/WAL exhaustion, TLS-path behavior,
+  filesystem faults, WAL exhaustion, commit-boundary or real-device ENOSPC,
+  TLS-path behavior,
   backup/restore, capacity/load/soak, real writer failover, provider
-  certification, or production readiness, all of which remain open.
+  certification, or production readiness, all of which remain open. DR-0070
+  below separately covers bounded pre-commit data-tablespace ENOSPC only.
 - DR-0070: Add a required live `runtime-postgres` integration test for a real,
   bounded data-tablespace `ENOSPC` before `COMMIT`. Start an exact
   digest-pinned disposable PostgreSQL 18 container with PGDATA, WAL, and

@@ -14,7 +14,7 @@ use std::{
     env,
     ffi::OsString,
     fmt, fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus},
     sync::atomic::{AtomicU64, Ordering},
@@ -41,12 +41,18 @@ pub const CRASH_REQUIRED_ENV: &str = "SUNRISE_EDGE_TEST_POSTGRES_CRASH_REQUIRED"
 
 /// Hard bound on how long [`LiveTestLock::acquire`] waits for the lock
 /// before giving up. Destructive live tests (the schema/durable-store
-/// conformance test and the SIGKILL crash-recovery scenario) serialize on
-/// this lock because more than one of them may run concurrently as separate
-/// `cargo test` binary processes, and one of them kills the whole
-/// database-service container out from under every other live test. A bound
-/// keeps a stuck or abandoned lock a loud failure instead of a hang.
-const LIVE_LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(180);
+/// conformance test, the SIGKILL crash-recovery scenario, and the disk-full
+/// ENOSPC scenario) serialize on this lock because up to three of them may
+/// run concurrently as separate `cargo test` binary processes within one CI
+/// job, and each holds it for its own container start/fault/recovery work
+/// before releasing it to the next waiter. CI bounds the whole job at 20
+/// minutes, so a waiter behind the other two must still fail loudly, well
+/// inside that job timeout, if the lock is genuinely stuck or abandoned
+/// rather than merely held by a slow-but-live sibling test; 600 seconds (10
+/// minutes) gives room for two preceding live tests to each run their full
+/// container lifecycle before this waiter's own acquisition is considered
+/// stuck.
+const LIVE_LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Poll interval while waiting for [`LIVE_LOCK_ACQUIRE_TIMEOUT`] to elapse.
 const LIVE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -936,6 +942,27 @@ pub(crate) fn random_hex_token(hex_len: usize) -> String {
     hex
 }
 
+/// Returns a test-only secret sourced from the operating system CSPRNG.
+/// Sunrise Edge treats Linux and macOS as first-class development hosts; both
+/// expose `/dev/urandom`. Unlike [`random_hex_token`], this value protects the
+/// disposable PostgreSQL superuser while its random port is published on the
+/// host loopback interface, so collision-only entropy is not sufficient.
+fn os_random_secret_hex(byte_len: usize) -> io::Result<String> {
+    let mut random_bytes: Vec<u8> = vec![0_u8; byte_len];
+    let mut random_source: fs::File = fs::File::open("/dev/urandom")?;
+    random_source.read_exact(&mut random_bytes)?;
+    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let capacity: usize = byte_len
+        .checked_mul(2)
+        .ok_or_else(|| io::Error::other("random secret hex length overflow"))?;
+    let mut secret: String = String::with_capacity(capacity);
+    for byte in random_bytes {
+        secret.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+        secret.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+    }
+    Ok(secret)
+}
+
 // --- Disk-full scenario: disposable container guard -------------------------
 
 /// Size cap, in bytes, of the tmpfs holding `PGDATA`/`pg_wal`/`pg_xact`. Large
@@ -969,7 +996,9 @@ impl DisposablePostgresContainer {
     /// default `postgres` database. Panics on any failure: a scenario that
     /// cannot even start its own disposable container proves nothing.
     pub fn start(image: &PinnedImage) -> Self {
-        let postgres_password = random_hex_token(32);
+        let postgres_password: String = os_random_secret_hex(32).unwrap_or_else(|error| {
+            panic!("failed to read PostgreSQL test password from OS randomness: {error}")
+        });
         let container_name = format!(
             "sunrise-edge-disk-full-{}-{}",
             std::process::id(),
@@ -1073,8 +1102,13 @@ impl DisposablePostgresContainer {
     /// server user can perform, so no exec in this scenario ever needs
     /// `--user root`.
     pub fn exec(&self, args: &[&str]) -> io::Result<String> {
-        let mut full_args: Vec<&str> =
-            vec!["exec", "--user", "postgres", self.container_id.as_str()];
+        let mut full_args: Vec<&str> = vec![
+            "exec",
+            "--user",
+            "postgres",
+            "--",
+            self.container_id.as_str(),
+        ];
         full_args.extend_from_slice(args);
         run_docker_command_bounded_output(docker_argv_command(&full_args), "docker exec")
     }
@@ -1389,5 +1423,16 @@ mod tests {
     #[test]
     fn random_hex_token_calls_are_distinct() {
         assert_ne!(random_hex_token(32), random_hex_token(32));
+    }
+
+    #[test]
+    fn os_random_secret_has_exact_lowercase_hex_length() {
+        let secret: String = os_random_secret_hex(32).unwrap();
+        assert_eq!(secret.len(), 64);
+        assert!(
+            secret
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
     }
 }
