@@ -1623,6 +1623,15 @@ pub const CONNECTION_EXHAUSTION_MAX_CONNECTIONS: u32 = 5;
 /// superuser-only carve-out for this scenario's counting to account for.
 pub const CONNECTION_EXHAUSTION_SUPERUSER_RESERVED_CONNECTIONS: u32 = 0;
 
+/// Exact server-side `-c reserved_connections=...` this scenario configures.
+/// PostgreSQL 16 added this as a second, independent reserved pool — for
+/// roles with the `pg_use_reserved_connections` predefined role, distinct
+/// from [`CONNECTION_EXHAUSTION_SUPERUSER_RESERVED_CONNECTIONS`] above — so
+/// it is pinned to zero explicitly for the same reason: any non-zero
+/// carve-out here would also break this scenario's exact
+/// blocker/slot accounting.
+pub const CONNECTION_EXHAUSTION_RESERVED_CONNECTIONS: u32 = 0;
+
 /// Size cap, in bytes, of the tmpfs holding `PGDATA`. This scenario never
 /// intentionally fills any filesystem — its fault is server connection-slot
 /// capacity, not disk space — so this is only a RAM-backed, disposable,
@@ -1631,11 +1640,18 @@ const CONNECTION_EXHAUSTION_PGDATA_TMPFS_BYTES: u64 = 512 * 1024 * 1024;
 
 /// A disposable, RAM-backed PostgreSQL container for the bounded
 /// connection-exhaustion scenario. Started with a tiny
-/// [`CONNECTION_EXHAUSTION_MAX_CONNECTIONS`] and zero
-/// [`CONNECTION_EXHAUSTION_SUPERUSER_RESERVED_CONNECTIONS`], and with
-/// `autovacuum` disabled so no background autovacuum worker can silently
-/// consume one of this scenario's exactly accounted-for connection slots
-/// during the test window.
+/// [`CONNECTION_EXHAUSTION_MAX_CONNECTIONS`], zero
+/// [`CONNECTION_EXHAUSTION_SUPERUSER_RESERVED_CONNECTIONS`], and zero
+/// [`CONNECTION_EXHAUSTION_RESERVED_CONNECTIONS`], so no role gets a
+/// capacity carve-out this scenario's exact-count assertions would need to
+/// special-case. Also starts with `autovacuum` disabled, but only as
+/// optional quiescence against unrelated background activity during the
+/// bounded test window: autovacuum workers and the autovacuum launcher are
+/// accounted from their own separate budget (`autovacuum_max_workers`,
+/// alongside `max_worker_processes` and `max_wal_senders`), never carved out
+/// of `max_connections`, so this scenario's `backend_type = 'client
+/// backend'`-filtered counts already exclude them regardless of this
+/// setting.
 ///
 /// [`Drop`] force-removes the container and never panics: on failure it only
 /// `eprintln!`s the container ID and its
@@ -1670,6 +1686,8 @@ impl ConnectionExhaustionPostgresContainer {
         let superuser_reserved_arg = format!(
             "superuser_reserved_connections={CONNECTION_EXHAUSTION_SUPERUSER_RESERVED_CONNECTIONS}"
         );
+        let reserved_connections_arg =
+            format!("reserved_connections={CONNECTION_EXHAUSTION_RESERVED_CONNECTIONS}");
         let run_output_result = run_docker_command_bounded_output(
             docker_argv_command(&[
                 "run",
@@ -1698,6 +1716,8 @@ impl ConnectionExhaustionPostgresContainer {
                 &max_connections_arg,
                 "-c",
                 &superuser_reserved_arg,
+                "-c",
+                &reserved_connections_arg,
                 "-c",
                 "autovacuum=off",
             ]),

@@ -13,12 +13,32 @@
 //! Scope: unlike the disk-full and WAL-full scenarios, which fault a
 //! filesystem, this scenario faults the server's own connection-slot
 //! capacity. An already-open operator connection bootstraps the disposable
-//! namespace and stays open for the whole scenario; a small, exactly bounded
+//! namespace and stays open for the whole scenario. Immediately after the
+//! short-lived admin client that created the disposable database is
+//! dropped, this test boundedly polls through the operator connection until
+//! exactly one active client backend (the operator's own) is visible —
+//! `Client::drop` only requests connection teardown asynchronously, so
+//! without this poll the admin client's backend could still transiently
+//! count against capacity right as the blocker loop below starts. This poll
+//! is safe, unlike the later transient-count poll this design deliberately
+//! avoids after releasing a blocker (see below): no `r2d2` pool exists yet
+//! at this point, and nothing else this test has started can spontaneously
+//! open or close a connection on its own, so the target count of exactly
+//! one, once reached, is stable rather than a value some independent
+//! background task could immediately overwrite. A small, exactly bounded
 //! number of direct blocker connections then saturate every remaining slot
 //! configured by `max_connections` (with `superuser_reserved_connections=0`
-//! so no role gets a carve-out, and `autovacuum=off` so no background worker
-//! can silently steal an accounted-for slot). One further direct connection
-//! attempt is live, ground-truth evidence that the server is genuinely out of
+//! and PostgreSQL 16+'s separate `reserved_connections=0` so no role gets a
+//! capacity carve-out this scenario's counting would need to special-case).
+//! `autovacuum` is disabled on this scenario's container too, but only as
+//! optional quiescence during the bounded window: autovacuum workers and the
+//! autovacuum launcher are accounted from their own separate budget
+//! (`autovacuum_max_workers`, alongside `max_worker_processes` and
+//! `max_wal_senders`), not carved out of `max_connections`, and every count
+//! this scenario asserts is already filtered to
+//! `backend_type = 'client backend'`, which excludes them regardless. One
+//! further direct connection attempt is live, ground-truth evidence that the
+//! server is genuinely out of
 //! connection slots: SQLSTATE `53300` (`too_many_connections`) at `FATAL`
 //! severity. With capacity still fully exhausted, a freshly built, max-size-one
 //! adapter pool — proven to hold zero physical connections before its first
@@ -88,6 +108,7 @@ use runtime_postgres::{
 };
 use std::{
     num::NonZeroU32,
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -189,12 +210,15 @@ fn connect_bounded(url: &str, label: &str) -> Client {
 
 /// Exact count of regular client-backend connections currently open on the
 /// server, through `client`'s own already-open session. Filtered to
-/// `backend_type = 'client backend'` so auxiliary processes (checkpointer,
-/// walwriter, the autovacuum launcher) — which do not draw from the same
-/// `max_connections` budget this scenario saturates — never perturb the
-/// count. `autovacuum=off` on this scenario's container additionally rules
-/// out an autovacuum worker (which would draw from that budget) appearing
-/// mid-test.
+/// `backend_type = 'client backend'` so auxiliary processes (the
+/// checkpointer, walwriter, the autovacuum launcher, and any autovacuum
+/// worker) never perturb the count. This filter alone is sufficient: those
+/// processes are accounted from their own separate budgets
+/// (`autovacuum_max_workers`, `max_worker_processes`, `max_wal_senders`),
+/// never carved out of the `max_connections` budget this scenario saturates,
+/// so `autovacuum=off` on this scenario's container is only optional
+/// quiescence against unrelated background activity during the bounded
+/// window, not a requirement for this count to be exact.
 fn active_client_backend_count(client: &mut Client) -> i64 {
     client
         .query_one(
@@ -203,6 +227,48 @@ fn active_client_backend_count(client: &mut Client) -> i64 {
         )
         .unwrap()
         .get(0)
+}
+
+/// Bound on how long [`wait_until_solely_operator_connection`] waits for the
+/// admin client's connection teardown to be reflected server-side.
+const ADMIN_TEARDOWN_POLL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Poll interval while waiting for [`ADMIN_TEARDOWN_POLL_TIMEOUT`] to elapse.
+const ADMIN_TEARDOWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Boundedly polls [`active_client_backend_count`] through `client` (the
+/// operator connection) until it reports exactly one active client backend:
+/// the operator connection's own. Dropping a `postgres::Client` only
+/// requests connection teardown; it does not wait for the server to have
+/// processed it, so without this poll the admin client that created the
+/// disposable database could still transiently count against capacity right
+/// as the blocker loop that follows starts opening connections, throwing off
+/// its exact accounting by one.
+///
+/// This is safe to poll for, unlike the later transient server-side count
+/// this design deliberately does not poll for after releasing a blocker
+/// connection (see this file's module docs): at this point in the scenario
+/// no `r2d2` pool exists yet, and nothing else this test has started can
+/// spontaneously open or close a connection on its own, so the target count
+/// of exactly one, once reached, is stable — not a value some independent,
+/// already-running background retry could immediately overwrite before this
+/// poll (or its caller) observes it.
+fn wait_until_solely_operator_connection(client: &mut Client) {
+    let deadline = Instant::now() + ADMIN_TEARDOWN_POLL_TIMEOUT;
+    loop {
+        let observed = active_client_backend_count(client);
+        if observed == 1 {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "expected exactly one active client backend (the operator connection) within \
+                 {ADMIN_TEARDOWN_POLL_TIMEOUT:?} after dropping the admin client, still observed \
+                 {observed}"
+            );
+        }
+        thread::sleep(ADMIN_TEARDOWN_POLL_INTERVAL);
+    }
 }
 
 fn deadline(budget_millis: u64) -> StorageDeadline {
@@ -292,6 +358,13 @@ fn postgres_connection_exhaustion_bounded_server_capacity() {
         "refusing to run the connection-exhaustion scenario against a non-disposable database"
     );
 
+    // The admin client above only requested its own teardown by dropping;
+    // wait for the server to have actually processed it before this
+    // scenario starts opening exactly-counted blocker connections. See
+    // `wait_until_solely_operator_connection`'s doc comment for why polling
+    // here (unlike later in this scenario) is safe.
+    wait_until_solely_operator_connection(&mut operator_client);
+
     apply_initial_schema(&mut operator_client).unwrap();
     verify_initial_schema(&mut operator_client).unwrap();
 
@@ -322,12 +395,14 @@ fn postgres_connection_exhaustion_bounded_server_capacity() {
     let configured_settings_row = operator_client
         .query_one(
             "SELECT current_setting('max_connections')::int, \
-             current_setting('superuser_reserved_connections')::int",
+             current_setting('superuser_reserved_connections')::int, \
+             current_setting('reserved_connections')::int",
             &[],
         )
         .unwrap();
     let configured_max_connections: i32 = configured_settings_row.get(0);
     let configured_superuser_reserved: i32 = configured_settings_row.get(1);
+    let configured_reserved_connections: i32 = configured_settings_row.get(2);
     assert_eq!(
         configured_max_connections,
         i32::try_from(support::CONNECTION_EXHAUSTION_MAX_CONNECTIONS).unwrap(),
@@ -338,6 +413,17 @@ fn postgres_connection_exhaustion_bounded_server_capacity() {
         configured_superuser_reserved,
         i32::try_from(support::CONNECTION_EXHAUSTION_SUPERUSER_RESERVED_CONNECTIONS).unwrap(),
         "the disposable container did not apply the configured superuser_reserved_connections"
+    );
+    // PostgreSQL 16+ reserves a second, independent pool of slots for roles
+    // with the `pg_use_reserved_connections` predefined role, distinct from
+    // `superuser_reserved_connections` above. Pinned to zero and read back
+    // here for the same reason: any non-zero carve-out would mean this
+    // scenario's exact blocker/slot accounting no longer matches the
+    // server's real capacity.
+    assert_eq!(
+        configured_reserved_connections,
+        i32::try_from(support::CONNECTION_EXHAUSTION_RESERVED_CONNECTIONS).unwrap(),
+        "the disposable container did not apply the configured reserved_connections"
     );
 
     // --- Fill every remaining slot with bounded direct blocker sessions -----

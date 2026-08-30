@@ -2208,8 +2208,18 @@ Phase 15 As-Is scope:
   WAL/data ENOSPCは未検証であり、この境界についてENOSPC固有の分類は主張しない。real-device ENOSPCと
   他のfault/capacity certificationも未実装のままである。
   さらに別のrequired live testはdigest-pinned disposable PostgreSQLをtiny exact `max_connections`、
-  zero `superuser_reserved_connections`、autovacuum無効で起動し、すでにopenなoperator connectionが
-  namespaceをbootstrapしたままscenario全体で開き続ける。小さくexactly boundedな数のdirect blocker
+  zero `superuser_reserved_connections`、zero PostgreSQL 16+ `reserved_connections`（
+  `pg_use_reserved_connections` role向けの別のindependent reserved pool）で起動し、どのroleにも
+  capacity carve-outを与えない。autovacuumも無効化するが、これはoptional quiescenceに過ぎない
+  ——autovacuum worker/launcherは自身のseparate budgetから割り当てられ、`max_connections`から
+  carve-outされることはない。すでにopenなoperator connectionがnamespaceをbootstrapしたまま
+  scenario全体で開き続ける。databaseを作成したshort-livedなadmin clientをdropした直後、operator
+  connection自身のconnectionだけがactiveであることをboundedにpollして確認する
+  ——`Client`のdropはasynchronousなteardownを要求するだけなので、このpollがなければadmin client
+  のbackendがblocker接続の厳密なcount開始時にtransientにcapacityへ残ってしまう可能性がある。この
+  pollがsafeなのは、この時点ではまだ`r2d2` poolが存在せず、このtestが開始した以外の何もconnection
+  countを自発的に変化させ得ないためであり、この同じscenarioの後半（下記）でtransient countをpoll
+  することがsafeでないのとは対照的である。小さくexactly boundedな数のdirect blocker
   connectionでserverの全connection slotを飽和させ、direct probeのSQLSTATE `53300`（`FATAL`
   severity）とexact active client-backend countでgenuineなexhaustionを証明する。capacityがまだ
   exhaustedのまま、zero physical connectionを保持すると証明したmax-size-oneのadapter poolで1回

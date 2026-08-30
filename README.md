@@ -244,8 +244,15 @@ cross-provider ingress milestones implemented through Phase 17:
   pre-commit WAL-filesystem ENOSPC evidence only.
 - A separate required CI scenario (see `ARCHITECTURE.md` DR-0072) starts an
   exact digest-pinned disposable PostgreSQL container with a tiny exact
-  `max_connections`, zero `superuser_reserved_connections`, and autovacuum
-  disabled, then saturates every server connection slot with a small,
+  `max_connections`, zero `superuser_reserved_connections`, and zero
+  PostgreSQL 16+ `reserved_connections` (a second, independent reserved
+  pool), so no role gets a capacity carve-out; autovacuum is disabled too,
+  but only as optional quiescence, since autovacuum workers are accounted
+  separately and never draw from `max_connections`. After the admin client
+  that creates the disposable database is dropped, the operator connection
+  boundedly polls until only its own connection remains — safe here, unlike
+  later in the same scenario, because no connection pool exists yet to race.
+  The scenario then saturates every server connection slot with a small,
   exactly bounded number of direct blocker connections, proving genuine
   exhaustion via a direct probe's SQLSTATE `53300` at `FATAL` severity. With
   capacity still exhausted, a max-size-one adapter pool proven to hold zero

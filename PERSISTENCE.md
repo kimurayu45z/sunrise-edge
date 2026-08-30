@@ -463,12 +463,23 @@ not general state reads:
    literal-`COMMIT` WAL/data ENOSPC remains untested, and no
    ENOSPC-specific classification is claimed for that boundary.
    A third required disposable-container scenario configures a tiny exact
-   `max_connections`, zero `superuser_reserved_connections`, and disabled
-   autovacuum, then saturates every server connection slot with a small,
-   exactly bounded number of direct blocker connections, proving genuine
-   exhaustion via a direct probe's SQLSTATE `53300` at `FATAL` severity and
-   the exact active client-backend count. With capacity still exhausted, a
-   freshly built, max-size-one adapter pool proven to hold zero physical
+   `max_connections`, zero `superuser_reserved_connections`, and zero
+   PostgreSQL 16+ `reserved_connections` (a second, independent reserved pool
+   for the `pg_use_reserved_connections` role), so no role gets a capacity
+   carve-out; autovacuum is disabled too, but only as optional quiescence,
+   since autovacuum workers/launcher are accounted from their own separate
+   budget and never carved out of `max_connections`. After the short-lived
+   admin client that creates the disposable database is dropped, the
+   operator connection boundedly polls until exactly one active client
+   backend (its own) is visible, proving the admin client's asynchronous
+   teardown was actually processed server-side before exact blocker counting
+   begins; this poll is safe only because no `r2d2` pool exists yet and
+   nothing else in the scenario can independently change the connection
+   count at that point. This scenario then saturates every server connection
+   slot with a small, exactly bounded number of direct blocker connections,
+   proving genuine exhaustion via a direct probe's SQLSTATE `53300` at
+   `FATAL` severity and the exact active client-backend count. With capacity
+   still exhausted, a freshly built, max-size-one adapter pool proven to hold zero physical
    connections drives one bounded structured invocation commit; because
    `r2d2`'s connection-acquisition wait never returns early on a bare
    refusal, the caller's own operation deadline has, by construction, also

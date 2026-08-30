@@ -186,9 +186,16 @@ production certification.
 
 `tests/postgres_connection_exhaustion.rs` starts and owns a separate
 digest-pinned disposable PostgreSQL 18 container configured with an exact
-tiny `max_connections` (5), zero `superuser_reserved_connections`, and
-`autovacuum` disabled so no background worker can silently consume an
-accounted-for slot. Set both variables to make it required locally:
+tiny `max_connections` (5), zero `superuser_reserved_connections`, and zero
+PostgreSQL 16+ `reserved_connections` (a second, independent reserved pool
+for the `pg_use_reserved_connections` role) — so no role gets a capacity
+carve-out this test's exact accounting would need to special-case.
+`autovacuum` is disabled too, but only as optional quiescence against
+unrelated background activity: autovacuum workers and the autovacuum
+launcher are accounted from their own separate budget, never carved out of
+`max_connections`, so this test's `backend_type = 'client backend'`-filtered
+counts already exclude them regardless. Set both variables to make it
+required locally:
 
 ```bash
 SUNRISE_EDGE_TEST_POSTGRES_CONNECTION_EXHAUSTION_IMAGE=postgres:18.6-alpine3.24@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2 \
@@ -197,7 +204,14 @@ SUNRISE_EDGE_TEST_POSTGRES_CONNECTION_EXHAUSTION_REQUIRED=1 \
 ```
 
 An already-open operator connection bootstraps the disposable namespace and
-stays open for the whole scenario. A small, exactly bounded number of direct
+stays open for the whole scenario. Immediately after the short-lived admin
+client that created the disposable database is dropped, the test boundedly
+polls through the operator connection until exactly one active client
+backend (its own) is visible, since dropping a connection only requests
+asynchronous teardown; this poll is safe because no connection pool exists
+yet and nothing else in the scenario can independently change the count at
+that point (unlike a later point in this same scenario, where such a poll
+would not be safe — see below). A small, exactly bounded number of direct
 blocker connections then saturate every remaining server slot; one further
 direct connection attempt is live evidence that the server is genuinely out
 of capacity: SQLSTATE `53300` (`too_many_connections`) at `FATAL` severity.

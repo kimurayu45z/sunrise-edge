@@ -1898,12 +1898,29 @@ version 1, and fail closed on zero identity/rule version, empty access, or
 - DR-0072: Add a required live `runtime-postgres` integration test for real
   server connection-slot exhaustion. Start an exact digest-pinned disposable
   PostgreSQL 18 container configured with a tiny exact `max_connections`
-  (5), zero `superuser_reserved_connections` (so no role gets a capacity
-  carve-out this scenario's counting would need to special-case), and
-  `autovacuum` disabled (so no background worker can silently draw from the
-  same connection-slot budget mid-test). An already-open operator connection
-  bootstraps the disposable namespace, reads back the server's own
-  `max_connections`/`superuser_reserved_connections` settings as
+  (5), zero `superuser_reserved_connections`, and zero PostgreSQL 16+
+  `reserved_connections` (a second, independent reserved pool for roles with
+  the `pg_use_reserved_connections` predefined role) so no role gets a
+  capacity carve-out this scenario's counting would need to special-case.
+  `autovacuum` is also disabled, but only as optional quiescence against
+  unrelated background activity: autovacuum workers and the autovacuum
+  launcher are accounted from their own separate budget
+  (`autovacuum_max_workers`, alongside `max_worker_processes` and
+  `max_wal_senders`), never carved out of `max_connections`, so this
+  scenario's `backend_type = 'client backend'`-filtered counts already
+  exclude them regardless. An already-open operator connection
+  bootstraps the disposable namespace and, immediately after the short-lived
+  admin client that created the database is dropped, boundedly polls through
+  that same connection until exactly one active client backend (its own) is
+  visible — proof the admin client's asynchronous connection teardown has
+  actually been processed server-side, since without it the admin backend
+  could still transiently count against capacity right as the blocker loop
+  starts. This poll is safe because no `r2d2` pool exists yet at this point
+  and nothing else in the scenario can spontaneously open or close a
+  connection, unlike a later point in this same scenario (see below), where
+  polling for a transient count would not be safe. The operator connection
+  then reads back the server's own `max_connections`,
+  `superuser_reserved_connections`, and `reserved_connections` settings as
   configuration ground truth, and stays open for the whole scenario. A small,
   exactly bounded number of direct blocker connections then saturate every
   remaining slot; one further direct connection attempt is live evidence of
