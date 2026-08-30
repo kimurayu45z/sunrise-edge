@@ -1184,9 +1184,11 @@ selection. Request traffic does not run DDL or bootstrap. An optional shared
 commit-loss capability now covers commit-boundary connection loss over the
 plain `NoTls` transport (see below), and a separate serialized live test now
 covers database-process SIGKILL and WAL recovery on a live host with a live
-page cache (DR-0069). In-flight cancellation, abrupt host/power loss, storage
-write-cache flush/torn-write/media/filesystem faults, disk-full/WAL
-exhaustion, TLS-path connection loss, backup/restore, capacity/load/soak, real
+page cache (DR-0069). A bounded disposable-container test separately covers
+pre-commit data-tablespace ENOSPC (DR-0070). In-flight cancellation, abrupt
+host/power loss, storage write-cache flush/torn-write/media/filesystem faults,
+WAL exhaustion, commit-boundary or real-device ENOSPC, TLS-path connection
+loss, backup/restore, capacity/load/soak, real
 writer failover, and production certification evidence remain open, so this
 is still As-Is adapter evidence rather than production readiness.
 
@@ -1223,10 +1225,12 @@ shows the backend returned a successful acknowledgement before the driver
 lost it, not crash durability under abrupt process/power loss, and it says
 nothing about TLS-path connection loss. A separate serialized live test now
 proves database-process SIGKILL and WAL recovery on a live host with a live
-page cache (DR-0069); it does not prove abrupt host/power loss, storage
-write-cache flush/torn-write/media/filesystem faults, disk-full/WAL
-exhaustion, TLS-path behavior, backup/restore, capacity/load/soak, real writer
-failover, provider certification, or production readiness, all of which
+page cache (DR-0069). A separate disposable-container scenario proves bounded
+data-tablespace ENOSPC before `COMMIT` and exact recovery after space is freed
+(DR-0070); neither test proves abrupt host/power loss, storage write-cache
+flush/torn-write/media/filesystem faults, WAL exhaustion, commit-boundary or
+real-device ENOSPC, TLS-path behavior, backup/restore, capacity/load/soak,
+real writer failover, provider certification, or production readiness, all of which
 remain backend-specific evidence. Passing this suite is As-Is contract
 evidence, not production certification.
 
@@ -1796,6 +1800,28 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   rather than skipping. This proves PostgreSQL database-process SIGKILL and
   WAL recovery on a live host with a live page cache; it does not prove
   abrupt host/power loss, storage write-cache flush/torn-write/media/
-  filesystem faults, disk-full/WAL exhaustion, TLS-path behavior,
+  filesystem faults, WAL exhaustion, commit-boundary or real-device ENOSPC,
+  TLS-path behavior,
   backup/restore, capacity/load/soak, real writer failover, provider
-  certification, or production readiness, all of which remain open.
+  certification, or production readiness, all of which remain open. DR-0070
+  below separately covers bounded pre-commit data-tablespace ENOSPC only.
+- DR-0070: Add a required live `runtime-postgres` integration test for a real,
+  bounded data-tablespace `ENOSPC` before `COMMIT`. Start an exact
+  digest-pinned disposable PostgreSQL 18 container with PGDATA, WAL, and
+  transaction status on an unfilled 512 MiB tmpfs and the database default
+  tablespace on a distinct 64 MiB tmpfs. Verify the SQL connection and Docker
+  exec target share an identity marker, verify the tablespace and PGDATA/WAL
+  device IDs differ, and verify the bounded filesystem capacity before
+  filling only the tablespace. A direct large incompressible relation write
+  must return SQLSTATE `53100`; the same fault applied to a structured durable
+  invocation must return the definite pre-commit
+  `Rejected(UnavailableBeforeCommit)`. After removing the filler, use the same
+  pool/store to prove no state or receipt was published and the commit sequence
+  did not advance, then commit and replay the identical invocation and complete
+  its exact outbox claim/acknowledgement. Docker commands use direct argv,
+  bounded time/output, strict digest/env parsing, and panic-safe removal of the
+  exact created container. This changes no schema, schema identity/generation,
+  canonical bytes, or protocol behavior. It proves only RAM-backed
+  data-tablespace VFS `ENOSPC` before commit; WAL exhaustion, commit-boundary
+  ENOSPC, real storage cache/media/filesystem failure, host/power loss, and
+  production certification remain open.

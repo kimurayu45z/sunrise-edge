@@ -50,8 +50,9 @@ persisted. A final unfaulted commit proves the connection pool recovers a
 healthy connection. This is evidence that the backend returned a successful
 commit acknowledgement over the plain transport before the driver lost it,
 not proof of crash durability under abrupt process/power loss; it says
-nothing about TLS-path connection loss, disk-full/WAL exhaustion,
-backup/restore, capacity/load/soak, or real failover.
+nothing about TLS-path connection loss, WAL or commit-boundary exhaustion,
+backup/restore, capacity/load/soak, or real failover. The separate bounded
+data-tablespace ENOSPC scenario described below does not broaden those claims.
 Request handling must never call `apply_initial_schema` or
 `bootstrap_namespace`; those remain operator-only actions. Writer failover uses
 the separate expected-generation `advance_writer_fence` operator seam and must
@@ -115,3 +116,24 @@ only after confirming no live test process for this crate
 still actually running — deleting it while a live test genuinely holds it
 would let two destructive live tests run concurrently against the same
 container.
+
+### Live bounded data-tablespace ENOSPC test
+
+`tests/postgres_disk_full.rs` starts and owns a digest-pinned disposable
+PostgreSQL 18 container. Set both variables to make it required locally:
+
+```bash
+SUNRISE_EDGE_TEST_POSTGRES_DISK_FULL_IMAGE=postgres:18.6-alpine3.24@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2 \
+SUNRISE_EDGE_TEST_POSTGRES_DISK_FULL_REQUIRED=1 \
+  cargo test -p runtime-postgres --all-features --test postgres_disk_full -- --nocapture
+```
+
+The test keeps PGDATA/WAL on an unfilled 512 MiB tmpfs, fills only a distinct
+64 MiB default tablespace, proves direct SQLSTATE `53100` and the adapter's
+definite pre-commit `UnavailableBeforeCommit`, then frees space and reconciles
+exact non-publication and recovery through the same pool/store. It force-removes
+only its exact created container on normal return or panic. Leaving both
+variables unset skips the test; setting the required flag without a valid
+digest-pinned image fails instead of skipping. This does not cover WAL or
+commit-boundary exhaustion, real storage media/cache/filesystem faults, or
+production certification.

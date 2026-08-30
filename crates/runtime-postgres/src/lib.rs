@@ -696,10 +696,23 @@ enum PreCommitFailure {
 
 impl PreCommitFailure {
     fn from_database(error: &postgres::Error) -> Self {
-        match error.code().map(postgres::error::SqlState::code) {
+        Self::from_sqlstate(error.code().map(postgres::error::SqlState::code))
+    }
+
+    /// Pure classification behind [`Self::from_database`], taking the raw
+    /// SQLSTATE code instead of a live `postgres::Error` so it can be unit
+    /// tested without a database connection.
+    fn from_sqlstate(code: Option<&str>) -> Self {
+        match code {
             Some("40001" | "40P01") => Self::Serialization,
             Some("55P03" | "57014") => Self::Deadline,
             Some("3F000" | "42P01" | "42703" | "42883") => Self::SchemaMismatch,
+            // Class 53 (insufficient resources): disk full (53100), out of
+            // memory (53200), too many connections (53300), configuration
+            // limit exceeded (53400). The statement definitively aborted and
+            // nothing was dispatched to COMMIT, so this is unavailability,
+            // never a conflict.
+            Some(code) if code.starts_with("53") => Self::Unavailable,
             Some(code) if code.starts_with("22") || code.starts_with("23") => {
                 Self::InvalidPersistedState
             }
@@ -3507,6 +3520,44 @@ mod tests {
         assert_eq!(
             classify_commit_error(None),
             DurableCommitOutcome::Indeterminate(IndeterminateCommitReason::ConnectionLost)
+        );
+    }
+
+    #[test]
+    fn pre_commit_class_53_is_unavailable_before_commit() {
+        for code in ["53100", "53200", "53300"] {
+            assert!(
+                matches!(
+                    PreCommitFailure::from_sqlstate(Some(code)),
+                    PreCommitFailure::Unavailable
+                ),
+                "expected {code} to classify as Unavailable"
+            );
+            assert_eq!(
+                PreCommitFailure::from_sqlstate(Some(code)).into_commit_rejection(),
+                DurableCommitRejection::UnavailableBeforeCommit
+            );
+        }
+    }
+
+    /// Pins the deliberate non-change described in `ARCHITECTURE.md` DR-0070:
+    /// PR86 has no live evidence for a `53100` at the commit boundary, so the
+    /// commit-boundary classifiers remain conservative and unchanged.
+    #[test]
+    fn commit_boundary_class_53_remains_conservative_indeterminate() {
+        assert_eq!(
+            classify_commit_error(Some("53100")),
+            DurableCommitOutcome::Indeterminate(IndeterminateCommitReason::ConnectionLost)
+        );
+        assert_eq!(
+            classify_outbox_claim_commit_error(Some("53100")),
+            DurableOutboxClaimOutcome::Indeterminate(IndeterminateCommitReason::ConnectionLost)
+        );
+        assert_eq!(
+            classify_outbox_acknowledgement_commit_error(Some("53100")),
+            DurableOutboxAcknowledgementOutcome::Indeterminate(
+                IndeterminateCommitReason::ConnectionLost
+            )
         );
     }
 }
