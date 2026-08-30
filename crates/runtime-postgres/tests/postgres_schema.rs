@@ -44,6 +44,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+mod support;
+
 const TEST_DATABASE: &str = "sunrise_edge_test";
 
 type TestPostgresManager = PostgresConnectionManager<NoTls>;
@@ -889,10 +891,19 @@ fn postgres_conformance_fixture(
 
 #[test]
 fn postgres_schema_and_durable_store_conformance() {
-    let Some(url) = std::env::var_os("SUNRISE_EDGE_TEST_POSTGRES_URL") else {
-        eprintln!("skipping live PostgreSQL conformance: SUNRISE_EDGE_TEST_POSTGRES_URL is unset");
+    let Some(url) = std::env::var_os(support::LIVE_POSTGRES_URL_ENV) else {
+        eprintln!(
+            "skipping live PostgreSQL conformance: {} is unset",
+            support::LIVE_POSTGRES_URL_ENV
+        );
         return;
     };
+    // Acquired before any live database work: this test destructively resets
+    // and reuses the shared `sunrise_edge_test` database, and a future
+    // SIGKILL crash-recovery scenario in this same test-binary family kills
+    // the whole database-service container, so at most one of these live
+    // tests may run against it at a time.
+    let _live_test_lock = support::LiveTestLock::acquire();
     let mut client = Client::connect(&url.to_string_lossy(), NoTls).unwrap();
     let database: String = client
         .query_one("SELECT current_database()", &[])

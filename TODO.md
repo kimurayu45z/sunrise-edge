@@ -2174,8 +2174,16 @@ Phase 15 As-Is scope:
   rejectされることを証明）を先に行った上でsame-identity reconciliationを証明し、最後にconnection pool
   recoveryを検証する（implemented As-Is；backendがCOMMITへ成功応答を返したことの証跡であり、abrupt
   process/power lossに対するcrash durabilityの証明ではなく、TLS-path connection lossは
-  対象外）。kill/power fault、disk full/WAL exhaustion、connection exhaustion、backup/restore、
-  capacity/load/soak、real writer failover、provider certificationは未実装である。
+  対象外）。別途、serializedなlive testがcommitted structured invocation（state、exact receipt、
+  1 due outbox message）の直後にintervening SQLなしでdatabase-service containerへ
+  `docker kill --signal=KILL`し、`docker start`と新規connectionでexact state/receipt、
+  `RequestAlreadyCommitted` replay、その1 requestへのexact claim/ack 1回に続く`NoDueWork`、
+  最終unfaulted commitを検証する
+  （implemented As-Is; ARCHITECTURE.md DR-0069）。これはlive host上のlive page cacheでの
+  database-process SIGKILLとWAL recoveryの証明であり、abrupt host/power loss、storage
+  write-cache flush/torn-write/media/filesystem fault、disk full/WAL exhaustion、connection
+  exhaustion、TLS-path connection loss、backup/restore、capacity/load/soak、real writer
+  failover、provider certificationは未実装である。
 - ComposedRuntimeはStateStore、BlobStore、Signer、Transport、Clock、Schedulerをhidden defaultなしで
   明示的に所有・合成する。SQLiteへstate/dedup/outboxをcommit後にruntimeをdropし、同じDBを別compositionで
   reopenしてstateを再適用せずoutboxを送ること、send failure leaseがreopen後もexpiry前は抑止されexpiry時だけ
@@ -2289,8 +2297,15 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
    same-identity reconciliationを証明し、pool recoveryを証明する
    （memory/PostgreSQL/commit-loss capability implemented As-Is；backendの成功応答の証跡でありabrupt
    process/power lossに対するcrash durabilityの証明ではない; provider adapters、TLS-path connection loss、
-   other fault/capacity certification pending）。
-5. kill/power fault、disk full/WAL exhaustion、connection exhaustion、capacity/load/soak、backup/restore、writer failoverをrehearsalする。
+   other fault/capacity certification pending）。別途、serializedなlive testがcommitted structured
+   invocationの直後にdatabase-service containerを`docker kill --signal=KILL`し、restart/readiness/
+   fresh connection reconciliationを検証する（implemented As-Is; ARCHITECTURE.md DR-0069）。これは
+   database-process SIGKILLとWAL recoveryの証明のみであり、abrupt host/power loss、storage write-cache
+   flush/torn-write/media/filesystem fault、TLS-path connection loss、capacity/load/soak、real writer
+   failover、backup/restore、provider certificationは未実装である。
+5. real host/power fault（storage write-cache flush、torn-write、media/filesystem fault含む）、
+   disk full/WAL exhaustion、connection exhaustion、capacity/load/soak、backup/restore、writer failoverを
+   rehearsalする。database-process SIGKILL/WAL recovery以外はこのstep 5の全項目が未実装のまま残っている。
 6. 同じcontractをCloudflare Durable ObjectとAWS persistenceへ実装し、real providerでcertifyする。
 
 Phase 16:

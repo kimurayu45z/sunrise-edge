@@ -64,7 +64,7 @@ The live integration test runs only against a dedicated database named
 
 ```bash
 SUNRISE_EDGE_TEST_POSTGRES_URL=postgresql://postgres:test@127.0.0.1:5432/sunrise_edge_test \
-  cargo test -p runtime-postgres --all-targets
+  cargo test -p runtime-postgres --test postgres_schema
 ```
 
 The test refuses to reset any database with a different name. It runs the same
@@ -73,3 +73,45 @@ pool/row-lock deadline exhaustion, commit-boundary deadline classification,
 serialization exhaustion, schema-skew injection, and the commit-loss
 connection-loss capability described above. CI supplies a digest-pinned
 PostgreSQL 18 service and runs this test through the normal workspace gate.
+
+### Live SIGKILL crash-recovery test
+
+`tests/postgres_crash_recovery.rs` is a separate test binary that kills and
+restarts the whole database-service container, so it requires **both**
+`SUNRISE_EDGE_TEST_POSTGRES_URL` **and** the exact full Docker container ID
+of that same container, in `SUNRISE_EDGE_TEST_POSTGRES_CONTAINER_ID`. A safe
+way to produce both against a disposable, named test container:
+
+```bash
+docker run -d --name sunrise-edge-pg-crash-test \
+  -e POSTGRES_PASSWORD=test -e POSTGRES_DB=sunrise_edge_test \
+  -p 55432:5432 postgres:18.6-alpine3.24@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2
+CONTAINER_ID="$(docker inspect --format '{{.Id}}' sunrise-edge-pg-crash-test)"
+
+SUNRISE_EDGE_TEST_POSTGRES_URL=postgresql://postgres:test@127.0.0.1:55432/sunrise_edge_test \
+SUNRISE_EDGE_TEST_POSTGRES_CONTAINER_ID="$CONTAINER_ID" \
+  cargo test -p runtime-postgres --test postgres_crash_recovery
+```
+
+`docker inspect --format '{{.Id}}'` prints the exact full ID Docker assigned
+that specific container; never derive, guess, or match a container by name
+or label at test time. Setting only `SUNRISE_EDGE_TEST_POSTGRES_URL` without
+the container ID is **intentionally rejected**, not silently skipped: partial
+crash-test configuration panics immediately (see
+`resolve_crash_scenario` in `tests/support/mod.rs`) rather than risk running,
+or quietly skipping, against the wrong assumption. Leave both variables unset
+to skip the crash test while still running the rest of `--all-targets`.
+
+This test also acquires a cross-process lock file before touching the
+database, named `sunrise-edge-runtime-postgres-live-test.lock` inside
+`std::env::temp_dir()` (i.e. `$TMPDIR` or the platform equivalent — commonly
+scoped per user, not shared host-wide), so it never runs concurrently with
+any other live test in this crate. The lock releases itself when the test
+process exits normally or panics. If a test process is killed before it can
+run its own cleanup, the lock file is abandoned and every future live test
+run fails loudly, pointing at that exact path. Only delete it by hand, and
+only after confirming no live test process for this crate
+(e.g. `pgrep -fl postgres_crash_recovery` or `pgrep -fl postgres_schema`) is
+still actually running — deleting it while a live test genuinely holds it
+would let two destructive live tests run concurrently against the same
+container.

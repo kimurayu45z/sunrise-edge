@@ -1180,13 +1180,15 @@ replaced attempt in the replacement transaction, and advances one message only
 through an exactly bound acknowledgement. Claim and acknowledgement take a
 shared namespace-metadata lock so a fence advance cannot race them without
 serializing unrelated delivery rows; `SKIP LOCKED` is confined to due delivery
-selection. Request traffic does not run DDL or bootstrap. In-flight
-cancellation, abrupt process/power fault, disk-full/WAL exhaustion, TLS-path
-connection loss, capacity/load/soak, real writer failover, and production
-certification evidence remain open; an optional shared commit-loss capability
-now covers commit-boundary connection loss over the plain `NoTls` transport
-(see below), so this is still As-Is adapter evidence rather than production
-readiness.
+selection. Request traffic does not run DDL or bootstrap. An optional shared
+commit-loss capability now covers commit-boundary connection loss over the
+plain `NoTls` transport (see below), and a separate serialized live test now
+covers database-process SIGKILL and WAL recovery on a live host with a live
+page cache (DR-0069). In-flight cancellation, abrupt host/power loss, storage
+write-cache flush/torn-write/media/filesystem faults, disk-full/WAL
+exhaustion, TLS-path connection loss, backup/restore, capacity/load/soak, real
+writer failover, and production certification evidence remain open, so this
+is still As-Is adapter evidence rather than production readiness.
 
 Runtime exposes the vendor-neutral durable-store conformance cases only to its
 own tests or adapters that opt into the non-default `durable-conformance`
@@ -1219,8 +1221,12 @@ succeed identically whether or not the prior transaction actually persisted.
 A final unfaulted commit proves the connection pool recovers afterward. This
 shows the backend returned a successful acknowledgement before the driver
 lost it, not crash durability under abrupt process/power loss, and it says
-nothing about TLS-path connection loss. Abrupt process/power fault, disk-full/WAL
-exhaustion, backup/restore, capacity/load/soak, and real writer failover
+nothing about TLS-path connection loss. A separate serialized live test now
+proves database-process SIGKILL and WAL recovery on a live host with a live
+page cache (DR-0069); it does not prove abrupt host/power loss, storage
+write-cache flush/torn-write/media/filesystem faults, disk-full/WAL
+exhaustion, TLS-path behavior, backup/restore, capacity/load/soak, real writer
+failover, provider certification, or production readiness, all of which
 remain backend-specific evidence. Passing this suite is As-Is contract
 evidence, not production certification.
 
@@ -1751,3 +1757,45 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   fee debit, mutating/consuming effects, shared/system owners, blob-backed
   body verification, and a future `HASH_DOMAIN_VERSION` bump (which is itself
   protocol-critical and would need its own provenance).
+- DR-0069: Add a live, serialized `runtime-postgres` integration test that
+  `docker kill --signal=KILL`s the database-process container immediately
+  after a committed structured invocation and verifies recovery through
+  `docker start` plus a fresh connection. The test commits one structured
+  invocation containing state, an exact receipt, and one due outbox message,
+  observes `Committed` with the committing pool still alive, then — with no
+  intervening SQL — sends the kill as direct argv (never a shell string)
+  against a container ID validated as lowercase hex and supplied only
+  through CI-controlled configuration, never derived at test time. It then
+  restarts the same container, boundedly polls a fresh client/`SELECT 1` for
+  readiness — the exact readiness criterion this test needs is a fresh
+  external connection plus `SELECT 1`, not a container-local probe — and
+  reconnects to verify the exact state revision/value, the exact receipt, an
+  identical `RequestAlreadyCommitted` replay, one exact claim and
+  acknowledgement followed by `NoDueWork` for that request, and a final
+  unfaulted commit. Also capture `pg_postmaster_start_time()`, projected as
+  an exact integer microsecond count (via `EXTRACT`'s `numeric` return type,
+  never a float, so nothing float-typed crosses into the Rust decode), once
+  immediately before the commit and again after restart through the fresh
+  connection, and assert it strictly advanced — this catches a configured
+  container ID that is valid but names an unrelated container, since killing
+  and restarting the wrong container leaves the real database process's
+  postmaster start time unchanged. Serialize this
+  test against every other live-database test with a bounded, cross-process,
+  atomically created (`create_new`/`O_EXCL`) lock file, since more than one
+  `cargo test` binary may run destructive live tests concurrently and this
+  one kills the shared database-service container out from under the rest.
+  An abandoned lock (its owning process killed before it could run `Drop`)
+  is never automatically reclaimed — a reclaiming waiter would need a
+  read-check-remove sequence that is inherently TOCTOU, able to delete a
+  replacement lock a new legitimate owner had just created — so it instead
+  fails every future acquisition loudly once the bound elapses, pointing at
+  the file for a human to remove. CI supplies the exact database-service
+  container ID and marks the scenario required so a broken container-ID
+  derivation fails the run instead of silently skipping; partial
+  configuration (only one of the live URL or container ID set) always fails
+  rather than skipping. This proves PostgreSQL database-process SIGKILL and
+  WAL recovery on a live host with a live page cache; it does not prove
+  abrupt host/power loss, storage write-cache flush/torn-write/media/
+  filesystem faults, disk-full/WAL exhaustion, TLS-path behavior,
+  backup/restore, capacity/load/soak, real writer failover, provider
+  certification, or production readiness, all of which remain open.
