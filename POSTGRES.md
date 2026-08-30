@@ -308,8 +308,15 @@ container, boundedly waits for readiness, and reconnects with a fresh
 pool/client to verify the exact committed state revision/value, the exact
 receipt, an identical `RequestAlreadyCommitted` replay, one exact claim and
 acknowledgement followed by `NoDueWork` for that request, and a final
-unfaulted commit. This proves PostgreSQL database-process SIGKILL and WAL recovery on a
-live host with a live page cache; it does not prove abrupt host/power loss,
+unfaulted commit. It also captures `pg_postmaster_start_time()` as an exact
+integer microsecond count (via `EXTRACT`'s `numeric` return type, never a
+float) immediately before the commit and again after restart through the
+fresh connection, and asserts it strictly advanced — this fails the test if
+the configured container ID is a valid but unrelated container, since
+killing and restarting the wrong container leaves the real database
+process, and its postmaster start time, untouched. This proves PostgreSQL
+database-process SIGKILL and WAL recovery on a live host with a live page
+cache; it does not prove abrupt host/power loss,
 storage write-cache flush/torn-write/media/filesystem faults, disk-full/WAL
 exhaustion, TLS-path behavior, backup/restore, capacity/load/soak, writer
 failover, provider certification, or production readiness. This test is

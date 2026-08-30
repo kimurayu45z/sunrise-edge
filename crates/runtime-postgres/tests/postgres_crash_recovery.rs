@@ -41,6 +41,30 @@ mod support;
 
 const TEST_DATABASE: &str = "sunrise_edge_test";
 
+/// Projects `pg_postmaster_start_time()` as an exact integer count of
+/// microseconds since the Unix epoch. `EXTRACT(EPOCH FROM ...)` returns
+/// `numeric` (exact decimal), not `double precision`, so multiplying by
+/// `1000000` and casting to `bigint` is exact decimal arithmetic with no
+/// floating-point rounding anywhere in the computation, and the driver
+/// decodes the result as a plain `i64` with no float ever entering the Rust
+/// side either.
+const POSTMASTER_START_TIME_MICROS_SQL: &str =
+    "SELECT (EXTRACT(EPOCH FROM pg_postmaster_start_time()) * 1000000)::bigint";
+
+/// Queries [`POSTMASTER_START_TIME_MICROS_SQL`] on `client`. Used once
+/// before the durable commit and once again after `guard.restart_and_wait_ready()`
+/// through a fresh connection, so the test can assert the value strictly
+/// advanced — proof that the *database process this client is actually
+/// talking to* really was killed and restarted, not merely that some
+/// container (possibly the wrong one, if `SUNRISE_EDGE_TEST_POSTGRES_CONTAINER_ID`
+/// is misconfigured to a valid-but-unrelated container) was.
+fn postmaster_start_time_micros(client: &mut Client) -> i64 {
+    client
+        .query_one(POSTMASTER_START_TIME_MICROS_SQL, &[])
+        .unwrap()
+        .get(0)
+}
+
 type TestPostgresManager = PostgresConnectionManager<NoTls>;
 
 fn now_millis() -> u64 {
@@ -85,12 +109,16 @@ fn postgres_crash_recovery_sigkill_and_wal_replay() {
         .to_string_lossy()
         .into_owned();
 
-    let mut guard = support::DockerCrashGuard::new(container_id, url.clone());
-
-    // Acquired before any live database work: this test kills the whole
-    // database-service container, so it must never run concurrently with
-    // any other live test in this crate.
+    // Acquired before any live database work, and before constructing the
+    // guard below: this test kills the whole database-service container, so
+    // it must never run concurrently with any other live test in this
+    // crate. Declared before `guard` so that on unwind, locals drop in
+    // reverse declaration order — `guard` drops first (best-effort restart,
+    // waiting for readiness) and only then does this lock drop and let
+    // another live test proceed against the container.
     let _live_test_lock = support::LiveTestLock::acquire();
+
+    let mut guard = support::DockerCrashGuard::new(container_id, url.clone());
 
     let mut client = Client::connect(&url, NoTls).unwrap();
     let database: String = client
@@ -207,6 +235,10 @@ fn postgres_crash_recovery_sigkill_and_wal_replay() {
     .unwrap();
     let replay_invocation = invocation.clone();
 
+    // Captured here, before the commit, so that the commit -> `sigkill()`
+    // sequence immediately below stays adjacent with no intervening SQL.
+    let pre_crash_postmaster_start_micros = postmaster_start_time_micros(&mut client);
+
     // From here until the confirmed `guard.sigkill()` immediately below, no
     // further SQL or database operation may run: the whole point of this
     // scenario is that nothing happens between the driver observing
@@ -230,6 +262,18 @@ fn postgres_crash_recovery_sigkill_and_wal_replay() {
         .unwrap()
         .get(0);
     assert_eq!(fresh_database, TEST_DATABASE);
+
+    let post_crash_postmaster_start_micros = postmaster_start_time_micros(&mut fresh_client);
+    assert!(
+        post_crash_postmaster_start_micros > pre_crash_postmaster_start_micros,
+        "postmaster start time did not strictly advance across the SIGKILL/restart \
+         (pre-crash {pre_crash_postmaster_start_micros}us, post-crash \
+         {post_crash_postmaster_start_micros}us); this means {} does not actually name the \
+         database-service container this test's client is talking to (for example, a valid but \
+         unrelated container), since killing and restarting the right container always advances \
+         its postmaster start time",
+        support::CRASH_CONTAINER_ID_ENV
+    );
 
     let mut fresh_database_config: Config = url.parse().unwrap();
     fresh_database_config.application_name("sunrise-edge-pr85-crash-recovery-post");

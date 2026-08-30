@@ -1772,7 +1772,14 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   reconnects to verify the exact state revision/value, the exact receipt, an
   identical `RequestAlreadyCommitted` replay, one exact claim and
   acknowledgement followed by `NoDueWork` for that request, and a final
-  unfaulted commit. Serialize this
+  unfaulted commit. Also capture `pg_postmaster_start_time()`, projected as
+  an exact integer microsecond count (via `EXTRACT`'s `numeric` return type,
+  never a float, so nothing float-typed crosses into the Rust decode), once
+  immediately before the commit and again after restart through the fresh
+  connection, and assert it strictly advanced — this catches a configured
+  container ID that is valid but names an unrelated container, since killing
+  and restarting the wrong container leaves the real database process's
+  postmaster start time unchanged. Serialize this
   test against every other live-database test with a bounded, cross-process,
   atomically created (`create_new`/`O_EXCL`) lock file, since more than one
   `cargo test` binary may run destructive live tests concurrently and this

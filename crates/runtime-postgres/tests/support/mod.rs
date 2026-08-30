@@ -9,14 +9,14 @@
 //! needs, and drives `docker` by direct argv.
 #![allow(dead_code)]
 
-use postgres::{Client, NoTls};
+use postgres::{Config, NoTls};
 use std::{
     env,
     ffi::OsString,
     fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    process::{Command, ExitStatus},
+    process::{Child, Command, ExitStatus},
     sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -51,10 +51,13 @@ const LIVE_LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(180);
 /// Poll interval while waiting for [`LIVE_LOCK_ACQUIRE_TIMEOUT`] to elapse.
 const LIVE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Resolves the one lock-file path every live test process on this host
-/// contends for. Fixed and outside the crate's own build/target directories
-/// so it identifies the same file regardless of which test binary or
-/// worktree invokes it.
+/// Resolves the one lock-file path every live test process sharing this OS
+/// temp directory contends for. `env::temp_dir()` resolves per `TMPDIR` (or
+/// platform equivalent), which is commonly scoped per user rather than
+/// shared host-wide, so this coordinates every live test process for one
+/// temp directory/user, not necessarily the whole host. Fixed and outside
+/// the crate's own build/target directories so it identifies the same file
+/// regardless of which test binary or worktree invokes it.
 fn live_lock_path() -> PathBuf {
     env::temp_dir().join("sunrise-edge-runtime-postgres-live-test.lock")
 }
@@ -362,31 +365,97 @@ fn docker_exit_error(label: &str, status: ExitStatus) -> io::Error {
     io::Error::other(format!("{label} exited with {status}"))
 }
 
-fn docker_kill(container_id: &ContainerId) -> io::Result<()> {
-    let status = docker_argv_command(&["kill", "--signal=KILL", container_id.as_str()]).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(docker_exit_error("docker kill", status))
+/// Bound on how long one spawned `docker` CLI invocation may run before this
+/// guard kills the `docker` process itself and reports a timeout, rather
+/// than let a hung Docker daemon or CLI turn a bounded test into an
+/// unbounded hang. `docker kill`/`docker start` normally complete in well
+/// under a second.
+const DOCKER_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Poll interval while waiting for a spawned `docker` child process to exit
+/// within [`DOCKER_COMMAND_TIMEOUT`].
+const DOCKER_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Runs `command` to completion using `spawn` plus `try_wait` polling
+/// instead of the blocking `status()`, so a hung child is bounded by
+/// [`DOCKER_COMMAND_TIMEOUT`] instead of hanging this guard forever. On
+/// timeout, kills and reaps the child before returning an error; no shell
+/// and no additional crate is involved, only `std::process`.
+fn run_docker_command_bounded(mut command: Command, label: &str) -> io::Result<()> {
+    let mut child: Child = command.spawn()?;
+    let deadline = Instant::now() + DOCKER_COMMAND_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(docker_exit_error(label, status))
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other(format!(
+                "{label} did not exit within {DOCKER_COMMAND_TIMEOUT:?} and was killed"
+            )));
+        }
+        thread::sleep(DOCKER_COMMAND_POLL_INTERVAL);
     }
 }
 
-fn docker_start(container_id: &ContainerId) -> io::Result<()> {
-    let status = docker_argv_command(&["start", container_id.as_str()]).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(docker_exit_error("docker start", status))
-    }
+fn docker_kill(container_id: &ContainerId) -> io::Result<()> {
+    run_docker_command_bounded(
+        docker_argv_command(&["kill", "--signal=KILL", container_id.as_str()]),
+        "docker kill",
+    )
 }
+
+fn docker_start(container_id: &ContainerId) -> io::Result<()> {
+    run_docker_command_bounded(
+        docker_argv_command(&["start", container_id.as_str()]),
+        "docker start",
+    )
+}
+
+/// Per-attempt connect timeout for the readiness probe below. Deliberately
+/// short relative to [`CONTAINER_READY_TIMEOUT`]: the poll loop, not any
+/// single attempt, provides the overall bound, so one attempt hanging on a
+/// dead container must not be allowed to consume the whole budget itself.
+const READINESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Statement timeout applied, session-wide, to the readiness probe's own
+/// connection before it runs the trivial query, so a connection that
+/// completes a TCP/startup handshake but never answers a query is also
+/// bounded well inside [`CONTAINER_READY_TIMEOUT`] rather than left to the
+/// driver's own (much longer, or absent) default.
+const READINESS_STATEMENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Readiness means a brand-new client can connect and run a trivial query,
 /// not merely that the container process is up: the exact readiness
 /// criterion this test needs before it reconnects and reads back committed
 /// data is a fresh external connection plus `SELECT 1`, not a container-local
-/// probe.
+/// probe. Built from a parsed [`Config`] (not the bare `Client::connect`
+/// convenience) specifically so an explicit, short `connect_timeout` and a
+/// bounded statement timeout apply to every attempt in the 60s poll loop
+/// this backs, instead of inheriting the driver's unbounded defaults.
 fn database_accepts_trivial_query(database_url: &str) -> bool {
-    let Ok(mut client) = Client::connect(database_url, NoTls) else {
+    let Ok(mut config) = database_url.parse::<Config>() else {
+        return false;
+    };
+    let statement_timeout_millis: u64 =
+        u64::try_from(READINESS_STATEMENT_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+    config.connect_timeout(READINESS_CONNECT_TIMEOUT);
+    config.tcp_user_timeout(READINESS_STATEMENT_TIMEOUT);
+    config.options(&format!("-c statement_timeout={statement_timeout_millis}"));
+    let Ok(mut client) = config.connect(NoTls) else {
         return false;
     };
     let Ok(row) = client.query_one("SELECT 1", &[]) else {
