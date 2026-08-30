@@ -270,10 +270,12 @@ explicit cancellation only before first storage dispatch; node-core object
 mutations/effects, fees, blob transfer verification, owned fast routing, and
 production object migrations remain deferred. Started work, client
 disconnect, and shutdown budgets remain uncancellable. Next, implement
-the remaining fault evidence after the bounded data-tablespace ENOSPC scenario
-in DR-0070: abrupt process/power fault, WAL exhaustion, commit-boundary and
-real storage-device ENOSPC, TLS-path connection loss,
-backup/restore, capacity/load/soak, real writer failover, and provider
+the remaining fault evidence after the bounded pre-commit data-tablespace
+ENOSPC (DR-0070), pre-commit WAL-filesystem ENOSPC (DR-0071), and server
+connection-slot exhaustion (DR-0072) scenarios: abrupt process/power fault,
+commit-boundary and real storage-device ENOSPC, TLS-path connection loss,
+backup/restore, capacity/load/soak, connection-pool behavior under a
+provider-managed pooler, real writer failover, and provider
 implementations. Do not spend further
 effort treating the opaque SQLite table or prefix scanner as the production
 schema. The adapter must not infer normalized rows from opaque key prefixes.

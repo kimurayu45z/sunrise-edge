@@ -2207,6 +2207,41 @@ Phase 15 As-Is scope:
   （bounded WAL-filesystem ENOSPCのみimplemented As-Is; ARCHITECTURE.md DR-0071）。literal `COMMIT`時の
   WAL/data ENOSPCは未検証であり、この境界についてENOSPC固有の分類は主張しない。real-device ENOSPCと
   他のfault/capacity certificationも未実装のままである。
+  さらに別のrequired live testはdigest-pinned disposable PostgreSQLをtiny exact `max_connections`、
+  zero `superuser_reserved_connections`、zero PostgreSQL 16+ `reserved_connections`（
+  `pg_use_reserved_connections` role向けの別のindependent reserved pool）で起動し、どのroleにも
+  capacity carve-outを与えない。autovacuumも無効化するが、これはoptional quiescenceに過ぎない
+  ——autovacuum worker/launcherは自身のseparate budgetから割り当てられ、`max_connections`から
+  carve-outされることはない。すでにopenなoperator connectionがnamespaceをbootstrapしたまま
+  scenario全体で開き続ける。databaseを作成したshort-livedなadmin clientをdropした直後、operator
+  connection自身のconnectionだけがactiveであることをboundedにpollして確認する
+  ——`Client`のdropはasynchronousなteardownを要求するだけなので、このpollがなければadmin client
+  のbackendがblocker接続の厳密なcount開始時にtransientにcapacityへ残ってしまう可能性がある。この
+  pollがsafeなのは、この時点ではまだ`r2d2` poolが存在せず、このtestが開始した以外の何もconnection
+  countを自発的に変化させ得ないためであり、この同じscenarioの後半（下記）でtransient countをpoll
+  することがsafeでないのとは対照的である。小さくexactly boundedな数のdirect blocker
+  connectionでserverの全connection slotを飽和させ、direct probeのSQLSTATE `53300`（`FATAL`
+  severity）とexact active client-backend countでgenuineなexhaustionを証明する。capacityがまだ
+  exhaustedのまま、zero physical connectionを保持すると証明したmax-size-oneのadapter poolで1回
+  bounded structured invocation commitを実行する。`r2d2`のconnection-acquisition waitはbareな
+  refusalでは早期returnしないため、このcrateがfailureをclassifyする時点でcaller自身のoperation
+  deadlineも構造的にちょうど経過しており、pool exhaustionとdeadline exhaustionは同一のdefinite
+  pre-commit `Rejected(DeadlineExceededBeforeCommit)`へcollapseする（connectionとtransactionが
+  既にopenな状態でfaultが発生するDR-0070/DR-0071とは異なり、`UnavailableBeforeCommit`にはならない）。
+  adapter poolはsaturated中に新規connectionを開けないため、state/receipt/outbox行とcommit
+  sequenceの非公開はstoreではなくstill-openなoperator connectionを通じて証明する。rejected
+  attempt自身の内部connection試行は`commit_invocation`が返った後も止まらず、`r2d2`が独立して
+  短いbackoffで再試行し続けるため、blocker connectionを厳密に1つだけ解放して空いたslotはこの
+  testが呼び出すどの呼び出しとも無関係にその背後のretryが任意のタイミングで奪う可能性がある。
+  解放直後の一時的なcountをpollしてこの独立したretryとraceさせるのではなく、次の
+  `commit_invocation`呼び出しがcapacity獲得後に必ず成功することを要求し、成功後にstill-openな
+  operator connectionを通じてsteady-stateのactive client-backend countが厳密に`max_connections`
+  であり、そのうちちょうど1つがadapter pool自身の`application_name`を持つことを証明することで、
+  adapter pool自身が解放されたslotを奪ったことを確定的に証明する。同じinvocationのrecovery、
+  exact replay/claim/ack、pool usabilityも同じpool/storeで証明できる（bounded
+  connection-exhaustion evidenceのみimplemented As-Is; ARCHITECTURE.md DR-0072）。real-device
+  resource exhaustion、load/soak capacity、provider-managed pooler（例: PgBouncer）下での
+  connection-pool挙動、production certificationは未実装のままである。
 - ComposedRuntimeはStateStore、BlobStore、Signer、Transport、Clock、Schedulerをhidden defaultなしで
   明示的に所有・合成する。SQLiteへstate/dedup/outboxをcommit後にruntimeをdropし、同じDBを別compositionで
   reopenしてstateを再適用せずoutboxを送ること、send failure leaseがreopen後もexpiry前は抑止されexpiry時だけ
@@ -2327,10 +2362,14 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
    flush/torn-write/media/filesystem fault、TLS-path connection loss、capacity/load/soak、real writer
    failover、backup/restore、provider certificationは未実装である。
 5. real host/power fault（storage write-cache flush、torn-write、media/filesystem fault含む）、
-   commit-boundary/real storage-device ENOSPC、connection exhaustion、
+   commit-boundary/real storage-device ENOSPC、
    capacity/load/soak、backup/restore、writer failoverをrehearsalする。database-process
    SIGKILL/WAL recovery、bounded pre-commit data-tablespace ENOSPC（DR-0070）、bounded pre-commit
-   WAL-filesystem ENOSPC（DR-0071）以外はこのstep 5の全項目が未実装のまま残っている。
+   WAL-filesystem ENOSPC（DR-0071）、bounded server connection-slot exhaustion（DR-0072）以外は
+   このstep 5の全項目が未実装のまま残っている。connection exhaustionはDR-0072でserverが飽和した
+   際にadapter poolがdefinite pre-commit `Rejected(DeadlineExceededBeforeCommit)`を返すことを
+   bounded disposable containerで証明したが、real-device resource exhaustion、load/soak capacity、
+   provider-managed pooler下での挙動、production certificationは未実装のままである。
 6. 同じcontractをCloudflare Durable ObjectとAWS persistenceへ実装し、real providerでcertifyする。
 
 Phase 16:

@@ -229,9 +229,52 @@ cross-provider ingress milestones implemented through Phase 17:
   returns SQLSTATE `53100`, proves the adapter rejects the pre-commit
   structured invocation as `UnavailableBeforeCommit`, then frees space and
   reconciles no state/receipt publication before the identical invocation,
-  outbox claim, and acknowledgement succeed. This is bounded data-tablespace
-  ENOSPC evidence only: WAL exhaustion, commit-boundary ENOSPC, real storage
-  media/cache/filesystem faults, and production certification remain open.
+  outbox claim, and acknowledgement succeed. This is bounded pre-commit
+  data-tablespace ENOSPC evidence only.
+- A separate required CI scenario (see `ARCHITECTURE.md` DR-0071) relocates
+  `pg_wal` alone onto its own bounded 64 MiB tmpfs, distinct from and much
+  smaller than the unfilled 512 MiB tmpfs holding PGDATA and the default
+  tablespace, then fills only the WAL mount. A direct write crossing a WAL
+  segment boundary still returns SQLSTATE `53100`, but at `PANIC` severity,
+  and PostgreSQL crash-restarts the whole postmaster; after an in-place
+  recovery, a second independent fill drives the adapter's own structured
+  invocation commit to exhaust WAL and crash the server, observing the
+  definite pre-commit `Rejected(UnavailableBeforeCommit)`, then reconciles no
+  publication and exact recovery through the same pool/store. This is bounded
+  pre-commit WAL-filesystem ENOSPC evidence only.
+- A separate required CI scenario (see `ARCHITECTURE.md` DR-0072) starts an
+  exact digest-pinned disposable PostgreSQL container with a tiny exact
+  `max_connections`, zero `superuser_reserved_connections`, and zero
+  PostgreSQL 16+ `reserved_connections` (a second, independent reserved
+  pool), so no role gets a capacity carve-out; autovacuum is disabled too,
+  but only as optional quiescence, since autovacuum workers are accounted
+  separately and never draw from `max_connections`. After the admin client
+  that creates the disposable database is dropped, the operator connection
+  boundedly polls until only its own connection remains — safe here, unlike
+  later in the same scenario, because no connection pool exists yet to race.
+  The scenario then saturates every server connection slot with a small,
+  exactly bounded number of direct blocker connections, proving genuine
+  exhaustion via a direct probe's SQLSTATE `53300` at `FATAL` severity. With
+  capacity still exhausted, a max-size-one adapter pool proven to hold zero
+  physical connections drives one bounded structured invocation commit; its
+  outcome is the definite pre-commit `Rejected(DeadlineExceededBeforeCommit)`,
+  since this adapter's pool-acquisition wait and the caller's own operation
+  deadline are, by construction, exhausted together, rather than
+  `UnavailableBeforeCommit`, which this adapter reserves for a fault
+  surfacing after a connection is already open. Non-publication is proven
+  through a still-open operator connection. Because the rejected attempt's
+  own internal connection retry keeps running in the background after that
+  call returns, this test does not poll for a transient count after
+  releasing exactly one blocker connection (which would race that
+  independent retry); it instead proves recovery deterministically through
+  the next successful commit plus post-recovery server-side connection
+  counts, then proves exact replay/claim/acknowledgement and pool usability
+  through the same pool/store. This is bounded server
+  connection-slot exhaustion evidence only. Together, DR-0070/DR-0071/DR-0072
+  leave literal-`COMMIT` WAL/data ENOSPC, real storage-device ENOSPC and
+  block-device faults, load/soak capacity, connection-pool behavior under a
+  provider-managed pooler, TLS-path connection loss, backup/restore, real
+  writer failover, and production certification open.
 - An explicit `ComposedRuntime` for assembling independently selected state,
   blob, signer, transport, clock, and scheduler components without hidden
   defaults. Native conformance tests close/reopen SQLite into a new composition,
@@ -354,8 +397,9 @@ cross-provider ingress milestones implemented through Phase 17:
 Important remaining work includes the owned-object fast path, concrete
 node-event dispatch and protocol handlers, in-flight durable-I/O cancellation,
 real provider trigger wiring, abrupt host/power-fault recovery conformance
-(database-process SIGKILL/WAL recovery and bounded data-tablespace ENOSPC are
-covered As-Is; see DR-0069/DR-0070),
+(database-process SIGKILL/WAL recovery, bounded pre-commit data-tablespace
+and WAL-filesystem ENOSPC, and bounded server connection-slot exhaustion are
+covered As-Is; see DR-0069/DR-0070/DR-0071/DR-0072),
 portable system-module execution, cryptographic slashing proof verification,
 fee-object debiting,
 provider persistence bindings, runtime adapters, networking/RPC surfaces, and
@@ -371,7 +415,9 @@ capacity evidence. Native structured requests now honor an explicit
 cooperative cancellation signal only before first storage dispatch;
 client-disconnect cancellation, abrupt host/power fault (beyond the
 database-process SIGKILL/WAL recovery evidence in DR-0069),
-WAL exhaustion and commit-boundary/storage-device ENOSPC beyond DR-0070,
+literal-`COMMIT` WAL/data ENOSPC and real storage-device ENOSPC beyond
+DR-0070/DR-0071, connection-pool behavior under a provider-managed pooler and
+load/soak capacity beyond DR-0072's bounded evidence,
 TLS-path connection loss, backup/restore, real
 writer failover, and provider conformance follow on that foundation. Phase
 16/17 provider
