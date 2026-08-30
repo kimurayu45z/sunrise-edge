@@ -1525,6 +1525,256 @@ impl Drop for WalFullPostgresContainer {
     }
 }
 
+// --- Connection-exhaustion scenario: strict environment parsing -------------
+
+/// Environment variable naming the digest-pinned PostgreSQL image the bounded
+/// connection-exhaustion scenario starts as its own disposable container
+/// (never the shared CI service container, and never another scenario's own
+/// container). Must parse as [`PinnedImage`].
+pub const CONNECTION_EXHAUSTION_IMAGE_ENV: &str =
+    "SUNRISE_EDGE_TEST_POSTGRES_CONNECTION_EXHAUSTION_IMAGE";
+
+/// Environment variable that, when set to exactly `"1"`, forbids the
+/// connection-exhaustion scenario from silently skipping.
+pub const CONNECTION_EXHAUSTION_REQUIRED_ENV: &str =
+    "SUNRISE_EDGE_TEST_POSTGRES_CONNECTION_EXHAUSTION_REQUIRED";
+
+/// Outcome of strictly resolving whether the bounded connection-exhaustion
+/// scenario runs in this process. Same shape and rules as [`DiskFullScenario`]
+/// and [`WalFullScenario`]: only "both absent" skips.
+#[derive(Debug)]
+pub enum ConnectionExhaustionScenario {
+    /// No connection-exhaustion image is configured: the scenario is skipped.
+    Skip,
+    /// Run the scenario against a disposable container started from this
+    /// pinned image.
+    Run(PinnedImage),
+}
+
+/// Strictly resolves [`ConnectionExhaustionScenario`] from
+/// [`CONNECTION_EXHAUSTION_IMAGE_ENV`] and [`CONNECTION_EXHAUSTION_REQUIRED_ENV`];
+/// see [`resolve_disk_full_scenario`] for the exact rules this mirrors.
+pub fn resolve_connection_exhaustion_scenario() -> ConnectionExhaustionScenario {
+    resolve_connection_exhaustion_scenario_from(
+        env::var_os(CONNECTION_EXHAUSTION_REQUIRED_ENV),
+        env::var_os(CONNECTION_EXHAUSTION_IMAGE_ENV),
+    )
+}
+
+fn resolve_connection_exhaustion_scenario_from(
+    required_raw: Option<OsString>,
+    image_raw: Option<OsString>,
+) -> ConnectionExhaustionScenario {
+    let required = parse_connection_exhaustion_required_flag(required_raw);
+    match image_raw {
+        None => {
+            if required {
+                panic!(
+                    "{CONNECTION_EXHAUSTION_REQUIRED_ENV} is set but \
+                     {CONNECTION_EXHAUSTION_IMAGE_ENV} is not configured"
+                );
+            }
+            ConnectionExhaustionScenario::Skip
+        }
+        Some(raw) => {
+            ConnectionExhaustionScenario::Run(parse_connection_exhaustion_pinned_image(raw))
+        }
+    }
+}
+
+fn parse_connection_exhaustion_pinned_image(raw: OsString) -> PinnedImage {
+    let text = raw
+        .to_str()
+        .unwrap_or_else(|| panic!("{CONNECTION_EXHAUSTION_IMAGE_ENV} must be valid UTF-8"));
+    PinnedImage::parse(text)
+        .unwrap_or_else(|error| panic!("{CONNECTION_EXHAUSTION_IMAGE_ENV} is invalid: {error}"))
+}
+
+fn parse_connection_exhaustion_required_flag(raw: Option<OsString>) -> bool {
+    match raw {
+        None => false,
+        Some(raw) => {
+            let text = raw.to_str().unwrap_or_else(|| {
+                panic!("{CONNECTION_EXHAUSTION_REQUIRED_ENV} must be valid UTF-8")
+            });
+            match text {
+                "1" => true,
+                other => panic!(
+                    "{CONNECTION_EXHAUSTION_REQUIRED_ENV} must be exactly \"1\" when set, got \
+                     {other:?}"
+                ),
+            }
+        }
+    }
+}
+
+// --- Connection-exhaustion scenario: disposable container with a tiny cap --
+
+/// Exact server-side connection capacity this scenario configures via
+/// `-c max_connections=...`. Deliberately tiny — far below the shared CI
+/// database's default — so a small, exactly bounded number of direct blocker
+/// connections can deterministically saturate every slot.
+pub const CONNECTION_EXHAUSTION_MAX_CONNECTIONS: u32 = 5;
+
+/// Exact server-side `-c superuser_reserved_connections=...` this scenario
+/// configures. Zero so every session this scenario opens (all as the
+/// container's superuser role) is bound by the same
+/// [`CONNECTION_EXHAUSTION_MAX_CONNECTIONS`] ceiling, with no separate
+/// superuser-only carve-out for this scenario's counting to account for.
+pub const CONNECTION_EXHAUSTION_SUPERUSER_RESERVED_CONNECTIONS: u32 = 0;
+
+/// Size cap, in bytes, of the tmpfs holding `PGDATA`. This scenario never
+/// intentionally fills any filesystem — its fault is server connection-slot
+/// capacity, not disk space — so this is only a RAM-backed, disposable,
+/// bounded home for the cluster.
+const CONNECTION_EXHAUSTION_PGDATA_TMPFS_BYTES: u64 = 512 * 1024 * 1024;
+
+/// A disposable, RAM-backed PostgreSQL container for the bounded
+/// connection-exhaustion scenario. Started with a tiny
+/// [`CONNECTION_EXHAUSTION_MAX_CONNECTIONS`] and zero
+/// [`CONNECTION_EXHAUSTION_SUPERUSER_RESERVED_CONNECTIONS`], and with
+/// `autovacuum` disabled so no background autovacuum worker can silently
+/// consume one of this scenario's exactly accounted-for connection slots
+/// during the test window.
+///
+/// [`Drop`] force-removes the container and never panics: on failure it only
+/// `eprintln!`s the container ID and its
+/// `sunrise-edge-test=connection-exhaustion` label so a human can find and
+/// remove a leaked container.
+pub struct ConnectionExhaustionPostgresContainer {
+    container_id: ContainerId,
+    published_port: u16,
+    postgres_password: String,
+}
+
+impl ConnectionExhaustionPostgresContainer {
+    /// Starts a fresh disposable container from `image` and waits for a
+    /// fresh client connection plus a trivial query to succeed against its
+    /// default `postgres` database. Panics on any failure: a scenario that
+    /// cannot even start its own disposable container proves nothing.
+    pub fn start(image: &PinnedImage) -> Self {
+        let postgres_password: String = os_random_secret_hex(32).unwrap_or_else(|error| {
+            panic!("failed to read PostgreSQL test password from OS randomness: {error}")
+        });
+        let container_name = format!(
+            "sunrise-edge-connection-exhaustion-{}-{}",
+            std::process::id(),
+            random_hex_token(16)
+        );
+        let pgdata_mount = format!(
+            "type=tmpfs,destination=/var/lib/postgresql,tmpfs-size={CONNECTION_EXHAUSTION_PGDATA_TMPFS_BYTES}"
+        );
+        let password_env = format!("POSTGRES_PASSWORD={postgres_password}");
+        let max_connections_arg =
+            format!("max_connections={CONNECTION_EXHAUSTION_MAX_CONNECTIONS}");
+        let superuser_reserved_arg = format!(
+            "superuser_reserved_connections={CONNECTION_EXHAUSTION_SUPERUSER_RESERVED_CONNECTIONS}"
+        );
+        let run_output_result = run_docker_command_bounded_output(
+            docker_argv_command(&[
+                "run",
+                "--detach",
+                "--name",
+                &container_name,
+                "--label",
+                "sunrise-edge-test=connection-exhaustion",
+                "--publish",
+                "127.0.0.1::5432",
+                "--memory",
+                "1g",
+                "--memory-swap",
+                "1g",
+                "--pids-limit",
+                "512",
+                "--mount",
+                &pgdata_mount,
+                "--env",
+                &password_env,
+                "--env",
+                "POSTGRES_DB=postgres",
+                "--",
+                image.as_str(),
+                "-c",
+                &max_connections_arg,
+                "-c",
+                &superuser_reserved_arg,
+                "-c",
+                "autovacuum=off",
+            ]),
+            "docker run (connection-exhaustion container)",
+        );
+        let run_output = run_output_result.unwrap_or_else(|error| {
+            let cleanup_error = run_docker_command_bounded(
+                docker_argv_command(&["rm", "--force", "--volumes", &container_name]),
+                "docker rm after failed run",
+            )
+            .err();
+            panic!(
+                "docker run (connection-exhaustion container) failed: {error}; cleanup by exact generated name returned {cleanup_error:?}"
+            )
+        });
+        let container_id = ContainerId::parse(run_output.trim()).unwrap_or_else(|error| {
+            let cleanup_error = run_docker_command_bounded(
+                docker_argv_command(&["rm", "--force", "--volumes", &container_name]),
+                "docker rm after invalid run output",
+            )
+            .err();
+            panic!(
+                "docker run produced an invalid container id {run_output:?}: {error}; cleanup by exact generated name returned {cleanup_error:?}"
+            )
+        });
+        let mut container = Self {
+            container_id,
+            published_port: 0,
+            postgres_password,
+        };
+        let port_output = run_docker_command_bounded_output(
+            docker_argv_command(&["port", container.container_id.as_str(), "5432/tcp"]),
+            "docker port (connection-exhaustion container)",
+        )
+        .unwrap_or_else(|error| panic!("docker port failed: {error}"));
+        container.published_port = parse_published_port(&port_output);
+        wait_for_database_ready(
+            &format!(
+                "connection-exhaustion container {}",
+                container.container_id.as_str()
+            ),
+            &container.url("postgres"),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        container
+    }
+
+    pub fn container_id(&self) -> &ContainerId {
+        &self.container_id
+    }
+
+    /// Builds the `postgresql://` URL for `database` against this
+    /// container's published port and generated password.
+    pub fn url(&self, database: &str) -> String {
+        format!(
+            "postgresql://postgres:{}@127.0.0.1:{}/{database}",
+            self.postgres_password, self.published_port
+        )
+    }
+}
+
+impl Drop for ConnectionExhaustionPostgresContainer {
+    fn drop(&mut self) {
+        let result = run_docker_command_bounded(
+            docker_argv_command(&["rm", "--force", "--volumes", self.container_id.as_str()]),
+            "docker rm (connection-exhaustion container)",
+        );
+        if let Err(error) = result {
+            eprintln!(
+                "ConnectionExhaustionPostgresContainer: failed to remove container {} (label \
+                 sunrise-edge-test=connection-exhaustion): {error}; remove it by hand",
+                self.container_id.as_str()
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1877,6 +2127,58 @@ mod tests {
         ) {
             WalFullScenario::Run(image) => assert_eq!(image.as_str(), raw_image),
             WalFullScenario::Skip => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn resolve_connection_exhaustion_scenario_skips_when_both_absent() {
+        assert!(matches!(
+            resolve_connection_exhaustion_scenario_from(None, None),
+            ConnectionExhaustionScenario::Skip
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "must be exactly")]
+    fn resolve_connection_exhaustion_scenario_fails_on_malformed_required_flag() {
+        resolve_connection_exhaustion_scenario_from(Some(OsString::from("true")), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not configured")]
+    fn resolve_connection_exhaustion_scenario_fails_when_required_but_no_image() {
+        resolve_connection_exhaustion_scenario_from(Some(OsString::from("1")), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "is invalid")]
+    fn resolve_connection_exhaustion_scenario_fails_on_malformed_image() {
+        resolve_connection_exhaustion_scenario_from(
+            Some(OsString::from("1")),
+            Some(OsString::from("bad")),
+        );
+    }
+
+    #[test]
+    fn resolve_connection_exhaustion_scenario_runs_with_only_image_configured() {
+        let raw_image =
+            "postgres@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2";
+        match resolve_connection_exhaustion_scenario_from(None, Some(OsString::from(raw_image))) {
+            ConnectionExhaustionScenario::Run(image) => assert_eq!(image.as_str(), raw_image),
+            ConnectionExhaustionScenario::Skip => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn resolve_connection_exhaustion_scenario_runs_with_required_and_image_configured() {
+        let raw_image =
+            "postgres@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2";
+        match resolve_connection_exhaustion_scenario_from(
+            Some(OsString::from("1")),
+            Some(OsString::from(raw_image)),
+        ) {
+            ConnectionExhaustionScenario::Run(image) => assert_eq!(image.as_str(), raw_image),
+            ConnectionExhaustionScenario::Skip => panic!("expected Run"),
         }
     }
 }

@@ -1187,10 +1187,16 @@ covers database-process SIGKILL and WAL recovery on a live host with a live
 page cache (DR-0069). Separate bounded disposable-container tests cover
 pre-commit data-tablespace ENOSPC (DR-0070) and pre-commit WAL-filesystem
 ENOSPC (DR-0071); the latter shows the same SQLSTATE `53100` at `PANIC`
-severity crashes the whole server, not just the connection. In-flight
+severity crashes the whole server, not just the connection. A further bounded
+disposable-container test covers real server connection-slot exhaustion
+(DR-0072), showing this adapter classifies it as the definite pre-commit
+`Rejected(DeadlineExceededBeforeCommit)`, not `UnavailableBeforeCommit`,
+because its pool-acquisition wait and the caller's own operation deadline
+are, by construction, exhausted together. In-flight
 cancellation, abrupt host/power loss, storage write-cache
 flush/torn-write/media/filesystem faults, commit-boundary or real-device
-ENOSPC, TLS-path connection loss, backup/restore, capacity/load/soak, real
+ENOSPC, TLS-path connection loss, backup/restore, capacity/load/soak,
+connection-pool behavior under a provider-managed pooler, real
 writer failover, and production certification evidence remain open, so this
 is still As-Is adapter evidence rather than production readiness.
 
@@ -1229,13 +1235,19 @@ nothing about TLS-path connection loss. A separate serialized live test now
 proves database-process SIGKILL and WAL recovery on a live host with a live
 page cache (DR-0069). Separate disposable-container scenarios prove bounded
 data-tablespace ENOSPC before `COMMIT` and exact recovery after space is
-freed (DR-0070), and bounded WAL-filesystem ENOSPC before `COMMIT`, which
+freed (DR-0070), bounded WAL-filesystem ENOSPC before `COMMIT`, which
 crashes and in-place restarts the whole server rather than just the
-connection, with exact recovery after space is freed (DR-0071); none of these
+connection, with exact recovery after space is freed (DR-0071), and bounded
+real server connection-slot exhaustion, which this adapter classifies as the
+definite pre-commit `Rejected(DeadlineExceededBeforeCommit)` rather than
+`UnavailableBeforeCommit` because its own pool-acquisition wait cannot
+outlast the caller's operation deadline, with exact recovery after one
+blocking connection is released (DR-0072); none of these
 tests prove abrupt host/power loss, storage write-cache
 flush/torn-write/media/filesystem faults, commit-boundary or
 real-device ENOSPC, TLS-path behavior, backup/restore, capacity/load/soak,
-real writer failover, provider certification, or production readiness, all of which
+connection-pool behavior under a provider-managed pooler, real writer
+failover, provider certification, or production readiness, all of which
 remain backend-specific evidence. Passing this suite is As-Is contract
 evidence, not production certification.
 
@@ -1883,3 +1895,63 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   ENOSPC-specific claim about its result classification.
   Real storage-device ENOSPC, block-device faults, host/power loss, and
   production certification also remain open.
+- DR-0072: Add a required live `runtime-postgres` integration test for real
+  server connection-slot exhaustion. Start an exact digest-pinned disposable
+  PostgreSQL 18 container configured with a tiny exact `max_connections`
+  (5), zero `superuser_reserved_connections` (so no role gets a capacity
+  carve-out this scenario's counting would need to special-case), and
+  `autovacuum` disabled (so no background worker can silently draw from the
+  same connection-slot budget mid-test). An already-open operator connection
+  bootstraps the disposable namespace, reads back the server's own
+  `max_connections`/`superuser_reserved_connections` settings as
+  configuration ground truth, and stays open for the whole scenario. A small,
+  exactly bounded number of direct blocker connections then saturate every
+  remaining slot; one further direct connection attempt is live evidence of
+  genuine exhaustion: SQLSTATE `53300` (`too_many_connections`) at `FATAL`
+  severity, with the exact active client-backend count independently
+  confirming full capacity through `pg_stat_activity`. With capacity still
+  fully exhausted, a freshly built, max-size-one adapter pool — proven to
+  hold zero physical connections before its first checkout via the pool's own
+  `state()` — drives one bounded structured invocation commit. Live evidence,
+  not the naively assumed `Rejected(UnavailableBeforeCommit)`: `r2d2`'s
+  `Pool::get_timeout` only ever returns once it either succeeds or its entire
+  requested wait elapses — it never returns early on a bare connection
+  refusal — so by the time this crate's connection-acquisition helper
+  re-checks the caller's operation deadline to classify the failure, that
+  deadline has, by construction, also just elapsed. Pool exhaustion and
+  deadline exhaustion therefore collapse into the same observable outcome in
+  this adapter: the definite pre-commit
+  `Rejected(DeadlineExceededBeforeCommit)`, not `UnavailableBeforeCommit`
+  (which this adapter reserves for a fault surfacing after a connection and
+  transaction are already open, as in DR-0070/DR-0071's disk-full/WAL-full
+  scenarios). This is proven bounded, not merely assumed, by asserting the
+  call's observed wall-clock duration tracks its configured context deadline
+  rather than running away past it, and that the pool records zero
+  connections both before and after the attempt. Because the adapter pool
+  itself cannot open any new connection while the server is saturated,
+  non-publication of the state row, receipt row, outbox row, and commit
+  sequence is proven directly through the still-open operator connection
+  instead of through the store. The rejected attempt's own internal
+  connection attempt does not stop once `commit_invocation` returns: `r2d2`
+  keeps retrying it independently, on its own short backoff, until it
+  succeeds or the pool is dropped, so the slot freed by releasing exactly one
+  blocker connection can be reclaimed by that already-running background
+  retry at any time, not necessarily by a call this test makes. Polling for
+  an intermediate server-side count after releasing the blocker would
+  therefore race that independent retry and be flaky by construction; this
+  test instead proves recovery deterministically by requiring the next
+  `commit_invocation` call to succeed once capacity is available however it
+  became available, then, through the same still-open operator connection,
+  proving the post-recovery, steady-state active client-backend count equals
+  `max_connections` exactly and that precisely one of those backends carries
+  the adapter pool's own distinct `application_name` — confirming specifically
+  that the adapter pool, not some other connection, reclaimed the freed slot.
+  The identical invocation then commits through the same pool and store; the
+  test also proves the exact `RequestAlreadyCommitted` replay, one exact
+  outbox claim/acknowledgement followed by `NoDueWork`, and pool usability
+  afterward. This changes no schema, canonical bytes, or protocol behavior.
+  It proves only real PostgreSQL server-side connection-slot exhaustion and
+  this adapter's resulting deadline-based classification; it does not prove
+  real-device resource exhaustion, load/soak capacity, connection-pool
+  behavior under a provider-managed pooler (e.g. PgBouncer), TLS-path
+  connection loss, real writer failover, or production certification.

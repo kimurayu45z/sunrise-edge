@@ -462,6 +462,41 @@ not general state reads:
    DR-0071). This closes bounded pre-commit WAL-filesystem ENOSPC evidence;
    literal-`COMMIT` WAL/data ENOSPC remains untested, and no
    ENOSPC-specific classification is claimed for that boundary.
+   A third required disposable-container scenario configures a tiny exact
+   `max_connections`, zero `superuser_reserved_connections`, and disabled
+   autovacuum, then saturates every server connection slot with a small,
+   exactly bounded number of direct blocker connections, proving genuine
+   exhaustion via a direct probe's SQLSTATE `53300` at `FATAL` severity and
+   the exact active client-backend count. With capacity still exhausted, a
+   freshly built, max-size-one adapter pool proven to hold zero physical
+   connections drives one bounded structured invocation commit; because
+   `r2d2`'s connection-acquisition wait never returns early on a bare
+   refusal, the caller's own operation deadline has, by construction, also
+   just elapsed by the time this crate classifies the failure, so pool
+   exhaustion and deadline exhaustion collapse into the same observable,
+   definite pre-commit `Rejected(DeadlineExceededBeforeCommit)` here — not
+   `UnavailableBeforeCommit`, which this adapter reserves for a fault
+   surfacing after a connection and transaction are already open. Because the
+   adapter pool cannot open a new connection while saturated,
+   non-publication of state/receipt/outbox rows and the commit sequence is
+   proven through the still-open operator connection instead of through the
+   store. The rejected attempt's own background connection retry keeps
+   running independently after that call returns, so it (not necessarily any
+   call this test makes) can reclaim the slot freed by releasing exactly one
+   blocker connection at any time; rather than racing that independent retry
+   with a poll for a transient count, this scenario proves recovery
+   deterministically by requiring the next `commit_invocation` call to
+   succeed, then, through the same still-open operator connection, proving
+   the post-recovery, steady-state client-backend count is exactly
+   `max_connections` with precisely one backend carrying the adapter pool's
+   own `application_name`, confirming the adapter pool specifically reclaimed
+   it. The identical invocation, exact replay/claim/acknowledgement, and pool
+   usability are then proven through the same pool/store (implemented As-Is;
+   see `ARCHITECTURE.md` DR-0072). This closes
+   bounded server connection-slot exhaustion evidence and this adapter's
+   resulting deadline-based classification for it; real-device resource
+   exhaustion, load/soak capacity, connection-pool behavior under a
+   provider-managed pooler, and production certification remain open.
 4. Preserve the implemented exact-boundary/pool/lock deadline evidence,
    pre-storage native cancellation, and the database-process SIGKILL/WAL
    recovery evidence above, then extend it with client-disconnect and
@@ -470,9 +505,9 @@ not general state reads:
    commit-boundary and real storage-device ENOSPC, TLS-path
    connection loss, capacity/load/soak
    tests, backup/restore rehearsal, and real writer-fencing failover tests.
-   Every one of these remains open; the database-process SIGKILL/WAL recovery
-   and bounded pre-commit data-tablespace and WAL-filesystem ENOSPC cases
-   above are the only implemented fault slices.
+   Every one of these remains open; the database-process SIGKILL/WAL recovery,
+   bounded pre-commit data-tablespace and WAL-filesystem ENOSPC, and bounded
+   connection-exhaustion cases above are the only implemented fault slices.
 5. Implement Cloudflare Durable Object and AWS mappings against the same
    contract and pass real-provider conformance before claiming support.
 
