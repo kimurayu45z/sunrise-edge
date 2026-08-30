@@ -11,7 +11,7 @@
     "check": "npm run typecheck && npm run lint && npm test"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "1.0.0",
+    "@cloudflare/vitest-plugin": "1.1.1",
     "@cloudflare/workers-types": "5.20260823.1",
     "@eslint/js": "10.0.1",
     "@types/node": "26.2.0",
