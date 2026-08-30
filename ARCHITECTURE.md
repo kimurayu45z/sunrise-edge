@@ -1198,8 +1198,8 @@ schema identity and restored namespace metadata/state/receipt verified
 before fence promotion, operator-only writer-fence advance on the restored
 namespace, stale pre-backup context fencing, and exact reconciliation plus
 fresh commit under a new context, alongside an atomic invalid-dump rollback
-and a valid missing-state gate rejection; this is rehearsal evidence for one `pg_dump`/SQL-execute
-snapshot cycle only, not a production backup/restore capability, and it does
+and a valid missing-state gate rejection; this is rehearsal evidence for one
+`pg_dump`/SQL-execute snapshot cycle only, not a production backup/restore capability, and it does
 not close the backup/restore evidence criterion below. In-flight
 cancellation, abrupt host/power loss, storage write-cache
 flush/torn-write/media/filesystem faults, commit-boundary or real-device

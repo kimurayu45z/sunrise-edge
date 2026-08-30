@@ -447,8 +447,8 @@ DR-0070/DR-0071, connection-pool behavior under a provider-managed pooler and
 load/soak capacity beyond DR-0072's bounded evidence,
 TLS-path connection loss, point-in-time recovery, continuous WAL archiving,
 hot/concurrent backup, checkpoint publication, blob-manifest/state-root/
-encryption-key verification, DR-0073's rehearsal-only snapshot evidence, real
-writer failover, and provider conformance follow on that foundation. Phase
+encryption-key verification, real writer failover, and provider conformance
+follow on that foundation. Phase
 16/17 provider
 trust, deployment, observability, and release rehearsal remain required.
 
