@@ -27,10 +27,11 @@ proves bounded pre-commit data-tablespace ENOSPC and recovery after freeing
 space (DR-0070); it deliberately leaves WAL and commit-boundary exhaustion
 open. A separate two-container test now rehearses a bounded `pg_dump`-based
 database-snapshot restore, verifying schema identity and restored namespace
-metadata/state/receipt before fence promotion, an operator-only writer-fence advance on the
-restored namespace, stale pre-backup context fencing, and exact
-reconciliation plus fresh commit under a new context, alongside a
-deterministic truncated-snapshot negative case (DR-0073 in `ARCHITECTURE.md`);
+metadata/state/receipt before fence promotion, an operator-only writer-fence
+advance on the restored namespace, stale pre-backup context fencing, and exact
+reconciliation plus fresh commit under a new context, alongside an atomic
+invalid-dump rollback and a valid missing-state gate rejection (DR-0073 in
+`ARCHITECTURE.md`);
 see section 5. This is rehearsal evidence for one `pg_dump`/SQL-execute
 snapshot cycle only — it is not a production backup/restore capability and
 does not close the accepted backup/restore evidence criterion in section 9.
@@ -375,11 +376,12 @@ with no publication, and proves a fresh context carrying the new fence
 reconciles the exact restored receipt/state, observes `RequestAlreadyCommitted`
 for the identical invocation, claims and acknowledges the
 exact restored pending outbox payload, and commits genuinely new work. A
-separate, deterministic negative case restores a snapshot truncated to
-exactly half its captured byte length into a third, empty database on the
-same target container and proves the identical rehearsal verification gate never passes
-against it after requiring the truncated restore execution itself to fail
-loudly. CI makes the scenario required with
+deterministic negative pair uses two additional databases on the same target:
+a dump cut inside the required `storage_metadata` table definition must fail
+its one simple-query batch atomically and leave no schema marker, while a
+syntactically valid dump with only the fixture's `state_records` insert removed
+must restore schema, namespace metadata, and receipt but fail the deeper
+rehearsal verification gate on missing state. CI makes the scenario required with
 `SUNRISE_EDGE_TEST_POSTGRES_BACKUP_RESTORE_REQUIRED=1`; leaving both that
 flag and `SUNRISE_EDGE_TEST_POSTGRES_BACKUP_RESTORE_IMAGE` unset skips it
 locally. This is a bounded database-snapshot restore rehearsal for one

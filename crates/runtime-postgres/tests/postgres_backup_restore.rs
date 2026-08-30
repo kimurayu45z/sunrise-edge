@@ -30,13 +30,12 @@
 //! restored target; and proves a fresh context carrying the new fence
 //! reconciles the exact restored receipt/state, claims and acknowledges the
 //! restored pending outbox payload, and then commits genuinely new work. A
-//! separate, deterministic negative case restores a snapshot truncated to
-//! exactly half its captured byte length into a third, empty database on the
-//! same target container (not a third container, since the fault here is
-//! snapshot content, not server isolation) and proves the same rehearsal
-//! verification gate — schema identity plus restored state/receipt ground
-//! truth read through the adapter — never passes against it. The truncated
-//! restore execution itself must also fail loudly.
+//! deterministic negative pair uses two additional empty databases on that
+//! same target container. One dump is cut inside a required `CREATE TABLE`;
+//! its one simple-query batch must fail atomically and leave no schema marker.
+//! A second, syntactically valid dump removes only the fixture's state-row
+//! insert; it must restore schema, namespace metadata, and receipt cleanly but
+//! still fail the deeper rehearsal verification gate on missing state.
 //!
 //! This is a database-snapshot restore rehearsal only, not a production
 //! backup/restore capability, and does **not** prove: point-in-time
@@ -87,10 +86,14 @@ const SOURCE_DATABASE: &str = "sunrise_edge_backup_restore_source";
 /// transformed snapshot SQL.
 const TARGET_DATABASE: &str = "sunrise_edge_backup_restore_target";
 
-/// A second, separate disposable database on the same target container
-/// (never the good-restore database above) that only ever receives the
-/// deterministically truncated, corrupted snapshot.
-const CORRUPT_DATABASE: &str = "sunrise_edge_backup_restore_corrupt";
+/// A second database on the target container that receives a dump cut inside
+/// one `CREATE TABLE` statement and must remain schema-empty after rollback.
+const INVALID_TRUNCATED_DATABASE: &str = "sunrise_edge_backup_restore_invalid_truncated";
+
+/// A third database on the target container that receives syntactically valid
+/// snapshot SQL with the sole state-record insert removed. Restore must
+/// succeed, but the deeper rehearsal gate must reject the missing ground truth.
+const MISSING_STATE_DATABASE: &str = "sunrise_edge_backup_restore_missing_state";
 
 /// Size of the state payload driven through the adapter's structured
 /// invocation. Small and unremarkable: this scenario's evidence is about
@@ -267,18 +270,45 @@ fn restore_passes_rehearsal_gate(
     receipt.as_ref() == Some(expected_receipt)
 }
 
-/// Truncates `text` to at most `max_bytes`, backing off to the nearest
-/// earlier UTF-8 character boundary if `max_bytes` would otherwise split a
-/// multi-byte character. The captured snapshot is plain-ASCII SQL, so this
-/// backoff is never expected to move more than a few bytes; it exists only so
-/// this deterministic corruption can never itself panic on a boundary it does
-/// not control.
-fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> &str {
-    let mut end = max_bytes.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
+/// Cuts the snapshot immediately after the opening parenthesis of one required
+/// table definition. Unlike a byte midpoint, this is structurally invalid by
+/// construction even when comments, columns, tables, or fixture payload sizes
+/// change elsewhere in the dump.
+fn truncate_inside_storage_metadata_definition(dump: &str) -> &str {
+    const MARKER: &str = "CREATE TABLE sunrise_edge.storage_metadata (";
+    let marker_start: usize = dump
+        .find(MARKER)
+        .expect("the snapshot must contain the storage_metadata table definition");
+    let end: usize = marker_start.checked_add(MARKER.len()).unwrap();
+    let truncated: &str = &dump[..end];
+    assert_eq!(
+        truncated.trim_end().as_bytes().last(),
+        Some(&b'('),
+        "the invalid snapshot must end inside a CREATE TABLE statement"
+    );
+    truncated
+}
+
+/// Removes exactly the one state-record `INSERT` emitted for this fixture while
+/// preserving a syntactically valid schema/metadata/receipt/outbox restore.
+/// The exact removal count makes schema or fixture drift fail loudly.
+fn remove_fixture_state_insert(dump: &str) -> String {
+    const PREFIX: &str = "INSERT INTO sunrise_edge.state_records ";
+    let mut removed: usize = 0;
+    let mut result = String::with_capacity(dump.len());
+    for line in dump.lines() {
+        if line.starts_with(PREFIX) {
+            removed = removed.checked_add(1).unwrap();
+            continue;
+        }
+        result.push_str(line);
+        result.push('\n');
     }
-    &text[..end]
+    assert_eq!(
+        removed, 1,
+        "the fixture snapshot must contain exactly one state_records INSERT"
+    );
+    result
 }
 
 /// Removes `pg_dump`'s `\restrict <key>` / `\unrestrict <key>` bracketing
@@ -677,35 +707,83 @@ fn postgres_backup_restore_rehearsal() {
             .unwrap()
     );
 
-    // --- Negative case: a truncated snapshot never passes the rehearsal gate
+    // --- Negative case 1: structurally invalid SQL fails atomically --------
 
-    let mut corrupt_admin =
-        connect_bounded(&target.url("postgres"), "postgres (target admin, corrupt)");
-    corrupt_admin
-        .execute(&format!("CREATE DATABASE {CORRUPT_DATABASE}"), &[])
+    let mut invalid_admin = connect_bounded(
+        &target.url("postgres"),
+        "postgres (target admin, invalid truncated snapshot)",
+    );
+    invalid_admin
+        .execute(
+            &format!("CREATE DATABASE {INVALID_TRUNCATED_DATABASE}"),
+            &[],
+        )
         .unwrap();
-    drop(corrupt_admin);
-    let mut corrupt_client = connect_bounded(&target.url(CORRUPT_DATABASE), CORRUPT_DATABASE);
+    drop(invalid_admin);
+    let mut invalid_client = connect_bounded(
+        &target.url(INVALID_TRUNCATED_DATABASE),
+        INVALID_TRUNCATED_DATABASE,
+    );
 
-    let truncated_dump = truncate_at_char_boundary(&dump_text, dump_text.len() / 2);
+    let truncated_dump = truncate_inside_storage_metadata_definition(&dump_text);
     assert!(
         !truncated_dump.is_empty() && truncated_dump.len() < dump_text.len(),
         "the truncated snapshot must be strictly shorter than the captured snapshot"
     );
-    corrupt_client
+    invalid_client
         .batch_execute(truncated_dump)
         .expect_err("the deterministically truncated snapshot must fail loudly during restore");
+    assert!(
+        verify_initial_schema(&mut invalid_client).is_err(),
+        "one simple-query batch is atomic: the failed truncated restore must leave no schema marker"
+    );
 
-    let corrupt_store = build_store(
+    // --- Negative case 2: valid SQL with missing state reaches the deep gate
+
+    let mut missing_state_admin = connect_bounded(
+        &target.url("postgres"),
+        "postgres (target admin, missing state snapshot)",
+    );
+    missing_state_admin
+        .execute(&format!("CREATE DATABASE {MISSING_STATE_DATABASE}"), &[])
+        .unwrap();
+    drop(missing_state_admin);
+    let mut missing_state_client =
+        connect_bounded(&target.url(MISSING_STATE_DATABASE), MISSING_STATE_DATABASE);
+    let missing_state_dump: String = remove_fixture_state_insert(&dump_text);
+    missing_state_client
+        .batch_execute(&missing_state_dump)
+        .expect("the syntactically valid snapshot without the state row must restore cleanly");
+
+    let missing_state_store = build_store(
         &target,
-        CORRUPT_DATABASE,
+        MISSING_STATE_DATABASE,
         &namespace,
-        "sunrise-edge-pr89-backup-restore-corrupt",
+        "sunrise-edge-pr89-backup-restore-missing-state",
+    );
+    verify_initial_schema(&mut missing_state_client).unwrap();
+    assert_eq!(
+        inspect_namespace(&mut missing_state_client, &namespace)
+            .unwrap()
+            .unwrap(),
+        pre_backup_metadata
+    );
+    let missing_state = missing_state_store
+        .get_versioned_durable(&stale_context, domain, &state_key)
+        .unwrap();
+    assert_eq!(missing_state.revision(), StateRevision::INITIAL);
+    assert_eq!(missing_state.value(), None);
+    assert_eq!(
+        missing_state_store
+            .get_request_receipt(&stale_context, domain, request_id)
+            .unwrap(),
+        Some(receipt.clone()),
+        "the valid corrupted restore must retain the receipt so the gate failure discriminates the missing state row"
     );
     assert!(
         !restore_passes_rehearsal_gate(
-            &corrupt_store,
-            &mut corrupt_client,
+            &missing_state_store,
+            &mut missing_state_client,
             &namespace,
             domain,
             &stale_context,
@@ -715,7 +793,6 @@ fn postgres_backup_restore_rehearsal() {
             request_id,
             &receipt,
         ),
-        "a deterministically truncated (half-length) snapshot must never pass the rehearsal \
-         gate, but schema identity and durable ground truth both verified"
+        "a cleanly restored snapshot missing the state row must never pass the rehearsal gate"
     );
 }

@@ -291,12 +291,12 @@ publication, and proves a fresh context carrying the new fence reconciles the
 exact restored receipt/state, observes `RequestAlreadyCommitted` for the
 identical invocation, and claims and acknowledges the exact restored
 pending outbox payload through `NoDueWork`, and then commits genuinely new
-work. A separate, deterministic negative case restores a snapshot truncated
-to exactly half its captured byte length into a third, empty database on the
-same target container (not a third container, since the fault here is
-snapshot content, not server isolation), requires the truncated restore
-execution itself to fail loudly, and proves the same rehearsal verification
-gate never passes against it.
+work. A deterministic negative pair uses two more empty databases on the same
+target container. A dump cut inside the required `storage_metadata` table
+definition must fail its one simple-query batch atomically and leave no schema
+marker. A syntactically valid dump with only the fixture's `state_records`
+insert removed must restore schema, namespace metadata, and receipt cleanly,
+yet fail the deeper rehearsal verification gate on the missing state row.
 
 It force-removes both of its exact created containers on normal return or
 panic. Leaving both variables unset skips the test; setting the required flag

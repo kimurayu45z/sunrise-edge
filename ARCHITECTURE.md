@@ -1197,8 +1197,8 @@ test (DR-0073) covers a `pg_dump`-based database-snapshot restore rehearsal:
 schema identity and restored namespace metadata/state/receipt verified
 before fence promotion, operator-only writer-fence advance on the restored
 namespace, stale pre-backup context fencing, and exact reconciliation plus
-fresh commit under a new context, alongside a deterministic truncated-snapshot
-negative case; this is rehearsal evidence for one `pg_dump`/SQL-execute
+fresh commit under a new context, alongside an atomic invalid-dump rollback
+and a valid missing-state gate rejection; this is rehearsal evidence for one `pg_dump`/SQL-execute
 snapshot cycle only, not a production backup/restore capability, and it does
 not close the backup/restore evidence criterion below. In-flight
 cancellation, abrupt host/power loss, storage write-cache
@@ -1257,7 +1257,8 @@ blocking connection is released (DR-0072), and a bounded two-container
 and restored namespace metadata/state/receipt before fence promotion, an
 operator-only writer-fence advance on the restored namespace, stale
 pre-backup context fencing, and exact reconciliation plus fresh commit under
-a new context, alongside a deterministic truncated-snapshot negative case
+a new context, alongside an atomic invalid-dump rollback and a valid
+missing-state gate rejection
 (DR-0073); none of these
 tests prove abrupt host/power loss, storage write-cache
 flush/torn-write/media/filesystem faults, commit-boundary or
@@ -2006,7 +2007,7 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   own bounded connection to the target, with no intermediate file, `docker
   cp`, or `psql` subprocess. PostgreSQL 18's `pg_dump` additionally brackets
   plain output in `\restrict`/`\unrestrict` lines, a `psql`-only safety
-  meta-command pair introduced for exactly this generation, not SQL; the
+  meta-command pair emitted by the pinned PostgreSQL 18 tool, not SQL; the
   server rejects them as a syntax error over the wire, so the test strips
   those two fixed lines before executing the snapshot, a deterministic format
   transform of *how* the snapshot is applied, not a content corruption of the
@@ -2024,13 +2025,13 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   payload through `NoDueWork`, and then commits genuinely new work. This
   target-only fence advance does not stop or fence the separately running
   source database, so it is not evidence of a single-writer failover. A
-  separate, deterministic negative case restores a snapshot truncated to
-  exactly half its captured byte length into a third, empty database on the
-  same target container (not a third container, since the fault here is
-  snapshot content, not server isolation) and proves the identical
-  rehearsal verification gate — schema identity plus restored state/receipt ground
-  truth, read through the adapter — never passes against it, and requires the
-  truncated restore execution itself to fail loudly. This
+  deterministic negative pair uses two additional databases on that same
+  target container. A dump cut immediately after the opening parenthesis of
+  the required `storage_metadata` table definition must fail its one
+  simple-query batch atomically and leave no schema marker. A syntactically
+  valid dump with exactly the fixture's `state_records` insert removed must
+  restore schema identity, namespace metadata, and receipt cleanly, yet fail
+  the deeper rehearsal verification gate on missing state. This
   changes no schema, canonical bytes, or protocol behavior. It is a bounded
   database-snapshot restore rehearsal only, explicitly not a production
   backup/restore capability, and critically does not close the accepted

@@ -40,18 +40,16 @@ pub const CRASH_REQUIRED_ENV: &str = "SUNRISE_EDGE_TEST_POSTGRES_CRASH_REQUIRED"
 // --- Bounded, cross-process live-test lock ---------------------------------
 
 /// Hard bound on how long [`LiveTestLock::acquire`] waits for the lock
-/// before giving up. Destructive live tests (the schema/durable-store
-/// conformance test, the SIGKILL crash-recovery scenario, and the disk-full
-/// ENOSPC scenario) serialize on this lock because up to three of them may
-/// run concurrently as separate `cargo test` binary processes within one CI
-/// job, and each holds it for its own container start/fault/recovery work
-/// before releasing it to the next waiter. CI bounds the whole job at 20
-/// minutes, so a waiter behind the other two must still fail loudly, well
-/// inside that job timeout, if the lock is genuinely stuck or abandoned
-/// rather than merely held by a slow-but-live sibling test; 600 seconds (10
-/// minutes) gives room for two preceding live tests to each run their full
-/// container lifecycle before this waiter's own acquisition is considered
-/// stuck.
+/// before giving up. Every live PostgreSQL integration-test binary serializes
+/// on this lock because `cargo test` may run the shared-schema conformance,
+/// SIGKILL, data-full, WAL-full, connection-exhaustion, and backup-restore
+/// scenarios as separate concurrent processes. Each holder completes its own
+/// bounded database/container work before releasing the next waiter. CI bounds
+/// the whole job at 20 minutes; 600 seconds (10 minutes) keeps an abandoned or
+/// genuinely stuck lock well inside that outer bound while allowing the normal
+/// short scenarios to queue. It is intentionally not the sum of every
+/// scenario's individual worst-case timeout: collectively exceeding this wait
+/// budget is itself a loud CI failure that requires investigation.
 const LIVE_LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Poll interval while waiting for [`LIVE_LOCK_ACQUIRE_TIMEOUT`] to elapse.
@@ -1900,12 +1898,13 @@ const BACKUP_RESTORE_PGDATA_TMPFS_BYTES: u64 = 512 * 1024 * 1024;
 /// never two databases inside one running server.
 ///
 /// [`Drop`] force-removes the container and never panics: on failure it only
-/// `eprintln!`s the container ID and its `sunrise-edge-test=backup-restore`
-/// label so a human can find and remove a leaked container.
+/// `eprintln!`s the container ID and its exact role-qualified label so a human
+/// can find and remove a leaked container.
 pub struct BackupRestorePostgresContainer {
     container_id: ContainerId,
     published_port: u16,
     postgres_password: String,
+    cleanup_label: String,
 }
 
 impl BackupRestorePostgresContainer {
@@ -1982,6 +1981,7 @@ impl BackupRestorePostgresContainer {
             container_id,
             published_port: 0,
             postgres_password,
+            cleanup_label: label,
         };
         let port_output = run_docker_command_bounded_output(
             docker_argv_command(&["port", container.container_id.as_str(), "5432/tcp"]),
@@ -2060,9 +2060,10 @@ impl Drop for BackupRestorePostgresContainer {
         );
         if let Err(error) = result {
             eprintln!(
-                "BackupRestorePostgresContainer: failed to remove container {} (label \
-                 sunrise-edge-test=backup-restore): {error}; remove it by hand",
-                self.container_id.as_str()
+                "BackupRestorePostgresContainer: failed to remove container {} (label {}): \
+                 {error}; remove it by hand",
+                self.container_id.as_str(),
+                self.cleanup_label
             );
         }
     }

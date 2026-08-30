@@ -2255,10 +2255,11 @@ Phase 15 As-Is scope:
   （旧fence）が`Rejected(WriterFenced)`でfail closedし公開なしであることを証明し、新fenceの
   fresh contextがexact restored receipt/stateをreconcileし、identical invocationで
   `RequestAlreadyCommitted`を観測してからrestored pending outbox
-  payloadをclaim/ackし、新規workをcommitできることを証明する。半分の長さへdeterministicに
-  truncateしたcorrupted snapshotのrestore自体がfail loudlyし、同じrehearsal verification gateを
-  決して通過しないことを証明する
-  negative caseも含む（bounded database-snapshot restore rehearsal evidenceのみ
+  payloadをclaim/ackし、新規workをcommitできることを証明する。negative pairではrequiredな
+  `storage_metadata`の`CREATE TABLE`途中でcutしたdumpがsingle simple-query batchとしてatomicに
+  failしschema markerを残さないことと、fixtureの`state_records` insertだけを除いたvalid dumpが
+  schema・namespace metadata・receiptをrestoreしながらmissing stateによってdeeper rehearsal
+  verification gateを通過しないことを証明する（bounded database-snapshot restore rehearsal evidenceのみ
   implemented As-Is; ARCHITECTURE.md DR-0073）。これは1回の`pg_dump`/SQL-execute snapshot
   cycleのrehearsalに過ぎずproduction backup/restore機能ではない。point-in-time recovery、
   continuous WAL archiving、concurrent write負荷下でのhot backup、
@@ -2406,10 +2407,11 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
    新規workをcommitできることを証明した
    （bounded database-snapshot restore rehearsal evidenceのみimplemented As-Is; ARCHITECTURE.md
    DR-0073）。このtarget側だけのfence advanceは独立して動き続けるsource databaseを停止・
-   fenceしないためsingle-writer failoverの証拠ではない。半分の長さへdeterministicに
-   truncateしたsnapshotのrestore自体がfail loudlyし、同じrehearsal verification gateを
-   決して通過しないことを証明する
-   別のnegative caseも含む。これは1回の`pg_dump`/SQL-execute
+   fenceしないためsingle-writer failoverの証拠ではない。negative pairではrequiredな
+   `storage_metadata`の`CREATE TABLE`途中でcutしたdumpがsingle simple-query batchとしてatomicに
+   failしschema markerを残さないことと、fixtureの`state_records` insertだけを除いたvalid dumpが
+   schema・namespace metadata・receiptをrestoreしながらmissing stateによってdeeper rehearsal
+   verification gateを通過しないことを証明する。これは1回の`pg_dump`/SQL-execute
    snapshot cycleに対するrehearsal evidenceに過ぎず、production backup/restore機能ではない。
    point-in-time recovery、continuous WAL archiving、concurrent write負荷下でのhot backup、
    `pg_basebackup`/replicationベースのbackup、backup encryption/off-host storage、

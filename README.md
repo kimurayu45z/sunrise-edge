@@ -280,14 +280,16 @@ cross-provider ingress milestones implemented through Phase 17:
   self-contained script directly into a fresh target database with the same
   PostgreSQL driver library. Before fence promotion it verifies exact schema
   identity and restored namespace metadata/state/receipt ground truth, then
-  advances the restored namespace's writer fence through the operator-only seam, proves a
+  advances the restored namespace's writer fence through the operator-only
+  seam, proves a
   stale pre-backup context is rejected as `WriterFenced` with no publication,
   and proves a fresh context reconciles the restored state/receipt, observes
   `RequestAlreadyCommitted` for the identical invocation, claims and
   acknowledges the exact pending outbox payload, and commits new work. A
-  deterministic negative case requires a snapshot truncated to half its
-  captured length to fail restore loudly and never pass the same rehearsal
-  verification gate. This is a bounded
+  deterministic negative pair proves both an atomic rollback for a dump cut
+  inside a required `CREATE TABLE` and a deeper gate rejection after a valid
+  restore omits only the fixture state row while retaining schema, metadata,
+  and receipt. This is a bounded
   database-snapshot restore rehearsal for one `pg_dump`/SQL-execute cycle
   only, not a production backup/restore capability: it does not close the
   backup/restore evidence criterion. Together, DR-0070/DR-0071/DR-0072/DR-0073
@@ -444,9 +446,8 @@ literal-`COMMIT` WAL/data ENOSPC and real storage-device ENOSPC beyond
 DR-0070/DR-0071, connection-pool behavior under a provider-managed pooler and
 load/soak capacity beyond DR-0072's bounded evidence,
 TLS-path connection loss, point-in-time recovery, continuous WAL archiving,
-hot/concurrent backup, checkpoint publication, and blob-manifest/state-root/
-encryption-key verification beyond DR-0073's bounded snapshot-rehearsal
-evidence, real
+hot/concurrent backup, checkpoint publication, blob-manifest/state-root/
+encryption-key verification, DR-0073's rehearsal-only snapshot evidence, real
 writer failover, and provider conformance follow on that foundation. Phase
 16/17 provider
 trust, deployment, observability, and release rehearsal remain required.
