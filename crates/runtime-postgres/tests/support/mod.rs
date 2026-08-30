@@ -40,18 +40,16 @@ pub const CRASH_REQUIRED_ENV: &str = "SUNRISE_EDGE_TEST_POSTGRES_CRASH_REQUIRED"
 // --- Bounded, cross-process live-test lock ---------------------------------
 
 /// Hard bound on how long [`LiveTestLock::acquire`] waits for the lock
-/// before giving up. Destructive live tests (the schema/durable-store
-/// conformance test, the SIGKILL crash-recovery scenario, and the disk-full
-/// ENOSPC scenario) serialize on this lock because up to three of them may
-/// run concurrently as separate `cargo test` binary processes within one CI
-/// job, and each holds it for its own container start/fault/recovery work
-/// before releasing it to the next waiter. CI bounds the whole job at 20
-/// minutes, so a waiter behind the other two must still fail loudly, well
-/// inside that job timeout, if the lock is genuinely stuck or abandoned
-/// rather than merely held by a slow-but-live sibling test; 600 seconds (10
-/// minutes) gives room for two preceding live tests to each run their full
-/// container lifecycle before this waiter's own acquisition is considered
-/// stuck.
+/// before giving up. Every live PostgreSQL integration-test binary serializes
+/// on this lock because `cargo test` may run the shared-schema conformance,
+/// SIGKILL, data-full, WAL-full, connection-exhaustion, and backup-restore
+/// scenarios as separate concurrent processes. Each holder completes its own
+/// bounded database/container work before releasing the next waiter. CI bounds
+/// the whole job at 20 minutes; 600 seconds (10 minutes) keeps an abandoned or
+/// genuinely stuck lock well inside that outer bound while allowing the normal
+/// short scenarios to queue. It is intentionally not the sum of every
+/// scenario's individual worst-case timeout: collectively exceeding this wait
+/// budget is itself a loud CI failure that requires investigation.
 const LIVE_LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Poll interval while waiting for [`LIVE_LOCK_ACQUIRE_TIMEOUT`] to elapse.
@@ -786,7 +784,21 @@ fn read_capped_file(path: &Path, max_bytes: u64) -> io::Result<String> {
 /// entirely. Both the stdout and stderr files are removed before returning,
 /// whether or not the command succeeded, and a failing exit status carries
 /// the captured stderr for diagnosis.
-fn run_docker_command_bounded_output(mut command: Command, label: &str) -> io::Result<String> {
+fn run_docker_command_bounded_output(command: Command, label: &str) -> io::Result<String> {
+    run_docker_command_bounded_output_capped(command, label, DOCKER_COMMAND_OUTPUT_MAX_BYTES)
+}
+
+/// Same as [`run_docker_command_bounded_output`], but with an explicit output
+/// cap instead of [`DOCKER_COMMAND_OUTPUT_MAX_BYTES`]. The backup-restore
+/// scenario's `pg_dump` output is a bounded logical-schema-plus-small-payload
+/// dump, larger than every other scenario's few-hundred-byte command output,
+/// so it needs its own, still-bounded, still-explicit cap rather than
+/// silently reusing the generic one.
+fn run_docker_command_bounded_output_capped(
+    mut command: Command,
+    label: &str,
+    max_bytes: u64,
+) -> io::Result<String> {
     let stdout_path = unique_temp_file_path(label, "stdout");
     let stderr_path = unique_temp_file_path(label, "stderr");
     let stdout_file = fs::OpenOptions::new()
@@ -822,13 +834,11 @@ fn run_docker_command_bounded_output(mut command: Command, label: &str) -> io::R
         let stderr_len: u64 = fs::metadata(&stderr_path)
             .map(|value| value.len())
             .unwrap_or(0);
-        if stdout_len > DOCKER_COMMAND_OUTPUT_MAX_BYTES
-            || stderr_len > DOCKER_COMMAND_OUTPUT_MAX_BYTES
-        {
+        if stdout_len > max_bytes || stderr_len > max_bytes {
             let _ = child.kill();
             let _ = child.wait();
             break Err(io::Error::other(format!(
-                "{label} exceeded the {DOCKER_COMMAND_OUTPUT_MAX_BYTES}-byte output cap and was killed"
+                "{label} exceeded the {max_bytes}-byte output cap and was killed"
             )));
         }
         match child.try_wait() {
@@ -850,8 +860,8 @@ fn run_docker_command_bounded_output(mut command: Command, label: &str) -> io::R
         }
         thread::sleep(DOCKER_COMMAND_POLL_INTERVAL);
     };
-    let stdout_result = read_capped_file(&stdout_path, DOCKER_COMMAND_OUTPUT_MAX_BYTES);
-    let stderr_result = read_capped_file(&stderr_path, DOCKER_COMMAND_OUTPUT_MAX_BYTES);
+    let stdout_result = read_capped_file(&stdout_path, max_bytes);
+    let stderr_result = read_capped_file(&stderr_path, max_bytes);
     let _ = fs::remove_file(&stdout_path);
     let _ = fs::remove_file(&stderr_path);
     status_result.map_err(|error| {
@@ -1795,6 +1805,270 @@ impl Drop for ConnectionExhaustionPostgresContainer {
     }
 }
 
+// --- Backup-restore scenario: strict environment parsing --------------------
+
+/// Environment variable naming the digest-pinned PostgreSQL image the bounded
+/// backup-restore rehearsal scenario starts as its own two disposable,
+/// mutually isolated containers (never the shared CI service container, and
+/// never another scenario's own container).
+pub const BACKUP_RESTORE_IMAGE_ENV: &str = "SUNRISE_EDGE_TEST_POSTGRES_BACKUP_RESTORE_IMAGE";
+
+/// Environment variable that, when set to exactly `"1"`, forbids the
+/// backup-restore scenario from silently skipping.
+pub const BACKUP_RESTORE_REQUIRED_ENV: &str = "SUNRISE_EDGE_TEST_POSTGRES_BACKUP_RESTORE_REQUIRED";
+
+/// Outcome of strictly resolving whether the bounded backup-restore rehearsal
+/// scenario runs in this process. Same shape and rules as [`DiskFullScenario`]:
+/// only "both absent" skips.
+#[derive(Debug)]
+pub enum BackupRestoreScenario {
+    /// No backup-restore image is configured: the scenario is skipped.
+    Skip,
+    /// Run the scenario against two disposable containers started from this
+    /// pinned image.
+    Run(PinnedImage),
+}
+
+/// Strictly resolves [`BackupRestoreScenario`] from [`BACKUP_RESTORE_IMAGE_ENV`]
+/// and [`BACKUP_RESTORE_REQUIRED_ENV`]; see [`resolve_disk_full_scenario`] for
+/// the exact rules this mirrors.
+pub fn resolve_backup_restore_scenario() -> BackupRestoreScenario {
+    resolve_backup_restore_scenario_from(
+        env::var_os(BACKUP_RESTORE_REQUIRED_ENV),
+        env::var_os(BACKUP_RESTORE_IMAGE_ENV),
+    )
+}
+
+fn resolve_backup_restore_scenario_from(
+    required_raw: Option<OsString>,
+    image_raw: Option<OsString>,
+) -> BackupRestoreScenario {
+    let required = parse_backup_restore_required_flag(required_raw);
+    match image_raw {
+        None => {
+            if required {
+                panic!(
+                    "{BACKUP_RESTORE_REQUIRED_ENV} is set but {BACKUP_RESTORE_IMAGE_ENV} is not \
+                     configured"
+                );
+            }
+            BackupRestoreScenario::Skip
+        }
+        Some(raw) => BackupRestoreScenario::Run(parse_backup_restore_pinned_image(raw)),
+    }
+}
+
+fn parse_backup_restore_pinned_image(raw: OsString) -> PinnedImage {
+    let text = raw
+        .to_str()
+        .unwrap_or_else(|| panic!("{BACKUP_RESTORE_IMAGE_ENV} must be valid UTF-8"));
+    PinnedImage::parse(text)
+        .unwrap_or_else(|error| panic!("{BACKUP_RESTORE_IMAGE_ENV} is invalid: {error}"))
+}
+
+fn parse_backup_restore_required_flag(raw: Option<OsString>) -> bool {
+    match raw {
+        None => false,
+        Some(raw) => {
+            let text = raw
+                .to_str()
+                .unwrap_or_else(|| panic!("{BACKUP_RESTORE_REQUIRED_ENV} must be valid UTF-8"));
+            match text {
+                "1" => true,
+                other => panic!(
+                    "{BACKUP_RESTORE_REQUIRED_ENV} must be exactly \"1\" when set, got {other:?}"
+                ),
+            }
+        }
+    }
+}
+
+// --- Backup-restore scenario: disposable containers and file transfer -------
+
+/// Size cap, in bytes, of the tmpfs holding `PGDATA` in each backup-restore
+/// container. Same magnitude as the other scenarios' unfilled PGDATA cap;
+/// this scenario never intentionally fills any filesystem.
+const BACKUP_RESTORE_PGDATA_TMPFS_BYTES: u64 = 512 * 1024 * 1024;
+
+/// A disposable, RAM-backed PostgreSQL container for the bounded
+/// backup-restore rehearsal scenario. The scenario starts two independent
+/// instances of this type (source and target): each gets its own generated
+/// container name/password and its own randomly published host port, so they
+/// are genuinely separate, mutually isolated PostgreSQL server processes,
+/// never two databases inside one running server.
+///
+/// [`Drop`] force-removes the container and never panics: on failure it only
+/// `eprintln!`s the container ID and its exact role-qualified label so a human
+/// can find and remove a leaked container.
+pub struct BackupRestorePostgresContainer {
+    container_id: ContainerId,
+    published_port: u16,
+    postgres_password: String,
+    cleanup_label: String,
+}
+
+impl BackupRestorePostgresContainer {
+    /// Starts a fresh disposable container from `image` and waits for a
+    /// fresh client connection plus a trivial query to succeed against its
+    /// default `postgres` database. `role` ("source" or "target") only
+    /// disambiguates the generated container name/label for human
+    /// diagnostics; the scenario itself tells the two containers apart by
+    /// their independently generated ID, port, and password, never by this
+    /// string. Panics on any failure: a scenario that cannot even start its
+    /// own disposable container proves nothing.
+    pub fn start(image: &PinnedImage, role: &str) -> Self {
+        let postgres_password: String = os_random_secret_hex(32).unwrap_or_else(|error| {
+            panic!("failed to read PostgreSQL test password from OS randomness: {error}")
+        });
+        let container_name = format!(
+            "sunrise-edge-backup-restore-{role}-{}-{}",
+            std::process::id(),
+            random_hex_token(16)
+        );
+        let label = format!("sunrise-edge-test=backup-restore-{role}");
+        let pgdata_mount = format!(
+            "type=tmpfs,destination=/var/lib/postgresql,tmpfs-size={BACKUP_RESTORE_PGDATA_TMPFS_BYTES}"
+        );
+        let password_env = format!("POSTGRES_PASSWORD={postgres_password}");
+        let run_output_result = run_docker_command_bounded_output(
+            docker_argv_command(&[
+                "run",
+                "--detach",
+                "--name",
+                &container_name,
+                "--label",
+                &label,
+                "--publish",
+                "127.0.0.1::5432",
+                "--memory",
+                "1g",
+                "--memory-swap",
+                "1g",
+                "--pids-limit",
+                "512",
+                "--mount",
+                &pgdata_mount,
+                "--env",
+                &password_env,
+                "--env",
+                "POSTGRES_DB=postgres",
+                "--",
+                image.as_str(),
+            ]),
+            "docker run (backup-restore container)",
+        );
+        let run_output = run_output_result.unwrap_or_else(|error| {
+            let cleanup_error = run_docker_command_bounded(
+                docker_argv_command(&["rm", "--force", "--volumes", &container_name]),
+                "docker rm after failed run",
+            )
+            .err();
+            panic!(
+                "docker run (backup-restore container) failed: {error}; cleanup by exact generated name returned {cleanup_error:?}"
+            )
+        });
+        let container_id = ContainerId::parse(run_output.trim()).unwrap_or_else(|error| {
+            let cleanup_error = run_docker_command_bounded(
+                docker_argv_command(&["rm", "--force", "--volumes", &container_name]),
+                "docker rm after invalid run output",
+            )
+            .err();
+            panic!(
+                "docker run produced an invalid container id {run_output:?}: {error}; cleanup by exact generated name returned {cleanup_error:?}"
+            )
+        });
+        let mut container = Self {
+            container_id,
+            published_port: 0,
+            postgres_password,
+            cleanup_label: label,
+        };
+        let port_output = run_docker_command_bounded_output(
+            docker_argv_command(&["port", container.container_id.as_str(), "5432/tcp"]),
+            "docker port (backup-restore container)",
+        )
+        .unwrap_or_else(|error| panic!("docker port failed: {error}"));
+        container.published_port = parse_published_port(&port_output);
+        wait_for_database_ready(
+            &format!(
+                "backup-restore container ({role}) {}",
+                container.container_id.as_str()
+            ),
+            &container.url("postgres"),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        container
+    }
+
+    pub fn container_id(&self) -> &ContainerId {
+        &self.container_id
+    }
+
+    /// Builds the `postgresql://` URL for `database` against this
+    /// container's published port and generated password.
+    pub fn url(&self, database: &str) -> String {
+        format!(
+            "postgresql://postgres:{}@127.0.0.1:{}/{database}",
+            self.postgres_password, self.published_port
+        )
+    }
+
+    /// Runs `docker exec --user postgres <id> <args>`, bounded, with capped
+    /// output. `pg_dump`/`psql`/`createdb` all connect over the container's
+    /// local Unix socket as the unprivileged `postgres` server/OS user, which
+    /// the official image's default `pg_hba.conf` trusts without a password,
+    /// so no exec in this scenario ever needs `--user root` or the generated
+    /// TCP password.
+    pub fn exec(&self, args: &[&str]) -> io::Result<String> {
+        let mut full_args: Vec<&str> = vec![
+            "exec",
+            "--user",
+            "postgres",
+            "--",
+            self.container_id.as_str(),
+        ];
+        full_args.extend_from_slice(args);
+        run_docker_command_bounded_output(docker_argv_command(&full_args), "docker exec")
+    }
+
+    /// Same as [`Self::exec`], but with an explicit output cap instead of
+    /// [`DOCKER_COMMAND_OUTPUT_MAX_BYTES`]. Used only for `pg_dump`, whose
+    /// captured stdout this scenario deliberately keeps small but which can
+    /// still exceed the generic per-exec cap sized for one-line probes.
+    pub fn exec_capped(&self, args: &[&str], max_bytes: u64) -> io::Result<String> {
+        let mut full_args: Vec<&str> = vec![
+            "exec",
+            "--user",
+            "postgres",
+            "--",
+            self.container_id.as_str(),
+        ];
+        full_args.extend_from_slice(args);
+        run_docker_command_bounded_output_capped(
+            docker_argv_command(&full_args),
+            "docker exec",
+            max_bytes,
+        )
+    }
+}
+
+impl Drop for BackupRestorePostgresContainer {
+    fn drop(&mut self) {
+        let result = run_docker_command_bounded(
+            docker_argv_command(&["rm", "--force", "--volumes", self.container_id.as_str()]),
+            "docker rm (backup-restore container)",
+        );
+        if let Err(error) = result {
+            eprintln!(
+                "BackupRestorePostgresContainer: failed to remove container {} (label {}): \
+                 {error}; remove it by hand",
+                self.container_id.as_str(),
+                self.cleanup_label
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2199,6 +2473,58 @@ mod tests {
         ) {
             ConnectionExhaustionScenario::Run(image) => assert_eq!(image.as_str(), raw_image),
             ConnectionExhaustionScenario::Skip => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn resolve_backup_restore_scenario_skips_when_both_absent() {
+        assert!(matches!(
+            resolve_backup_restore_scenario_from(None, None),
+            BackupRestoreScenario::Skip
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "must be exactly")]
+    fn resolve_backup_restore_scenario_fails_on_malformed_required_flag() {
+        resolve_backup_restore_scenario_from(Some(OsString::from("true")), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not configured")]
+    fn resolve_backup_restore_scenario_fails_when_required_but_no_image() {
+        resolve_backup_restore_scenario_from(Some(OsString::from("1")), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "is invalid")]
+    fn resolve_backup_restore_scenario_fails_on_malformed_image() {
+        resolve_backup_restore_scenario_from(
+            Some(OsString::from("1")),
+            Some(OsString::from("bad")),
+        );
+    }
+
+    #[test]
+    fn resolve_backup_restore_scenario_runs_with_only_image_configured() {
+        let raw_image =
+            "postgres@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2";
+        match resolve_backup_restore_scenario_from(None, Some(OsString::from(raw_image))) {
+            BackupRestoreScenario::Run(image) => assert_eq!(image.as_str(), raw_image),
+            BackupRestoreScenario::Skip => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn resolve_backup_restore_scenario_runs_with_required_and_image_configured() {
+        let raw_image =
+            "postgres@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2";
+        match resolve_backup_restore_scenario_from(
+            Some(OsString::from("1")),
+            Some(OsString::from(raw_image)),
+        ) {
+            BackupRestoreScenario::Run(image) => assert_eq!(image.as_str(), raw_image),
+            BackupRestoreScenario::Skip => panic!("expected Run"),
         }
     }
 }

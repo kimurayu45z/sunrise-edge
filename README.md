@@ -270,11 +270,35 @@ cross-provider ingress milestones implemented through Phase 17:
   the next successful commit plus post-recovery server-side connection
   counts, then proves exact replay/claim/acknowledgement and pool usability
   through the same pool/store. This is bounded server
-  connection-slot exhaustion evidence only. Together, DR-0070/DR-0071/DR-0072
+  connection-slot exhaustion evidence only.
+- A separate required CI scenario (see `ARCHITECTURE.md` DR-0073) starts two
+  fully separate, isolated digest-pinned disposable PostgreSQL containers (a
+  source and a target — different processes, passwords, and published
+  ports), commits one structured invocation on the source, and captures a
+  `pg_dump --inserts` snapshot, stripping PostgreSQL 18's `psql`-only
+  `\restrict`/`\unrestrict` bracketing lines before applying the
+  self-contained script directly into a fresh target database with the same
+  PostgreSQL driver library. Before fence promotion it verifies exact schema
+  identity and restored namespace metadata/state/receipt ground truth, then
+  advances the restored namespace's writer fence through the operator-only
+  seam, proves a
+  stale pre-backup context is rejected as `WriterFenced` with no publication,
+  and proves a fresh context reconciles the restored state/receipt, observes
+  `RequestAlreadyCommitted` for the identical invocation, claims and
+  acknowledges the exact pending outbox payload, and commits new work. A
+  deterministic negative pair proves both an atomic rollback for a dump cut
+  inside a required `CREATE TABLE` and a deeper gate rejection after a valid
+  restore omits only the fixture state row while retaining schema, metadata,
+  and receipt. This is a bounded
+  database-snapshot restore rehearsal for one `pg_dump`/SQL-execute cycle
+  only, not a production backup/restore capability: it does not close the
+  backup/restore evidence criterion. Together, DR-0070/DR-0071/DR-0072/DR-0073
   leave literal-`COMMIT` WAL/data ENOSPC, real storage-device ENOSPC and
   block-device faults, load/soak capacity, connection-pool behavior under a
-  provider-managed pooler, TLS-path connection loss, backup/restore, real
-  writer failover, and production certification open.
+  provider-managed pooler, TLS-path connection loss, point-in-time recovery,
+  continuous WAL archiving, hot/concurrent backup, checkpoint publication,
+  blob-manifest/state-root/encryption-key verification, real writer failover,
+  and production certification open.
 - An explicit `ComposedRuntime` for assembling independently selected state,
   blob, signer, transport, clock, and scheduler components without hidden
   defaults. Native conformance tests close/reopen SQLite into a new composition,
@@ -398,8 +422,11 @@ Important remaining work includes the owned-object fast path, concrete
 node-event dispatch and protocol handlers, in-flight durable-I/O cancellation,
 real provider trigger wiring, abrupt host/power-fault recovery conformance
 (database-process SIGKILL/WAL recovery, bounded pre-commit data-tablespace
-and WAL-filesystem ENOSPC, and bounded server connection-slot exhaustion are
-covered As-Is; see DR-0069/DR-0070/DR-0071/DR-0072),
+and WAL-filesystem ENOSPC, bounded server connection-slot exhaustion, and a
+bounded `pg_dump`-based database-snapshot restore rehearsal are covered
+As-Is; see DR-0069/DR-0070/DR-0071/DR-0072/DR-0073 — the last of these is a
+rehearsal for one snapshot cycle, not a production backup/restore
+capability),
 portable system-module execution, cryptographic slashing proof verification,
 fee-object debiting,
 provider persistence bindings, runtime adapters, networking/RPC surfaces, and
@@ -418,8 +445,10 @@ database-process SIGKILL/WAL recovery evidence in DR-0069),
 literal-`COMMIT` WAL/data ENOSPC and real storage-device ENOSPC beyond
 DR-0070/DR-0071, connection-pool behavior under a provider-managed pooler and
 load/soak capacity beyond DR-0072's bounded evidence,
-TLS-path connection loss, backup/restore, real
-writer failover, and provider conformance follow on that foundation. Phase
+TLS-path connection loss, point-in-time recovery, continuous WAL archiving,
+hot/concurrent backup, checkpoint publication, blob-manifest/state-root/
+encryption-key verification, real writer failover, and provider conformance
+follow on that foundation. Phase
 16/17 provider
 trust, deployment, observability, and release rehearsal remain required.
 

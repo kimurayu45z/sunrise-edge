@@ -25,7 +25,16 @@ abrupt host/power loss, other fault/capacity evidence, and production
 certification are not implemented. A separate disposable-container test now
 proves bounded pre-commit data-tablespace ENOSPC and recovery after freeing
 space (DR-0070); it deliberately leaves WAL and commit-boundary exhaustion
-open.
+open. A separate two-container test now rehearses a bounded `pg_dump`-based
+database-snapshot restore, verifying schema identity and restored namespace
+metadata/state/receipt before fence promotion, an operator-only writer-fence
+advance on the restored namespace, stale pre-backup context fencing, and exact
+reconciliation plus fresh commit under a new context, alongside an atomic
+invalid-dump rollback and a valid missing-state gate rejection (DR-0073 in
+`ARCHITECTURE.md`);
+see section 5. This is rehearsal evidence for one `pg_dump`/SQL-execute
+snapshot cycle only — it is not a production backup/restore capability and
+does not close the accepted backup/restore evidence criterion in section 9.
 
 This document refines [`PERSISTENCE.md`](PERSISTENCE.md) for the first
 production-oriented PostgreSQL backend. It deliberately does not map the
@@ -347,6 +356,45 @@ and panic-safe exact-container removal. CI makes the scenario required with
 RAM-backed VFS data-tablespace ENOSPC evidence before `COMMIT`, not WAL or
 commit-boundary ENOSPC, a real storage-media/filesystem fault, or certification.
 
+Another separate live test starts and owns two digest-pinned disposable
+PostgreSQL 18 containers — a source and a fully isolated target, each its own
+container process with its own generated password and published host port,
+never two databases inside one server. It commits one structured invocation
+(state, receipt, one pending outbox message) on the source, captures a
+snapshot with `pg_dump -d <db> --no-owner --no-privileges --inserts` inside
+the source container, strips PostgreSQL 18 `pg_dump`'s bracketing
+`\restrict`/`\unrestrict` lines (a `psql`-only safety meta-command pair, not
+SQL), and applies the resulting self-contained `INSERT`-only script directly
+into a fresh, empty database on the target with the same PostgreSQL driver
+library. Before advancing the copied namespace fence it verifies exact schema
+identity and reads the exact restored namespace metadata, state, and receipt
+back through the normal adapter read path. It then advances the restored
+namespace's writer fence through the operator-only `advance_writer_fence`
+seam, proves a stale context still carrying the pre-backup fence is rejected
+as the definite `Rejected(WriterFenced { .. })` against the restored target
+with no publication, and proves a fresh context carrying the new fence
+reconciles the exact restored receipt/state, observes `RequestAlreadyCommitted`
+for the identical invocation, claims and acknowledges the
+exact restored pending outbox payload, and commits genuinely new work. A
+deterministic negative pair uses two additional databases on the same target:
+a dump cut inside the required `storage_metadata` table definition must fail
+its one simple-query batch atomically and leave no schema marker, while a
+syntactically valid dump with only the fixture's `state_records` insert removed
+must restore schema, namespace metadata, and receipt but fail the deeper
+rehearsal verification gate on missing state. CI makes the scenario required with
+`SUNRISE_EDGE_TEST_POSTGRES_BACKUP_RESTORE_REQUIRED=1`; leaving both that
+flag and `SUNRISE_EDGE_TEST_POSTGRES_BACKUP_RESTORE_IMAGE` unset skips it
+locally. This is a bounded database-snapshot restore rehearsal for one
+`pg_dump`/SQL-execute cycle only, explicitly not a production
+backup/restore capability: it does not prove point-in-time recovery,
+continuous WAL archiving/shipping, a hot/consistent backup taken under
+concurrent write load, `pg_basebackup`/replication-based backup, backup
+encryption or off-host storage, retention/rotation policy, restore
+automation, checkpoint publication (the schema has no implemented
+checkpoint-publication path; `sunrise_edge.checkpoints` is not written or
+read by anything in this crate), blob-manifest verification, state-root
+verification, encryption-key verification, or certification.
+
 ## 6. Indexed claim and acknowledgement
 
 Claim first checks the lease-attempt identity. A matching active attempt returns
@@ -451,8 +499,16 @@ backend acceptance for the structured invocation commit, indexed outbox
 claim, and acknowledgement boundaries, over a plain `NoTls` transport only;
 it says nothing about TLS-path connection loss. The separate DR-0070 scenario
 now covers bounded pre-commit data-tablespace ENOSPC with exact non-publication
-and recovery evidence. Duplicate request races, abrupt/process faults, WAL or
+and recovery evidence. A separate two-container DR-0073 scenario now covers a
+bounded `pg_dump`-based database-snapshot restore rehearsal, with exact
+schema-identity/namespace-metadata/state/receipt verification before fence
+promotion, operator-only writer-fence advance, stale-context fencing, and post-restore reconciliation
+evidence for one snapshot cycle; this does not close the checkpoint/backup/
+restore-with-blob-manifest-verification criterion above, since point-in-time
+recovery, continuous WAL archiving, hot/concurrent backup, checkpoint
+publication, and blob-manifest/state-root/encryption-key verification remain
+unimplemented. Duplicate request races, abrupt/process faults, WAL or
 commit-boundary/real-device exhaustion, TLS-path connection loss,
-backup/restore, migration compatibility across real old and new binaries,
+migration compatibility across real old and new binaries,
 capacity/load/soak, real writer failover, and operational certification
 remain open.

@@ -249,3 +249,69 @@ without a valid digest-pinned image fails instead of skipping. This does not
 cover real-device resource exhaustion, load/soak capacity, connection-pool
 behavior under a provider-managed pooler (e.g. PgBouncer), TLS-path
 connection loss, real writer failover, or production certification.
+
+### Live bounded database-snapshot restore rehearsal test
+
+`tests/postgres_backup_restore.rs` starts and owns **two** separate
+digest-pinned disposable PostgreSQL 18 containers (a source and a fully
+isolated target — different container processes, different generated
+passwords, different published host ports). Set both variables to make it
+required locally:
+
+```bash
+SUNRISE_EDGE_TEST_POSTGRES_BACKUP_RESTORE_IMAGE=postgres:18.6-alpine3.24@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2 \
+SUNRISE_EDGE_TEST_POSTGRES_BACKUP_RESTORE_REQUIRED=1 \
+  cargo test -p runtime-postgres --all-features --test postgres_backup_restore -- --nocapture
+```
+
+The test commits one structured invocation (state, receipt, one pending
+outbox message) on the source, then runs `pg_dump -d <db> --no-owner
+--no-privileges --inserts` inside the source container via bounded `docker
+exec` output capture. `--inserts` avoids `COPY ... FROM stdin` embedded data
+blocks — the convention that the data literally follows the `COPY` statement
+in the same script is implemented by `psql` itself, not the wire protocol —
+so the captured plain-`INSERT` snapshot is a self-contained SQL script after
+the marker removal below. The test applies it through
+`postgres::Client::batch_execute` over its
+own bounded connection to the target, with no intermediate file, `docker cp`,
+or `psql` subprocess. It strips PostgreSQL 18 `pg_dump`'s bracketing
+`\restrict`/`\unrestrict` lines first: these are a `psql`-only safety
+meta-command pair, not SQL, and the server rejects them as a syntax error if
+sent verbatim over the wire, which is exactly what happens when bypassing
+`psql` this way.
+
+Before advancing the copied namespace fence, the test verifies exact schema
+identity (`verify_initial_schema`) and reads the exact restored namespace
+metadata, state, and receipt back through the normal adapter read path (never
+by inferring row contents from raw SQL). It then advances the restored
+namespace's writer fence through the operator-only `advance_writer_fence`
+seam, proves a stale context still carrying the pre-backup fence is rejected
+as `Rejected(WriterFenced { .. })` against the restored target with no
+publication, and proves a fresh context carrying the new fence reconciles the
+exact restored receipt/state, observes `RequestAlreadyCommitted` for the
+identical invocation, and claims and acknowledges the exact restored
+pending outbox payload through `NoDueWork`, and then commits genuinely new
+work. A deterministic negative pair uses two more empty databases on the same
+target container. A dump cut inside the required `storage_metadata` table
+definition must fail its one simple-query batch atomically and leave no schema
+marker. A syntactically valid dump with only the fixture's `state_records`
+insert removed must restore schema, namespace metadata, and receipt cleanly,
+yet fail the deeper rehearsal verification gate on the missing state row.
+
+It force-removes both of its exact created containers on normal return or
+panic. Leaving both variables unset skips the test; setting the required flag
+without a valid digest-pinned image fails instead of skipping. This is a
+bounded database-snapshot restore rehearsal only, not a production
+backup/restore capability: it does not cover point-in-time recovery,
+continuous WAL archiving/shipping, a hot/consistent backup taken under
+concurrent write load, `pg_basebackup`/replication-based backup, backup
+encryption or off-host storage, retention/rotation policy, restore
+automation, checkpoint publication (the schema has no implemented
+checkpoint-publication path; `sunrise_edge.checkpoints` is not written or
+read by anything in this crate), blob-manifest verification, state-root
+verification, encryption-key verification, multi-database/whole-cluster
+backup, backup under concurrent adapter write traffic, real storage-device or
+off-host transfer faults, capacity/load/soak, TLS-path connection loss, real
+writer failover beyond the one bounded fence advance proven here (the copied
+target fence does not fence or stop the still-isolated source database), or
+production certification.
