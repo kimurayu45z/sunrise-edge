@@ -222,6 +222,16 @@ cross-provider ingress milestones implemented through Phase 17:
   failover, provider certification, or production readiness, so this remains
   As-Is evidence alongside the commit-boundary connection-loss evidence
   above.
+- A separate required CI scenario (see `ARCHITECTURE.md` DR-0070) starts an
+  exact digest-pinned disposable PostgreSQL container with PGDATA/WAL on an
+  unfilled 512 MiB tmpfs and all database relations on a separate 64 MiB
+  tmpfs tablespace. It fills only that tablespace, proves a direct write
+  returns SQLSTATE `53100`, proves the adapter rejects the pre-commit
+  structured invocation as `UnavailableBeforeCommit`, then frees space and
+  reconciles no state/receipt publication before the identical invocation,
+  outbox claim, and acknowledgement succeed. This is bounded data-tablespace
+  ENOSPC evidence only: WAL exhaustion, commit-boundary ENOSPC, real storage
+  media/cache/filesystem faults, and production certification remain open.
 - An explicit `ComposedRuntime` for assembling independently selected state,
   blob, signer, transport, clock, and scheduler components without hidden
   defaults. Native conformance tests close/reopen SQLite into a new composition,
@@ -344,9 +354,10 @@ cross-provider ingress milestones implemented through Phase 17:
 Important remaining work includes the owned-object fast path, concrete
 node-event dispatch and protocol handlers, in-flight durable-I/O cancellation,
 real provider trigger wiring, abrupt host/power-fault recovery conformance
-(database-process SIGKILL/WAL recovery is now covered As-Is; see DR-0069),
-portable system-module
-execution, cryptographic slashing proof verification, fee-object debiting,
+(database-process SIGKILL/WAL recovery and bounded data-tablespace ENOSPC are
+covered As-Is; see DR-0069/DR-0070),
+portable system-module execution, cryptographic slashing proof verification,
+fee-object debiting,
 provider persistence bindings, runtime adapters, networking/RPC surfaces, and
 independent security review.
 
@@ -360,7 +371,8 @@ capacity evidence. Native structured requests now honor an explicit
 cooperative cancellation signal only before first storage dispatch;
 client-disconnect cancellation, abrupt host/power fault (beyond the
 database-process SIGKILL/WAL recovery evidence in DR-0069),
-disk-full/WAL exhaustion, TLS-path connection loss, backup/restore, real
+WAL exhaustion and commit-boundary/storage-device ENOSPC beyond DR-0070,
+TLS-path connection loss, backup/restore, real
 writer failover, and provider conformance follow on that foundation. Phase
 16/17 provider
 trust, deployment, observability, and release rehearsal remain required.

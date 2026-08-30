@@ -428,15 +428,24 @@ not general state reads:
    flush/torn-write/media/filesystem faults, disk-full/WAL exhaustion,
    TLS-path connection loss, backup/restore, capacity/load/soak, real writer
    failover, provider certification, or production readiness.
+   A separate required disposable-container scenario puts PGDATA/WAL on an
+   unfilled bounded tmpfs and the database default tablespace on a distinct
+   64 MiB tmpfs, then fills only the latter. It proves direct SQLSTATE `53100`,
+   definite `UnavailableBeforeCommit`, no state/receipt/commit-sequence
+   publication, and recovery through the same pool/store after freeing space
+   (implemented As-Is; see `ARCHITECTURE.md` DR-0070). This closes only bounded
+   pre-commit data-tablespace ENOSPC evidence.
 4. Preserve the implemented exact-boundary/pool/lock deadline evidence,
    pre-storage native cancellation, and the database-process SIGKILL/WAL
    recovery evidence above, then extend it with client-disconnect and
    in-flight cancellation semantics, abrupt real host/power fault (storage
    write-cache flush, torn-write, media/filesystem faults included),
-   disk-full/WAL exhaustion, TLS-path connection loss, capacity/load/soak
+   WAL exhaustion, commit-boundary and real storage-device ENOSPC, TLS-path
+   connection loss, capacity/load/soak
    tests, backup/restore rehearsal, and real writer-fencing failover tests.
-   Every one of these remains open except the database-process SIGKILL/WAL
-   recovery case above.
+   Every one of these remains open; the database-process SIGKILL/WAL recovery
+   and bounded pre-commit data-tablespace ENOSPC cases above are the only
+   implemented fault slices.
 5. Implement Cloudflare Durable Object and AWS mappings against the same
    contract and pass real-provider conformance before claiming support.
 

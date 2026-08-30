@@ -2184,6 +2184,12 @@ Phase 15 As-Is scope:
   write-cache flush/torn-write/media/filesystem fault、disk full/WAL exhaustion、connection
   exhaustion、TLS-path connection loss、backup/restore、capacity/load/soak、real writer
   failover、provider certificationは未実装である。
+  別のrequired live testはdigest-pinned disposable PostgreSQLでPGDATA/WALを未充填の
+  512 MiB tmpfs、database default tablespaceを別の64 MiB tmpfsへ置き、後者だけを満杯にする。
+  direct SQLSTATE `53100`、pre-commit `UnavailableBeforeCommit`、state/receipt/commit sequence
+  非公開、space解放後のsame pool/store recoveryとexact replay/claim/ackを検証する
+  （bounded data-tablespace ENOSPCのみimplemented As-Is; ARCHITECTURE.md DR-0070）。WAL exhaustion、
+  commit-boundary/real-device ENOSPCと他のfault/capacity certificationは未実装のままである。
 - ComposedRuntimeはStateStore、BlobStore、Signer、Transport、Clock、Schedulerをhidden defaultなしで
   明示的に所有・合成する。SQLiteへstate/dedup/outboxをcommit後にruntimeをdropし、同じDBを別compositionで
   reopenしてstateを再適用せずoutboxを送ること、send failure leaseがreopen後もexpiry前は抑止されexpiry時だけ
@@ -2304,8 +2310,10 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
    flush/torn-write/media/filesystem fault、TLS-path connection loss、capacity/load/soak、real writer
    failover、backup/restore、provider certificationは未実装である。
 5. real host/power fault（storage write-cache flush、torn-write、media/filesystem fault含む）、
-   disk full/WAL exhaustion、connection exhaustion、capacity/load/soak、backup/restore、writer failoverを
-   rehearsalする。database-process SIGKILL/WAL recovery以外はこのstep 5の全項目が未実装のまま残っている。
+   WAL exhaustion、commit-boundary/real storage-device ENOSPC、connection exhaustion、
+   capacity/load/soak、backup/restore、writer failoverをrehearsalする。database-process
+   SIGKILL/WAL recoveryとbounded pre-commit data-tablespace ENOSPC（DR-0070）以外はこのstep 5の
+   全項目が未実装のまま残っている。
 6. 同じcontractをCloudflare Durable ObjectとAWS persistenceへ実装し、real providerでcertifyする。
 
 Phase 16:

@@ -22,7 +22,10 @@ container immediately after a committed structured invocation and verifies
 recovery after restart (DR-0069 in `ARCHITECTURE.md`); see section 5. Migration
 operations beyond initial bootstrap, cancellation, TLS-path connection loss,
 abrupt host/power loss, other fault/capacity evidence, and production
-certification are not implemented.
+certification are not implemented. A separate disposable-container test now
+proves bounded pre-commit data-tablespace ENOSPC and recovery after freeing
+space (DR-0070); it deliberately leaves WAL and commit-boundary exhaustion
+open.
 
 This document refines [`PERSISTENCE.md`](PERSISTENCE.md) for the first
 production-oriented PostgreSQL backend. It deliberately does not map the
@@ -325,6 +328,25 @@ only when both the live URL and the CI-provided container ID
 (`SUNRISE_EDGE_TEST_POSTGRES_CONTAINER_ID`) are absent; partial configuration
 fails rather than skipping.
 
+A second separate live test starts and owns a digest-pinned disposable
+PostgreSQL 18 container. PGDATA/WAL use an unfilled 512 MiB tmpfs while the
+database default tablespace uses a distinct 64 MiB tmpfs. Before injecting the
+fault, the test correlates its SQL connection with the Docker target through an
+identity marker, verifies the tablespace path and capacity, and verifies that
+the tablespace and PGDATA/WAL have different device IDs. It fills only the
+tablespace, requires a direct incompressible relation write to return SQLSTATE
+`53100`, and requires the adapter's structured invocation to return the
+definite pre-commit `Rejected(UnavailableBeforeCommit)`. After removing the
+filler it uses the same pool/store to prove absent state/receipt and unchanged
+commit sequence, then commits and replays the identical invocation and
+completes its exact outbox claim/acknowledgement. The container lifecycle uses
+direct argv, bounded child time/output, strict digest/configuration parsing,
+and panic-safe exact-container removal. CI makes the scenario required with
+`SUNRISE_EDGE_TEST_POSTGRES_DISK_FULL_REQUIRED=1`; leaving both that flag and
+`SUNRISE_EDGE_TEST_POSTGRES_DISK_FULL_IMAGE` unset skips it locally. This is
+RAM-backed VFS data-tablespace ENOSPC evidence before `COMMIT`, not WAL or
+commit-boundary ENOSPC, a real storage-media/filesystem fault, or certification.
+
 ## 6. Indexed claim and acknowledgement
 
 Claim first checks the lease-attempt identity. A matching active attempt returns
@@ -396,7 +418,8 @@ The adapter is not production-certified until automated evidence covers:
 - stale writer, failover, and schema-generation fencing;
 - claim/ack connection loss at every commit boundary;
 - delayed acknowledgement after later messages advance;
-- pool exhaustion, statement timeout, disk full, abrupt process/power loss;
+- pool exhaustion, statement timeout, WAL/commit-boundary or real-device disk
+  full, abrupt process/power loss;
 - checkpoint/backup/restore with blob-manifest verification;
 - migration skew across old/new binaries;
 - measured connection, transaction-size, contention, recovery, load, and soak
@@ -426,8 +449,10 @@ commit-loss capability covers commit-boundary connection loss immediately
 before `COMMIT` dispatch for a plain state commit, and immediately after
 backend acceptance for the structured invocation commit, indexed outbox
 claim, and acknowledgement boundaries, over a plain `NoTls` transport only;
-it says nothing about TLS-path connection loss. Duplicate request races,
-abrupt/process faults, disk-full/WAL exhaustion, TLS-path connection loss,
+it says nothing about TLS-path connection loss. The separate DR-0070 scenario
+now covers bounded pre-commit data-tablespace ENOSPC with exact non-publication
+and recovery evidence. Duplicate request races, abrupt/process faults, WAL or
+commit-boundary/real-device exhaustion, TLS-path connection loss,
 backup/restore, migration compatibility across real old and new binaries,
 capacity/load/soak, real writer failover, and operational certification
 remain open.
