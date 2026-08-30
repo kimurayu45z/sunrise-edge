@@ -2188,8 +2188,25 @@ Phase 15 As-Is scope:
   512 MiB tmpfs、database default tablespaceを別の64 MiB tmpfsへ置き、後者だけを満杯にする。
   direct SQLSTATE `53100`、pre-commit `UnavailableBeforeCommit`、state/receipt/commit sequence
   非公開、space解放後のsame pool/store recoveryとexact replay/claim/ackを検証する
-  （bounded data-tablespace ENOSPCのみimplemented As-Is; ARCHITECTURE.md DR-0070）。WAL exhaustion、
-  commit-boundary/real-device ENOSPCと他のfault/capacity certificationは未実装のままである。
+  （bounded data-tablespace ENOSPCのみimplemented As-Is; ARCHITECTURE.md DR-0070）。
+  さらに別のrequired live testはdigest-pinned disposable PostgreSQLで`pg_wal`だけを`initdb --waldir`で
+  別の64 MiB tmpfsへ切り離し、未充填の512 MiB tmpfs上のPGDATA/default tablespaceとは明確に区別した上で
+  WAL側だけを満杯にする。direct incompressible writeはWAL segment境界を跨ぐと引き続きSQLSTATE `53100`を
+  返すが、severityはDR-0070のplain `ERROR`ではなく`PANIC`であり、直後に同じconnectionがcloseする
+  （PostgreSQLがwhole postmasterをterminateしてcrash-restartするため、その後のautomatic recoveryも
+  WAL不足で同様に失敗しserverが二度落ちる）。同じmount上でin-place recoveryした後、WALを独立に再充填し、
+  bounded incompressible state mutationを使ってadapter自身のstructured invocation commitにWALを枯渇させ、
+  serverを再度crashさせる。観測されたpublic outcomeはdefinite pre-commit
+  `Rejected(UnavailableBeforeCommit)`である。adapter APIはraw database errorを公開しないため、exact
+  SQLSTATE/severityを主張するのはdirectな第一cycleだけである。connectionだけでなく
+  server全体が落ちるため、containerのentrypointをsupervisor scriptで上書きしてcontainer自体はcrash後も
+  生存させ、`docker start`/`docker kill`を使わずWAL解放後に`pg_ctl start`で同じtmpfs mount上へin-place
+  restartする。二回のrestartそれぞれでstrictly advanceした`pg_postmaster_start_time()`によりgenuineな
+  crash/recoveryを証明した上で、
+  同じpool/storeでstate/receipt/commit sequence非公開とrecovery後のexact replay/claim/ackを検証する
+  （bounded WAL-filesystem ENOSPCのみimplemented As-Is; ARCHITECTURE.md DR-0071）。literal `COMMIT`時の
+  WAL/data ENOSPCは未検証であり、この境界についてENOSPC固有の分類は主張しない。real-device ENOSPCと
+  他のfault/capacity certificationも未実装のままである。
 - ComposedRuntimeはStateStore、BlobStore、Signer、Transport、Clock、Schedulerをhidden defaultなしで
   明示的に所有・合成する。SQLiteへstate/dedup/outboxをcommit後にruntimeをdropし、同じDBを別compositionで
   reopenしてstateを再適用せずoutboxを送ること、send failure leaseがreopen後もexpiry前は抑止されexpiry時だけ
@@ -2310,10 +2327,10 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
    flush/torn-write/media/filesystem fault、TLS-path connection loss、capacity/load/soak、real writer
    failover、backup/restore、provider certificationは未実装である。
 5. real host/power fault（storage write-cache flush、torn-write、media/filesystem fault含む）、
-   WAL exhaustion、commit-boundary/real storage-device ENOSPC、connection exhaustion、
+   commit-boundary/real storage-device ENOSPC、connection exhaustion、
    capacity/load/soak、backup/restore、writer failoverをrehearsalする。database-process
-   SIGKILL/WAL recoveryとbounded pre-commit data-tablespace ENOSPC（DR-0070）以外はこのstep 5の
-   全項目が未実装のまま残っている。
+   SIGKILL/WAL recovery、bounded pre-commit data-tablespace ENOSPC（DR-0070）、bounded pre-commit
+   WAL-filesystem ENOSPC（DR-0071）以外はこのstep 5の全項目が未実装のまま残っている。
 6. 同じcontractをCloudflare Durable ObjectとAWS persistenceへ実装し、real providerでcertifyする。
 
 Phase 16:
