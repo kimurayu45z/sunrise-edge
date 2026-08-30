@@ -2241,7 +2241,30 @@ Phase 15 As-Is scope:
   exact replay/claim/ack、pool usabilityも同じpool/storeで証明できる（bounded
   connection-exhaustion evidenceのみimplemented As-Is; ARCHITECTURE.md DR-0072）。real-device
   resource exhaustion、load/soak capacity、provider-managed pooler（例: PgBouncer）下での
-  connection-pool挙動、production certificationは未実装のままである。
+  connection-pool挙動、production certificationは未実装のままである。別のrequired live testは
+  digest-pinnedなsourceとtargetの2つの独立したdisposable containerを起動し、sourceで1件の
+  structured invocation（state、receipt、1 pending outbox message）をcommitした後、
+  `pg_dump -d <db> --no-owner --no-privileges --inserts`でsnapshotを取得する。`--inserts`は
+  `COPY ... FROM stdin`の埋め込みdata block（`psql`自身が実装するclient-side convention）を
+  回避し、self-containedな`INSERT`文だけのSQLをadapter自身の`postgres::Client::batch_execute`で
+  直接targetへ適用できるようにする。PostgreSQL 18の`pg_dump`が付与する`psql`専用の
+  `\restrict`/`\unrestrict`行（SQLではなくwireへ送ればsyntax errorになる）は事前に除去する。
+  copied namespaceのfenceを進める前にexact schema identityと、restored namespace metadata・
+  state・receiptをadapterのread path経由でexact ground truthとして検証し、operator-only
+  `advance_writer_fence`でrestored namespaceのwriter fenceを進め、stale pre-backup context
+  （旧fence）が`Rejected(WriterFenced)`でfail closedし公開なしであることを証明し、新fenceの
+  fresh contextがexact restored receipt/stateをreconcileし、identical invocationで
+  `RequestAlreadyCommitted`を観測してからrestored pending outbox
+  payloadをclaim/ackし、新規workをcommitできることを証明する。半分の長さへdeterministicに
+  truncateしたcorrupted snapshotのrestore自体がfail loudlyし、同じrehearsal verification gateを
+  決して通過しないことを証明する
+  negative caseも含む（bounded database-snapshot restore rehearsal evidenceのみ
+  implemented As-Is; ARCHITECTURE.md DR-0073）。これは1回の`pg_dump`/SQL-execute snapshot
+  cycleのrehearsalに過ぎずproduction backup/restore機能ではない。point-in-time recovery、
+  continuous WAL archiving、concurrent write負荷下でのhot backup、
+  `pg_basebackup`/replicationベースのbackup、backup encryption/off-host storage、
+  checkpoint publication（`sunrise_edge.checkpoints`は未使用）、blob-manifest/state-root/
+  encryption-key verification、production certificationは未実装のままである。
 - ComposedRuntimeはStateStore、BlobStore、Signer、Transport、Clock、Schedulerをhidden defaultなしで
   明示的に所有・合成する。SQLiteへstate/dedup/outboxをcommit後にruntimeをdropし、同じDBを別compositionで
   reopenしてstateを再適用せずoutboxを送ること、send failure leaseがreopen後もexpiry前は抑止されexpiry時だけ
@@ -2365,11 +2388,37 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
    commit-boundary/real storage-device ENOSPC、
    capacity/load/soak、backup/restore、writer failoverをrehearsalする。database-process
    SIGKILL/WAL recovery、bounded pre-commit data-tablespace ENOSPC（DR-0070）、bounded pre-commit
-   WAL-filesystem ENOSPC（DR-0071）、bounded server connection-slot exhaustion（DR-0072）以外は
+   WAL-filesystem ENOSPC（DR-0071）、bounded server connection-slot exhaustion（DR-0072）、bounded
+   `pg_dump`ベースのdatabase-snapshot restore rehearsal（DR-0073）以外は
    このstep 5の全項目が未実装のまま残っている。connection exhaustionはDR-0072でserverが飽和した
    際にadapter poolがdefinite pre-commit `Rejected(DeadlineExceededBeforeCommit)`を返すことを
    bounded disposable containerで証明したが、real-device resource exhaustion、load/soak capacity、
-   provider-managed pooler下での挙動、production certificationは未実装のままである。
+   provider-managed pooler下での挙動、production certificationは未実装のままである。DR-0073は
+   digest-pinnedなsourceとtargetの2つの独立したdisposable containerで`pg_dump --inserts`
+   snapshotを取得し、PostgreSQL 18の`pg_dump`が付与する`psql`専用の`\restrict`/`\unrestrict`行
+   （SQLではない）を除去した上でadapter自身のdriver connection経由で別isolated targetへ
+   直接restoreし、fence promotion前にexact schema identityとrestored namespace metadata・
+   state・receiptをadapterのread pathで検証し、operator-only
+   `advance_writer_fence`でrestored namespaceのwriter fenceを進め、stale pre-backup context
+   （旧fence）が`Rejected(WriterFenced)`でfail closedし、新fenceのfresh contextがexact
+   restored state/receiptをreconcileし、identical invocationで`RequestAlreadyCommitted`を
+   観測してからexact pending outbox payloadのclaim/ackを完了して
+   新規workをcommitできることを証明した
+   （bounded database-snapshot restore rehearsal evidenceのみimplemented As-Is; ARCHITECTURE.md
+   DR-0073）。このtarget側だけのfence advanceは独立して動き続けるsource databaseを停止・
+   fenceしないためsingle-writer failoverの証拠ではない。半分の長さへdeterministicに
+   truncateしたsnapshotのrestore自体がfail loudlyし、同じrehearsal verification gateを
+   決して通過しないことを証明する
+   別のnegative caseも含む。これは1回の`pg_dump`/SQL-execute
+   snapshot cycleに対するrehearsal evidenceに過ぎず、production backup/restore機能ではない。
+   point-in-time recovery、continuous WAL archiving、concurrent write負荷下でのhot backup、
+   `pg_basebackup`/replicationベースのbackup、backup encryption/off-host storage、
+   retention/rotation policy、restore automation、checkpoint publication（schemaには
+   checkpoint publicationの実装がなく、`sunrise_edge.checkpoints`はこのcrateのどこからも
+   書き込み・読み取りされていない）、blob-manifest/state-root/encryption-key verification、
+   multi-database/whole-cluster backup、concurrent adapter write traffic下でのbackup、
+   real storage-device/off-host transfer fault、production certificationは未実装のままであり、
+   backup/restore評価基準を閉じるものではない。
 6. 同じcontractをCloudflare Durable ObjectとAWS persistenceへ実装し、real providerでcertifyする。
 
 Phase 16:

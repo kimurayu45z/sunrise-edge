@@ -1192,13 +1192,23 @@ disposable-container test covers real server connection-slot exhaustion
 (DR-0072), showing this adapter classifies it as the definite pre-commit
 `Rejected(DeadlineExceededBeforeCommit)`, not `UnavailableBeforeCommit`,
 because its pool-acquisition wait and the caller's own operation deadline
-are, by construction, exhausted together. In-flight
+are, by construction, exhausted together. A further bounded two-container
+test (DR-0073) covers a `pg_dump`-based database-snapshot restore rehearsal:
+schema identity and restored namespace metadata/state/receipt verified
+before fence promotion, operator-only writer-fence advance on the restored
+namespace, stale pre-backup context fencing, and exact reconciliation plus
+fresh commit under a new context, alongside a deterministic truncated-snapshot
+negative case; this is rehearsal evidence for one `pg_dump`/SQL-execute
+snapshot cycle only, not a production backup/restore capability, and it does
+not close the backup/restore evidence criterion below. In-flight
 cancellation, abrupt host/power loss, storage write-cache
 flush/torn-write/media/filesystem faults, commit-boundary or real-device
-ENOSPC, TLS-path connection loss, backup/restore, capacity/load/soak,
-connection-pool behavior under a provider-managed pooler, real
-writer failover, and production certification evidence remain open, so this
-is still As-Is adapter evidence rather than production readiness.
+ENOSPC, TLS-path connection loss, point-in-time recovery, continuous WAL
+archiving, hot/concurrent backup, checkpoint publication, blob-manifest/
+state-root/encryption-key verification, capacity/load/soak, connection-pool
+behavior under a provider-managed pooler, real writer failover, and
+production certification evidence remain open, so this is still As-Is
+adapter evidence rather than production readiness.
 
 Runtime exposes the vendor-neutral durable-store conformance cases only to its
 own tests or adapters that opt into the non-default `durable-conformance`
@@ -1242,10 +1252,18 @@ real server connection-slot exhaustion, which this adapter classifies as the
 definite pre-commit `Rejected(DeadlineExceededBeforeCommit)` rather than
 `UnavailableBeforeCommit` because its own pool-acquisition wait cannot
 outlast the caller's operation deadline, with exact recovery after one
-blocking connection is released (DR-0072); none of these
+blocking connection is released (DR-0072), and a bounded two-container
+`pg_dump`-based database-snapshot restore rehearsal, proving schema identity
+and restored namespace metadata/state/receipt before fence promotion, an
+operator-only writer-fence advance on the restored namespace, stale
+pre-backup context fencing, and exact reconciliation plus fresh commit under
+a new context, alongside a deterministic truncated-snapshot negative case
+(DR-0073); none of these
 tests prove abrupt host/power loss, storage write-cache
 flush/torn-write/media/filesystem faults, commit-boundary or
-real-device ENOSPC, TLS-path behavior, backup/restore, capacity/load/soak,
+real-device ENOSPC, TLS-path behavior, point-in-time recovery, continuous WAL
+archiving, hot/concurrent backup, checkpoint publication, blob-manifest/
+state-root/encryption-key verification, capacity/load/soak,
 connection-pool behavior under a provider-managed pooler, real writer
 failover, provider certification, or production readiness, all of which
 remain backend-specific evidence. Passing this suite is As-Is contract
@@ -1972,3 +1990,59 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   real-device resource exhaustion, load/soak capacity, connection-pool
   behavior under a provider-managed pooler (e.g. PgBouncer), TLS-path
   connection loss, real writer failover, or production certification.
+- DR-0073: Add a required live `runtime-postgres` integration test for a
+  bounded database-snapshot restore rehearsal. Start two separate
+  digest-pinned disposable PostgreSQL 18 containers — a source and a fully
+  isolated target, each its own container process with its own generated
+  password and published host port, never merely two databases inside one
+  server — and commit one structured invocation (state, receipt, one pending
+  outbox message) on the source. Take a snapshot with `pg_dump -d <db>
+  --no-owner --no-privileges --inserts` inside the source container through
+  bounded `docker exec` output capture; `--inserts` avoids `COPY ... FROM
+  stdin` embedded data blocks, whose "data follows in the same script"
+  convention is implemented by `psql` itself, not the wire protocol, so the
+  captured plain-`INSERT` snapshot is a fully self-contained SQL script this
+  test applies directly through `postgres::Client::batch_execute` over its
+  own bounded connection to the target, with no intermediate file, `docker
+  cp`, or `psql` subprocess. PostgreSQL 18's `pg_dump` additionally brackets
+  plain output in `\restrict`/`\unrestrict` lines, a `psql`-only safety
+  meta-command pair introduced for exactly this generation, not SQL; the
+  server rejects them as a syntax error over the wire, so the test strips
+  those two fixed lines before executing the snapshot, a deterministic format
+  transform of *how* the snapshot is applied, not a content corruption of the
+  schema or data it represents. Before advancing the copied namespace fence, the
+  test verifies exact schema identity (`verify_initial_schema`) and reads the
+  exact restored namespace metadata, state, and receipt back through the
+  normal adapter read path, never by inferring row contents from raw SQL. It
+  then advances the restored namespace's writer fence through the
+  operator-only `advance_writer_fence` seam, proves a stale context still
+  carrying the pre-backup fence is rejected as `Rejected(WriterFenced {
+  .. })` against the restored target with no publication, and proves a fresh
+  context carrying the new fence reconciles the exact restored
+  receipt/state, observes `RequestAlreadyCommitted` for the identical
+  invocation, and claims and acknowledges the exact restored pending outbox
+  payload through `NoDueWork`, and then commits genuinely new work. This
+  target-only fence advance does not stop or fence the separately running
+  source database, so it is not evidence of a single-writer failover. A
+  separate, deterministic negative case restores a snapshot truncated to
+  exactly half its captured byte length into a third, empty database on the
+  same target container (not a third container, since the fault here is
+  snapshot content, not server isolation) and proves the identical
+  rehearsal verification gate — schema identity plus restored state/receipt ground
+  truth, read through the adapter — never passes against it, and requires the
+  truncated restore execution itself to fail loudly. This
+  changes no schema, canonical bytes, or protocol behavior. It is a bounded
+  database-snapshot restore rehearsal only, explicitly not a production
+  backup/restore capability, and critically does not close the accepted
+  backup/restore evidence criterion: it does not prove point-in-time
+  recovery, continuous WAL archiving/shipping, a hot/consistent backup taken
+  under concurrent write load, `pg_basebackup`/replication-based backup,
+  backup encryption or off-host storage, retention/rotation policy, restore
+  automation, checkpoint publication (the schema has no implemented
+  checkpoint-publication path; `sunrise_edge.checkpoints` is not written or
+  read by anything in this crate), blob-manifest verification, state-root
+  verification, encryption-key verification, multi-database/whole-cluster
+  backup, backup under concurrent adapter write traffic, real storage-device
+  or off-host transfer faults, capacity/load/soak, TLS-path connection loss,
+  real writer failover beyond the one bounded fence advance proven here, or
+  production certification.
