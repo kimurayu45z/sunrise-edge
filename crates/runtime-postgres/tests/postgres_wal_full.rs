@@ -109,9 +109,10 @@ const FILL_HEADROOM_KIB: u64 = 1024;
 
 /// Size of the incompressible payload driven through both the direct
 /// ground-truth probe (cycle 1) and the adapter's own state mutation
-/// (cycle 2). PostgreSQL WAL segments are a fixed 16 MiB; this is
+/// (cycle 2). This test cluster fixes WAL segments at 2 MiB during `initdb`;
+/// the payload is
 /// comfortably larger so the write's WAL record reliably crosses into a new
-/// segment (which needs a fresh, zero-filled 16 MiB file the nearly-full WAL
+/// segment (which needs a fresh, zero-filled segment file the nearly-full WAL
 /// tmpfs cannot supply) regardless of exactly how much of the current
 /// segment is already used. Enforced below to stay well inside
 /// `runtime::MAX_STATE_VALUE_BYTES` (32 MiB), since cycle 2 drives this
