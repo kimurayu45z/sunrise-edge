@@ -435,17 +435,44 @@ not general state reads:
    publication, and recovery through the same pool/store after freeing space
    (implemented As-Is; see `ARCHITECTURE.md` DR-0070). This closes only bounded
    pre-commit data-tablespace ENOSPC evidence.
+   A second required disposable-container scenario relocates `pg_wal` alone
+   onto its own bounded 64 MiB tmpfs, distinct from and much smaller than the
+   unfilled 512 MiB tmpfs holding PGDATA and the default tablespace, then
+   fills only the WAL mount. A direct incompressible write that crosses a WAL
+   segment boundary still returns SQLSTATE `53100`, but at `PANIC` severity,
+   and the connection then closes as PostgreSQL terminates every backend and
+   crash-restarts the whole postmaster (its own automatic recovery attempt
+   fails the same way, taking the server down a second time). After an
+   in-place recovery, a second independent fill drives a bounded
+   incompressible state mutation through the adapter so its own structured
+   invocation commit exhausts WAL and crashes the server; its observed public
+   outcome is the definite pre-commit `Rejected(UnavailableBeforeCommit)`.
+   The adapter does not expose the raw database error, so only the direct
+   first cycle claims exact SQLSTATE and severity.
+   Because this fault is fatal to the whole server rather than to one
+   connection, the container's entrypoint is overridden with a small
+   supervisor script that keeps the container itself alive across the crash,
+   so recovery can free WAL space and restart postgres in place with
+   `pg_ctl start` on the same, never-torn-down tmpfs mounts (never
+   `docker start`/`docker kill`, which would recreate the mounts empty and
+   destroy the evidence). A strictly-advanced `pg_postmaster_start_time()`
+   after each restart proves two genuine crash/recovery cycles, and the same
+   pool/store then prove no state/receipt/commit-sequence publication and
+   recovery after freeing space (implemented As-Is; see `ARCHITECTURE.md`
+   DR-0071). This closes bounded pre-commit WAL-filesystem ENOSPC evidence;
+   literal-`COMMIT` WAL/data ENOSPC remains untested, and no
+   ENOSPC-specific classification is claimed for that boundary.
 4. Preserve the implemented exact-boundary/pool/lock deadline evidence,
    pre-storage native cancellation, and the database-process SIGKILL/WAL
    recovery evidence above, then extend it with client-disconnect and
    in-flight cancellation semantics, abrupt real host/power fault (storage
    write-cache flush, torn-write, media/filesystem faults included),
-   WAL exhaustion, commit-boundary and real storage-device ENOSPC, TLS-path
+   commit-boundary and real storage-device ENOSPC, TLS-path
    connection loss, capacity/load/soak
    tests, backup/restore rehearsal, and real writer-fencing failover tests.
    Every one of these remains open; the database-process SIGKILL/WAL recovery
-   and bounded pre-commit data-tablespace ENOSPC cases above are the only
-   implemented fault slices.
+   and bounded pre-commit data-tablespace and WAL-filesystem ENOSPC cases
+   above are the only implemented fault slices.
 5. Implement Cloudflare Durable Object and AWS mappings against the same
    contract and pass real-provider conformance before claiming support.
 

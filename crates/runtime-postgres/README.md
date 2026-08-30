@@ -137,3 +137,47 @@ variables unset skips the test; setting the required flag without a valid
 digest-pinned image fails instead of skipping. This does not cover WAL or
 commit-boundary exhaustion, real storage media/cache/filesystem faults, or
 production certification.
+
+### Live bounded WAL-exhaustion test
+
+`tests/postgres_wal_full.rs` starts and owns a separate digest-pinned
+disposable PostgreSQL 18 container that relocates `pg_wal` (via `initdb
+--waldir`) onto its own small 64 MiB tmpfs, distinct from and much smaller
+than the unfilled 512 MiB tmpfs holding PGDATA and the default tablespace.
+Set both variables to make it required locally:
+
+```bash
+SUNRISE_EDGE_TEST_POSTGRES_WAL_FULL_IMAGE=postgres:18.6-alpine3.24@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2 \
+SUNRISE_EDGE_TEST_POSTGRES_WAL_FULL_REQUIRED=1 \
+  cargo test -p runtime-postgres --all-features --test postgres_wal_full -- --nocapture
+```
+
+Unlike the disk-full scenario's data-tablespace `ENOSPC`, a real write
+failure on the WAL filesystem is fatal to the *entire* PostgreSQL server: a
+direct client write that crosses a WAL segment boundary on the nearly-full
+WAL tmpfs still returns SQLSTATE `53100` (`disk_full`), but at `PANIC`
+severity rather than the disk-full scenario's plain `ERROR`, and the
+connection then closes as the whole postmaster terminates every backend and
+crash-restarts (its own automatic recovery attempt fails the same way, since
+it also needs to write WAL, taking the server down a second time). After an
+in-place recovery, the test independently refills the same mount and drives
+a bounded incompressible state mutation through the adapter, making the
+adapter's own structured invocation commit exhaust WAL and crash the server.
+Its observed public outcome is `UnavailableBeforeCommit`; only the direct
+first cycle claims the raw SQLSTATE and severity because the adapter API does
+not expose them. Because the whole server (not just one
+connection) goes down, this test overrides the container's entrypoint with a
+small supervisor script that keeps the *container* itself alive across the
+crash; recovery frees WAL space and restarts postgres **in place** with
+`pg_ctl start` inside that same, still-running container — never `docker
+start`, which would recreate every tmpfs mount empty and destroy the
+evidence — then reconciles exact non-publication and recovery, including a
+strictly-advanced `pg_postmaster_start_time()` after each of the two restarts,
+through the same pool/store.
+It force-removes only its exact created container on normal return or panic.
+Leaving both variables unset skips the test; setting the required flag
+without a valid digest-pinned image fails instead of skipping. This does not
+cover literal-`COMMIT` WAL/data `ENOSPC`; that boundary remains untested and
+this scenario makes no ENOSPC-specific classification claim for it. It also
+does not cover real storage-device `ENOSPC`, block-device faults, or
+production certification.

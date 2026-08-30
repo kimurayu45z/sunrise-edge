@@ -1130,6 +1130,401 @@ impl Drop for DisposablePostgresContainer {
     }
 }
 
+// --- WAL-full scenario: strict environment parsing --------------------------
+
+/// Environment variable naming the digest-pinned PostgreSQL image the
+/// bounded WAL-exhaustion scenario starts as its own disposable container
+/// (never the shared CI service container, and never the disk-full
+/// scenario's own container). Must parse as [`PinnedImage`].
+pub const WAL_FULL_IMAGE_ENV: &str = "SUNRISE_EDGE_TEST_POSTGRES_WAL_FULL_IMAGE";
+
+/// Environment variable that, when set to exactly `"1"`, forbids the
+/// WAL-exhaustion scenario from silently skipping.
+pub const WAL_FULL_REQUIRED_ENV: &str = "SUNRISE_EDGE_TEST_POSTGRES_WAL_FULL_REQUIRED";
+
+/// Outcome of strictly resolving whether the bounded WAL-exhaustion scenario
+/// runs in this process. Same shape and rules as [`DiskFullScenario`]: only
+/// "both absent" skips.
+#[derive(Debug)]
+pub enum WalFullScenario {
+    /// No WAL-full image is configured: the scenario is skipped.
+    Skip,
+    /// Run the scenario against a disposable container started from this
+    /// pinned image.
+    Run(PinnedImage),
+}
+
+/// Strictly resolves [`WalFullScenario`] from [`WAL_FULL_IMAGE_ENV`] and
+/// [`WAL_FULL_REQUIRED_ENV`]; see [`resolve_disk_full_scenario`] for the exact
+/// rules this mirrors.
+pub fn resolve_wal_full_scenario() -> WalFullScenario {
+    resolve_wal_full_scenario_from(
+        env::var_os(WAL_FULL_REQUIRED_ENV),
+        env::var_os(WAL_FULL_IMAGE_ENV),
+    )
+}
+
+fn resolve_wal_full_scenario_from(
+    required_raw: Option<OsString>,
+    image_raw: Option<OsString>,
+) -> WalFullScenario {
+    let required = parse_wal_full_required_flag(required_raw);
+    match image_raw {
+        None => {
+            if required {
+                panic!("{WAL_FULL_REQUIRED_ENV} is set but {WAL_FULL_IMAGE_ENV} is not configured");
+            }
+            WalFullScenario::Skip
+        }
+        Some(raw) => WalFullScenario::Run(parse_wal_full_pinned_image(raw)),
+    }
+}
+
+fn parse_wal_full_pinned_image(raw: OsString) -> PinnedImage {
+    let text = raw
+        .to_str()
+        .unwrap_or_else(|| panic!("{WAL_FULL_IMAGE_ENV} must be valid UTF-8"));
+    PinnedImage::parse(text)
+        .unwrap_or_else(|error| panic!("{WAL_FULL_IMAGE_ENV} is invalid: {error}"))
+}
+
+fn parse_wal_full_required_flag(raw: Option<OsString>) -> bool {
+    match raw {
+        None => false,
+        Some(raw) => {
+            let text = raw
+                .to_str()
+                .unwrap_or_else(|| panic!("{WAL_FULL_REQUIRED_ENV} must be valid UTF-8"));
+            match text {
+                "1" => true,
+                other => {
+                    panic!("{WAL_FULL_REQUIRED_ENV} must be exactly \"1\" when set, got {other:?}")
+                }
+            }
+        }
+    }
+}
+
+// --- WAL-full scenario: disposable container with a separate small WAL fs --
+
+/// Size cap, in bytes, of the tmpfs holding `PGDATA` excluding `pg_wal`. Same
+/// magnitude as the disk-full scenario's unfilled PGDATA cap; this filesystem
+/// is never intentionally filled.
+const WAL_FULL_PGDATA_TMPFS_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Size cap, in bytes, of the tmpfs holding only `pg_wal`. This is the only
+/// filesystem this scenario fills. Independent of the disk-full scenario's
+/// own bounded-tablespace cap even though both happen to be 64 MiB.
+const WAL_FULL_WAL_TMPFS_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Absolute path of the dedicated WAL tmpfs mount inside the container.
+pub const WAL_FULL_WAL_MOUNT: &str = "/pgwal";
+
+/// Absolute path `POSTGRES_INITDB_WALDIR` points `initdb --waldir` at: the
+/// exact target the live `pg_wal` symlink must resolve to, inside
+/// [`WAL_FULL_WAL_MOUNT`].
+pub const WAL_FULL_WAL_DIRECTORY: &str = "/pgwal/wal";
+
+/// `initdb` argument fixing a 2 MiB WAL segment size for this scenario's
+/// cluster, set once at `initdb` time (unlike [`WAL_FULL_POSTGRES_EXTRA_OPTIONS`],
+/// this cannot be changed later by `pg_ctl start`). PostgreSQL enforces
+/// `min_wal_size >= 2 * wal_segment_size`, so the default 16 MiB segment size
+/// would force `min_wal_size` (and therefore the number of already-allocated
+/// segments live evidence shows PostgreSQL keeps recycled and ready after a
+/// crash/recovery cycle) up to 32 MiB — uncomfortably close to
+/// `runtime::MAX_STATE_VALUE_BYTES` (32 MiB), the largest single state value
+/// this scenario's adapter-driven fault (see `tests/postgres_wal_full.rs`
+/// cycle 2) can ever present. A 2 MiB segment size instead lets
+/// [`WAL_FULL_POSTGRES_EXTRA_OPTIONS`] hold `min_wal_size` down at 4 MiB, so
+/// that same payload keeps a wide, live-verified margin over however many
+/// segments happen to already be recycled and ready, on a fresh boot or
+/// after any number of prior crash/recovery cycles.
+const WAL_FULL_INITDB_ARGS_ENV: &str = "POSTGRES_INITDB_ARGS=--wal-segsize=2";
+
+/// Extra postgres server options this scenario always launches with, both on
+/// initial start (via the entrypoint override below) and on every later
+/// in-place `pg_ctl start` restart, so idle WAL usage stays a small, constant
+/// fraction of [`WAL_FULL_WAL_TMPFS_BYTES`] instead of drifting between the
+/// initial boot and a later restart. `max_wal_size` is deliberately left
+/// large (64 MiB, the whole WAL mount) rather than also shrunk: live evidence
+/// shows that shrinking it alongside the segment size makes the background
+/// checkpointer recycle old segments aggressively enough, mid-write, to
+/// dodge the fault entirely, since checkpointing is triggered as WAL usage
+/// approaches `max_wal_size`, not `min_wal_size`.
+const WAL_FULL_POSTGRES_EXTRA_OPTIONS: &str = "-c max_wal_size=64MB -c min_wal_size=4MB";
+
+/// Bound on how long [`WalFullPostgresContainer::wait_until_postgres_down`]
+/// waits for `pg_ctl status` to report the server is no longer running.
+const WAL_FULL_POSTGRES_DOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Poll interval while waiting for [`WAL_FULL_POSTGRES_DOWN_TIMEOUT`] to elapse.
+const WAL_FULL_POSTGRES_DOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// A disposable, RAM-backed PostgreSQL container for the bounded
+/// WAL-exhaustion scenario. `PGDATA` (excluding `pg_wal`) lives on a large,
+/// never-filled tmpfs; `pg_wal` is relocated by `initdb --waldir` onto a
+/// separate, much smaller tmpfs mounted at [`WAL_FULL_WAL_MOUNT`], which is
+/// the only filesystem this scenario fills.
+///
+/// Unlike [`DisposablePostgresContainer`], this container overrides the
+/// image's entrypoint with a small supervisor shell script that backgrounds
+/// `docker-entrypoint.sh postgres` and then `sleep infinity`s after it exits.
+/// A real WAL write failure is fatal to the whole PostgreSQL server process
+/// (see `tests/postgres_wal_full.rs` for why), which would otherwise take the
+/// container's PID 1 down with it; `docker start`ing a stopped container
+/// recreates every tmpfs mount empty, destroying exactly the durable evidence
+/// (committed rows, the still-full WAL filesystem) this scenario exists to
+/// preserve. The supervisor keeps the container itself alive across that
+/// crash so [`Self::restart_postgres_in_place`] can bring PostgreSQL back up
+/// with `pg_ctl start` on the same, never-torn-down tmpfs mounts.
+///
+/// [`Drop`] force-removes the container and never panics: on failure it only
+/// `eprintln!`s the container ID and its `sunrise-edge-test=wal-full` label
+/// so a human can find and remove a leaked container.
+pub struct WalFullPostgresContainer {
+    container_id: ContainerId,
+    published_port: u16,
+    postgres_password: String,
+}
+
+impl WalFullPostgresContainer {
+    /// Starts a fresh disposable container from `image` and waits for a
+    /// fresh client connection plus a trivial query to succeed against its
+    /// default `postgres` database. Panics on any failure: a scenario that
+    /// cannot even start its own disposable container proves nothing.
+    pub fn start(image: &PinnedImage) -> Self {
+        let postgres_password: String = os_random_secret_hex(32).unwrap_or_else(|error| {
+            panic!("failed to read PostgreSQL test password from OS randomness: {error}")
+        });
+        let container_name = format!(
+            "sunrise-edge-wal-full-{}-{}",
+            std::process::id(),
+            random_hex_token(16)
+        );
+        let pgdata_mount = format!(
+            "type=tmpfs,destination=/var/lib/postgresql,tmpfs-size={WAL_FULL_PGDATA_TMPFS_BYTES}"
+        );
+        let wal_mount = format!(
+            "type=tmpfs,destination={WAL_FULL_WAL_MOUNT},tmpfs-size={WAL_FULL_WAL_TMPFS_BYTES},tmpfs-mode=0777"
+        );
+        let password_env = format!("POSTGRES_PASSWORD={postgres_password}");
+        let waldir_env = format!("POSTGRES_INITDB_WALDIR={WAL_FULL_WAL_DIRECTORY}");
+        // The only place this module hands a string to a shell: the
+        // container's own `sh`, overriding its entrypoint, never the host
+        // shell. The script is a fixed constant with no interpolated
+        // caller-controlled data.
+        let supervisor_script = format!(
+            "/usr/local/bin/docker-entrypoint.sh postgres {WAL_FULL_POSTGRES_EXTRA_OPTIONS} & wait $!; sleep infinity"
+        );
+        let run_output_result = run_docker_command_bounded_output(
+            docker_argv_command(&[
+                "run",
+                "--detach",
+                "--name",
+                &container_name,
+                "--label",
+                "sunrise-edge-test=wal-full",
+                "--entrypoint",
+                "sh",
+                "--publish",
+                "127.0.0.1::5432",
+                "--memory",
+                "1g",
+                "--memory-swap",
+                "1g",
+                "--pids-limit",
+                "512",
+                "--mount",
+                &pgdata_mount,
+                "--mount",
+                &wal_mount,
+                "--env",
+                &password_env,
+                "--env",
+                "POSTGRES_DB=postgres",
+                "--env",
+                &waldir_env,
+                "--env",
+                WAL_FULL_INITDB_ARGS_ENV,
+                "--",
+                image.as_str(),
+                "-c",
+                &supervisor_script,
+            ]),
+            "docker run (wal-full container)",
+        );
+        let run_output = run_output_result.unwrap_or_else(|error| {
+            let cleanup_error = run_docker_command_bounded(
+                docker_argv_command(&["rm", "--force", "--volumes", &container_name]),
+                "docker rm after failed run",
+            )
+            .err();
+            panic!(
+                "docker run (wal-full container) failed: {error}; cleanup by exact generated name returned {cleanup_error:?}"
+            )
+        });
+        let container_id = ContainerId::parse(run_output.trim()).unwrap_or_else(|error| {
+            let cleanup_error = run_docker_command_bounded(
+                docker_argv_command(&["rm", "--force", "--volumes", &container_name]),
+                "docker rm after invalid run output",
+            )
+            .err();
+            panic!(
+                "docker run produced an invalid container id {run_output:?}: {error}; cleanup by exact generated name returned {cleanup_error:?}"
+            )
+        });
+        let mut container = Self {
+            container_id,
+            published_port: 0,
+            postgres_password,
+        };
+        let port_output = run_docker_command_bounded_output(
+            docker_argv_command(&["port", container.container_id.as_str(), "5432/tcp"]),
+            "docker port (wal-full container)",
+        )
+        .unwrap_or_else(|error| panic!("docker port failed: {error}"));
+        container.published_port = parse_published_port(&port_output);
+        wait_for_database_ready(
+            &format!("wal-full container {}", container.container_id.as_str()),
+            &container.url("postgres"),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        container
+    }
+
+    pub fn container_id(&self) -> &ContainerId {
+        &self.container_id
+    }
+
+    /// Builds the `postgresql://` URL for `database` against this
+    /// container's published port and generated password.
+    pub fn url(&self, database: &str) -> String {
+        format!(
+            "postgresql://postgres:{}@127.0.0.1:{}/{database}",
+            self.postgres_password, self.published_port
+        )
+    }
+
+    /// Runs `docker exec --user postgres <id> <args>`, bounded, with capped
+    /// output. Every fault-preparation step this scenario needs (the
+    /// identity marker, the `df`/`stat`/`readlink` probes, the filler
+    /// write/removal, and `pg_ctl status`/`start`) is an action the
+    /// unprivileged `postgres` server user can perform.
+    pub fn exec(&self, args: &[&str]) -> io::Result<String> {
+        let mut full_args: Vec<&str> = vec![
+            "exec",
+            "--user",
+            "postgres",
+            "--",
+            self.container_id.as_str(),
+        ];
+        full_args.extend_from_slice(args);
+        run_docker_command_bounded_output(docker_argv_command(&full_args), "docker exec")
+    }
+
+    /// True while the container's PID 1 (the supervisor script) is still
+    /// running, regardless of whether the postgres server process inside it
+    /// is up. Used to prove the container/tmpfs mounts survived the WAL
+    /// exhaustion fault even though the database process did not.
+    pub fn is_running(&self) -> bool {
+        let output = run_docker_command_bounded_output(
+            docker_argv_command(&[
+                "inspect",
+                "--format",
+                "{{.State.Status}}",
+                self.container_id.as_str(),
+            ]),
+            "docker inspect (wal-full container)",
+        )
+        .unwrap_or_else(|error| panic!("docker inspect failed: {error}"));
+        output.trim() == "running"
+    }
+
+    /// True once `pg_ctl status -D pgdata` reports the server is not running
+    /// (exit status 3). Any other non-zero exit is treated as an unexpected
+    /// failure and panics, since this scenario only ever expects "running" or
+    /// "not running" for a `PGDATA` it knows exists.
+    fn postgres_is_down(&self, pgdata: &str) -> bool {
+        match self.exec(&["pg_ctl", "status", "-D", pgdata]) {
+            Ok(_) => false,
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("exit status: 3") {
+                    true
+                } else {
+                    panic!("unexpected `pg_ctl status -D {pgdata}` failure: {message}");
+                }
+            }
+        }
+    }
+
+    /// Boundedly waits for the postgres server process inside this container
+    /// to exit after the WAL-exhaustion fault, confirmed via `pg_ctl status`
+    /// rather than a fixed sleep. This scenario's fault triggers PostgreSQL's
+    /// own internal automatic-crash-recovery attempt, which (with WAL still
+    /// full) also fails and brings the whole postmaster down a second time;
+    /// polling `pg_ctl status` to a stable "not running" result means this
+    /// call never races that internal retry.
+    pub fn wait_until_postgres_down(&self, pgdata: &str) {
+        let deadline = Instant::now() + WAL_FULL_POSTGRES_DOWN_TIMEOUT;
+        loop {
+            if self.postgres_is_down(pgdata) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "postgres did not stop within {WAL_FULL_POSTGRES_DOWN_TIMEOUT:?} after the \
+                     WAL-exhaustion fault"
+                );
+            }
+            thread::sleep(WAL_FULL_POSTGRES_DOWN_POLL_INTERVAL);
+        }
+    }
+
+    /// Restarts postgres in place with `pg_ctl start` inside this same,
+    /// still-running container: never `docker start`/`docker kill`, which
+    /// would tear down and recreate every tmpfs mount empty. Boundedly waits
+    /// for a fresh client connection plus a trivial query against `database`
+    /// afterward. Panics on failure or timeout.
+    pub fn restart_postgres_in_place(&self, pgdata: &str, database: &str) {
+        self.exec(&[
+            "pg_ctl",
+            "start",
+            "-D",
+            pgdata,
+            "-l",
+            "/tmp/sunrise-edge-wal-full-restart.log",
+            "-o",
+            WAL_FULL_POSTGRES_EXTRA_OPTIONS,
+        ])
+        .unwrap_or_else(|error| panic!("pg_ctl start -D {pgdata} failed: {error}"));
+        wait_for_database_ready(
+            &format!(
+                "wal-full container {} (post-fault restart)",
+                self.container_id.as_str()
+            ),
+            &self.url(database),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    }
+}
+
+impl Drop for WalFullPostgresContainer {
+    fn drop(&mut self) {
+        let result = run_docker_command_bounded(
+            docker_argv_command(&["rm", "--force", "--volumes", self.container_id.as_str()]),
+            "docker rm (wal-full container)",
+        );
+        if let Err(error) = result {
+            eprintln!(
+                "WalFullPostgresContainer: failed to remove container {} (label \
+                 sunrise-edge-test=wal-full): {error}; remove it by hand",
+                self.container_id.as_str()
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1434,5 +1829,54 @@ mod tests {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         );
+    }
+
+    #[test]
+    fn resolve_wal_full_scenario_skips_when_both_absent() {
+        assert!(matches!(
+            resolve_wal_full_scenario_from(None, None),
+            WalFullScenario::Skip
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "must be exactly")]
+    fn resolve_wal_full_scenario_fails_on_malformed_required_flag() {
+        resolve_wal_full_scenario_from(Some(OsString::from("true")), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not configured")]
+    fn resolve_wal_full_scenario_fails_when_required_but_no_image() {
+        resolve_wal_full_scenario_from(Some(OsString::from("1")), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "is invalid")]
+    fn resolve_wal_full_scenario_fails_on_malformed_image() {
+        resolve_wal_full_scenario_from(Some(OsString::from("1")), Some(OsString::from("bad")));
+    }
+
+    #[test]
+    fn resolve_wal_full_scenario_runs_with_only_image_configured() {
+        let raw_image =
+            "postgres@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2";
+        match resolve_wal_full_scenario_from(None, Some(OsString::from(raw_image))) {
+            WalFullScenario::Run(image) => assert_eq!(image.as_str(), raw_image),
+            WalFullScenario::Skip => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn resolve_wal_full_scenario_runs_with_required_and_image_configured() {
+        let raw_image =
+            "postgres@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2";
+        match resolve_wal_full_scenario_from(
+            Some(OsString::from("1")),
+            Some(OsString::from(raw_image)),
+        ) {
+            WalFullScenario::Run(image) => assert_eq!(image.as_str(), raw_image),
+            WalFullScenario::Skip => panic!("expected Run"),
+        }
     }
 }

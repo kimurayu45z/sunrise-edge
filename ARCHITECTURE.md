@@ -1184,11 +1184,13 @@ selection. Request traffic does not run DDL or bootstrap. An optional shared
 commit-loss capability now covers commit-boundary connection loss over the
 plain `NoTls` transport (see below), and a separate serialized live test now
 covers database-process SIGKILL and WAL recovery on a live host with a live
-page cache (DR-0069). A bounded disposable-container test separately covers
-pre-commit data-tablespace ENOSPC (DR-0070). In-flight cancellation, abrupt
-host/power loss, storage write-cache flush/torn-write/media/filesystem faults,
-WAL exhaustion, commit-boundary or real-device ENOSPC, TLS-path connection
-loss, backup/restore, capacity/load/soak, real
+page cache (DR-0069). Separate bounded disposable-container tests cover
+pre-commit data-tablespace ENOSPC (DR-0070) and pre-commit WAL-filesystem
+ENOSPC (DR-0071); the latter shows the same SQLSTATE `53100` at `PANIC`
+severity crashes the whole server, not just the connection. In-flight
+cancellation, abrupt host/power loss, storage write-cache
+flush/torn-write/media/filesystem faults, commit-boundary or real-device
+ENOSPC, TLS-path connection loss, backup/restore, capacity/load/soak, real
 writer failover, and production certification evidence remain open, so this
 is still As-Is adapter evidence rather than production readiness.
 
@@ -1225,10 +1227,13 @@ shows the backend returned a successful acknowledgement before the driver
 lost it, not crash durability under abrupt process/power loss, and it says
 nothing about TLS-path connection loss. A separate serialized live test now
 proves database-process SIGKILL and WAL recovery on a live host with a live
-page cache (DR-0069). A separate disposable-container scenario proves bounded
-data-tablespace ENOSPC before `COMMIT` and exact recovery after space is freed
-(DR-0070); neither test proves abrupt host/power loss, storage write-cache
-flush/torn-write/media/filesystem faults, WAL exhaustion, commit-boundary or
+page cache (DR-0069). Separate disposable-container scenarios prove bounded
+data-tablespace ENOSPC before `COMMIT` and exact recovery after space is
+freed (DR-0070), and bounded WAL-filesystem ENOSPC before `COMMIT`, which
+crashes and in-place restarts the whole server rather than just the
+connection, with exact recovery after space is freed (DR-0071); none of these
+tests prove abrupt host/power loss, storage write-cache
+flush/torn-write/media/filesystem faults, commit-boundary or
 real-device ENOSPC, TLS-path behavior, backup/restore, capacity/load/soak,
 real writer failover, provider certification, or production readiness, all of which
 remain backend-specific evidence. Passing this suite is As-Is contract
@@ -1825,3 +1830,56 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   data-tablespace VFS `ENOSPC` before commit; WAL exhaustion, commit-boundary
   ENOSPC, real storage cache/media/filesystem failure, host/power loss, and
   production certification remain open.
+- DR-0071: Add a required live `runtime-postgres` integration test for a real,
+  bounded WAL-filesystem `ENOSPC`. Start an exact digest-pinned disposable
+  PostgreSQL 18 container that relocates `pg_wal` with `initdb --waldir` onto
+  its own 64 MiB tmpfs, distinct from and much smaller than the unfilled
+  512 MiB tmpfs holding PGDATA and the (unmodified) default tablespace.
+  Verify the SQL connection and Docker exec target share an identity marker
+  on the WAL mount, verify `pg_wal` resolves to the exact configured WAL
+  directory, verify the PGDATA/WAL device IDs differ, and verify both
+  filesystems' bounded capacity before filling only the WAL mount. Live
+  evidence, not an assumption carried over from DR-0070: a direct
+  incompressible write large enough to force a new configured 2 MiB WAL
+  segment still
+  returns SQLSTATE `53100` (`disk_full`), but at `PANIC` severity rather than
+  DR-0070's plain `ERROR`, and the same connection then closes as PostgreSQL
+  terminates every backend and crash-restarts the whole postmaster (whose own
+  automatic recovery attempt fails the same way, since it also needs to
+  write WAL, taking the server down a second time). After freeing WAL space
+  and restarting in place, refill the same mount independently and use a
+  bounded incompressible state mutation so the adapter's own structured
+  invocation commit is the operation that exhausts WAL and crashes the
+  server. Its public outcome must be the observed definite pre-commit
+  `Rejected(UnavailableBeforeCommit)`; the adapter does not expose the raw
+  database error, so only the direct first cycle claims exact SQLSTATE and
+  severity. The definite rejection is justified because this failure occurs
+  before the adapter dispatches its own `COMMIT`, so no partial effect of
+  that invocation can have reached durable storage. Because the fault
+  is fatal to the whole server rather than to one connection (the key
+  difference from DR-0070's data-tablespace ENOSPC, which leaves the
+  connection and server alive), the container overrides its entrypoint with
+  a small supervisor script that keeps the *container* itself alive across
+  the crash — confirmed by asserting the container stays "running" while
+  `pg_ctl status` reports the server is not — so recovery can free WAL space
+  and restart postgres **in place** with `pg_ctl start` on the same,
+  never-torn-down tmpfs mounts; `docker start`/`docker kill` are never used
+  here, since either would recreate every tmpfs mount empty and destroy the
+  evidence. A strictly-advanced `pg_postmaster_start_time()` after each of
+  the two restarts proves two genuine crash/recovery cycles (not lucky
+  reconnects to a server that never actually went down), and the same
+  pool/store prove no state or receipt was published and the commit sequence
+  did not advance, then commit and replay the identical invocation and
+  complete its exact outbox claim/acknowledgement. Docker commands use direct
+  argv, bounded
+  time/output, strict digest/env parsing, and panic-safe removal of the
+  exact created container. This changes no schema, schema
+  identity/generation, canonical bytes, or protocol behavior. It proves only
+  RAM-backed WAL-filesystem `ENOSPC` outside the commit boundary. Neither this
+  nor DR-0070 has live evidence for a WAL or data `ENOSPC` at the commit
+  boundary itself (that is, a fault during the literal `COMMIT` statement
+  rather than an earlier statement in the same transaction); commit-boundary
+  `ENOSPC` therefore remains open, and this decision makes no
+  ENOSPC-specific claim about its result classification.
+  Real storage-device ENOSPC, block-device faults, host/power loss, and
+  production certification also remain open.
