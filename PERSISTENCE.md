@@ -414,12 +414,29 @@ not general state reads:
    implementation is a bounded `NoTls` TCP proxy in
    `runtime-postgres`'s live test; it shows the backend acknowledged commit
    before the driver lost it, not crash durability under abrupt process/power
-   loss, and it proves nothing about TLS-path connection loss.
-4. Preserve the implemented exact-boundary/pool/lock deadline evidence and
-   pre-storage native cancellation, then extend it with client-disconnect and
-   in-flight cancellation semantics, abrupt process/power fault, disk-full/WAL
-   exhaustion, TLS-path connection loss, capacity/load/soak tests, backup/restore
-   rehearsal, and real writer-fencing failover tests.
+   loss, and it proves nothing about TLS-path connection loss. A separate,
+   serialized live test now `docker kill --signal=KILL`s the database-service
+   container immediately after a committed structured invocation (state, an
+   exact receipt, and one due outbox message), then restarts the same
+   container, waits for readiness, and reconnects to verify the exact
+   state/receipt, an identical `RequestAlreadyCommitted` replay, one exact
+   claim and acknowledgement followed by `NoDueWork` for that request, and a
+   final unfaulted commit
+   (implemented As-Is; see `ARCHITECTURE.md` DR-0069). This proves PostgreSQL
+   database-process SIGKILL and WAL recovery on a live host with a live page
+   cache; it does not prove abrupt host/power loss, storage write-cache
+   flush/torn-write/media/filesystem faults, disk-full/WAL exhaustion,
+   TLS-path connection loss, backup/restore, capacity/load/soak, real writer
+   failover, provider certification, or production readiness.
+4. Preserve the implemented exact-boundary/pool/lock deadline evidence,
+   pre-storage native cancellation, and the database-process SIGKILL/WAL
+   recovery evidence above, then extend it with client-disconnect and
+   in-flight cancellation semantics, abrupt real host/power fault (storage
+   write-cache flush, torn-write, media/filesystem faults included),
+   disk-full/WAL exhaustion, TLS-path connection loss, capacity/load/soak
+   tests, backup/restore rehearsal, and real writer-fencing failover tests.
+   Every one of these remains open except the database-process SIGKILL/WAL
+   recovery case above.
 5. Implement Cloudflare Durable Object and AWS mappings against the same
    contract and pass real-provider conformance before claiming support.
 

@@ -206,6 +206,22 @@ cross-provider ingress milestones implemented through Phase 17:
   crash durability under abrupt process/power loss, and it says nothing about
   TLS-path loss or capacity. Broader fault, operations, and production
   certification remain pending, so this is still As-Is evidence.
+- A separate, serialized live PostgreSQL crash-recovery test (see
+  `ARCHITECTURE.md` DR-0069) commits one structured invocation containing
+  state, an exact receipt, and one outbox message and observes `Committed`
+  with the committing pool still alive; with no intervening SQL, it then
+  `docker kill --signal=KILL`s the exact database-service container, restarts
+  that same container, waits for readiness, and reconnects with a fresh
+  pool/client to verify the exact state and receipt, an identical
+  `RequestAlreadyCommitted` replay, one exact claim and acknowledgement
+  followed by `NoDueWork` for that request, and a final unfaulted commit. This proves
+  PostgreSQL database-process SIGKILL and WAL recovery on a live host with a
+  live page cache; it does not prove abrupt host/power loss, storage
+  write-cache flush/torn-write/media/filesystem faults, disk-full/WAL
+  exhaustion, TLS-path behavior, backup/restore, capacity/load/soak, writer
+  failover, provider certification, or production readiness, so this remains
+  As-Is evidence alongside the commit-boundary connection-loss evidence
+  above.
 - An explicit `ComposedRuntime` for assembling independently selected state,
   blob, signer, transport, clock, and scheduler components without hidden
   defaults. Native conformance tests close/reopen SQLite into a new composition,
@@ -327,7 +343,8 @@ cross-provider ingress milestones implemented through Phase 17:
 
 Important remaining work includes the owned-object fast path, concrete
 node-event dispatch and protocol handlers, in-flight durable-I/O cancellation,
-real provider trigger wiring, abrupt process/power-fault recovery conformance,
+real provider trigger wiring, abrupt host/power-fault recovery conformance
+(database-process SIGKILL/WAL recovery is now covered As-Is; see DR-0069),
 portable system-module
 execution, cryptographic slashing proof verification, fee-object debiting,
 provider persistence bindings, runtime adapters, networking/RPC surfaces, and
@@ -341,9 +358,11 @@ structured commit, indexed outbox adapter, and shared memory/PostgreSQL
 conformance, now including commit-boundary connection-loss evidence, with
 capacity evidence. Native structured requests now honor an explicit
 cooperative cancellation signal only before first storage dispatch;
-client-disconnect cancellation, abrupt process/power fault, disk-full/WAL
-exhaustion, TLS-path connection loss, backup/restore, real writer failover,
-and provider conformance follow on that foundation. Phase 16/17 provider
+client-disconnect cancellation, abrupt host/power fault (beyond the
+database-process SIGKILL/WAL recovery evidence in DR-0069),
+disk-full/WAL exhaustion, TLS-path connection loss, backup/restore, real
+writer failover, and provider conformance follow on that foundation. Phase
+16/17 provider
 trust, deployment, observability, and release rehearsal remain required.
 
 ## Workspace map

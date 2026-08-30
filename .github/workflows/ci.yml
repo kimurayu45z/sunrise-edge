@@ -52,4 +52,7 @@ jobs:
         run: npm ci --prefix adapters/cloudflare-workers
 
       - name: Run repository validation
+        env:
+          SUNRISE_EDGE_TEST_POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+          SUNRISE_EDGE_TEST_POSTGRES_CRASH_REQUIRED: "1"
         run: ./scripts/check-all.sh

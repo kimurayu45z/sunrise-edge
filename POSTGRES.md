@@ -17,8 +17,11 @@ optional shared commit-loss capability now proves commit-boundary connection
 loss immediately before `COMMIT` dispatch for one state commit and,
 separately, immediately after backend acceptance for a structured invocation
 commit, outbox claim, and acknowledgement, over a plain `NoTls` transport; see
-section 5. Migration operations beyond initial bootstrap, cancellation,
-TLS-path connection loss, other fault/capacity evidence, and production
+section 5. A separate live test now also SIGKILLs the database-process
+container immediately after a committed structured invocation and verifies
+recovery after restart (DR-0069 in `ARCHITECTURE.md`); see section 5. Migration
+operations beyond initial bootstrap, cancellation, TLS-path connection loss,
+abrupt host/power loss, other fault/capacity evidence, and production
 certification are not implemented.
 
 This document refines [`PERSISTENCE.md`](PERSISTENCE.md) for the first
@@ -293,6 +296,27 @@ healthy connection. This is evidence that the backend returned a successful
 commit acknowledgement over the plain transport before the driver lost it,
 not proof of crash durability under abrupt process/power loss, and it says
 nothing about TLS-path connection loss.
+
+A separate live test, serialized against the other live tests because it
+kills the whole database-service container, commits one structured invocation
+containing state, an exact receipt, and one outbox message and observes
+`Committed` with the committing pool still alive; with no intervening SQL, it
+validates the exact configured container ID and then invokes
+`docker kill --signal=KILL` on it as argv with no shell. Only after the kill
+does it drop the old pool/clients. It then `docker start`s the same
+container, boundedly waits for readiness, and reconnects with a fresh
+pool/client to verify the exact committed state revision/value, the exact
+receipt, an identical `RequestAlreadyCommitted` replay, one exact claim and
+acknowledgement followed by `NoDueWork` for that request, and a final
+unfaulted commit. This proves PostgreSQL database-process SIGKILL and WAL recovery on a
+live host with a live page cache; it does not prove abrupt host/power loss,
+storage write-cache flush/torn-write/media/filesystem faults, disk-full/WAL
+exhaustion, TLS-path behavior, backup/restore, capacity/load/soak, writer
+failover, provider certification, or production readiness. This test is
+required in CI (`SUNRISE_EDGE_TEST_POSTGRES_CRASH_REQUIRED`) and locally skips
+only when both the live URL and the CI-provided container ID
+(`SUNRISE_EDGE_TEST_POSTGRES_CONTAINER_ID`) are absent; partial configuration
+fails rather than skipping.
 
 ## 6. Indexed claim and acknowledgement
 
