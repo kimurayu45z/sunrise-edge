@@ -140,11 +140,16 @@ cross-provider ingress milestones implemented through Phase 17:
   the self-describing stored digest algorithm — never the reader's epoch hash
   suite — under bounded inline-body budgets, so it no longer trusts the
   storage adapter for object-body integrity (see `ARCHITECTURE.md` DR-0068).
-  Mutating/consuming access, shared/system ownership, blob bodies,
-  module loading, fee debit, object effects, FastVote/FastCertificate, and
-  certificate publication remain unimplemented, so the owned fast path is not
-  yet safe to activate on a live chain. The other externally accepted
-  node-event families, especially certificate, protocol-upgrade, and
+  A private node-core foundation now strictly translates effects for already
+  verified owned Address objects into bounded durable Update/Delete mutations,
+  rejecting creation, undeclared or duplicate effects, version/identity/shape
+  changes, overflow, unsupported owners, and missing trusted mutation context.
+  The live handler still rejects Write/Consume before storage I/O and does not
+  yet connect execution effects to the atomic invocation. Shared/system
+  ownership, blob bodies, module loading, fee debit, FastVote/FastCertificate,
+  and certificate publication also remain unimplemented, so the owned fast
+  path is not yet safe to activate on a live chain. The other externally
+  accepted node-event families, especially certificate, protocol-upgrade, and
   validator-set-change events, still need their own authenticated and
   authorized ingress boundaries before any live activation. The outer
   `NodeEvent.request_id` remains unsigned and is only an idempotency identity;
@@ -473,27 +478,22 @@ fee-object debiting,
 provider persistence bindings, runtime adapters, networking/RPC surfaces, and
 independent security review.
 
-The next planned technical milestones work backward through the Phase 15
-production exit criteria in [`TODO.md`](TODO.md) and the accepted
-[persistence design](PERSISTENCE.md): implement the accepted
-[PostgreSQL reference design](POSTGRES.md): extend the now-implemented fenced
-structured commit, indexed outbox adapter, and shared memory/PostgreSQL
-conformance, now including commit-boundary connection-loss evidence, with
-capacity evidence. Native structured requests now honor an explicit
-cooperative cancellation signal only before first storage dispatch;
-client-disconnect cancellation, abrupt host/power fault (beyond the
-database-process SIGKILL/WAL recovery evidence in DR-0069),
-literal-`COMMIT` WAL/data ENOSPC and real storage-device ENOSPC beyond
-DR-0070/DR-0071, load/soak capacity beyond DR-0072's bounded evidence,
-provider-managed pooler service certification, high availability, and
-load/soak beyond DR-0075's bounded rehearsal,
-PostgreSQL-server/provider TLS behavior beyond DR-0074's bounded
-client-to-terminator evidence, point-in-time recovery, continuous WAL archiving,
-hot/concurrent backup, checkpoint publication, blob-manifest/state-root/
-encryption-key verification, real writer failover, and provider conformance
-follow on that foundation. Phase
-16/17 provider
-trust, deployment, observability, and release rehearsal remain required.
+The next milestone is the explicit [Developer MVP Gate](TODO.md#developer-mvp-gate),
+so client-library and front-end work can exercise a real end-to-end product
+before further production hardening. The immediate sequence is to wire the
+verified owned-object Write/Consume translation into the same atomic durable
+invocation as nonce, state, receipt, and outbox; connect one bounded
+preinstalled deterministic WASM contract; expose local devnet query APIs; then
+build a TypeScript client and counter demo with restart and duplicate-request
+E2E coverage. The MVP remains single-validator, owned-object only, fee-free,
+local-SQLite, and explicitly non-production.
+
+The Phase 15-17 production exit criteria and accepted persistence designs are
+preserved. Additional capacity/load/soak evidence, PITR, HA/failover,
+provider-managed pooler certification, real-provider deployment, provider
+trust, observability, and release rehearsal are frozen until the Developer MVP
+Gate passes unless one is required to protect MVP correctness or fail-closed
+behavior.
 
 ## Workspace map
 

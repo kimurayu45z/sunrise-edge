@@ -1722,6 +1722,47 @@ production-ready、mainnet-ready、監査済みを意味しない。
 - 各PhaseのPRを完了するときは、TODOのAs-Isと残存production exit criteriaを同時に
   更新する。criteriaを満たしていない項目へ単に`implemented`だけを付けない。
 
+## Developer MVP Gate
+
+Phase 15-17のproduction hardeningを先へ積み上げる前に、クライアントライブラリと
+フロントUIを実際に構築・検証できるsingle-node Developer MVPを完成させる。
+このgateはproduction readinessやmainnet readinessを意味せず、既存のTo-Be criteriaを
+削除しない。MVP correctnessを直接妨げる場合を除き、追加のcapacity/load/soak、PITR、
+HA/failover、provider-managed pooler、real-provider certification、provider deploymentの
+作業はgate通過後の`Post-MVP Production Hardening`へ凍結する。
+
+Developer MVP completion criteria:
+
+1. native HTTPとlocal durable SQLiteを使い、停止・再起動できるsingle-node local devnetを
+   documented commandで起動できる。
+2. authenticated owned inline objectのRead/Write/Consumeを実行し、signed accessと
+   deterministic `ObjectEffect`を厳密に対応付け、nonce、application state、object head/version、
+   receipt、outboxを同じdurable invocationでatomic commitする。Create、Shared/System owner、
+   blob-backed bodyは明示的にfail closedのままでよい。
+3. governed/preinstalled moduleをexact commitmentからloadし、bounded deterministic WASMで
+   少なくとも1つのstateful contractを実行できる。任意upload、JIT、production meteringは
+   MVP範囲外とする。
+4. chain/context情報、object、receipt、authenticated senderのnext nonceを取得するbounded
+   query APIを提供する。
+5. TypeScript client libraryでkey/address、canonical transaction encode/sign、submit、
+   receipt wait、queryを提供し、serverのcanonical contractに対するstable vectorsを共有する。
+6. client libraryだけを使う最小のcounter demo UIで、read、increment、receipt待機、再読込を
+   end-to-endで実行できる。
+7. devnet再起動後もstate/object/receipt/nonceが保持され、同一request retryがeffectを
+   二重適用しないことを自動E2Eで証明する。
+8. single validator、owned-object only、fee-free dev profile、local SQLite、non-production security/
+   operationsという制約をREADMEと起動時表示へ明記する。
+
+現在のMVP実装順序:
+
+1. verified owned-object inputとdeterministic effectのfail-closed対応、およびruntime durable
+   mutationへのpure translation（implemented As-Is）。このfoundationはprivateで、live handlerは
+   引き続きWrite/Consumeをstorage I/O前に拒否する。
+2. trusted executionから得たWrite/Consume effectsをstructured durable invocationへ接続し、
+   exact object head assertionとmutationをnonce/state/receipt/outboxとatomic commitする。
+3. preinstalled module loadとbounded deterministic WASM executionを接続する。
+4. local devnet/query API、TypeScript client、counter demo UI、restart/duplicate E2Eを順に追加する。
+
 Phase 1:
 - workspace
 - protocol primitives
@@ -1973,7 +2014,11 @@ Phase 15 As-Is scope:
   bootstrap/inspection/request-path metadata readのすべてでfail closed
   （`SchemaMismatch`）する（object digest provenance/recomputation implemented As-Is;
   DR-0067の該当pending itemを解消した）。
-  Write/Consume、Shared/System owner、blob body、module load、object effects、fee debit、owned fast pathは未実装である。
+  verified inputとdeterministic `ObjectEffect`をstrictに対応付け、owned Address objectのUpdate/Deleteを
+  bounded durable mutationへ変換するprivate foundationはimplemented As-Isである。Create、owner/type/schema変更、
+  version不整合、undeclared/duplicate effect、overflow、untrusted mutation contextはfail closedにする。
+  ただしlive handlerは引き続きWrite/Consumeをstorage I/O前に拒否し、execution effectやtrusted checkpoint contextを
+  durable invocationへ接続していない。Shared/System owner、blob body、module load、fee debit、owned fast pathも未実装である。
   node-core additive handlerはmanifest domainをI/O前にresolveし、typed receipt replayをstate readより先に行い、
   read-only assertionを含むstate/receipt/outboxをこのenvelopeへ構築する。definite commitまたはexact replay以外では
   outputを返さない。single-lock memoryとnormalized PostgreSQL conformance storeでatomic publication、object lifecycle/ABA、
@@ -2403,7 +2448,10 @@ Phase 15 To-Be production exit criteria:
     disaster recovery、key rotation、rollback非依存のsafe disable、operator runbook、SLO/alertを
     rehearsalし、independent security reviewを完了する。
 
-Phase 15 persistence implementation order（To-Beからの逆算）:
+Post-MVP Production Hardening: Phase 15 persistence implementation order（To-Beからの逆算）:
+
+以下はDeveloper MVP Gate通過まで凍結する。ただし、MVPのatomic correctness、restart safety、
+fail-closed behaviorを直接満たすために必要な既存contract修正は先行してよい。
 
 1. SQLite既存dataを暗黙migrationせず、writer fence、deadline、typed conflict/indeterminate failureを持つ
    durable domain adapter boundaryを定義する（implemented As-Is; composition/provider implementation pending）。

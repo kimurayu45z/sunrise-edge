@@ -283,6 +283,26 @@ normalized state table and changes no database schema generation or
 Transaction wire field/version, but it allocates persisted record type ID
 `0xE006`.
 
+The Developer MVP object-effect foundation keeps the verified storage result
+private inside node-core. After the signed reference, exact current head,
+immutable inline version, provenance-bound digest, typed owner, and body bounds
+have all been checked, the loader retains the exact typed `Object` beside its
+head read assertion. A private pure translator then requires a one-to-one
+correspondence between declared access and deterministic `ObjectEffect`: Read
+accepts no effect, Write accepts exactly one same-identity `Mutated` effect with
+an exact previous version and checked `+1` version, and Consume accepts exactly
+one exact-version `Deleted` effect. Creation, undeclared or duplicate effects,
+owner/type/schema changes, unsupported owners, overflow, and missing trusted
+creation context fail closed. A Write is encoded canonically, bounded again,
+hashed with the active Object suite from trusted chain/protocol/epoch context,
+and translated into a new immutable version plus Update mutation while
+preserving its routing projection; Consume translates to Delete. The live
+handler currently invokes this boundary only for the already-supported
+read-only case with no effects. Its existing dispatch validation still rejects
+Write/Consume before storage I/O, so no new mutation is reachable until a later
+slice supplies trusted execution effects/checkpoint context and atomically
+composes the returned mutations with nonce, state, receipt, and outbox.
+
 Protocol version 3 MUST NOT be activated on any live chain until fee debit,
 module access, mutating/consuming object effects, shared-object ordering,
 FastVote/FastCertificate, and certificate publication are implemented and
@@ -2177,3 +2197,17 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   pooler service certification, load/soak capacity, PgBouncer high
   availability or connection draining, TLS on either the client or backend
   leg, real writer failover, or production readiness.
+- DR-0076: Prioritize an explicit Developer MVP Gate before further Phase
+  15-17 production hardening. Preserve every production exit criterion, but
+  freeze additional capacity/load/soak, PITR, HA/failover, managed-pooler,
+  provider-certification, and deployment work unless it blocks MVP correctness
+  or fail-closed behavior. Start with a private verified-object/effect
+  translator: it can consume only node-core's already-authorized typed inputs,
+  rejects any mismatch or unsupported scope, and emits bounded runtime
+  Update/Delete mutations. Keep live Write/Consume rejected until a subsequent
+  change atomically composes trusted deterministic execution effects with the
+  existing nonce/state/object/receipt/outbox transaction. Complete the MVP with
+  one preinstalled deterministic contract, local devnet/query APIs, a
+  TypeScript client, a counter UI, and restart/duplicate E2E evidence; retain
+  explicit single-validator, owned-only, fee-free, local-SQLite,
+  non-production limitations.
