@@ -1761,7 +1761,14 @@ Developer MVP completion criteria:
    exact object head assertionとmutationをnonce/state/receipt/outboxとatomic commitする
    additive node-core entrypoint（implemented As-Is）。generic/read-only/native HTTP経路は
    引き続きWrite/Consumeをstorage I/O前に拒否する。
-3. preinstalled module loadとbounded deterministic WASM executionを接続する。
+3. committed `ProtocolConfig`から固定したactive system-module registryとbounded immutable
+   preinstalled catalogのcode/manifest/semantics commitmentを照合し、object-onlyの
+   deterministic WASM executionをowned-effects atomic durable entrypointへ接続する
+   （implemented As-Is in node-core）。code/manifestはcommitted digest自身のalgorithmで再検証し、
+   epoch-only hash-suite rotation後もreadableとする。専用`SystemModuleManifest` hash purpose、
+   pre-activation gas ceiling、engine-independent trap normalizationを適用し、canonical
+   `ExecutionEffects`をresponseへ返す。trapはobject mutationなしのRejected receipt/nonceとして
+   commitする。zero-object callはこのMVP pathでは明示的に拒否し、native HTTP/devnet wiringは未実装。
 4. local devnet/query API、TypeScript client、counter demo UI、restart/duplicate E2Eを順に追加する。
 
 Phase 1:
@@ -2022,15 +2029,20 @@ Phase 15 As-Is scope:
   exact head assertion、Update/Delete、nonce、state、receipt、outboxを同じstructured durable invocationでcommitする。
   exact request replayはobject I/Oやtransitionより先にreceiptからreconcileするためeffectを再適用しない。
   generic handlerはresolved objectを渡さず、返されたeffectを黙って捨てずにfail closedにする。
-  ただしnative HTTPはread-only entrypointを使い続け、preinstalled module loadとbounded deterministic WASMを
-  trusted callerとして接続するまでWrite/Consumeをstorage I/O前に拒否する。Shared/System owner、blob body、
-  module load、fee debit、owned fast path certificateも未実装である。
+  bounded preinstalled module loadとdeterministic WASM executionはadditive node-core entrypointへ
+  接続済みで、認証時のcommitted registry、immutable catalogのcode/manifest/semantics commitment、
+  manifest input boundとpre-activation gas ceilingをfail closedに照合し、code/manifest commitmentは
+  digest自身のalgorithmと専用SystemModule domainで再検証し、canonical effectsをowned object atomic
+  commitへ渡す。trap text/fuel accountingは固定reason/full-gas/empty-effectsへ正規化してから永続化する。
+  exact replayはmodule resolve/object read/execution前にreceiptから返る。ただしnative HTTPはread-only
+  entrypointを使い続ける。Shared/System owner、blob body、native/devnet module wiring、fee debit、owned fast path
+  certificateは未実装である。
   node-core additive handlerはmanifest domainをI/O前にresolveし、typed receipt replayをstate readより先に行い、
   read-only assertionを含むstate/receipt/outboxをこのenvelopeへ構築する。definite commitまたはexact replay以外では
   outputを返さない。single-lock memoryとnormalized PostgreSQL conformance storeでatomic publication、object lifecycle/ABA、
   conflict rollback、read-only、bound domain、fence、deadline、object read-count bound、blob round-trip、replayを検証する
-  （runtime/memory/PostgreSQLとnode-core authenticated owned-object atomic effects implemented As-Is;
-  native module executionとprovider certification pending）。
+  （runtime/memory/PostgreSQL、node-core authenticated owned-object atomic effects、bounded preinstalled
+  module execution implemented As-Is; native/devnet wiringとprovider certification pending）。
 - owned transaction fast pathの認証基盤として、`crypto`にexact-pinned
   `ed25519-zebra` 4.2.0（`[workspace.dependencies]`でdefault features無効を
   一箇所宣言。committed `Cargo.lock`はその依存`curve25519-dalek`を4.1.3で
