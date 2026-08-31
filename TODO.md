@@ -1731,7 +1731,10 @@ Phase 15-17のproduction hardeningを先へ積み上げる前に、クライア�
 HA/failover、provider-managed pooler、real-provider certification、provider deploymentの
 作業はgate通過後の`Post-MVP Production Hardening`へ凍結する。
 
-Developer MVP completion criteria:
+Developer MVP completion criteria（capability criteria 2-3を満たしながら、product
+surfaceはARCHITECTURE.md DR-0081の順序に従う: local devnet、bounded query API、Rust
+client、Rust CLI、TypeScript client、explorer、wallet、restart/duplicate E2E、
+explicit dev limitations）:
 
 1. native HTTPとlocal durable SQLiteを使い、停止・再起動できるsingle-node local devnetを
    documented commandで起動できる。
@@ -1740,18 +1743,34 @@ Developer MVP completion criteria:
    receipt、outboxを同じdurable invocationでatomic commitする。Create、Shared/System owner、
    blob-backed bodyは明示的にfail closedのままでよい。
 3. governed/preinstalled moduleをexact commitmentからloadし、bounded deterministic WASMで
-   少なくとも1つのstateful contractを実行できる。任意upload、JIT、production meteringは
-   MVP範囲外とする。
+   少なくとも1つのstateful contractを実行できる（devnetの具体的なmoduleは
+   `sunrise.devnet.asset_account.v1`の`transfer` entrypoint。DR-0081参照）。任意upload、JIT、
+   production meteringはMVP範囲外とする。
 4. chain/context情報、object、receipt、authenticated senderのnext nonceを取得するbounded
    query APIを提供する。
-5. TypeScript client libraryでkey/address、canonical transaction encode/sign、submit、
-   receipt wait、queryを提供し、serverのcanonical contractに対するstable vectorsを共有する。
-6. client libraryだけを使う最小のcounter demo UIで、read、increment、receipt待機、再読込を
-   end-to-endで実行できる。
-7. devnet再起動後もstate/object/receipt/nonceが保持され、同一request retryがeffectを
-   二重適用しないことを自動E2Eで証明する。
-8. single validator、owned-object only、fee-free dev profile、local SQLite、non-production security/
-   operationsという制約をREADMEと起動時表示へ明記する。
+5. `clients/rust`でkey/address、canonical transaction encode/sign、submit、receipt wait、
+   queryを提供するRust client libraryを実装し、serverのcanonical contractに対する
+   stable vectorsを共有する。
+6. `clients/rust`のみに依存するRust-only developer CLI（`apps/cli`）を実装する。
+   `apps/cli`はNode/browser runtimeに依存せず、canonical encode/decode・signing・RPC呼び出しは
+   すべて`clients/rust`経由とする。
+7. `clients/typescript`でkey/address、canonical transaction encode/sign、submit、
+   receipt wait、queryを提供するTypeScript client libraryを実装し、同じstable vectorsを共有する。
+8. `apps/explorer`として、SvelteKit + shadcn-svelte（Luma）によるstatic/CSR専用のexplorer app
+   を実装する。request-time server-side rendering、SvelteKit server adapter、
+   `+page.server`/`+layout.server`/`+server` route、server actions/remote functions/
+   server-held sessionやkeyは一切使わない。dynamic chain dataは`clients/typescript`経由の
+   client-side fetchのみとする。
+9. `apps/wallet`として、同様にSvelteKit + shadcn-svelte（Luma）によるstatic/CSR専用のwallet app
+   を実装する。制約は8と同一（SSR/server adapter/server route/server actionsなし）に加え、
+   signing keyはbrowser内でのみ生成・保持・使用し、server側へ渡したり生成させたりしない。
+   `apps/explorer`と`apps/wallet`の間でreal duplicationが発生するまで、共有UI packageは
+   導入しない。
+10. devnet再起動後もstate/object/receipt/nonceが保持され、同一request retryがeffectを
+    二重適用しないことを自動E2Eで証明する。
+11. single validator、owned-object only、fee-free dev profile、local SQLite、
+    same-sender-only asset movement（cross-owner transfer authorizationは未実装のためfail
+    closed）、non-production security/operationsという制約をREADMEと起動時表示へ明記する。
 
 現在のMVP実装順序:
 
@@ -1770,7 +1789,7 @@ Developer MVP completion criteria:
    pre-activation gas ceiling、engine-independent trap normalizationを適用し、canonical
    `ExecutionEffects`をresponseへ返す。trapはobject mutationなしのRejected receipt/nonceとして
    commitする。zero-object callはこのMVP pathでは明示的に拒否する。native HTTP wiringはstep 4で
-   実装済み（implemented As-Is）、devnet binary/startup wiringは未実装。
+   実装済み（implemented As-Is）、devnet binary/startup wiringもstep 5で実装済み。
 4. DR-0078のpreinstalled-WASM entrypointを新しいadditive `native-http`合成
    （`preinstalled_wasm_structured_durable_router`/`_with_executor`）経由でHTTPへ公開する
    （implemented As-Is）。既存の`structured_durable_router`はread-only entrypointのまま変更しない。
@@ -1805,7 +1824,19 @@ Developer MVP completion criteria:
    Shared/System、blob、native binary/devnet startup wiring、query API、TypeScript client、UI、
    arbitrary upload、fees/meteringは引き続きこのstepの範囲外（Shared/System/blob coverageは
    node-core側に留め、HTTP層で重複させない）。
-5. local devnet/query API、TypeScript client、counter demo UI、restart/duplicate E2Eを順に追加する。
+5. local devnet、bounded query API、Rust client（`clients/rust`）、Rust CLI（`apps/cli`）、
+   TypeScript client（`clients/typescript`）、explorer（`apps/explorer`）、wallet
+   （`apps/wallet`）、restart/duplicate E2E、explicit dev limitationsの順に追加する
+   （DR-0081；旧DR-0080の`clients/typescript`/`demo/counter`という組み合わせを置き換え、
+   `demo/counter`は作成しない）。devnetの最初のstateful preinstalled moduleは
+   `sunrise.devnet.asset_account.v1`（`transfer` entrypoint）とし、同一senderが所有する
+   2つのordinary asset-account objectの間でのみ残高を移動する。fees::AssetIdを使った
+   real 32-byte asset識別、conservation、amount underflow/overflow/asset ID mismatchの
+   fail closedを満たす。destination側owner authorizationとowner変更は既存のowned-effects
+   pathで引き続きfail closedのため、このMVPはsame-sender movementのみを示し、
+   user-to-user transferではない。devnetのfee registryは空のままとし、すべてのtransactionは
+   `fee_payment: None`でcommitする（fee assetもordinaryなasset accountの上のprotocol policyに
+   過ぎず、native coinや別実装のbalance/transfer/fee pathを持たない。DR-0081参照）。
    前提として、`runtime-sqlite`へ`StructuredDurableDomainStateStore`/`IndexedOutboxRepository`を
    実装するadditive、local-only、non-productionな`SqliteDurableStore`を追加済み
    （implemented As-Is）。既存のopaque `SqliteStateStore`とは別テーブル・別`PRAGMA application_id`で、
@@ -1833,14 +1864,32 @@ Developer MVP completion criteria:
    test、short deadlineがfixed busy timeoutを待たないことを示すbounded contention testで検証済み。
    corruption testはrepresentativeなstrict-decode/cross-checkルールを検証するものであり、
    すべてのルールを網羅しているわけではない。native-http経路への接続はstep 4で実装済み
-   （implemented As-Is）、devnet binary/startup wiringは未実装。
+   （implemented As-Is）。`apps/devnet`はstrict config、SQLite writer-fence boot、restart-safe
+   identity source、canonical asset-account codec/stable vector、preinstalled WASM/catalog、
+   2-accountのatomicかつrestart-idempotentなseed、同じin-process artifactから構成した
+   registry/catalog commitmentのstartup整合性検証、
+   bounded native routerのstartup wiringまで実装済み（implemented As-Is）。binaryはloopbackで
+   HTTPをserveし、live smokeで`204` livenessと、同一account IDを保った次writer generationでの
+   再起動を検証済み。WASM単体実行は同一`AssetId`の送金成功と異なる`AssetId`のeffectなし拒否を
+   直接検証する。bounded query APIとsigned duplicate-transfer HTTP E2Eは未実装で、次のsliceに残る。
 
-**Repository-boundary decision**: Developer MVP completion criteria 5/6の TypeScript client library
-とcounter demo UIは、Developer MVP Gateを通過するまでこのmonorepo内に留め、実装時点で
-`clients/typescript`/`demo/counter`というtop-levelディレクトリとする（ARCHITECTURE.md DR-0080）。
-別repoへのextractionは、(a) canonical wire contracts/共有test vectorsが安定し、(b) 実際の
-independent consumerまたは独立したrelease cadenceが存在し、(c) E2Eがin-tree buildではなく
-releaseされたdevnet artifactをtargetできるようになるまで延期する。
+**Repository-boundary decision**（ARCHITECTURE.md DR-0081；DR-0080の同名決定のうち
+repository-boundary/counter-demo deliverableのみを置き換える。DR-0080に記録された
+実装済みのnative-http compositionやerror classificationはhistorical recordとして
+変更しない）: Developer MVP completion criteria 5-9のRust client library
+（`clients/rust`）、Rust CLI（`apps/cli`）、TypeScript client library
+（`clients/typescript`）、explorer app（`apps/explorer`）、wallet app（`apps/wallet`）は、
+Developer MVP Gateを通過するまでこのmonorepo内に留め、実装時点でこれらのtop-level
+ディレクトリとする。`apps/cli`は`clients/rust`にのみ依存するRust-only client（Node/browser
+runtimeには依存しない）。`apps/explorer`と`apps/wallet`は別々のSvelteKit + shadcn-svelte
+（Luma）static/CSR app（request-time SSR、server adapter、`+page.server`/`+layout.server`/
+`+server`、server actions/remote functions/server-held session・keyなし）とし、walletの
+signing keyはbrowser限定とする。両app間で共有UI packageは、real duplicationが生じるまで
+導入しない。旧DR-0080が定めた`clients/typescript`/`demo/counter`という組み合わせは
+この6ディレクトリ構成に置き換わり、`demo/counter`は作成しない。別repoへのextractionは、
+(a) canonical wire contracts/共有test vectorsが安定し、(b) 実際のindependent consumerまたは
+独立したrelease cadenceが存在し、(c) E2Eがin-tree buildではなくreleaseされたdevnet
+artifactをtargetできるようになるまで、`clients/*`のいずれについても延期する。
 
 Phase 1:
 - workspace

@@ -55,6 +55,7 @@ pub use execution::{ObjectEffect, ResolvedObject};
 pub use preinstalled_wasm::{
     MAX_PREINSTALLED_MODULE_GAS_LIMIT, MAX_PREINSTALLED_MODULE_WASM_BYTES,
     MAX_PREINSTALLED_MODULES, PreinstalledModuleCatalog, PreinstalledModuleCatalogEntry,
+    reconcile_preinstalled_registry_and_catalog,
 };
 pub use transaction_auth::{
     AuthenticatedTransaction, MAX_TRANSACTION_SIGNABLE_BYTES, TransactionAuthError,

@@ -1,0 +1,24 @@
+[package]
+name = "sunrise-edge-devnet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+canonical-encoding.workspace = true
+execution.workspace = true
+fees.workspace = true
+hashing.workspace = true
+native-http.workspace = true
+node-core.workspace = true
+objects.workspace = true
+protocol-config.workspace = true
+protocol-types.workspace = true
+runtime.workspace = true
+runtime-sqlite.workspace = true
+system-modules.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+
+[dev-dependencies]
+wat.workspace = true

@@ -281,15 +281,30 @@ owned-effects composition is implemented As-Is, including trusted checkpoint
 regression rejection and exact-replay non-reapplication, and `native-http`
 now exposes DR-0078's preinstalled-WASM entrypoint through an additive
 `preinstalled_wasm_structured_durable_router` (DR-0080); `structured_durable_router`
-is unaffected and still uses the read-only entrypoint. Next, wire local
-devnet binary/startup around the additive SQLite structured store, add
-bounded query APIs, then build a TypeScript client and counter demo with
-restart/duplicate E2E evidence; both stay in this monorepo through the
-Developer MVP Gate (top-level `clients/typescript`/`demo/counter` once
-implemented) rather than extracting to separate repositories yet. Create,
-Shared/System ownership, blob transfer, arbitrary module upload, fees, fast
-certificates, and production object migrations remain deferred. The opaque
-SQLite table and prefix scanner remain local compatibility/reference paths,
-not production schema. Started blocking work remains uncancellable and its
-configured admission limit is not
+is unaffected and still uses the read-only entrypoint. DR-0081 fixes the
+Developer MVP product-surface plan ahead of implementation: wire the local
+devnet binary/startup (`apps/devnet`) around the additive SQLite structured
+store with strict loopback binding, a persisted fence/boot generation,
+startup registry/catalog reconciliation, and seeded asset accounts (see
+`ARCHITECTURE.md` "Local devnet architecture"); add a bounded query API; then
+build, in order, a Rust client (`clients/rust`), a Rust-only CLI (`apps/cli`,
+depending only on `clients/rust`), a TypeScript client (`clients/typescript`),
+and separate static/CSR SvelteKit + shadcn-svelte apps (`apps/explorer`,
+`apps/wallet` — no request-time server-side rendering, server adapter, or
+server-held sessions/keys; fixed-shell build-time prerendering is allowed and
+wallet signing stays browser-only) with restart/duplicate E2E
+evidence. This replaces DR-0080's earlier `clients/typescript`/`demo/counter`
+pairing; no `demo/counter` directory is created. The devnet's own
+demonstration contract is `sunrise.devnet.asset_account.v1`
+(`transfer`), moving balance only between two ordinary, same-sender-owned
+asset accounts under the uniform fungible asset model (one `AssetId`/account/
+transfer path for every asset, no privileged native coin or special fee path)
+ratified in DR-0081; cross-owner transfer authorization stays fail-closed, so
+this demonstrates same-sender movement only, and the devnet fee registry
+stays empty with every transaction committing `fee_payment: None`. Create,
+Shared/System ownership, blob transfer, arbitrary module upload, fee
+charging/gas metering, fast certificates, and production object migrations
+remain deferred. The opaque SQLite table and prefix scanner remain local
+compatibility/reference paths, not production schema. Started blocking work
+remains uncancellable and its configured admission limit is not
 a validated capacity budget.

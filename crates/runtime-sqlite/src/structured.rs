@@ -358,6 +358,27 @@ impl SqliteDurableStore {
         transaction.commit()?;
         Ok(next)
     }
+
+    /// Reads the currently persisted writer fence.
+    ///
+    /// This is an explicit operator-only accessor, not part of any runtime
+    /// trait; request handling must never be able to reach it. Like
+    /// [`SqliteDurableStore::advance_writer_fence`], it carries no
+    /// `DurableOperationContext` deadline, so it resets the connection's
+    /// SQLite `busy_timeout` back to the fixed operator default before
+    /// acquiring a transaction. It revalidates the exact schema identity and
+    /// chain/validator/domain namespace and reads the writer fence from one
+    /// consistent `Deferred` snapshot, then rolls the read-only transaction
+    /// back (equivalent to a commit here, since nothing was written).
+    pub fn writer_fence(&self) -> Result<WriterFenceGeneration, SqliteDurableStoreError> {
+        let mut connection = self.connection()?;
+        connection.busy_timeout(STRUCTURED_BUSY_TIMEOUT)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        verify_namespace(&transaction, &self.namespace)?;
+        let fence = read_writer_fence(&transaction)?;
+        transaction.rollback()?;
+        Ok(fence)
+    }
 }
 
 fn structured_schema_ddl() -> String {
