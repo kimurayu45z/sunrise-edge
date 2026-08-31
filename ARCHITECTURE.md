@@ -309,10 +309,29 @@ an exact request replay reconciles the receipt before object reads or execution
 and therefore cannot reapply an effect. Generic handlers receive no resolved
 objects and reject any returned object effect instead of silently discarding
 it. The existing read-only entrypoint and native HTTP composition retain the
-read-only policy and still reject Write/Consume before storage I/O. Connecting
-the bounded preinstalled module loader and deterministic WASM engine is the
-next MVP slice; only that trusted composition may select the checkpoint and
-call the owned-effects entrypoint.
+read-only policy and still reject Write/Consume before storage I/O.
+
+An additive trusted preinstalled-WASM composition now captures the exact
+matching `SystemModule` record (or its committed absence) from the same
+`ProtocolConfig` used at authentication, so a later caller cannot substitute
+another registry entry without cloning the full registry per request. For this
+MVP path,
+`Transaction.module_ref` maps `ObjectId` bytes to `ModuleId`, object version to
+module version, and object digest to the exact canonical code commitment. The
+selected entry must be active at the transaction epoch and must match a bounded
+immutable node-supplied catalog. Node-core independently hashes its WASM bytes
+under `ContractCode`, canonically encodes and hashes its manifest under the
+existing `ProtocolConfig` purpose, and matches the supplied semantics digest.
+Only then does the bounded deterministic WASM engine run over the already
+verified objects. Canonical `ExecutionEffects` are returned in the response;
+successful owned effects use the existing atomic translator, while a trapped
+execution commits a deterministic rejected receipt and nonce with exact object
+head assertions but no mutation. Exact receipt replay returns before module
+resolution, object reads, or execution. The composition is object-only and
+uses the signed object-access count for logical-domain placement without a
+dummy application key. Native HTTP activation, arbitrary uploads, JIT/AOT,
+production metering, and a dedicated manifest hash-purpose identifier remain
+deferred.
 
 Protocol version 3 MUST NOT be activated on any live chain until fee debit,
 module access, mutating/consuming object effects, shared-object ordering,
