@@ -1871,7 +1871,22 @@ explicit dev limitations）:
    bounded native routerのstartup wiringまで実装済み（implemented As-Is）。binaryはloopbackで
    HTTPをserveし、live smokeで`204` livenessと、同一account IDを保った次writer generationでの
    再起動を検証済み。WASM単体実行は同一`AssetId`の送金成功と異なる`AssetId`のeffectなし拒否を
-   直接検証する。bounded query APIとsigned duplicate-transfer HTTP E2Eは未実装で、次のsliceに残る。
+   直接検証する。bounded query APIはDR-0082で設計を固定し、次の実装sliceとする。signed
+   duplicate-transfer HTTP E2Eは未実装で、後続sliceに残る。
+6. DR-0082のbounded canonical query APIを、両方のstructured durable routerへadditiveに
+   実装する。`GET /v1/context`、`/v1/objects/{object_id}`、
+   `/v1/receipts/{request_id}`、`/v1/senders/{sender}/next-nonce`だけを公開し、64文字の
+   lowercase hex selector以外をstorage I/O前に拒否する。contextはtrusted chain/epoch、exact
+   canonical `ProtocolConfig`、committed logical domainを返す。objectはabsence/tombstone/
+   verified inline/blob referenceをtyped canonical resultで表し、inlineはnode-coreがhead、
+   immutable version、digest、schema、provenance、owner projectionを照合してbody digestを再計算する。
+   receiptはouter durable receiptとcanonical `NodeDedupRecord`のidentity/digest/re-encodingを照合し、
+   nonceはcurrent trusted epochのpersisted `SenderNonceRecord`をnode-coreだけがdecodeして、true
+   absenceなら0、deleted/corrupt stateならfail closedとする。sender pathはpublic lookup selectorで
+   あって認可ではなく、submit authorizationは署名のみが与える。全successはcanonical type IDs
+   `0xE102`-`0xE105`、`Cache-Control: no-store`、typed absenceを200で返し、既存のblocking
+   admission、trusted fence/deadline/correlation identity、bounded object/receipt sizesを再利用する。
+   scan/list/prefix/arbitrary state key、blob fetch、historical version selector、proof/indexerはMVP外。
 
 **Repository-boundary decision**（ARCHITECTURE.md DR-0081；DR-0080の同名決定のうち
 repository-boundary/counter-demo deliverableのみを置き換える。DR-0080に記録された

@@ -1526,16 +1526,69 @@ verified the same seeded object IDs after reopening under the next writer
 generation. A signed duplicate-transfer HTTP E2E is still planned; direct WASM
 tests already prove successful same-asset movement and effect-free rejection
 of mixed asset IDs. No other `clients/*`/`apps/*` path from DR-0081 exists.
-The bounded query API (chain/
-context info, object reads, receipts, and an authenticated sender's next
-nonce) is the next separate implementation slice after the devnet binary
-itself, not part of this architecture entry. Known current limitations that
+The bounded query API (chain/context info, object reads, receipts, and an
+authenticated sender's next nonce) is the next separate implementation slice
+defined below. Known current limitations that
 must stay visible at devnet startup and in documentation once implemented:
 single validator; owned-object only (Create, Shared/System ownership, and
 blob bodies remain fail-closed); fee-free (`fee_payment: None`, empty fee
 registry); same-sender-only asset movement (no cross-owner transfer
 authorization); local SQLite only; and an overall non-production security/
 operations posture.
+
+## 43. Bounded Developer MVP query API
+
+The Developer MVP exposes four additive `GET` routes from both normalized
+structured routers. They share the event route's blocking-admission limit and
+trusted storage authority, but accept no request body, writer fence, deadline,
+domain, chain context, or protocol selector from HTTP:
+
+- `/v1/context` returns the trusted `chain_id`, current `epoch`, exact canonical
+  `ProtocolConfig`, and the single committed logical atomicity domain.
+- `/v1/objects/{object_id}` returns true absence, a retained tombstone, a
+  verified current inline object, or an explicit current blob reference.
+- `/v1/receipts/{request_id}` returns typed absence or the exact canonical
+  `NodeDedupRecord` after checking it against the outer durable receipt.
+- `/v1/senders/{sender}/next-nonce` returns the next nonce for the current
+  trusted epoch. The address in this URL is only an untrusted public lookup
+  selector. It grants no authority and cannot substitute for transaction
+  authentication; the returned value is usable only by a transaction whose
+  signature authenticates that same sender under the committed auth profile.
+
+Every path identifier is exactly 64 lowercase ASCII hexadecimal characters.
+Malformed identifiers fail before identity allocation, clock access, or
+storage I/O. Successful results use
+`application/vnd.sunrise-edge.query-result`, `Cache-Control: no-store`, and
+four independent canonical version-1 frames: context `0xE102`, object
+`0xE103`, receipt `0xE104`, and next-nonce `0xE105`. Object status identifiers
+are `1 = absent`, `2 = tombstoned`, `3 = current inline`, and `4 = current blob
+reference`; receipt status identifiers are `1 = absent` and `2 = present`.
+These identifiers and exact frames are stable client contracts and require
+literal test vectors.
+
+Absence is a normal `200` typed result so receipt polling needs no
+transport-specific interpretation. A current inline object includes its head
+revision, immutable version, self-describing digest, and exact canonical
+`objects::Object` bytes. Node-core, not the HTTP adapter or storage adapter,
+cross-checks head/version/digest/schema/provenance/owner projection and
+recomputes the inline body digest from the version's stored chain and protocol
+provenance before returning it. A blob-backed version returns only explicit
+metadata and its blob digest; this MVP does not fetch or claim to verify an
+unavailable blob body. A tombstone retains the ABA-safe head revision and last
+immutable version. Receipt presence includes the outer event digest and exact
+canonical dedup bytes only after strict decode, identity/digest agreement, and
+canonical re-encoding checks. A deleted nonce record for an epoch that may be
+accepted remains corruption and fails closed; true absence at initial revision
+returns zero.
+
+All storage-backed queries allocate a restart-safe correlation identity and a
+bounded deadline from the embedding host, resolve the domain solely from the
+committed manifest, and run through the same bounded blocking executor as
+submission. Capacity exhaustion is `503`; malformed paths are `400`; corrupt,
+unverifiable, or otherwise invalid durable state is an opaque `500`. Query
+responses are bounded by the existing maximum canonical object/receipt sizes;
+there is no scan, list, prefix, pagination, proof, historical-version selector,
+or arbitrary state-key endpoint in this MVP slice.
 
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
@@ -2774,3 +2827,10 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   effect; freeze, close, delegate, and allowance/approval semantics; Shared/
   System object ownership; blob-backed object bodies and arbitrary module
   upload; and all other production-hardening work already frozen by DR-0076.
+- DR-0082: Add the bounded canonical Developer MVP query surface described in
+  "Bounded Developer MVP query API". Keep query selectors non-authoritative,
+  resolve all chain/domain/epoch/storage authority from trusted composition,
+  independently verify durable object and receipt content before returning it,
+  encode absence and blob-unavailable state explicitly, and exclude scans and
+  arbitrary state access. This is a stable client wire contract, not a public
+  RPC security or production indexing architecture.
