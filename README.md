@@ -147,11 +147,15 @@ cross-provider ingress milestones implemented through Phase 17:
   missing trusted mutation context, then atomically commits valid effects with
   exact head assertions, sender nonce,
   application state, receipt, and outbox. Exact request replay returns the
-  persisted result without re-running or reapplying execution. The native HTTP
-  composition still calls the read-only entrypoint and therefore rejects
-  Write/Consume before storage I/O until bounded module execution is connected.
-  Shared/system
-  ownership, blob bodies, module loading, fee debit, FastVote/FastCertificate,
+  persisted result without re-running or reapplying execution. `structured_durable_router`
+  still calls the read-only entrypoint and therefore rejects Write/Consume
+  before storage I/O; a new additive `preinstalled_wasm_structured_durable_router`
+  (`_with_executor`) composes trusted `Arc<PreinstalledModuleCatalog>`/
+  `WasmExecutionEngine`/`created_checkpoint` and calls the preinstalled-WASM
+  entrypoint instead, so a signed owned Write/Consume can execute a governed
+  deterministic contract over HTTP; both routers share the same request-scoped
+  outbox claim/send/ack path and admission/cancellation bounds. Shared/system
+  ownership, blob bodies, arbitrary module upload, fee debit, FastVote/FastCertificate,
   and certificate publication also remain unimplemented, so the owned fast
   path is not yet safe to activate on a live chain. The other externally
   accepted node-event families, especially certificate, protocol-upgrade, and
@@ -199,9 +203,9 @@ cross-provider ingress milestones implemented through Phase 17:
   request replay after reopen returns `RequestAlreadyCommitted`, and that
   outbox acknowledgement stays idempotent after reopen, and a bounded
   contention test proving a short deadline does not wait the fixed default.
-  It exists so the preinstalled-WASM native devnet can use one local durable
-  structured store; it is not provider-hardened and is not exposed through
-  native HTTP.
+  It exists so the preinstalled-WASM native routers can use one local durable
+  structured store; it is not provider-hardened, and native binary/devnet
+  startup wiring around it remains unimplemented.
 - An accepted [production persistence architecture](PERSISTENCE.md) that makes
   validator-local atomicity domains, complete read-set validation, normalized
   object/receipt/outbox data, indexed recovery, writer fencing, migration, and
@@ -527,11 +531,19 @@ code/manifest/semantics commitments under dedicated hash domains, remains
 compatible with epoch-only hash-suite rotation, enforces a conservative fuel
 ceiling, executes bounded deterministic WASM, and atomically commits its
 owned-object effects, nonce, receipt, and outbox. Traps are normalized before
-their canonical effects enter a durable receipt. Native HTTP does not invoke
-this path yet. The immediate sequence is to wire it into the local devnet,
-expose bounded query APIs, then build a TypeScript client and counter demo with
-restart and duplicate-request E2E coverage. The MVP remains single-validator,
-owned-object only, fee-free, local-SQLite, and explicitly non-production.
+their canonical effects enter a durable receipt. A new additive native-http
+composition, `preinstalled_wasm_structured_durable_router`, now invokes this
+path over HTTP; `structured_durable_router` remains on the read-only
+entrypoint and is unaffected. The immediate sequence is to wire the local
+devnet binary/startup around it, expose bounded query APIs, then build a
+TypeScript client and counter demo with restart and duplicate-request E2E
+coverage. The TypeScript client and counter demo stay in this monorepo (as
+top-level `clients/typescript` and `demo/counter` once implemented) through
+the Developer MVP Gate; extraction into their own repositories is deferred
+until the canonical contracts/vectors are stable, a real independent consumer
+or release cadence exists, and E2E can target a released devnet artifact (see
+`ARCHITECTURE.md` DR-0080). The MVP remains single-validator, owned-object
+only, fee-free, local-SQLite, and explicitly non-production.
 
 The Phase 15-17 production exit criteria and accepted persistence designs are
 preserved. Additional capacity/load/soak evidence, PITR, HA/failover,

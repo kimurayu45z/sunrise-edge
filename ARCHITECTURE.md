@@ -2409,3 +2409,71 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   connection pooling, disk/WAL/connection-exhaustion fault evidence,
   PgBouncer/backup-restore rehearsal, or TLS commit-loss evidence, and is not
   suitable for multi-writer or production deployments.
+- DR-0080: Expose DR-0078's preinstalled-WASM entrypoint through a new
+  additive `native-http` composition (`preinstalled_wasm_structured_durable_router`
+  / `_with_executor`) rather than changing `structured_durable_router`, which
+  stays on the read-only entrypoint and is behaviorally unchanged; both
+  routers now share one private core (`invoke_structured_durable_event_with_execution`)
+  parameterized by a small private `StructuredDurableAuthenticatedExecution`
+  policy enum (`ReadOnly` vs `PreinstalledWasm`), so the authenticated
+  preparation, storage context construction, and exact request-scoped outbox
+  claim/send/ack path is implemented once, not duplicated per router. A new
+  public `PreinstalledWasmComposition` holds only `Arc<PreinstalledModuleCatalog>`,
+  the zero-sized `execution::WasmExecutionEngine`, and a `created_checkpoint: u64`
+  fixed at router-composition time; none of the three is ever read from HTTP
+  body bytes, and `created_checkpoint` is never derived from wall-clock time.
+  `SubmitTransaction` on the new route calls
+  `handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution`;
+  every other event kind still runs through the same generic
+  `TransactionalNodeStateMachine` path as every other native route. Blocking
+  admission and pre-storage-dispatch cancellation are unchanged, because both
+  routers dispatch through the identical shared core. `native-http` gained a
+  normal (not dev-only) dependency on `execution`, needed only to name
+  `WasmExecutionEngine` in `PreinstalledWasmComposition`'s public signature.
+  Coarse HTTP error classification (`node_error_response`) was extended:
+  malformed/inactive/unknown module reference
+  (`PreinstalledModuleUnknown`/`Inactive`/`NotYetActive`/`ReferenceDigestMismatch`)
+  and args/gas/zero-object request faults
+  (`PreinstalledModuleArgsTooLarge`/`GasLimitExceedsCeiling`/`ZeroObjectAccess`)
+  remain deterministic, opaque-coded client errors (`422`/`400`); catalog/commitment
+  mismatch (`PreinstalledModuleNotCataloged`/`CodeHashMismatch`/`ManifestHashMismatch`/
+  `SemanticsHashMismatch`) and `ObjectCreatedCheckpointRegression` are now
+  classified as host/operator failures (`500`, opaque codes), because they can
+  only mean the trusted composition-time catalog disagrees with the
+  governance-committed registry or the trusted `created_checkpoint` regressed,
+  never something the caller controls; no variant's `Display` text or internal
+  digest/hash values are ever put in the response body. Tests build every
+  fixture (module code/manifest/semantics digests, object digests) from
+  `HashSuiteResolver`/canonical encoders rather than pasting digests, cover a
+  signed owned `Write` committing `Accepted` and advancing object
+  version/nonce/receipt, an exact duplicate not re-executing or reapplying, a
+  close/reopen `SqliteDurableStore` replay returning the persisted result
+  (using a real wall-clock `DurableOperationContext`/`SystemClock`, since
+  DR-0079's `SqliteDurableStore` compares its deadline against actual
+  `SystemTime::now()`, unlike `MemoryDurableStateStore`'s settable virtual
+  clock), directly asserting the receipt survives reopen and, separately from
+  exact-replay reconciliation, that a fresh request ID at the already-spent
+  nonce still conflicts after reopen (proving the persisted sender-nonce
+  record itself survived, not only the receipt exact-replay reconciles from
+  first), a deterministic trap committing `Rejected` while consuming the
+  nonce and leaving the object unchanged, a zero-object call rejecting before
+  its first storage dispatch — proven directly by reusing the existing
+  cancel-on-first-receipt-read store/signal wrapper and observing the signal
+  never flips, rather than only by output-side effects — the existing
+  read-only route still rejecting `Write`/`Consume`, and cancellation/admission
+  bounds holding on the new route. Native binary/devnet startup wiring, query
+  APIs, the TypeScript
+  client, the counter UI, arbitrary module upload, and fee/gas metering remain
+  out of scope and deferred, as does provider-hardening work.
+
+  **Repository-boundary decision.** The TypeScript client and the minimal
+  counter demo (Developer MVP Gate steps 5-6) stay inside this monorepo
+  through the Developer MVP Gate, as top-level `clients/typescript` and
+  `demo/counter` directories once those steps are implemented, rather than
+  starting as separate repositories. Extraction into their own repositories is
+  deferred until all of: the canonical wire contracts and shared test vectors
+  they depend on are stable, a real independent consumer or an independent
+  release cadence for the client exists, and an E2E suite can target a
+  released devnet artifact instead of an in-tree build. Until then, splitting
+  them out would only add release/versioning coordination overhead without a
+  concrete consumer to justify it.

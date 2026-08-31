@@ -17,14 +17,17 @@ use canonical_encoding::{
     CanonicalDecodingError, CanonicalEncodingError, CanonicalStruct, decode_canonical_frame,
 };
 use core::fmt;
+use execution::WasmExecutionEngine;
 use hashing::HashSuiteResolver;
 use node_core::{
     AuthenticatedSubmitTransaction, MAX_NODE_OUTPUT_ITEMS, MAX_NODE_PAYLOAD_BYTES, NodeConfig,
     NodeCoreError, NodeEvent, NodeEventKind, NodeOutboxBatch, NodeOutboxDelivery, NodeResponse,
-    OutboxClaim, OutboxLeaseId, RequestId, TransactionAuthError, TransactionalNodeStateMachine,
-    acknowledge_outbox_message, acknowledge_outbox_message_in_domain,
-    authenticate_submit_transaction_event, claim_next_outbox_message,
-    claim_next_outbox_message_in_domain, handle_authenticated_resolved_durable_submit_transaction,
+    OutboxClaim, OutboxLeaseId, PreinstalledModuleCatalog, RequestId, TransactionAuthError,
+    TransactionalNodeStateMachine, acknowledge_outbox_message,
+    acknowledge_outbox_message_in_domain, authenticate_submit_transaction_event,
+    claim_next_outbox_message, claim_next_outbox_message_in_domain,
+    handle_authenticated_resolved_durable_submit_transaction,
+    handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution,
     handle_idempotent_event, handle_resolved_durable_idempotent_event,
     handle_resolved_idempotent_event,
 };
@@ -205,6 +208,39 @@ impl<S, T, C, I> StructuredDurableNativeComponents<S, T, C, I> {
         match &self.cancellation {
             Some(cancellation) => cancellation.is_cancelled(),
             None => false,
+        }
+    }
+}
+
+/// Trusted preinstalled-WASM composition input for
+/// [`preinstalled_wasm_structured_durable_router`].
+///
+/// Every field is fixed by trusted node composition, exactly like
+/// [`node_core::handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution`]
+/// requires: `catalog` and `engine` never come from HTTP request bytes, and
+/// `created_checkpoint` never comes from request bytes or wall-clock time. It
+/// is the caller's already-validated chain-progress value, identical in
+/// origin and trust level to the `created_checkpoint` accepted by that
+/// function.
+#[derive(Clone, Debug)]
+pub struct PreinstalledWasmComposition {
+    catalog: Arc<PreinstalledModuleCatalog>,
+    engine: WasmExecutionEngine,
+    created_checkpoint: u64,
+}
+
+impl PreinstalledWasmComposition {
+    /// Creates a trusted preinstalled-WASM composition input.
+    #[must_use]
+    pub const fn new(
+        catalog: Arc<PreinstalledModuleCatalog>,
+        engine: WasmExecutionEngine,
+        created_checkpoint: u64,
+    ) -> Self {
+        Self {
+            catalog,
+            engine,
+            created_checkpoint,
         }
     }
 }
@@ -635,6 +671,20 @@ struct StructuredDurableNativeHttpState<S, M, T, C, I> {
 type SharedStructuredDurableNativeHttpState<S, M, T, C, I> =
     Arc<StructuredDurableNativeHttpState<S, M, T, C, I>>;
 
+struct PreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I> {
+    components: StructuredDurableNativeComponents<S, T, C, I>,
+    preinstalled_wasm: PreinstalledWasmComposition,
+    protocol_config: ProtocolConfig,
+    authority: StructuredDurableRequestAuthority,
+    config: NodeConfig,
+    resolver: HashSuiteResolver,
+    machine: Arc<M>,
+    blocking_executor: NativeBlockingExecutor,
+}
+
+type SharedPreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I> =
+    Arc<PreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I>>;
+
 /// Builds the recoverable native HTTP router.
 ///
 /// Application state, request deduplication, responses, and the ordered outbox
@@ -824,17 +874,7 @@ where
     C: Clock + Send + Sync + 'static,
     I: IndexedOutboxIdentitySource + Send + Sync + 'static,
 {
-    if protocol_config.protocol_version != config.protocol_version() {
-        return Err(
-            StructuredDurableRouterError::ProtocolVersionAuthorityMismatch {
-                node_config: config.protocol_version(),
-                protocol_config: protocol_config.protocol_version,
-            },
-        );
-    }
-    if protocol_config.domain_placement.is_none() {
-        return Err(StructuredDurableRouterError::MissingDomainPlacement);
-    }
+    validate_structured_durable_router_authority(&protocol_config, &config)?;
     let state = Arc::new(StructuredDurableNativeHttpState {
         components,
         protocol_config,
@@ -852,6 +892,113 @@ where
         )
         .layer(DefaultBodyLimit::max(MAX_HTTP_EVENT_BODY_BYTES))
         .with_state(state))
+}
+
+/// Builds the normalized durable native router with preinstalled-WASM
+/// `SubmitTransaction` execution.
+///
+/// This is [`structured_durable_router`] with one difference: a
+/// `SubmitTransaction` event is committed through
+/// [`node_core::handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution`]
+/// instead of the read-only entrypoint, so a signed owned `Write`/`Consume`
+/// object access can execute a trusted preinstalled deterministic WASM
+/// contract call and commit its object effects. Every other event kind
+/// still runs through the same generic [`TransactionalNodeStateMachine`]
+/// path as [`structured_durable_router`]. `preinstalled_wasm`'s catalog,
+/// engine, and `created_checkpoint` are fixed, composition-trusted values
+/// (see [`PreinstalledWasmComposition`]); none of them is ever derived from
+/// an HTTP request or wall-clock time. [`structured_durable_router`] itself
+/// is unaffected by this composition and remains read-only.
+#[allow(clippy::too_many_arguments)]
+pub fn preinstalled_wasm_structured_durable_router<S, M, T, C, I>(
+    components: StructuredDurableNativeComponents<S, T, C, I>,
+    preinstalled_wasm: PreinstalledWasmComposition,
+    protocol_config: ProtocolConfig,
+    authority: StructuredDurableRequestAuthority,
+    config: NodeConfig,
+    resolver: HashSuiteResolver,
+    machine: Arc<M>,
+    blocking_policy: NativeBlockingPolicy,
+) -> Result<Router, StructuredDurableRouterError>
+where
+    S: IndexedOutboxRepository + Send + Sync + 'static,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    T: Transport + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+    I: IndexedOutboxIdentitySource + Send + Sync + 'static,
+{
+    preinstalled_wasm_structured_durable_router_with_executor(
+        components,
+        preinstalled_wasm,
+        protocol_config,
+        authority,
+        config,
+        resolver,
+        machine,
+        NativeBlockingExecutor::new(blocking_policy),
+    )
+}
+
+/// Builds the preinstalled-WASM durable router with shared blocking admission.
+#[allow(clippy::too_many_arguments)]
+pub fn preinstalled_wasm_structured_durable_router_with_executor<S, M, T, C, I>(
+    components: StructuredDurableNativeComponents<S, T, C, I>,
+    preinstalled_wasm: PreinstalledWasmComposition,
+    protocol_config: ProtocolConfig,
+    authority: StructuredDurableRequestAuthority,
+    config: NodeConfig,
+    resolver: HashSuiteResolver,
+    machine: Arc<M>,
+    blocking_executor: NativeBlockingExecutor,
+) -> Result<Router, StructuredDurableRouterError>
+where
+    S: IndexedOutboxRepository + Send + Sync + 'static,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    T: Transport + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+    I: IndexedOutboxIdentitySource + Send + Sync + 'static,
+{
+    validate_structured_durable_router_authority(&protocol_config, &config)?;
+    let state = Arc::new(PreinstalledWasmStructuredDurableNativeHttpState {
+        components,
+        preinstalled_wasm,
+        protocol_config,
+        authority,
+        config,
+        resolver,
+        machine,
+        blocking_executor,
+    });
+    Ok(Router::new()
+        .route(LIVENESS_PATH, get(liveness))
+        .route(
+            NODE_EVENT_PATH,
+            post(submit_preinstalled_wasm_structured_durable_event::<S, M, T, C, I>),
+        )
+        .layer(DefaultBodyLimit::max(MAX_HTTP_EVENT_BODY_BYTES))
+        .with_state(state))
+}
+
+/// Checked once at composition time by both [`structured_durable_router`] and
+/// [`preinstalled_wasm_structured_durable_router`]: see
+/// [`StructuredDurableRouterError`] for why this must never diverge per
+/// request.
+fn validate_structured_durable_router_authority(
+    protocol_config: &ProtocolConfig,
+    config: &NodeConfig,
+) -> Result<(), StructuredDurableRouterError> {
+    if protocol_config.protocol_version != config.protocol_version() {
+        return Err(
+            StructuredDurableRouterError::ProtocolVersionAuthorityMismatch {
+                node_config: config.protocol_version(),
+                protocol_config: protocol_config.protocol_version,
+            },
+        );
+    }
+    if protocol_config.domain_placement.is_none() {
+        return Err(StructuredDurableRouterError::MissingDomainPlacement);
+    }
+    Ok(())
 }
 
 /// Serves a configured native router until the shutdown future completes.
@@ -1497,6 +1644,67 @@ where
         .into_response()
 }
 
+async fn submit_preinstalled_wasm_structured_durable_event<S, M, T, C, I>(
+    State(state): State<SharedPreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response
+where
+    S: IndexedOutboxRepository + Send + Sync + 'static,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    T: Transport + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+    I: IndexedOutboxIdentitySource + Send + Sync + 'static,
+{
+    if !has_supported_content_type(&headers) {
+        return error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported-content-type",
+        );
+    }
+    if has_unsupported_content_encoding(&headers) {
+        return error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported-content-encoding",
+        );
+    }
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => return error_response(error.status(), "body-rejected"),
+    };
+    if state.components.is_cancelled() {
+        return cancelled_before_storage_response();
+    }
+    let permit = match state.blocking_executor.try_acquire() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => return overload_response(),
+        Err(TryAcquireError::Closed) => {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "blocking-admission-closed");
+        }
+    };
+    let blocking_state = Arc::clone(&state);
+    let work = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        invoke_preinstalled_wasm_structured_durable_event(blocking_state.as_ref(), &body)
+    });
+    let result = match work.await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => return invocation_error_response(&error),
+        Err(_) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "blocking-task-failed");
+        }
+    };
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, NODE_RESULT_MEDIA_TYPE),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        result,
+    )
+        .into_response()
+}
+
 enum InvocationError {
     CancelledBeforeStorage,
     Node(NodeCoreError),
@@ -1589,6 +1797,23 @@ where
         .map_err(|_| InvocationError::ResultEncoding)
 }
 
+/// Distinguishes how one authenticated `SubmitTransaction` is executed by
+/// [`invoke_structured_durable_event_with_execution`], the shared core behind
+/// both [`invoke_structured_durable_event`] and
+/// [`invoke_preinstalled_wasm_structured_durable_event`]. Every other stage
+/// of the request path (authenticated preparation, storage context, exact
+/// request-scoped outbox claim/send/ack) is identical for every variant.
+enum StructuredDurableAuthenticatedExecution<'a> {
+    /// [`handle_authenticated_resolved_durable_submit_transaction`]: read-only.
+    ReadOnly,
+    /// [`handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution`].
+    PreinstalledWasm {
+        catalog: &'a PreinstalledModuleCatalog,
+        engine: WasmExecutionEngine,
+        created_checkpoint: u64,
+    },
+}
+
 fn invoke_structured_durable_event<S, M, T, C, I>(
     state: &StructuredDurableNativeHttpState<S, M, T, C, I>,
     body: &[u8],
@@ -1600,11 +1825,68 @@ where
     C: Clock,
     I: IndexedOutboxIdentitySource,
 {
-    if state.components.is_cancelled() {
+    invoke_structured_durable_event_with_execution(
+        &state.components,
+        &state.protocol_config,
+        &state.authority,
+        &state.config,
+        &state.resolver,
+        state.machine.as_ref(),
+        StructuredDurableAuthenticatedExecution::ReadOnly,
+        body,
+    )
+}
+
+fn invoke_preinstalled_wasm_structured_durable_event<S, M, T, C, I>(
+    state: &PreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I>,
+    body: &[u8],
+) -> Result<Vec<u8>, InvocationError>
+where
+    S: IndexedOutboxRepository,
+    M: TransactionalNodeStateMachine,
+    T: Transport,
+    C: Clock,
+    I: IndexedOutboxIdentitySource,
+{
+    invoke_structured_durable_event_with_execution(
+        &state.components,
+        &state.protocol_config,
+        &state.authority,
+        &state.config,
+        &state.resolver,
+        state.machine.as_ref(),
+        StructuredDurableAuthenticatedExecution::PreinstalledWasm {
+            catalog: state.preinstalled_wasm.catalog.as_ref(),
+            engine: state.preinstalled_wasm.engine,
+            created_checkpoint: state.preinstalled_wasm.created_checkpoint,
+        },
+        body,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn invoke_structured_durable_event_with_execution<S, M, T, C, I>(
+    components: &StructuredDurableNativeComponents<S, T, C, I>,
+    protocol_config: &ProtocolConfig,
+    authority: &StructuredDurableRequestAuthority,
+    config: &NodeConfig,
+    resolver: &HashSuiteResolver,
+    machine: &M,
+    execution: StructuredDurableAuthenticatedExecution<'_>,
+    body: &[u8],
+) -> Result<Vec<u8>, InvocationError>
+where
+    S: IndexedOutboxRepository,
+    M: TransactionalNodeStateMachine,
+    T: Transport,
+    C: Clock,
+    I: IndexedOutboxIdentitySource,
+{
+    if components.is_cancelled() {
         return Err(InvocationError::CancelledBeforeStorage);
     }
     let event = NodeEvent::decode(body).map_err(InvocationError::Node)?;
-    validate_native_event_context(&event, &state.config).map_err(InvocationError::Node)?;
+    validate_native_event_context(&event, config).map_err(InvocationError::Node)?;
     let request_id = event.request_id();
     enum PreparedStructuredEvent {
         Authenticated(Box<AuthenticatedSubmitTransaction>),
@@ -1613,67 +1895,79 @@ where
     let prepared_event: PreparedStructuredEvent =
         if event.kind() == NodeEventKind::SubmitTransaction {
             PreparedStructuredEvent::Authenticated(Box::new(
-                authenticate_submit_transaction_event(event, &state.config, &state.protocol_config)
+                authenticate_submit_transaction_event(event, config, protocol_config)
                     .map_err(InvocationError::Node)?,
             ))
         } else {
             PreparedStructuredEvent::Generic(event)
         };
-    let placement: &DomainPlacementManifest = state
-        .protocol_config
+    let placement: &DomainPlacementManifest = protocol_config
         .domain_placement
         .as_ref()
         .ok_or(ProtocolConfigError::MissingDomainPlacement)
         .map_err(NodeCoreError::from)
         .map_err(InvocationError::Node)?;
-    let identity = state
-        .components
+    let identity = components
         .identities
         .next_attempt_identity()
         .map_err(|error| InvocationError::Indexed(IndexedOutboxRecoveryError::Identity(error)))?;
-    let now_unix_millis =
-        state.components.clock.now_unix_millis().map_err(|error| {
-            InvocationError::Indexed(IndexedOutboxRecoveryError::Runtime(error))
-        })?;
+    let now_unix_millis = components
+        .clock
+        .now_unix_millis()
+        .map_err(|error| InvocationError::Indexed(IndexedOutboxRecoveryError::Runtime(error)))?;
     let deadline_unix_millis = now_unix_millis
-        .checked_add(state.authority.operation_timeout_millis.get())
+        .checked_add(authority.operation_timeout_millis.get())
         .ok_or(InvocationError::Indexed(
             IndexedOutboxRecoveryError::TimeOverflow,
         ))?;
     let lease_expires_at_unix_millis = now_unix_millis
-        .checked_add(state.authority.lease_duration_millis.get())
+        .checked_add(authority.lease_duration_millis.get())
         .ok_or(InvocationError::Indexed(
             IndexedOutboxRecoveryError::TimeOverflow,
         ))?;
     let deadline = StorageDeadline::new(deadline_unix_millis).ok_or(InvocationError::Indexed(
         IndexedOutboxRecoveryError::TimeOverflow,
     ))?;
-    let context = DurableOperationContext::new(
-        state.authority.writer_fence,
-        deadline,
-        identity.correlation_id,
-    );
-    if state.components.is_cancelled() {
+    let context =
+        DurableOperationContext::new(authority.writer_fence, deadline, identity.correlation_id);
+    if components.is_cancelled() {
         return Err(InvocationError::CancelledBeforeStorage);
     }
-    let resolved = match prepared_event {
-        PreparedStructuredEvent::Authenticated(submission) => {
-            handle_authenticated_resolved_durable_submit_transaction(
-                state.components.store.as_ref(),
-                &context,
-                &state.resolver,
-                *submission,
-                state.machine.as_ref(),
-            )
-        }
-        PreparedStructuredEvent::Generic(event) => handle_resolved_durable_idempotent_event(
-            state.components.store.as_ref(),
+    let resolved = match (prepared_event, execution) {
+        (
+            PreparedStructuredEvent::Authenticated(submission),
+            StructuredDurableAuthenticatedExecution::ReadOnly,
+        ) => handle_authenticated_resolved_durable_submit_transaction(
+            components.store.as_ref(),
+            &context,
+            resolver,
+            *submission,
+            machine,
+        ),
+        (
+            PreparedStructuredEvent::Authenticated(submission),
+            StructuredDurableAuthenticatedExecution::PreinstalledWasm {
+                catalog,
+                engine,
+                created_checkpoint,
+            },
+        ) => handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            components.store.as_ref(),
+            &context,
+            resolver,
+            catalog,
+            &engine,
+            *submission,
+            created_checkpoint,
+        ),
+        (PreparedStructuredEvent::Generic(event), _) => handle_resolved_durable_idempotent_event(
+            components.store.as_ref(),
             &context,
             placement,
-            &state.config,
-            &state.resolver,
+            config,
+            resolver,
             event,
-            state.machine.as_ref(),
+            machine,
         ),
     }
     .map_err(InvocationError::Node)?;
@@ -1688,9 +1982,8 @@ where
         lease_expires_at_unix_millis,
     )
     .map_err(|error| InvocationError::Indexed(IndexedOutboxRecoveryError::Contract(error)))?;
-    let claim =
-        reconcile_request_outbox_claim(state.components.store.as_ref(), &context, claim_request)
-            .map_err(InvocationError::Indexed)?;
+    let claim = reconcile_request_outbox_claim(components.store.as_ref(), &context, claim_request)
+        .map_err(InvocationError::Indexed)?;
     if let Some(claim) = claim {
         if claim.request_id() != outbox_request_id
             || claim.lease_id() != identity.lease_id
@@ -1702,7 +1995,7 @@ where
         }
         let outbound = NodeEvent::decode(claim.canonical_payload())
             .map_err(|error| InvocationError::Indexed(IndexedOutboxRecoveryError::Node(error)))?;
-        validate_native_event_context(&outbound, &state.config)
+        validate_native_event_context(&outbound, config)
             .map_err(|error| InvocationError::Indexed(IndexedOutboxRecoveryError::Node(error)))?;
         let canonical_payload = outbound
             .encode()
@@ -1712,8 +2005,7 @@ where
                 NodeCoreError::PersistenceInvariant("request outbox payload is not canonical"),
             )));
         }
-        state
-            .components
+        components
             .transport
             .send(canonical_payload)
             .map_err(|_| InvocationError::Indexed(IndexedOutboxRecoveryError::Send))?;
@@ -1723,12 +2015,8 @@ where
             claim.message_index(),
             claim.lease_id(),
         );
-        reconcile_indexed_acknowledgement(
-            state.components.store.as_ref(),
-            &context,
-            acknowledgement,
-        )
-        .map_err(InvocationError::Indexed)?;
+        reconcile_indexed_acknowledgement(components.store.as_ref(), &context, acknowledgement)
+            .map_err(InvocationError::Indexed)?;
     }
 
     HttpNodeResult::new(request_id, resolved.output().responses().to_vec())
@@ -2145,6 +2433,53 @@ fn node_error_response(error: &NodeCoreError) -> Response {
         NodeCoreError::ObjectBodyTooLarge { .. } => {
             (StatusCode::UNPROCESSABLE_ENTITY, "object-body-too-large")
         }
+        // Malformed/inactive/unknown module reference: deterministic,
+        // request-dependent client faults.
+        NodeCoreError::PreinstalledModuleUnknown { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "preinstalled-module-unknown",
+        ),
+        NodeCoreError::PreinstalledModuleInactive { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "preinstalled-module-inactive",
+        ),
+        NodeCoreError::PreinstalledModuleNotYetActive { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "preinstalled-module-not-yet-active",
+        ),
+        NodeCoreError::PreinstalledModuleReferenceDigestMismatch { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "preinstalled-module-reference-invalid",
+        ),
+        // Args/gas/zero-object request faults: deterministic client errors.
+        NodeCoreError::PreinstalledModuleArgsTooLarge { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "preinstalled-module-args-too-large",
+        ),
+        NodeCoreError::PreinstalledModuleGasLimitExceedsCeiling { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "preinstalled-module-gas-limit-exceeded",
+        ),
+        NodeCoreError::PreinstalledModuleZeroObjectAccess => (
+            StatusCode::BAD_REQUEST,
+            "preinstalled-module-zero-object-access",
+        ),
+        // Catalog/commitment mismatch: the composition-trusted catalog
+        // disagrees with the governance-committed registry, which is a host
+        // misconfiguration rather than anything the caller controls.
+        NodeCoreError::PreinstalledModuleNotCataloged { .. }
+        | NodeCoreError::PreinstalledModuleCodeHashMismatch { .. }
+        | NodeCoreError::PreinstalledModuleManifestHashMismatch { .. }
+        | NodeCoreError::PreinstalledModuleSemanticsHashMismatch { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "preinstalled-module-catalog-mismatch",
+        ),
+        // `created_checkpoint` is trusted node composition, never request
+        // input; a regression here is a host/operator failure.
+        NodeCoreError::ObjectCreatedCheckpointRegression { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "object-created-checkpoint-regression",
+        ),
         NodeCoreError::ResponseRequestMismatch { .. }
         | NodeCoreError::StateTooLarge(_)
         | NodeCoreError::TooManyOutputItems { .. }
@@ -2238,7 +2573,7 @@ fn take_list_bytes<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use abi::AccessManifest;
+    use abi::{AccessEntry, AccessManifest};
     use axum::{
         body::{Body, to_bytes},
         http::Request,
@@ -2251,24 +2586,28 @@ mod tests {
     use node_core::{
         NodeOutboxDelivery, NodeOutput, NodeResponseStatus, NodeStateAccess, NodeStateAccessMode,
         NodeStateAccessPlan, NodeStateSnapshot, NodeStateUpdate, OutboundMessage,
-        TransactionalNodeTransition,
+        PreinstalledModuleCatalogEntry, TransactionalNodeTransition,
     };
-    use objects::{AccessMode, Address, ObjectId, ObjectRef};
+    use objects::{AccessMode, Address, Object, ObjectId, ObjectRef, Owner, encode_object};
     use protocol_config::TransactionAuthProfile;
     use protocol_types::{
-        ChainId, Digest32, Epoch, HashAlgorithmId, HashSuite, HashSuiteSchedule, ProtocolVersion,
-        SignatureSchemeId, ValidatorId,
+        ChainId, Digest32, Epoch, HashAlgorithmId, HashPurpose, HashSuite, HashSuiteSchedule,
+        ProtocolVersion, SignatureSchemeId, ValidatorId,
     };
     use runtime::{
         AtomicStateTransaction, CompareAndSwapResult, ComposedRuntime, DurableCommitOutcome,
         DurableCommitRejection, DurableDomainStateStore, DurableInvocationTransaction,
+        DurableObjectChanges, DurableObjectHead, DurableObjectHeadRead, DurableObjectMutation,
+        DurableObjectMutationEntry, DurableObjectOwnerProjection, DurableObjectProvenance,
+        DurableObjectRoutingProjection, DurableObjectVersion, DurableObjectVersionRecord,
         DurableOutboxClaim, DurableReadError, DurableRequestId, DurableRequestReceipt,
         IndexedOutboxRepository, ManualClock, MemoryBlobStore, MemoryDurableStateStore,
         MemoryRuntime, MemoryScheduler, MemorySigner, MemoryStateStore, MemoryTransport,
         OutboxRequestId, RequestOutboxClaimRequest, RuntimeError, StateStore,
-        StructuredDurableDomainStateStore, TransactionalStateStore, VersionedStateValue,
+        StructuredDurableDomainStateStore, SystemClock, TransactionalStateStore,
+        VersionedStateValue,
     };
-    use runtime_sqlite::SqliteStateStore;
+    use runtime_sqlite::{SqliteDurableStore, SqliteNamespace, SqliteStateStore};
     use std::{
         collections::VecDeque,
         fs,
@@ -2278,6 +2617,10 @@ mod tests {
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         },
         time::{SystemTime, UNIX_EPOCH},
+    };
+    use system_modules::{
+        GasModel, ModuleId, ModuleStatus, SystemModule, SystemModuleManifest, SystemModuleRegistry,
+        TypeSchema, encode_system_module_manifest,
     };
     use tokio::sync::Notify;
     use tower::ServiceExt;
@@ -2543,6 +2886,296 @@ mod tests {
         );
         let bytes = signed_transaction_bytes(signing_key, &tx);
         submit_transaction_event(request_id, bytes)
+    }
+
+    // ── preinstalled WASM native HTTP composition ───────────────────────
+
+    /// A contract that overwrites `object[0]`'s data with a fixed byte,
+    /// matching `execution::wasm_engine`'s stable host ABI.
+    fn preinstalled_write_wasm_bytes() -> Vec<u8> {
+        wat::parse_str(
+            r#"(module
+                (import "env" "get_object_count"   (func $get_object_count   (result i32)))
+                (import "env" "get_object_data_len"(func $get_object_data_len(param i32)(result i32)))
+                (import "env" "read_object_data"   (func $read_object_data   (param i32 i32 i32 i32)(result i32)))
+                (import "env" "write_object_data"  (func $write_object_data  (param i32 i32 i32)(result i32)))
+                (import "env" "consume_object"     (func $consume_object     (param i32)(result i32)))
+                (import "env" "create_object"      (func $create_object      (param i32 i32 i32 i32 i32 i32)(result i32)))
+                (import "env" "emit_event"         (func $emit_event         (param i32 i32 i32 i32)(result i32)))
+                (import "env" "get_args_len"       (func $get_args_len       (result i32)))
+                (import "env" "read_args"          (func $read_args          (param i32 i32 i32)(result i32)))
+                (import "env" "abort"              (func $abort              (param i32 i32)))
+                (memory 1)
+                (export "memory" (memory 0))
+                (data (i32.const 0) "\CA\FE")
+                (func (export "run")
+                  (drop (call $write_object_data (i32.const 0) (i32.const 0) (i32.const 2)))))"#,
+        )
+        .unwrap()
+    }
+
+    /// A contract that always traps via `abort`.
+    fn preinstalled_trap_wasm_bytes() -> Vec<u8> {
+        wat::parse_str(
+            r#"(module
+                (import "env" "get_object_count"   (func $get_object_count   (result i32)))
+                (import "env" "get_object_data_len"(func $get_object_data_len(param i32)(result i32)))
+                (import "env" "read_object_data"   (func $read_object_data   (param i32 i32 i32 i32)(result i32)))
+                (import "env" "write_object_data"  (func $write_object_data  (param i32 i32 i32)(result i32)))
+                (import "env" "consume_object"     (func $consume_object     (param i32)(result i32)))
+                (import "env" "create_object"      (func $create_object      (param i32 i32 i32 i32 i32 i32)(result i32)))
+                (import "env" "emit_event"         (func $emit_event         (param i32 i32 i32 i32)(result i32)))
+                (import "env" "get_args_len"       (func $get_args_len       (result i32)))
+                (import "env" "read_args"          (func $read_args          (param i32 i32 i32)(result i32)))
+                (import "env" "abort"              (func $abort              (param i32 i32)))
+                (memory 1)
+                (export "memory" (memory 0))
+                (data (i32.const 0) "http-preinstalled-trap-marker")
+                (func (export "run")
+                  (call $abort (i32.const 0) (i32.const 30))))"#,
+        )
+        .unwrap()
+    }
+
+    fn preinstalled_manifest(module_id: ModuleId, max_input_size: u64) -> SystemModuleManifest {
+        SystemModuleManifest {
+            module_id,
+            input_schema: TypeSchema {
+                descriptor: "http.preinstalled.input.v1".to_string(),
+                schema_hash: Digest32::new(HashAlgorithmId::Sha2_256, [0x11; 32]),
+            },
+            output_schema: TypeSchema {
+                descriptor: "http.preinstalled.output.v1".to_string(),
+                schema_hash: Digest32::new(HashAlgorithmId::Sha2_256, [0x22; 32]),
+            },
+            max_input_size,
+            gas_model: GasModel {
+                base_cost: 1,
+                per_input_byte_cost: 1,
+            },
+            zk_hint: None,
+        }
+    }
+
+    /// Builds a committed [`SystemModuleRegistry`] entry and a matching
+    /// [`node_core::PreinstalledModuleCatalog`] entry whose commitments
+    /// agree, plus the `ObjectRef` a transaction must declare as
+    /// `module_ref` to reference it. Every digest is computed from
+    /// `resolver`, matching
+    /// `node_core::preinstalled_wasm::resolve_preinstalled_module`'s exact
+    /// verification rules, rather than a pasted constant.
+    fn preinstalled_module_fixture(
+        resolver: &HashSuiteResolver,
+        module_id: ModuleId,
+        version: u64,
+        wasm_bytes: Vec<u8>,
+        max_input_size: u64,
+    ) -> (SystemModuleRegistry, PreinstalledModuleCatalog, ObjectRef) {
+        let manifest = preinstalled_manifest(module_id, max_input_size);
+        let semantics_hash = Digest32::new(HashAlgorithmId::Sha2_256, [0x33; 32]);
+        let code_hash = resolver
+            .hash_for_purpose(Epoch::new(0), HashPurpose::ContractCode, &wasm_bytes)
+            .unwrap();
+        let manifest_bytes = encode_system_module_manifest(&manifest).unwrap();
+        let manifest_hash = resolver
+            .hash_for_purpose(
+                Epoch::new(0),
+                HashPurpose::SystemModuleManifest,
+                &manifest_bytes,
+            )
+            .unwrap();
+        let module = SystemModule {
+            module_id,
+            version,
+            canonical_code_hash: code_hash,
+            semantics_hash,
+            manifest_hash,
+            activation_epoch: Epoch::new(0),
+            status: ModuleStatus::Active,
+        };
+        let mut registry = SystemModuleRegistry::new();
+        registry.add_module(module).unwrap();
+        let entry = PreinstalledModuleCatalogEntry::new(
+            module_id,
+            version,
+            wasm_bytes,
+            manifest,
+            semantics_hash,
+        )
+        .unwrap();
+        let catalog = PreinstalledModuleCatalog::new(vec![entry]).unwrap();
+        let module_ref = ObjectRef {
+            id: ObjectId::new(*module_id.as_bytes()),
+            version,
+            digest: code_hash,
+        };
+        (registry, catalog, module_ref)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn preinstalled_wasm_transaction(
+        sender: Address,
+        chain: ChainId,
+        epoch: Epoch,
+        nonce: u64,
+        access_manifest: AccessManifest,
+        module_ref: ObjectRef,
+        args: Vec<u8>,
+    ) -> Transaction {
+        Transaction {
+            chain_id: chain,
+            protocol_version: ProtocolVersion::new(3),
+            epoch,
+            sender,
+            nonce,
+            access_manifest,
+            module_ref,
+            entrypoint: "run".to_string(),
+            args,
+            gas_limit: 1_000_000,
+            fee_payment: None,
+            signature: Vec::new(),
+        }
+    }
+
+    /// A real, deterministically Ed25519-signed `SubmitTransaction`
+    /// `NodeEvent` invoking a preinstalled module, matching
+    /// [`signed_submit_transaction_event`]'s signing but with a caller-chosen
+    /// access manifest, module reference, and args.
+    fn signed_preinstalled_wasm_submit_transaction_event(
+        signing_key: &ed25519_zebra::SigningKey,
+        request_id: RequestId,
+        nonce: u64,
+        access_manifest: AccessManifest,
+        module_ref: ObjectRef,
+        args: Vec<u8>,
+    ) -> NodeEvent {
+        let sender = dev_sender_address(signing_key);
+        let tx = preinstalled_wasm_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            nonce,
+            access_manifest,
+            module_ref,
+            args,
+        );
+        let bytes = signed_transaction_bytes(signing_key, &tx);
+        submit_transaction_event(request_id, bytes)
+    }
+
+    /// A committed protocol configuration like [`active_protocol_config`],
+    /// additionally carrying `registry` as the committed system-module
+    /// registry a preinstalled-WASM call resolves `module_ref` against.
+    fn preinstalled_protocol_config(
+        domain: AtomicityDomainId,
+        registry: SystemModuleRegistry,
+    ) -> ProtocolConfig {
+        let mut protocol_config = active_protocol_config(domain);
+        protocol_config.system_modules = registry;
+        protocol_config
+    }
+
+    /// A [`DurableOperationContext`] deadline computed from real wall-clock
+    /// time, required by [`SqliteDurableStore`] (unlike [`MemoryDurableStateStore`],
+    /// it compares the deadline against actual `SystemTime::now()`, not a
+    /// settable virtual clock), matching `runtime-sqlite`'s own
+    /// `live_context` test helper.
+    fn live_operation_context(
+        fence: WriterFenceGeneration,
+        correlation_byte: u8,
+    ) -> DurableOperationContext {
+        let now = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(now + 60_000).unwrap(),
+            StorageCorrelationId::new([correlation_byte; 16]).unwrap(),
+        )
+    }
+
+    /// Directly commits one address-owned inline object version and head as
+    /// fixture setup, bypassing every HTTP/node-core entrypoint, exactly like
+    /// `node_core`'s own `commit_memory_inline_object` test helper.
+    fn commit_owned_object<S>(
+        store: &S,
+        context: &DurableOperationContext,
+        domain: AtomicityDomainId,
+        object: Object,
+        chain: &str,
+        created_checkpoint: u64,
+        receipt_byte: u8,
+    ) -> ObjectRef
+    where
+        S: IndexedOutboxRepository,
+    {
+        let object_id = object.id;
+        let object_version = object.version;
+        let owner = object.owner.clone();
+        let canonical_bytes = encode_object(&object).unwrap();
+        let chain_id = ChainId::new(chain).unwrap();
+        let digest = resolver()
+            .hash_for_purpose(Epoch::new(0), HashPurpose::Object, &canonical_bytes)
+            .unwrap();
+        let provenance = DurableObjectProvenance::new(chain_id, ProtocolVersion::new(3));
+        let record = DurableObjectVersionRecord::from_inline_object(
+            object,
+            digest,
+            provenance,
+            created_checkpoint,
+        )
+        .unwrap();
+        let changes = DurableObjectChanges::new(
+            vec![DurableObjectHeadRead::new(
+                object_id,
+                DurableObjectHead::Absent,
+            )],
+            vec![DurableObjectMutationEntry::new(
+                object_id,
+                DurableObjectMutation::Create {
+                    version: record,
+                    owner_projection: DurableObjectOwnerProjection::from_owner(owner).unwrap(),
+                    routing_projection: DurableObjectRoutingProjection::default(),
+                },
+            )],
+        )
+        .unwrap();
+        let receipt = DurableRequestReceipt::new(
+            DurableRequestId::new([receipt_byte; 32]).unwrap(),
+            Digest32::new(
+                HashAlgorithmId::Sha2_256,
+                [receipt_byte.wrapping_add(1); 32],
+            ),
+            vec![receipt_byte.wrapping_add(2)],
+        )
+        .unwrap();
+        let invocation =
+            DurableInvocationTransaction::new(domain, None, changes, receipt, None).unwrap();
+        assert_eq!(
+            store.commit_invocation(context, invocation),
+            DurableCommitOutcome::Committed
+        );
+        ObjectRef {
+            id: object_id,
+            version: object_version,
+            digest,
+        }
+    }
+
+    fn owned_object(id: ObjectId, owner: Address, byte: u8) -> Object {
+        Object {
+            id,
+            version: 1,
+            owner: Owner::Address(owner),
+            type_hash: Digest32::new(HashAlgorithmId::Sha2_256, [byte.wrapping_add(1); 32]),
+            schema_version: u32::from(byte),
+            data: vec![byte],
+        }
     }
 
     struct IncrementMachine {
@@ -3273,6 +3906,72 @@ mod tests {
         .unwrap()
     }
 
+    fn preinstalled_app<S, C>(
+        store: Arc<S>,
+        transport: Arc<MemoryTransport>,
+        clock: Arc<C>,
+        protocol_config: ProtocolConfig,
+        config: NodeConfig,
+        catalog: Arc<PreinstalledModuleCatalog>,
+        created_checkpoint: u64,
+    ) -> Router
+    where
+        S: IndexedOutboxRepository + Send + Sync + 'static,
+        C: Clock + Send + Sync + 'static,
+    {
+        let machine: Arc<IncrementMachine> = Arc::new(IncrementMachine::new(config.state_key()));
+        preinstalled_wasm_structured_durable_router(
+            StructuredDurableNativeComponents::new(
+                store,
+                transport,
+                clock,
+                Arc::new(SequenceIndexedIdentities::default()),
+            ),
+            PreinstalledWasmComposition::new(catalog, WasmExecutionEngine, created_checkpoint),
+            protocol_config,
+            structured_request_authority(),
+            config,
+            resolver(),
+            machine,
+            NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+        )
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn preinstalled_app_with_cancellation<S>(
+        store: Arc<S>,
+        transport: Arc<MemoryTransport>,
+        clock: Arc<ManualClock>,
+        protocol_config: ProtocolConfig,
+        config: NodeConfig,
+        catalog: Arc<PreinstalledModuleCatalog>,
+        created_checkpoint: u64,
+        cancellation: Arc<dyn InvocationCancellation>,
+    ) -> Router
+    where
+        S: IndexedOutboxRepository + Send + Sync + 'static,
+    {
+        let machine = Arc::new(IncrementMachine::new(config.state_key()));
+        preinstalled_wasm_structured_durable_router(
+            StructuredDurableNativeComponents::with_cancellation(
+                store,
+                transport,
+                clock,
+                Arc::new(SequenceIndexedIdentities::default()),
+                cancellation,
+            ),
+            PreinstalledWasmComposition::new(catalog, WasmExecutionEngine, created_checkpoint),
+            protocol_config,
+            structured_request_authority(),
+            config,
+            resolver(),
+            machine,
+            NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+        )
+        .unwrap()
+    }
+
     async fn assert_submit_rejected_before_side_effects_with_config(
         body: Vec<u8>,
         protocol_config: ProtocolConfig,
@@ -3662,6 +4361,104 @@ mod tests {
                 },
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "object-body-too-large",
+            ),
+            (
+                NodeCoreError::PreinstalledModuleUnknown {
+                    module_id: ModuleId::new([0x63; 32]),
+                    version: 1,
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "preinstalled-module-unknown",
+            ),
+            (
+                NodeCoreError::PreinstalledModuleInactive {
+                    module_id: ModuleId::new([0x63; 32]),
+                    version: 1,
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "preinstalled-module-inactive",
+            ),
+            (
+                NodeCoreError::PreinstalledModuleNotYetActive {
+                    module_id: ModuleId::new([0x63; 32]),
+                    version: 1,
+                    activation_epoch: Epoch::new(9),
+                    current_epoch: Epoch::new(7),
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "preinstalled-module-not-yet-active",
+            ),
+            (
+                NodeCoreError::PreinstalledModuleReferenceDigestMismatch {
+                    module_id: ModuleId::new([0x63; 32]),
+                    version: 1,
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "preinstalled-module-reference-invalid",
+            ),
+            (
+                NodeCoreError::PreinstalledModuleArgsTooLarge {
+                    module_id: ModuleId::new([0x63; 32]),
+                    version: 1,
+                    actual: 128,
+                    maximum: 64,
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "preinstalled-module-args-too-large",
+            ),
+            (
+                NodeCoreError::PreinstalledModuleGasLimitExceedsCeiling {
+                    requested: 20_000_000,
+                    maximum: 10_000_000,
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "preinstalled-module-gas-limit-exceeded",
+            ),
+            (
+                NodeCoreError::PreinstalledModuleZeroObjectAccess,
+                StatusCode::BAD_REQUEST,
+                "preinstalled-module-zero-object-access",
+            ),
+            (
+                NodeCoreError::PreinstalledModuleNotCataloged {
+                    module_id: ModuleId::new([0x63; 32]),
+                    version: 1,
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "preinstalled-module-catalog-mismatch",
+            ),
+            (
+                NodeCoreError::PreinstalledModuleCodeHashMismatch {
+                    module_id: ModuleId::new([0x63; 32]),
+                    version: 1,
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "preinstalled-module-catalog-mismatch",
+            ),
+            (
+                NodeCoreError::PreinstalledModuleManifestHashMismatch {
+                    module_id: ModuleId::new([0x63; 32]),
+                    version: 1,
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "preinstalled-module-catalog-mismatch",
+            ),
+            (
+                NodeCoreError::PreinstalledModuleSemanticsHashMismatch {
+                    module_id: ModuleId::new([0x63; 32]),
+                    version: 1,
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "preinstalled-module-catalog-mismatch",
+            ),
+            (
+                NodeCoreError::ObjectCreatedCheckpointRegression {
+                    object_id,
+                    previous_created_checkpoint: 9,
+                    attempted_created_checkpoint: 5,
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "object-created-checkpoint-regression",
             ),
         ];
 
@@ -4482,6 +5279,772 @@ mod tests {
             "durable-storage-unavailable"
         );
         assert!(transport.drain_outbound().unwrap().is_empty());
+    }
+
+    // ── preinstalled-WASM structured durable route ──────────────────────
+
+    #[tokio::test]
+    async fn preinstalled_route_write_commits_accepted_and_advances_object_version_and_nonce_receipt()
+     {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xB1; 32]).unwrap();
+        let module_id = ModuleId::new([0x70; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &resolver(),
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+        );
+        let protocol_config = preinstalled_protocol_config(domain, registry);
+        let signing_key = dev_signing_key(0x51);
+        let sender = dev_sender_address(&signing_key);
+        let setup_context = DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(20_000).unwrap(),
+            StorageCorrelationId::new([0xB1; 16]).unwrap(),
+        );
+        let write_object = owned_object(ObjectId::new([0xB2; 32]), sender, 0x40);
+        let write_ref = commit_owned_object(
+            store.as_ref(),
+            &setup_context,
+            domain,
+            write_object,
+            "sunrise-test",
+            9,
+            0x41,
+        );
+        let write_object_id = write_ref.id;
+        let catalog = Arc::new(catalog);
+        let app = preinstalled_app(
+            Arc::clone(&store),
+            Arc::clone(&transport),
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+            Arc::clone(&catalog),
+            9,
+        );
+        let mut manifest = AccessManifest::new();
+        manifest.push(AccessEntry {
+            object_ref: write_ref,
+            mode: AccessMode::Write,
+        });
+        let id = request_id(0xB3);
+        let event = signed_preinstalled_wasm_submit_transaction_event(
+            &signing_key,
+            id,
+            0,
+            manifest.clone(),
+            module_ref.clone(),
+            vec![1, 2],
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event.encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+            .await
+            .unwrap();
+        let result = HttpNodeResult::decode(&bytes).unwrap();
+        assert_eq!(result.responses().len(), 1);
+        assert_eq!(result.responses()[0].status(), NodeResponseStatus::Accepted);
+        assert!(result.responses()[0].payload().is_some());
+
+        let write_head = store
+            .get_object_head(&setup_context, domain, write_object_id)
+            .unwrap();
+        assert_eq!(write_head.object_version(), DurableObjectVersion::new(2));
+        let write_v2 = store
+            .get_object_version(
+                &setup_context,
+                domain,
+                write_object_id,
+                DurableObjectVersion::new(2).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            write_v2.payload().inline().unwrap().object().data,
+            vec![0xCA, 0xFE]
+        );
+        assert!(
+            store
+                .get_request_receipt(
+                    &setup_context,
+                    domain,
+                    DurableRequestId::new(*id.as_bytes()).unwrap()
+                )
+                .unwrap()
+                .is_some()
+        );
+
+        // A fresh request at the same already-spent nonce fails with a
+        // conflict, proving the nonce advanced past 0.
+        let replay_nonce_event = signed_preinstalled_wasm_submit_transaction_event(
+            &signing_key,
+            request_id(0xB4),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        let nonce_response = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(replay_nonce_event.encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(nonce_response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            to_bytes(nonce_response.into_body(), 128).await.unwrap(),
+            "sender-nonce-mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn preinstalled_route_exact_duplicate_does_not_reexecute_or_reapply() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xB5; 32]).unwrap();
+        let module_id = ModuleId::new([0x71; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &resolver(),
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+        );
+        let protocol_config = preinstalled_protocol_config(domain, registry);
+        let signing_key = dev_signing_key(0x52);
+        let sender = dev_sender_address(&signing_key);
+        let setup_context = DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(20_000).unwrap(),
+            StorageCorrelationId::new([0xB5; 16]).unwrap(),
+        );
+        let write_object = owned_object(ObjectId::new([0xB6; 32]), sender, 0x42);
+        let write_ref = commit_owned_object(
+            store.as_ref(),
+            &setup_context,
+            domain,
+            write_object,
+            "sunrise-test",
+            9,
+            0x43,
+        );
+        let write_object_id = write_ref.id;
+        let catalog = Arc::new(catalog);
+        let app = preinstalled_app(
+            Arc::clone(&store),
+            Arc::clone(&transport),
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+            catalog,
+            9,
+        );
+        let mut manifest = AccessManifest::new();
+        manifest.push(AccessEntry {
+            object_ref: write_ref,
+            mode: AccessMode::Write,
+        });
+        let event = signed_preinstalled_wasm_submit_transaction_event(
+            &signing_key,
+            request_id(0xB7),
+            0,
+            manifest,
+            module_ref,
+            vec![3, 4],
+        );
+        let body = event.encode().unwrap();
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_bytes = to_bytes(first.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+            .await
+            .unwrap();
+
+        let second = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_bytes = to_bytes(second.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+            .await
+            .unwrap();
+
+        assert_eq!(first_bytes, second_bytes);
+        let write_head = store
+            .get_object_head(&setup_context, domain, write_object_id)
+            .unwrap();
+        assert_eq!(write_head.object_version(), DurableObjectVersion::new(2));
+    }
+
+    #[tokio::test]
+    async fn preinstalled_route_replay_after_sqlite_reopen_returns_persisted_result() {
+        let database = TestDatabase::new();
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let chain = ChainId::new("sunrise-test").unwrap();
+        let validator = ValidatorId::new([0x44; 32]);
+        let domain = AtomicityDomainId::new([0xB8; 32]).unwrap();
+        let namespace = SqliteNamespace::new(chain, validator, domain);
+        let config = config();
+        let module_id = ModuleId::new([0x72; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &resolver(),
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+        );
+        let protocol_config = preinstalled_protocol_config(domain, registry);
+        let catalog = Arc::new(catalog);
+        let signing_key = dev_signing_key(0x53);
+        let sender = dev_sender_address(&signing_key);
+        let id = request_id(0xB9);
+        let mut manifest = AccessManifest::new();
+
+        let first_bytes = {
+            let store = Arc::new(
+                SqliteDurableStore::open(&database.path, namespace.clone(), fence).unwrap(),
+            );
+            let setup_context = live_operation_context(fence, 0xB9);
+            let write_object = owned_object(ObjectId::new([0xBA; 32]), sender, 0x44);
+            let write_ref = commit_owned_object(
+                store.as_ref(),
+                &setup_context,
+                domain,
+                write_object,
+                "sunrise-test",
+                9,
+                0x45,
+            );
+            manifest.push(AccessEntry {
+                object_ref: write_ref,
+                mode: AccessMode::Write,
+            });
+            let app = preinstalled_app(
+                Arc::clone(&store),
+                Arc::new(MemoryTransport::default()),
+                Arc::new(SystemClock),
+                protocol_config.clone(),
+                config.clone(),
+                Arc::clone(&catalog),
+                9,
+            );
+            let event = signed_preinstalled_wasm_submit_transaction_event(
+                &signing_key,
+                id,
+                0,
+                manifest.clone(),
+                module_ref.clone(),
+                vec![5, 6],
+            );
+            let response = app
+                .oneshot(
+                    Request::post(NODE_EVENT_PATH)
+                        .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                        .body(Body::from(event.encode().unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            to_bytes(response.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+                .await
+                .unwrap()
+        };
+
+        let reopened =
+            Arc::new(SqliteDurableStore::open(&database.path, namespace, fence).unwrap());
+
+        // Directly prove the durable receipt survived the close/reopen,
+        // independent of the exact-replay HTTP round trip below.
+        let receipt_context = live_operation_context(fence, 0xBC);
+        assert!(
+            reopened
+                .get_request_receipt(
+                    &receipt_context,
+                    domain,
+                    DurableRequestId::new(*id.as_bytes()).unwrap(),
+                )
+                .unwrap()
+                .is_some()
+        );
+
+        let replay_app = preinstalled_app(
+            Arc::clone(&reopened),
+            Arc::new(MemoryTransport::default()),
+            Arc::new(SystemClock),
+            protocol_config.clone(),
+            config.clone(),
+            Arc::clone(&catalog),
+            9,
+        );
+        let replay_event = signed_preinstalled_wasm_submit_transaction_event(
+            &signing_key,
+            id,
+            0,
+            manifest.clone(),
+            module_ref.clone(),
+            vec![5, 6],
+        );
+        let replay_response = replay_app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(replay_event.encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay_response.status(), StatusCode::OK);
+        let replay_bytes = to_bytes(replay_response.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(first_bytes, replay_bytes);
+
+        let read_context = live_operation_context(fence, 0xBB);
+        let write_head = reopened
+            .get_object_head(&read_context, domain, ObjectId::new([0xBA; 32]))
+            .unwrap();
+        assert_eq!(write_head.object_version(), DurableObjectVersion::new(2));
+
+        // A fresh request ID at the already-spent nonce 0, with the same
+        // module/object access, conflicts. Exact replay above reconciles
+        // from the persisted receipt before ever checking the nonce, so this
+        // proves the sender-nonce record itself survived reopen, not just
+        // the receipt.
+        let nonce_probe_app = preinstalled_app(
+            reopened,
+            Arc::new(MemoryTransport::default()),
+            Arc::new(SystemClock),
+            protocol_config,
+            config,
+            catalog,
+            9,
+        );
+        let nonce_probe_event = signed_preinstalled_wasm_submit_transaction_event(
+            &signing_key,
+            request_id(0xBD),
+            0,
+            manifest,
+            module_ref,
+            vec![5, 6],
+        );
+        let nonce_probe_response = nonce_probe_app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(nonce_probe_event.encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(nonce_probe_response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            to_bytes(nonce_probe_response.into_body(), 128)
+                .await
+                .unwrap(),
+            "sender-nonce-mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn preinstalled_route_trap_returns_rejected_and_leaves_object_unchanged() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xBC; 32]).unwrap();
+        let module_id = ModuleId::new([0x73; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &resolver(),
+            module_id,
+            1,
+            preinstalled_trap_wasm_bytes(),
+            64,
+        );
+        let protocol_config = preinstalled_protocol_config(domain, registry);
+        let signing_key = dev_signing_key(0x54);
+        let sender = dev_sender_address(&signing_key);
+        let setup_context = DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(20_000).unwrap(),
+            StorageCorrelationId::new([0xBC; 16]).unwrap(),
+        );
+        let write_object = owned_object(ObjectId::new([0xBD; 32]), sender, 0x46);
+        let write_ref = commit_owned_object(
+            store.as_ref(),
+            &setup_context,
+            domain,
+            write_object,
+            "sunrise-test",
+            9,
+            0x47,
+        );
+        let write_object_id = write_ref.id;
+        let catalog = Arc::new(catalog);
+        let app = preinstalled_app(
+            Arc::clone(&store),
+            Arc::clone(&transport),
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+            catalog,
+            9,
+        );
+        let mut manifest = AccessManifest::new();
+        manifest.push(AccessEntry {
+            object_ref: write_ref,
+            mode: AccessMode::Write,
+        });
+        let id = request_id(0xBE);
+        let event = signed_preinstalled_wasm_submit_transaction_event(
+            &signing_key,
+            id,
+            0,
+            manifest.clone(),
+            module_ref.clone(),
+            vec![7, 8],
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event.encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+            .await
+            .unwrap();
+        let result = HttpNodeResult::decode(&bytes).unwrap();
+        assert_eq!(result.responses().len(), 1);
+        assert_eq!(result.responses()[0].status(), NodeResponseStatus::Rejected);
+
+        let write_head = store
+            .get_object_head(&setup_context, domain, write_object_id)
+            .unwrap();
+        assert_eq!(write_head.object_version(), DurableObjectVersion::new(1));
+
+        // The trap still consumed the nonce: a fresh request at the same
+        // nonce conflicts.
+        let replay_nonce_event = signed_preinstalled_wasm_submit_transaction_event(
+            &signing_key,
+            request_id(0xBF),
+            0,
+            manifest,
+            module_ref,
+            vec![7, 8],
+        );
+        let nonce_response = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(replay_nonce_event.encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(nonce_response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            to_bytes(nonce_response.into_body(), 128).await.unwrap(),
+            "sender-nonce-mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn preinstalled_route_zero_object_call_rejects_before_storage_dispatch() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let inner = MemoryDurableStateStore::new(fence);
+        inner.set_time(10_000);
+        let cancellation = Arc::new(ManualCancellation::default());
+        let store = Arc::new(CancelOnFirstReceiptReadStore::new(
+            inner,
+            Arc::clone(&cancellation),
+        ));
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xC0; 32]).unwrap();
+        let module_id = ModuleId::new([0x74; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &resolver(),
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+        );
+        let protocol_config = preinstalled_protocol_config(domain, registry);
+        let signing_key = dev_signing_key(0x55);
+        let catalog = Arc::new(catalog);
+        let app = preinstalled_app(
+            Arc::clone(&store),
+            Arc::clone(&transport),
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+            catalog,
+            9,
+        );
+        let id = request_id(0xC1);
+        let event = signed_preinstalled_wasm_submit_transaction_event(
+            &signing_key,
+            id,
+            0,
+            AccessManifest::new(),
+            module_ref,
+            vec![1],
+        );
+
+        let response = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event.encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "preinstalled-module-zero-object-access"
+        );
+        // `CancelOnFirstReceiptReadStore` flips this signal the moment
+        // `get_request_receipt` is first dispatched, so it staying false
+        // directly proves the structured durable path never reached its
+        // first storage read for this rejected call.
+        assert!(!cancellation.is_cancelled());
+        assert_eq!(store.receipt_reads(), 0);
+        let read_context = DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(20_000).unwrap(),
+            StorageCorrelationId::new([0xC1; 16]).unwrap(),
+        );
+        assert_eq!(
+            store
+                .inner
+                .get_request_receipt(
+                    &read_context,
+                    domain,
+                    DurableRequestId::new(*id.as_bytes()).unwrap()
+                )
+                .unwrap(),
+            None
+        );
+        assert!(transport.drain_outbound().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn structured_route_still_rejects_write_and_consume_access() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xC2; 32]).unwrap();
+        let protocol_config = active_protocol_config(domain);
+        let app = structured_app(
+            Arc::clone(&store),
+            Arc::clone(&transport),
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+        );
+        let signing_key = dev_signing_key(0x56);
+        let sender = dev_sender_address(&signing_key);
+
+        for (byte, mode) in [(0xC3_u8, AccessMode::Write), (0xC4_u8, AccessMode::Consume)] {
+            let mut tx = unsigned_transaction(
+                sender,
+                ChainId::new("sunrise-test").unwrap(),
+                Epoch::new(7),
+                0,
+            );
+            tx.access_manifest.push(AccessEntry {
+                object_ref: ObjectRef {
+                    id: ObjectId::new([byte; 32]),
+                    version: 1,
+                    digest: Digest32::new(HashAlgorithmId::Sha2_256, [byte; 32]),
+                },
+                mode,
+            });
+            let signed_bytes = signed_transaction_bytes(&signing_key, &tx);
+            let event = submit_transaction_event(request_id(byte), signed_bytes);
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(NODE_EVENT_PATH)
+                        .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                        .body(Body::from(event.encode().unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+            assert_eq!(
+                to_bytes(response.into_body(), 128).await.unwrap(),
+                "object-mutating-access-unsupported"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preinstalled_route_rejects_cancellation_before_storage_dispatch() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xC5; 32]).unwrap();
+        let protocol_config = active_protocol_config(domain);
+        let cancellation: Arc<ManualCancellation> = Arc::new(ManualCancellation::default());
+        cancellation.cancel();
+        let catalog = Arc::new(PreinstalledModuleCatalog::new(Vec::new()).unwrap());
+        let app = preinstalled_app_with_cancellation(
+            Arc::clone(&store),
+            Arc::clone(&transport),
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+            catalog,
+            9,
+            cancellation,
+        );
+
+        let response = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event(request_id(0xC6)).encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "invocation-cancelled-before-storage"
+        );
+        assert!(transport.drain_outbound().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn preinstalled_route_admission_rejects_when_blocking_capacity_exhausted() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xC7; 32]).unwrap();
+        let protocol_config = active_protocol_config(domain);
+        let blocking_executor =
+            NativeBlockingExecutor::new(NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap()));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let machine = Arc::new(BlockingMachine {
+            inner: IncrementMachine::new(config.state_key()),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let catalog = Arc::new(PreinstalledModuleCatalog::new(Vec::new()).unwrap());
+        let app = preinstalled_wasm_structured_durable_router_with_executor(
+            StructuredDurableNativeComponents::new(
+                store,
+                transport,
+                Arc::new(ManualClock::new(10_000)),
+                Arc::new(SequenceIndexedIdentities::default()),
+            ),
+            PreinstalledWasmComposition::new(catalog, WasmExecutionEngine, 9),
+            protocol_config,
+            structured_request_authority(),
+            config,
+            resolver(),
+            machine,
+            blocking_executor.clone(),
+        )
+        .unwrap();
+
+        let first_app = app.clone();
+        let first = tokio::spawn(async move {
+            first_app
+                .oneshot(
+                    Request::post(NODE_EVENT_PATH)
+                        .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                        .body(Body::from(event(request_id(0xC8)).encode().unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        entered.notified().await;
+
+        let overloaded = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event(request_id(0xC9)).encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let (released, release_signal) = release.as_ref();
+        *released.lock().unwrap() = true;
+        release_signal.notify_all();
+        let first = first.await.unwrap();
+
+        assert_eq!(overloaded.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            to_bytes(overloaded.into_body(), 128).await.unwrap(),
+            "blocking-capacity-exhausted"
+        );
+        assert_eq!(first.status(), StatusCode::OK);
     }
 
     #[tokio::test]

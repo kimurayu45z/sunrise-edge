@@ -869,8 +869,10 @@ dependencies = [
  "protocol-types",
  "runtime",
  "runtime-sqlite",
+ "system-modules",
  "tokio",
  "tower",
+ "wat",
 ]
 
 [[package]]

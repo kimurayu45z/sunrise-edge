@@ -1759,8 +1759,9 @@ Developer MVP completion criteria:
    mutationへのpure translation（implemented As-Is）。
 2. trusted executionから得たWrite/Consume effectsをstructured durable invocationへ接続し、
    exact object head assertionとmutationをnonce/state/receipt/outboxとatomic commitする
-   additive node-core entrypoint（implemented As-Is）。generic/read-only/native HTTP経路は
-   引き続きWrite/Consumeをstorage I/O前に拒否する。
+   additive node-core entrypoint（implemented As-Is）。generic/read-only経路
+   （`structured_durable_router`を含む）は引き続きWrite/Consumeをstorage I/O前に拒否する
+   （step 5の`preinstalled_wasm_structured_durable_router`のみ例外）。
 3. committed `ProtocolConfig`から固定したactive system-module registryとbounded immutable
    preinstalled catalogのcode/manifest/semantics commitmentを照合し、object-onlyの
    deterministic WASM executionをowned-effects atomic durable entrypointへ接続する
@@ -1768,7 +1769,8 @@ Developer MVP completion criteria:
    epoch-only hash-suite rotation後もreadableとする。専用`SystemModuleManifest` hash purpose、
    pre-activation gas ceiling、engine-independent trap normalizationを適用し、canonical
    `ExecutionEffects`をresponseへ返す。trapはobject mutationなしのRejected receipt/nonceとして
-   commitする。zero-object callはこのMVP pathでは明示的に拒否し、native HTTP/devnet wiringは未実装。
+   commitする。zero-object callはこのMVP pathでは明示的に拒否する。native HTTP wiringはstep 5で
+   実装済み（implemented As-Is）、devnet binary/startup wiringは未実装。
 4. local devnet/query API、TypeScript client、counter demo UI、restart/duplicate E2Eを順に追加する。
    前提として、`runtime-sqlite`へ`StructuredDurableDomainStateStore`/`IndexedOutboxRepository`を
    実装するadditive、local-only、non-productionな`SqliteDurableStore`を追加済み
@@ -1796,7 +1798,34 @@ Developer MVP completion criteria:
    `RequestAlreadyCommitted`・reopen後のoutbox acknowledgement冪等性を含むrestart persistence
    test、short deadlineがfixed busy timeoutを待たないことを示すbounded contention testで検証済み。
    corruption testはrepresentativeなstrict-decode/cross-checkルールを検証するものであり、
-   すべてのルールを網羅しているわけではない。native devnet/node-coreへの接続は次のPRで行う。
+   すべてのルールを網羅しているわけではない。native-http経路への接続はstep 5で実装済み
+   （implemented As-Is）、devnet binary/startup wiringは未実装。
+5. DR-0078のpreinstalled-WASM entrypointを新しいadditive `native-http`合成
+   （`preinstalled_wasm_structured_durable_router`/`_with_executor`）経由でHTTPへ公開する
+   （implemented As-Is）。既存の`structured_durable_router`はread-only entrypointのまま変更しない。
+   両routerは認証済み準備・storage context構築・exact request-scoped outbox claim/send/ack pathを
+   共有する1つのprivate core（`invoke_structured_durable_event_with_execution`）を、小さなprivate
+   `StructuredDurableAuthenticatedExecution` policy enum（`ReadOnly`/`PreinstalledWasm`）で
+   parameterizeして再利用し、重複させない。新しいpublic `PreinstalledWasmComposition`は
+   `Arc<PreinstalledModuleCatalog>`・zero-sizedな`execution::WasmExecutionEngine`・
+   `created_checkpoint: u64`のみを保持するcomposition-trusted inputで、HTTP request bytesや
+   wall clockからは決して取得しない。新routerの`SubmitTransaction`は
+   `handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution`を
+   呼び、他のevent kindは既存のgeneric machine pathのままとする。blocking admissionと
+   pre-storage-dispatch cancellationは両routerで同一のsemanticsを保つ。coarse HTTP error
+   classificationを拡張し、malformed/inactive/unknown module referenceとargs/gas/zero-object
+   requestは引き続きdeterministic client error、catalog/commitment mismatchと
+   `ObjectCreatedCheckpointRegression`はhost/operator failureとして分類する（内部詳細は
+   leakしない）。fixtureはすべて`HashSuiteResolver`/canonical encoderから計算し、pasted digestを
+   使わない。Create、Shared/System、blob、native binary/devnet startup wiring、query API、
+   TypeScript client、UI、arbitrary upload、fees/meteringは引き続きこのstepの範囲外。
+
+**Repository-boundary decision**: Developer MVP completion criteria 5/6の TypeScript client library
+とcounter demo UIは、Developer MVP Gateを通過するまでこのmonorepo内に留め、実装時点で
+`clients/typescript`/`demo/counter`というtop-levelディレクトリとする（ARCHITECTURE.md DR-0080）。
+別repoへのextractionは、(a) canonical wire contracts/共有test vectorsが安定し、(b) 実際の
+independent consumerまたは独立したrelease cadenceが存在し、(c) E2Eがin-tree buildではなく
+releaseされたdevnet artifactをtargetできるようになるまで延期する。
 
 Phase 1:
 - workspace
