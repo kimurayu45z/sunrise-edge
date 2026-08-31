@@ -1418,11 +1418,11 @@ separate work.
 
 ## 42. Local devnet architecture
 
-DR-0081 fixes the local devnet's architecture ahead of its implementation so
+DR-0081 fixed the local devnet's architecture ahead of its implementation so
 the client/app work that depends on it can target a stable contract. The
 devnet composes the existing `preinstalled_wasm_structured_durable_router`
-around a dedicated startup binary in `apps/devnet` (planned; not yet
-implemented) rather than introducing new protocol behavior:
+around a dedicated startup binary in `apps/devnet` rather than introducing new
+protocol behavior:
 
 - **Strict loopback startup.** The devnet binds only a loopback address
   (`127.0.0.1`/`::1`); it never binds a non-loopback interface, and
@@ -1434,8 +1434,8 @@ implemented) rather than introducing new protocol behavior:
   accessor, advances that exact value with checked arithmetic, and uses the
   result as that process's boot generation and `created_checkpoint`. It never
   invents an in-memory substitute for missing or invalid durable metadata.
-  The accessor is part of the planned devnet implementation slice; it does not
-  exist yet. This flow makes boot generations non-decreasing across restarts
+  The implemented accessor and startup flow make boot generations
+  non-decreasing across restarts
   and fences stale request contexts from a prior process.
 - **SQLite structured store.** State, object, receipt, and outbox data use the
   additive, local-only, non-production `SqliteDurableStore` (DR-0079), never
@@ -1508,12 +1508,17 @@ implemented) rather than introducing new protocol behavior:
   constraints" and the scheduler-callable recovery API above), consistent with
   treating process lifetime as a non-requirement.
 
-Current vs. planned: `apps/devnet` now exists with strict loopback-only
-configuration, persisted writer-fence advancement across SQLite reopen, and a
-restart-safe bounded identity source. Its binary deliberately reports that the
-native request composition is not wired and serves no HTTP yet; registry/
-catalog composition, asset-account seeding/module execution, and the real
-router remain planned. No other `clients/*`/`apps/*` path from DR-0081 exists.
+Current vs. planned: `apps/devnet` now has strict loopback-only configuration,
+persisted writer-fence advancement across SQLite reopen, a restart-safe
+bounded identity source, exact canonical asset-account codecs/vectors, a
+committed WAT/WASM module, reconciled registry/catalog composition, and atomic
+restart-idempotent account seeding. Its binary composes those pieces into the
+bounded preinstalled-WASM native router and serves HTTP on the configured
+loopback address. Live smoke validation observed a `204` liveness response and
+verified the same seeded object IDs after reopening under the next writer
+generation. A signed duplicate-transfer HTTP E2E is still planned; direct WASM
+tests already prove successful same-asset movement and effect-free rejection
+of mixed asset IDs. No other `clients/*`/`apps/*` path from DR-0081 exists.
 The bounded query API (chain/
 context info, object reads, receipts, and an authenticated sender's next
 nonce) is the next separate implementation slice after the devnet binary

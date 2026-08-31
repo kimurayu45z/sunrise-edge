@@ -13,6 +13,8 @@ use std::{
 
 /// Hard admission ceiling for the local-only devnet.
 pub const MAX_DEVNET_CONCURRENCY: usize = 1_024;
+/// Maximum development owners seeded by one local process boot.
+pub const MAX_DEVNET_OWNERS: usize = 64;
 
 /// One browser/client-controlled development owner address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -123,6 +125,11 @@ impl DevnetConfig {
                     epoch = Some(Epoch::new(parsed));
                 }
                 "--dev-owner" => {
+                    if dev_owners.len() >= MAX_DEVNET_OWNERS {
+                        return Err(DevnetConfigError::TooManyDevOwners {
+                            maximum: MAX_DEVNET_OWNERS,
+                        });
+                    }
                     let value: String = required_utf8_value(&mut iterator, "--dev-owner")?;
                     let owner: DevOwner = parse_dev_owner(&value)?;
                     if dev_owners.contains(&owner) {
@@ -295,6 +302,11 @@ pub enum DevnetConfigError {
     MaxConcurrentOutOfRange(usize),
     /// No development owner was supplied.
     MissingDevOwner,
+    /// More development owners were supplied than one boot may seed.
+    TooManyDevOwners {
+        /// Maximum owner count accepted by one process.
+        maximum: usize,
+    },
     /// A development owner was not exactly 32 bytes of hexadecimal.
     InvalidDevOwner(String),
     /// A development owner appeared more than once.
@@ -328,6 +340,9 @@ impl fmt::Display for DevnetConfigError {
                 "--max-concurrent must be in 1..={MAX_DEVNET_CONCURRENCY}, got {value}"
             ),
             Self::MissingDevOwner => f.write_str("at least one --dev-owner is required"),
+            Self::TooManyDevOwners { maximum } => {
+                write!(f, "at most {maximum} --dev-owner values are accepted")
+            }
             Self::InvalidDevOwner(value) => write!(
                 f,
                 "--dev-owner must be exactly 64 hexadecimal characters, got {value:?}"
@@ -429,6 +444,25 @@ mod tests {
         assert!(matches!(
             DevnetConfig::parse_from(duplicate),
             Err(DevnetConfigError::DuplicateDevOwner(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_more_than_the_bounded_owner_count() {
+        let mut args: Vec<OsString> = valid_args();
+        args.drain(8..10);
+        let max_concurrent: Vec<OsString> = args.split_off(8);
+        for value in 1..=(MAX_DEVNET_OWNERS + 1) {
+            args.push(OsString::from("--dev-owner"));
+            args.push(OsString::from(format!("{value:064x}")));
+        }
+        args.extend(max_concurrent);
+
+        assert!(matches!(
+            DevnetConfig::parse_from(args),
+            Err(DevnetConfigError::TooManyDevOwners {
+                maximum: MAX_DEVNET_OWNERS
+            })
         ));
     }
 

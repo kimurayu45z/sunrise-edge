@@ -1789,7 +1789,7 @@ explicit dev limitations）:
    pre-activation gas ceiling、engine-independent trap normalizationを適用し、canonical
    `ExecutionEffects`をresponseへ返す。trapはobject mutationなしのRejected receipt/nonceとして
    commitする。zero-object callはこのMVP pathでは明示的に拒否する。native HTTP wiringはstep 4で
-   実装済み（implemented As-Is）、devnet binary/startup wiringは未実装。
+   実装済み（implemented As-Is）、devnet binary/startup wiringもstep 5で実装済み。
 4. DR-0078のpreinstalled-WASM entrypointを新しいadditive `native-http`合成
    （`preinstalled_wasm_structured_durable_router`/`_with_executor`）経由でHTTPへ公開する
    （implemented As-Is）。既存の`structured_durable_router`はread-only entrypointのまま変更しない。
@@ -1864,9 +1864,13 @@ explicit dev limitations）:
    test、short deadlineがfixed busy timeoutを待たないことを示すbounded contention testで検証済み。
    corruption testはrepresentativeなstrict-decode/cross-checkルールを検証するものであり、
    すべてのルールを網羅しているわけではない。native-http経路への接続はstep 4で実装済み
-   （implemented As-Is）。`apps/devnet`のstrict config、SQLite writer-fence boot、
-   restart-safe identity sourceまでは実装済みだが、binaryは未接続を明示してHTTPをserveせず、
-   catalog/module、seed、native routerのstartup wiringは未実装。
+   （implemented As-Is）。`apps/devnet`はstrict config、SQLite writer-fence boot、restart-safe
+   identity source、canonical asset-account codec/stable vector、preinstalled WASM/catalog、
+   2-accountのatomicかつrestart-idempotentなseed、startup registry/catalog reconciliation、
+   bounded native routerのstartup wiringまで実装済み（implemented As-Is）。binaryはloopbackで
+   HTTPをserveし、live smokeで`204` livenessと、同一account IDを保った次writer generationでの
+   再起動を検証済み。WASM単体実行は同一`AssetId`の送金成功と異なる`AssetId`のeffectなし拒否を
+   直接検証する。bounded query APIとsigned duplicate-transfer HTTP E2Eは未実装で、次のsliceに残る。
 
 **Repository-boundary decision**（ARCHITECTURE.md DR-0081；DR-0080の同名決定のうち
 repository-boundary/counter-demo deliverableのみを置き換える。DR-0080に記録された

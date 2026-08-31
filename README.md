@@ -560,12 +560,12 @@ any `clients/*` directory into its own repository remains deferred until the
 canonical contracts/vectors are stable, a real independent consumer or release
 cadence exists, and E2E can target a released devnet artifact.
 
-The planned devnet demonstration contract will be a preinstalled
+The devnet demonstration contract is a preinstalled
 `sunrise.devnet.asset_account.v1` module with one `transfer` entrypoint
 between two ordinary, same-sender-owned asset-account objects, using the same
 single `AssetId`/account/transfer path as every other asset — there is no
-privileged native coin or special-cased balance/transfer/fee path. It will
-enforce conservation and fail closed on zero amount, underflow, overflow, and
+privileged native coin or special-cased balance/transfer/fee path. It enforces
+conservation and fails closed on zero amount, underflow, overflow, and
 asset-ID mismatch.
 Because cross-owner destination authorization and object owner changes remain
 fail-closed on the existing owned-effects path, this demonstrates only
@@ -574,12 +574,16 @@ registry stays empty and every transaction commits with `fee_payment: None`.
 The MVP remains single-validator, owned-object only, fee-free, local-SQLite,
 and explicitly non-production.
 
-The first `apps/devnet` foundation is implemented: strict loopback-only CLI
-configuration, durable SQLite writer-fence advancement on every boot, and
-restart-safe bounded outbox identities. Its binary intentionally prints that
-the native router is not wired and does not serve HTTP yet. Catalog/module
-composition, asset-account seeding, and request E2E remain the next devnet
-implementation slice; this foundation is not the completed devnet criterion.
+`apps/devnet` now composes strict loopback-only CLI configuration, durable
+SQLite writer-fence advancement on every boot, restart-safe bounded outbox
+identities, canonical asset-account frames and stable vectors, a committed
+preinstalled WASM module/catalog, idempotent two-account seeding, and the
+bounded native HTTP router. Startup reconciles the registry/catalog and
+verifies existing seed lineage instead of resetting balances. Live local
+smoke evidence covers a `204` liveness response and restart with the same
+account IDs under the next writer generation. The bounded query API and a
+signed duplicate-transfer HTTP E2E remain the next slices; this is not yet the
+completed devnet criterion.
 
 The Phase 15-17 production exit criteria and accepted persistence designs are
 preserved. Additional capacity/load/soak evidence, PITR, HA/failover,

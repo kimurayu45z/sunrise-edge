@@ -1,6 +1,6 @@
 //! Persisted writer-fence startup for the local devnet.
 
-use crate::config::DevnetConfig;
+use crate::{config::DevnetConfig, genesis::DEVNET_DOMAIN_BYTES};
 use protocol_types::{AtomicityDomainId, ValidatorId};
 use runtime::WriterFenceGeneration;
 use runtime_sqlite::{SqliteDurableStore, SqliteDurableStoreError, SqliteNamespace};
@@ -10,7 +10,6 @@ use std::{error::Error, fmt, fs, io, path::PathBuf};
 pub const DEVNET_DATABASE_FILE: &str = "structured.sqlite3";
 const INITIAL_WRITER_FENCE_VALUE: u64 = 1;
 const DEVNET_VALIDATOR_BYTES: [u8; 32] = [0x56; 32];
-const DEVNET_DOMAIN_BYTES: [u8; 32] = [0x44; 32];
 
 /// One successfully fenced local devnet boot.
 #[derive(Debug)]
