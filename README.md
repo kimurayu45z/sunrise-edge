@@ -574,6 +574,13 @@ registry stays empty and every transaction commits with `fee_payment: None`.
 The MVP remains single-validator, owned-object only, fee-free, local-SQLite,
 and explicitly non-production.
 
+The first `apps/devnet` foundation is implemented: strict loopback-only CLI
+configuration, durable SQLite writer-fence advancement on every boot, and
+restart-safe bounded outbox identities. Its binary intentionally prints that
+the native router is not wired and does not serve HTTP yet. Catalog/module
+composition, asset-account seeding, and request E2E remain the next devnet
+implementation slice; this foundation is not the completed devnet criterion.
+
 The Phase 15-17 production exit criteria and accepted persistence designs are
 preserved. Additional capacity/load/soak evidence, PITR, HA/failover,
 provider-managed pooler certification, real-provider deployment, provider

@@ -23,6 +23,7 @@ members = [
     "crates/consensus",
     "crates/node-core",
     "crates/native-http",
+    "apps/devnet",
 ]
 resolver = "3"
 

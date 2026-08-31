@@ -1,0 +1,12 @@
+[package]
+name = "sunrise-edge-devnet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+native-http.workspace = true
+node-core.workspace = true
+protocol-types.workspace = true
+runtime.workspace = true
+runtime-sqlite.workspace = true

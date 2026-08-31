@@ -1864,7 +1864,9 @@ explicit dev limitations）:
    test、short deadlineがfixed busy timeoutを待たないことを示すbounded contention testで検証済み。
    corruption testはrepresentativeなstrict-decode/cross-checkルールを検証するものであり、
    すべてのルールを網羅しているわけではない。native-http経路への接続はstep 4で実装済み
-   （implemented As-Is）、devnet binary/startup wiringは未実装。
+   （implemented As-Is）。`apps/devnet`のstrict config、SQLite writer-fence boot、
+   restart-safe identity sourceまでは実装済みだが、binaryは未接続を明示してHTTPをserveせず、
+   catalog/module、seed、native routerのstartup wiringは未実装。
 
 **Repository-boundary decision**（ARCHITECTURE.md DR-0081；DR-0080の同名決定のうち
 repository-boundary/counter-demo deliverableのみを置き換える。DR-0080に記録された

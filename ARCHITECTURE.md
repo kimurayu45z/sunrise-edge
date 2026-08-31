@@ -1481,9 +1481,13 @@ implemented) rather than introducing new protocol behavior:
   constraints" and the scheduler-callable recovery API above), consistent with
   treating process lifetime as a non-requirement.
 
-Current vs. planned: everything above is fixed architecture for `apps/devnet`;
-the binary and its startup wiring are not yet implemented, and neither is any
-`clients/*`/`apps/*` directory from DR-0081. The bounded query API (chain/
+Current vs. planned: `apps/devnet` now exists with strict loopback-only
+configuration, persisted writer-fence advancement across SQLite reopen, and a
+restart-safe bounded identity source. Its binary deliberately reports that the
+native request composition is not wired and serves no HTTP yet; registry/
+catalog composition, asset-account seeding/module execution, and the real
+router remain planned. No other `clients/*`/`apps/*` path from DR-0081 exists.
+The bounded query API (chain/
 context info, object reads, receipts, and an authenticated sender's next
 nonce) is the next separate implementation slice after the devnet binary
 itself, not part of this architecture entry. Known current limitations that
