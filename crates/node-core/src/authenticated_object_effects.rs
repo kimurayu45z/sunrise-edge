@@ -9,7 +9,7 @@ use super::{
     MAX_AUTHENTICATED_OBJECT_BODY_BYTES, MAX_AUTHENTICATED_OBJECT_READS,
     MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES, NodeCoreError,
 };
-use execution::ObjectEffect;
+use execution::{ObjectEffect, ResolvedObject};
 use hashing::HashSuiteResolver;
 use objects::{AccessMode, Object, ObjectId, Owner, encode_object};
 use protocol_types::{ChainId, Epoch, HashPurpose, ProtocolVersion};
@@ -25,11 +25,26 @@ pub(super) struct VerifiedAuthenticatedObject {
     mode: AccessMode,
     head: DurableObjectHead,
     object: Object,
+    /// `created_checkpoint` recorded on the previous
+    /// [`DurableObjectVersionRecord`] loaded from storage for this object,
+    /// used to reject a Write whose trusted context would move the
+    /// checkpoint backwards.
+    previous_created_checkpoint: u64,
 }
 
 impl VerifiedAuthenticatedObject {
-    const fn new(mode: AccessMode, head: DurableObjectHead, object: Object) -> Self {
-        Self { mode, head, object }
+    const fn new(
+        mode: AccessMode,
+        head: DurableObjectHead,
+        object: Object,
+        previous_created_checkpoint: u64,
+    ) -> Self {
+        Self {
+            mode,
+            head,
+            object,
+            previous_created_checkpoint,
+        }
     }
 }
 
@@ -55,15 +70,30 @@ impl LoadedAuthenticatedObjects {
         mode: AccessMode,
         head: DurableObjectHead,
         object: Object,
+        previous_created_checkpoint: u64,
     ) {
         self.reads
             .push(DurableObjectHeadRead::new(object_id, head.clone()));
-        self.verified
-            .push(VerifiedAuthenticatedObject::new(mode, head, object));
+        self.verified.push(VerifiedAuthenticatedObject::new(
+            mode,
+            head,
+            object,
+            previous_created_checkpoint,
+        ));
     }
 
     pub(super) fn verified(&self) -> &[VerifiedAuthenticatedObject] {
         &self.verified
+    }
+
+    pub(super) fn resolved_objects(&self) -> Vec<ResolvedObject> {
+        self.verified
+            .iter()
+            .map(|verified: &VerifiedAuthenticatedObject| ResolvedObject {
+                object: verified.object.clone(),
+                mode: verified.mode,
+            })
+            .collect()
     }
 
     /// Records the already bounds-checked total inline body bytes loaded for
@@ -88,10 +118,10 @@ impl LoadedAuthenticatedObjects {
 /// context (the same `chain_id`, `protocol_version`, and `epoch` the ingress
 /// path verified before dispatch), never from unauthenticated request input.
 /// `created_checkpoint` is trusted verbatim by this module: it is not
-/// re-derived or bounded here, so the future call site that supplies it is
-/// responsible for enforcing that checkpoints are monotonically
-/// non-decreasing across an object's version history before constructing
-/// this context.
+/// re-derived here, but a Write is rejected if it would move the checkpoint
+/// backwards relative to the previous
+/// [`DurableObjectVersionRecord::created_checkpoint`] loaded from storage for
+/// that object (see [`NodeCoreError::ObjectCreatedCheckpointRegression`]).
 pub(super) struct TrustedObjectMutationContext<'a> {
     pub(super) resolver: &'a HashSuiteResolver,
     pub(super) chain_id: &'a ChainId,
@@ -102,10 +132,10 @@ pub(super) struct TrustedObjectMutationContext<'a> {
 
 /// Validates exact signed-access/effect correspondence and builds durable mutations.
 ///
-/// The current live handler calls this with an empty effect list after loading
-/// read-only inputs. The Write/Consume execution integration will supply a trusted
-/// mutation context in the next Developer MVP slice; until then the ingress path
-/// continues to reject those access modes before storage I/O.
+/// The read-only handler calls this with an empty effect list and no mutation
+/// context. The separate owned-effects handler supplies trusted execution
+/// effects and composition-selected checkpoint context. Native HTTP remains on
+/// the read-only handler until bounded module execution is connected.
 ///
 /// `loaded_body_bytes` is the already bounds-checked total inline body bytes
 /// the loader read for `verified` (see
@@ -267,6 +297,13 @@ fn translate_update(
 
     let context: &TrustedObjectMutationContext<'_> =
         context.ok_or(NodeCoreError::ObjectMutationContextMissing { object_id })?;
+    if context.created_checkpoint < input.previous_created_checkpoint {
+        return Err(NodeCoreError::ObjectCreatedCheckpointRegression {
+            object_id,
+            previous_created_checkpoint: input.previous_created_checkpoint,
+            attempted_created_checkpoint: context.created_checkpoint,
+        });
+    }
     if context.resolver.chain_id() != context.chain_id
         || context.resolver.protocol_version() != context.protocol_version
     {
@@ -349,6 +386,14 @@ mod tests {
     }
 
     fn verified(mode: AccessMode, object: Object) -> VerifiedAuthenticatedObject {
+        verified_at_checkpoint(mode, object, 0)
+    }
+
+    fn verified_at_checkpoint(
+        mode: AccessMode,
+        object: Object,
+        previous_created_checkpoint: u64,
+    ) -> VerifiedAuthenticatedObject {
         let owner_projection =
             DurableObjectOwnerProjection::from_owner(object.owner.clone()).unwrap();
         let head = DurableObjectHead::Current {
@@ -358,7 +403,7 @@ mod tests {
             owner_projection,
             routing_projection: DurableObjectRoutingProjection::new(Some(vec![0x44])).unwrap(),
         };
-        VerifiedAuthenticatedObject::new(mode, head, object)
+        VerifiedAuthenticatedObject::new(mode, head, object, previous_created_checkpoint)
     }
 
     #[test]
@@ -902,6 +947,7 @@ mod tests {
             AccessMode::Write,
             DurableObjectHead::Absent,
             current.clone(),
+            0,
         );
         let resolver = resolver();
         let chain_id = ChainId::new("sunrise-mvp").unwrap();
@@ -924,5 +970,53 @@ mod tests {
             ),
             Err(NodeCoreError::ObjectEffectMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn write_effect_rejects_checkpoint_regression_and_accepts_exact_boundary() {
+        let current = object(5, Owner::Address(Address::new([0x61; 32])), vec![0x1c]);
+        let mut next = current.clone();
+        next.version = 6;
+        next.data = vec![0x1d];
+        let resolver = resolver();
+        let chain_id = ChainId::new("sunrise-mvp").unwrap();
+        let context = TrustedObjectMutationContext {
+            resolver: &resolver,
+            chain_id: &chain_id,
+            protocol_version: ProtocolVersion::new(1),
+            epoch: Epoch::new(0),
+            created_checkpoint: 17,
+        };
+        let effect = ObjectEffect::Mutated {
+            previous_version: 5,
+            new_object: next,
+        };
+
+        let exact = translate_authenticated_object_effects(
+            &[verified_at_checkpoint(
+                AccessMode::Write,
+                current.clone(),
+                17,
+            )],
+            std::slice::from_ref(&effect),
+            Some(&context),
+            0,
+        )
+        .unwrap();
+        assert_eq!(exact.len(), 1);
+
+        assert_eq!(
+            translate_authenticated_object_effects(
+                &[verified_at_checkpoint(AccessMode::Write, current, 18)],
+                std::slice::from_ref(&effect),
+                Some(&context),
+                0,
+            ),
+            Err(NodeCoreError::ObjectCreatedCheckpointRegression {
+                object_id: ObjectId::new([0x41; 32]),
+                previous_created_checkpoint: 18,
+                attempted_created_checkpoint: 17,
+            })
+        );
     }
 }

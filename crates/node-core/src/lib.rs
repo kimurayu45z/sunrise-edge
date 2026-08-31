@@ -12,7 +12,7 @@ use canonical_encoding::{
     CanonicalDecodingError, CanonicalEncodingError, CanonicalStruct, decode_canonical_frame,
 };
 use core::fmt;
-use execution::ObjectEffect;
+use execution::{ObjectEffect, ResolvedObject};
 use hashing::{HashSuiteResolver, HashingError};
 use objects::{AccessMode, Address, Object, ObjectId, ObjectRef, Owner};
 use protocol_config::{DomainPlacementManifest, ProtocolConfig, ProtocolConfigError};
@@ -405,6 +405,15 @@ pub enum NodeCoreError {
         /// Object requiring a new immutable version.
         object_id: ObjectId,
     },
+    /// A new immutable object version attempted to move its creation checkpoint backwards.
+    ObjectCreatedCheckpointRegression {
+        /// Object whose checkpoint would regress.
+        object_id: ObjectId,
+        /// Checkpoint stored on the previous immutable version.
+        previous_created_checkpoint: u64,
+        /// Checkpoint proposed for the new immutable version.
+        attempted_created_checkpoint: u64,
+    },
 }
 
 impl fmt::Display for NodeCoreError {
@@ -689,6 +698,14 @@ impl fmt::Display for NodeCoreError {
             Self::ObjectMutationContextMissing { object_id } => write!(
                 f,
                 "object {object_id} mutation is missing trusted creation context"
+            ),
+            Self::ObjectCreatedCheckpointRegression {
+                object_id,
+                previous_created_checkpoint,
+                attempted_created_checkpoint,
+            } => write!(
+                f,
+                "object {object_id} creation checkpoint regressed from {previous_created_checkpoint} to {attempted_created_checkpoint}"
             ),
         }
     }
@@ -1154,22 +1171,29 @@ struct AuthenticatedObjectDispatch {
     accesses: Vec<AuthenticatedObjectAccess>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthenticatedObjectPolicy {
+    ReadOnly,
+    OwnedMutations,
+}
+
 impl AuthenticatedObjectDispatch {
     /// Derives and validates the dispatch descriptor from the authenticated
     /// inner transaction's sender and declared object-access manifest.
     ///
     /// Every check here is pure and requires zero storage I/O: bounding the
     /// declared access count, sorting and rejecting a duplicate object
-    /// identifier, requiring a non-zero object version, and rejecting any
-    /// access mode other than [`AccessMode::Read`] (`Write` and `Consume`
-    /// mutations are unimplemented in this slice and must fail closed rather
-    /// than silently downgrade).
+    /// identifier, requiring a non-zero object version, and enforcing the
+    /// selected internal access policy. The established public entrypoint uses
+    /// read-only policy; only the additive owned-effects entrypoint enables
+    /// Write/Consume.
     fn from_authenticated_transaction(
         transaction: &AuthenticatedTransaction,
+        policy: AuthenticatedObjectPolicy,
     ) -> Result<Self, NodeCoreError> {
         let inner = transaction.transaction();
         let authority: Address = inner.sender;
-        let accesses = validate_object_entries(inner.access_manifest.entries.as_slice())?;
+        let accesses = validate_object_entries(inner.access_manifest.entries.as_slice(), policy)?;
         Ok(Self {
             authority,
             accesses,
@@ -1180,10 +1204,8 @@ impl AuthenticatedObjectDispatch {
 /// Pure, zero-I/O validation of one declared object-access manifest.
 ///
 /// Bounds the declared access count, sorts and rejects a duplicate object
-/// identifier, requires a non-zero object version, and rejects any access
-/// mode other than [`AccessMode::Read`] (`Write` and `Consume` mutations are
-/// unimplemented in this slice and must fail closed rather than silently
-/// downgrade).
+/// identifier, requires a non-zero object version, and enforces the selected
+/// internal access policy.
 ///
 /// Split out of [`AuthenticatedObjectDispatch::from_authenticated_transaction`]
 /// so it can be exercised directly with hand-built entries: the authenticated
@@ -1193,6 +1215,7 @@ impl AuthenticatedObjectDispatch {
 /// full authenticated submission path.
 fn validate_object_entries(
     entries: &[AccessEntry],
+    policy: AuthenticatedObjectPolicy,
 ) -> Result<Vec<AuthenticatedObjectAccess>, NodeCoreError> {
     if entries.len() > MAX_AUTHENTICATED_OBJECT_READS {
         return Err(NodeCoreError::ObjectManifestTooLarge {
@@ -1225,7 +1248,7 @@ fn validate_object_entries(
                 version: access.object_ref.version,
             });
         }
-        if access.mode != AccessMode::Read {
+        if policy == AuthenticatedObjectPolicy::ReadOnly && access.mode != AccessMode::Read {
             return Err(NodeCoreError::ObjectAccessModeUnsupported {
                 object_id: access.object_ref.id,
                 mode: access.mode,
@@ -1917,6 +1940,7 @@ impl NodeStateAccessPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeStateSnapshot {
     values: BTreeMap<Vec<u8>, VersionedStateValue>,
+    resolved_objects: Vec<ResolvedObject>,
 }
 
 impl NodeStateSnapshot {
@@ -1931,6 +1955,13 @@ impl NodeStateSnapshot {
         self.values
             .iter()
             .map(|(key, value)| (key.as_slice(), value))
+    }
+
+    /// Returns authenticated, integrity-checked object inputs in canonical
+    /// manifest order. Generic event handlers always provide an empty slice.
+    #[must_use]
+    pub fn resolved_objects(&self) -> &[ResolvedObject] {
+        &self.resolved_objects
     }
 }
 
@@ -1978,6 +2009,7 @@ impl NodeStateUpdate {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransactionalNodeTransition {
     updates: Vec<NodeStateUpdate>,
+    object_effects: Vec<ObjectEffect>,
     output: NodeOutput,
 }
 
@@ -2000,7 +2032,50 @@ impl TransactionalNodeTransition {
         if updates.windows(2).any(|pair| pair[0].key == pair[1].key) {
             return Err(NodeCoreError::DuplicateStateUpdateKey);
         }
-        Ok(Self { updates, output })
+        Ok(Self {
+            updates,
+            object_effects: Vec::new(),
+            output,
+        })
+    }
+
+    /// Creates a bounded transition that also requests deterministic owned-
+    /// object mutations on the authenticated transaction path.
+    ///
+    /// The handler independently validates every effect against the signed
+    /// access manifest and verified object versions before atomic commit.
+    pub fn with_object_effects(
+        mut updates: Vec<NodeStateUpdate>,
+        object_effects: Vec<ObjectEffect>,
+        output: NodeOutput,
+    ) -> Result<Self, NodeCoreError> {
+        if updates.is_empty() && object_effects.is_empty() {
+            return Err(NodeCoreError::EmptyStateUpdates);
+        }
+        if updates.len() > MAX_ATOMIC_STATE_WRITES {
+            return Err(NodeCoreError::TooManyStateUpdates {
+                count: updates.len(),
+                maximum: MAX_ATOMIC_STATE_WRITES,
+            });
+        }
+        if object_effects.len() > MAX_AUTHENTICATED_OBJECT_READS {
+            return Err(NodeCoreError::TooManyObjectEffects {
+                actual: object_effects.len(),
+                maximum: MAX_AUTHENTICATED_OBJECT_READS,
+            });
+        }
+        updates.sort_by(|left: &NodeStateUpdate, right: &NodeStateUpdate| left.key.cmp(&right.key));
+        if updates
+            .windows(2)
+            .any(|pair: &[NodeStateUpdate]| pair[0].key == pair[1].key)
+        {
+            return Err(NodeCoreError::DuplicateStateUpdateKey);
+        }
+        Ok(Self {
+            updates,
+            object_effects,
+            output,
+        })
     }
 
     /// Creates a transition that publishes only a receipt after asserting reads.
@@ -2013,6 +2088,7 @@ impl TransactionalNodeTransition {
     pub const fn read_only(output: NodeOutput) -> Self {
         Self {
             updates: Vec::new(),
+            object_effects: Vec::new(),
             output,
         }
     }
@@ -2028,6 +2104,22 @@ impl TransactionalNodeTransition {
     pub const fn output(&self) -> &NodeOutput {
         &self.output
     }
+
+    /// Returns deterministic object effects held until the same atomic commit
+    /// as state, nonce, receipt, and outbox.
+    #[must_use]
+    pub fn object_effects(&self) -> &[ObjectEffect] {
+        &self.object_effects
+    }
+}
+
+fn reject_object_effects_without_authenticated_dispatch(
+    effects: &[ObjectEffect],
+) -> Result<(), NodeCoreError> {
+    let mutations: Vec<DurableObjectMutationEntry> =
+        translate_authenticated_object_effects(&[], effects, None, 0)?;
+    debug_assert!(mutations.is_empty());
+    Ok(())
 }
 
 /// Application transition over a declared, versioned multi-key snapshot.
@@ -2242,9 +2334,13 @@ where
         }
         values.insert(access.key.clone(), observed);
     }
-    let snapshot = NodeStateSnapshot { values };
+    let snapshot = NodeStateSnapshot {
+        values,
+        resolved_objects: Vec::new(),
+    };
 
     let transition = machine.transition(&snapshot, &event)?;
+    reject_object_effects_without_authenticated_dispatch(transition.object_effects())?;
     validate_output_context(transition.output(), &event, config)?;
     let (reads, mutations) = domain_transition_parts(&plan, &snapshot, transition.updates)?;
     let transaction = AtomicStateTransaction::new(
@@ -2287,9 +2383,13 @@ where
         }
         values.insert(access.key.clone(), observed);
     }
-    let snapshot = NodeStateSnapshot { values };
+    let snapshot = NodeStateSnapshot {
+        values,
+        resolved_objects: Vec::new(),
+    };
 
     let transition = machine.transition(&snapshot, &event)?;
+    reject_object_effects_without_authenticated_dispatch(transition.object_effects())?;
     validate_output_context(transition.output(), &event, config)?;
 
     let writes = asserted_transition_writes(&plan, &snapshot, transition.updates)?;
@@ -2393,8 +2493,12 @@ where
         }
         values.insert(access.key.clone(), observed);
     }
-    let snapshot = NodeStateSnapshot { values };
+    let snapshot = NodeStateSnapshot {
+        values,
+        resolved_objects: Vec::new(),
+    };
     let transition = machine.transition(&snapshot, &event)?;
+    reject_object_effects_without_authenticated_dispatch(transition.object_effects())?;
     validate_output_context(transition.output(), &event, config)?;
     let dedup_record = NodeDedupRecord::new(
         event.request_id(),
@@ -2510,7 +2614,7 @@ where
     let plan = machine.access_plan(&event)?;
     let domain = placement.resolve_domain(event.epoch(), plan.accesses().len())?;
     let output = handle_durable_idempotent_event_with_plan(
-        store, context, domain, resolver, event, machine, plan, None, None,
+        store, context, domain, resolver, event, machine, plan, None, None, None,
     )?;
     Ok(ResolvedNodeOutput::new(domain, output))
 }
@@ -2530,8 +2634,10 @@ where
 /// must resolve, through its exact current head and immutable version, to a
 /// typed object whose owner is that sender's address or is immutable, and the
 /// resulting head-read assertions commit atomically alongside everything
-/// else. `Write`/`Consume` access, shared/system owners, and blob payloads
-/// fail closed rather than silently downgrade.
+/// else. This established entrypoint remains read-only; `Write`/`Consume`,
+/// shared/system owners, and blob payloads fail closed rather than silently
+/// downgrade. Use the explicit owned-effects entrypoint for the bounded MVP
+/// mutation surface.
 pub fn handle_authenticated_resolved_durable_submit_transaction<S, M>(
     store: &S,
     context: &DurableOperationContext,
@@ -2543,14 +2649,73 @@ where
     S: StructuredDurableDomainStateStore,
     M: TransactionalNodeStateMachine,
 {
+    handle_authenticated_submit_transaction_with_policy(
+        store,
+        context,
+        resolver,
+        submission,
+        machine,
+        AuthenticatedObjectPolicy::ReadOnly,
+        None,
+    )
+}
+
+/// Commits authenticated owned inline-object Write/Consume effects through the
+/// same durable invocation as sender nonce, application state, receipt, and
+/// outbox.
+///
+/// `created_checkpoint` is trusted node composition, never request input. The
+/// caller must derive it from its already-validated chain progress. Node-core
+/// rejects a value lower than the previous immutable object's checkpoint.
+/// Create, shared/system ownership, immutable mutations, and blob bodies remain
+/// unsupported and fail closed.
+pub fn handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects<S, M>(
+    store: &S,
+    context: &DurableOperationContext,
+    resolver: &HashSuiteResolver,
+    submission: AuthenticatedSubmitTransaction,
+    created_checkpoint: u64,
+    machine: &M,
+) -> Result<ResolvedNodeOutput, NodeCoreError>
+where
+    S: StructuredDurableDomainStateStore,
+    M: TransactionalNodeStateMachine,
+{
+    handle_authenticated_submit_transaction_with_policy(
+        store,
+        context,
+        resolver,
+        submission,
+        machine,
+        AuthenticatedObjectPolicy::OwnedMutations,
+        Some(created_checkpoint),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_authenticated_submit_transaction_with_policy<S, M>(
+    store: &S,
+    context: &DurableOperationContext,
+    resolver: &HashSuiteResolver,
+    submission: AuthenticatedSubmitTransaction,
+    machine: &M,
+    object_policy: AuthenticatedObjectPolicy,
+    created_checkpoint: Option<u64>,
+) -> Result<ResolvedNodeOutput, NodeCoreError>
+where
+    S: StructuredDurableDomainStateStore,
+    M: TransactionalNodeStateMachine,
+{
     let plan = machine.access_plan(submission.event())?;
     let domain = submission
         .placement
         .resolve_domain(submission.event().epoch(), plan.accesses().len())?;
     let reservation =
         SenderNonceReservation::from_authenticated_transaction(&submission.transaction);
-    let dispatch =
-        AuthenticatedObjectDispatch::from_authenticated_transaction(&submission.transaction)?;
+    let dispatch = AuthenticatedObjectDispatch::from_authenticated_transaction(
+        &submission.transaction,
+        object_policy,
+    )?;
     let AuthenticatedSubmitTransaction {
         event,
         transaction: _authenticated_transaction,
@@ -2566,6 +2731,7 @@ where
         plan,
         Some(reservation),
         Some(dispatch),
+        created_checkpoint,
     )?;
     Ok(ResolvedNodeOutput::new(domain, output))
 }
@@ -2589,6 +2755,7 @@ fn handle_durable_idempotent_event_with_plan<S, M>(
     plan: NodeStateAccessPlan,
     reservation: Option<SenderNonceReservation>,
     dispatch: Option<AuthenticatedObjectDispatch>,
+    created_checkpoint: Option<u64>,
 ) -> Result<NodeOutput, NodeCoreError>
 where
     S: StructuredDurableDomainStateStore,
@@ -2688,28 +2855,15 @@ where
 
     // Object reads happen only after the receipt and nonce checks above, so a
     // stale or replayed request never spends the fan-out cost of the
-    // per-entry head/version storage round-trips. The application-machine
-    // interface is unchanged and receives no object data at all, so nothing
-    // here can be influenced by `machine.transition` below.
+    // per-entry head/version storage round-trips. Only this authenticated
+    // path supplies verified typed object inputs to the pure transition;
+    // generic handlers always supply an empty object slice.
     let loaded_objects: LoadedAuthenticatedObjects = match &dispatch {
         Some(dispatch) => {
             load_and_authorize_objects(store, context, domain, event.chain_id(), dispatch)?
         }
         None => LoadedAuthenticatedObjects::default(),
     };
-    // The current live path remains read-only. Calling the authenticated
-    // effect translator here makes that fail-closed contract explicit and
-    // exercises the same production-code surface the next MVP slice will use
-    // after deterministic execution supplies effects and trusted checkpoint
-    // context. Write/Consume are still rejected during dispatch validation.
-    let no_object_effects: &[ObjectEffect] = &[];
-    let object_mutations: Vec<DurableObjectMutationEntry> = translate_authenticated_object_effects(
-        loaded_objects.verified(),
-        no_object_effects,
-        None,
-        loaded_objects.total_body_bytes(),
-    )?;
-
     let mut values = BTreeMap::new();
     for access in plan.accesses() {
         let observed = store.get_versioned_durable(context, domain, access.key())?;
@@ -2718,9 +2872,28 @@ where
         }
         values.insert(access.key.clone(), observed);
     }
-    let snapshot = NodeStateSnapshot { values };
+    let snapshot = NodeStateSnapshot {
+        values,
+        resolved_objects: loaded_objects.resolved_objects(),
+    };
     let transition = machine.transition(&snapshot, &event)?;
     validate_output_event_context(transition.output(), &event)?;
+    let mutation_context: Option<authenticated_object_effects::TrustedObjectMutationContext<'_>> =
+        created_checkpoint.map(|created_checkpoint: u64| {
+            authenticated_object_effects::TrustedObjectMutationContext {
+                resolver,
+                chain_id: event.chain_id(),
+                protocol_version: event.protocol_version(),
+                epoch: event.epoch(),
+                created_checkpoint,
+            }
+        });
+    let object_mutations: Vec<DurableObjectMutationEntry> = translate_authenticated_object_effects(
+        loaded_objects.verified(),
+        transition.object_effects(),
+        mutation_context.as_ref(),
+        loaded_objects.total_body_bytes(),
+    )?;
 
     let dedup_record = NodeDedupRecord::new(
         event.request_id(),
@@ -2942,13 +3115,22 @@ where
                     return Err(NodeCoreError::ObjectOwnerMismatch { object_id });
                 }
             }
-            Owner::Immutable => {}
+            Owner::Immutable if access.mode == AccessMode::Read => {}
+            Owner::Immutable => {
+                return Err(NodeCoreError::ObjectOwnerKindUnsupported { object_id });
+            }
             Owner::Shared | Owner::System => {
                 return Err(NodeCoreError::ObjectOwnerKindUnsupported { object_id });
             }
         }
 
-        loaded.push(object_id, access.mode, head, object.clone());
+        loaded.push(
+            object_id,
+            access.mode,
+            head,
+            object.clone(),
+            record.created_checkpoint(),
+        );
     }
     loaded.set_total_body_bytes(total_body_bytes);
     Ok(loaded)
@@ -3042,8 +3224,12 @@ where
         }
         values.insert(access.key.clone(), observed);
     }
-    let snapshot = NodeStateSnapshot { values };
+    let snapshot = NodeStateSnapshot {
+        values,
+        resolved_objects: Vec::new(),
+    };
     let transition = machine.transition(&snapshot, &event)?;
+    reject_object_effects_without_authenticated_dispatch(transition.object_effects())?;
     validate_output_context(transition.output(), &event, config)?;
     let dedup_record = NodeDedupRecord::new(
         event.request_id(),
@@ -5854,6 +6040,148 @@ mod tests {
         )
     }
 
+    fn commit_memory_inline_object(
+        store: &MemoryDurableStateStore,
+        context: &DurableOperationContext,
+        object_domain: AtomicityDomainId,
+        object: Object,
+        chain: &str,
+        created_checkpoint: u64,
+        receipt_byte: u8,
+    ) -> ObjectRef {
+        let object_id: ObjectId = object.id;
+        let object_version: u64 = object.version;
+        let owner: Owner = object.owner.clone();
+        let (record, digest): (DurableObjectVersionRecord, Digest32) =
+            hashed_object_version(object, chain, created_checkpoint);
+        let changes: DurableObjectChanges = DurableObjectChanges::new(
+            vec![runtime::DurableObjectHeadRead::new(
+                object_id,
+                DurableObjectHead::Absent,
+            )],
+            vec![runtime::DurableObjectMutationEntry::new(
+                object_id,
+                runtime::DurableObjectMutation::Create {
+                    version: record,
+                    owner_projection: DurableObjectOwnerProjection::from_owner(owner).unwrap(),
+                    routing_projection: DurableObjectRoutingProjection::default(),
+                },
+            )],
+        )
+        .unwrap();
+        let receipt: DurableRequestReceipt = DurableRequestReceipt::new(
+            DurableRequestId::new([receipt_byte; 32]).unwrap(),
+            Digest32::new(
+                HashAlgorithmId::Sha2_256,
+                [receipt_byte.wrapping_add(1); 32],
+            ),
+            vec![receipt_byte.wrapping_add(2)],
+        )
+        .unwrap();
+        let invocation: DurableInvocationTransaction =
+            DurableInvocationTransaction::new(object_domain, None, changes, receipt, None).unwrap();
+        assert_eq!(
+            store.commit_invocation(context, invocation),
+            DurableCommitOutcome::Committed
+        );
+        ObjectRef {
+            id: object_id,
+            version: object_version,
+            digest,
+        }
+    }
+
+    struct OwnedObjectEffectMachine {
+        expected_inputs: Vec<(ObjectId, AccessMode)>,
+        replacement_byte: u8,
+        calls: AtomicUsize,
+    }
+
+    impl TransactionalNodeStateMachine for OwnedObjectEffectMachine {
+        fn access_plan(&self, _event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            NodeStateAccessPlan::new(vec![NodeStateAccess::new(
+                b"state/owned-object-effects".to_vec(),
+                NodeStateAccessMode::ReadOnly,
+            )?])
+        }
+
+        fn transition(
+            &self,
+            state: &NodeStateSnapshot,
+            event: &NodeEvent,
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let actual_inputs: Vec<(ObjectId, AccessMode)> = state
+                .resolved_objects()
+                .iter()
+                .map(|input: &ResolvedObject| (input.object.id, input.mode))
+                .collect();
+            assert_eq!(actual_inputs, self.expected_inputs);
+
+            let mut effects: Vec<ObjectEffect> = Vec::new();
+            for input in state.resolved_objects() {
+                match input.mode {
+                    AccessMode::Read => {}
+                    AccessMode::Write => {
+                        let mut new_object: Object = input.object.clone();
+                        new_object.version = new_object.version.checked_add(1).unwrap();
+                        new_object.data = vec![self.replacement_byte];
+                        effects.push(ObjectEffect::Mutated {
+                            previous_version: input.object.version,
+                            new_object,
+                        });
+                    }
+                    AccessMode::Consume => effects.push(ObjectEffect::Deleted {
+                        id: input.object.id,
+                        version: input.object.version,
+                    }),
+                }
+            }
+            let output: NodeOutput = NodeOutput::new(
+                vec![NodeResponse::new(
+                    event.request_id(),
+                    NodeResponseStatus::Accepted,
+                    None,
+                )?],
+                Vec::new(),
+            )?;
+            TransactionalNodeTransition::with_object_effects(Vec::new(), effects, output)
+        }
+    }
+
+    struct UndeclaredObjectEffectMachine;
+
+    impl TransactionalNodeStateMachine for UndeclaredObjectEffectMachine {
+        fn access_plan(&self, _event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            NodeStateAccessPlan::new(vec![NodeStateAccess::new(
+                b"state/undeclared-object-effect".to_vec(),
+                NodeStateAccessMode::ReadOnly,
+            )?])
+        }
+
+        fn transition(
+            &self,
+            state: &NodeStateSnapshot,
+            event: &NodeEvent,
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            assert!(state.resolved_objects().is_empty());
+            let object_id: ObjectId = ObjectId::new([0xA1; 32]);
+            let effect: ObjectEffect = ObjectEffect::Deleted {
+                id: object_id,
+                version: 1,
+            };
+            let output: NodeOutput = NodeOutput::new(
+                vec![NodeResponse::new(
+                    event.request_id(),
+                    NodeResponseStatus::Accepted,
+                    None,
+                )?],
+                Vec::new(),
+            )?;
+            TransactionalNodeTransition::with_object_effects(Vec::new(), vec![effect], output)
+        }
+    }
+
     #[test]
     fn authenticated_read_only_manifest_commits_sorted_exact_head_assertions() {
         let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
@@ -5941,7 +6269,8 @@ mod tests {
         let accepted: Vec<AccessEntry> = (0..32u8)
             .map(|byte| entry(byte, 1, AccessMode::Read))
             .collect();
-        let accesses = validate_object_entries(&accepted).unwrap();
+        let accesses =
+            validate_object_entries(&accepted, AuthenticatedObjectPolicy::ReadOnly).unwrap();
         assert_eq!(accesses.len(), 32);
         assert!(
             accesses
@@ -5953,7 +6282,7 @@ mod tests {
             .map(|byte| entry(byte, 1, AccessMode::Read))
             .collect();
         assert_eq!(
-            validate_object_entries(&too_many).unwrap_err(),
+            validate_object_entries(&too_many, AuthenticatedObjectPolicy::ReadOnly).unwrap_err(),
             NodeCoreError::ObjectManifestTooLarge {
                 count: 33,
                 maximum: MAX_AUTHENTICATED_OBJECT_READS,
@@ -5980,7 +6309,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            validate_object_entries(&duplicate).unwrap_err(),
+            validate_object_entries(&duplicate, AuthenticatedObjectPolicy::ReadOnly).unwrap_err(),
             NodeCoreError::DuplicateObjectAccess {
                 object_id: duplicate_id
             }
@@ -5988,7 +6317,11 @@ mod tests {
 
         let zero_version_id = ObjectId::new([0x0A; 32]);
         assert_eq!(
-            validate_object_entries(&[entry(0x0A, 0, AccessMode::Read)]).unwrap_err(),
+            validate_object_entries(
+                &[entry(0x0A, 0, AccessMode::Read)],
+                AuthenticatedObjectPolicy::ReadOnly,
+            )
+            .unwrap_err(),
             NodeCoreError::InvalidObjectVersion {
                 object_id: zero_version_id,
                 version: 0,
@@ -5998,10 +6331,24 @@ mod tests {
         for mode in [AccessMode::Write, AccessMode::Consume] {
             let object_id = ObjectId::new([0x0B; 32]);
             assert_eq!(
-                validate_object_entries(&[entry(0x0B, 1, mode)]).unwrap_err(),
+                validate_object_entries(
+                    &[entry(0x0B, 1, mode)],
+                    AuthenticatedObjectPolicy::ReadOnly,
+                )
+                .unwrap_err(),
                 NodeCoreError::ObjectAccessModeUnsupported { object_id, mode }
             );
         }
+
+        let owned_modes = validate_object_entries(
+            &[
+                entry(0x0C, 1, AccessMode::Write),
+                entry(0x0D, 1, AccessMode::Consume),
+            ],
+            AuthenticatedObjectPolicy::OwnedMutations,
+        )
+        .unwrap();
+        assert_eq!(owned_modes.len(), 2);
     }
 
     /// Every storage-facing branch of `load_and_authorize_objects` that only
@@ -7034,6 +7381,264 @@ mod tests {
             .unwrap();
         let nonce_record = SenderNonceRecord::decode(persisted_nonce.value().unwrap()).unwrap();
         assert_eq!(nonce_record.next_nonce, 1);
+    }
+
+    #[test]
+    fn memory_store_authenticated_owned_write_commits_atomically_and_replays_receipt() {
+        let store: MemoryDurableStateStore =
+            MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let node_config: NodeConfig = config("sunrise-test");
+        let protocol_config: ProtocolConfig = active_protocol_config(0xFA);
+        let signing_key: SigningKey = dev_signing_key(0xCA);
+        let sender: Address = dev_sender_address(&signing_key);
+        let context: DurableOperationContext = durable_context();
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let object_domain: AtomicityDomainId = domain(0xFA);
+        let read_id: ObjectId = ObjectId::new([0x84; 32]);
+        let write_id: ObjectId = ObjectId::new([0x94; 32]);
+        let read_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            test_object(read_id, 1, Owner::Immutable, 0x84),
+            "sunrise-test",
+            4,
+            0x31,
+        );
+        let write_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            test_object(write_id, 1, Owner::Address(sender), 0x94),
+            "sunrise-test",
+            5,
+            0x34,
+        );
+        let manifest: AccessManifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: write_ref,
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: read_ref,
+                mode: AccessMode::Read,
+            },
+        ]);
+        let submission: AuthenticatedSubmitTransaction = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xE8),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        let replay_submission: AuthenticatedSubmitTransaction = submission.clone();
+        let machine: OwnedObjectEffectMachine = OwnedObjectEffectMachine {
+            expected_inputs: vec![(read_id, AccessMode::Read), (write_id, AccessMode::Write)],
+            replacement_byte: 0xA4,
+            calls: AtomicUsize::new(0),
+        };
+
+        let first: ResolvedNodeOutput =
+            handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+                &store,
+                &context,
+                &hash_resolver,
+                submission,
+                6,
+                &machine,
+            )
+            .unwrap();
+        let replay: ResolvedNodeOutput =
+            handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+                &store,
+                &context,
+                &hash_resolver,
+                replay_submission,
+                999,
+                &machine,
+            )
+            .unwrap();
+
+        assert_eq!(first, replay);
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        let write_head: DurableObjectHead = store
+            .get_object_head(&context, object_domain, write_id)
+            .unwrap();
+        assert_eq!(write_head.object_version(), DurableObjectVersion::new(2));
+        let write_v2: DurableObjectVersionRecord = store
+            .get_object_version(
+                &context,
+                object_domain,
+                write_id,
+                DurableObjectVersion::new(2).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(write_v2.created_checkpoint(), 6);
+        assert_eq!(
+            write_v2.payload().inline().unwrap().object().data,
+            vec![0xA4]
+        );
+        let read_head: DurableObjectHead = store
+            .get_object_head(&context, object_domain, read_id)
+            .unwrap();
+        assert_eq!(read_head.object_version(), DurableObjectVersion::new(1));
+        let nonce_key: Vec<u8> =
+            sender_nonce_key_for("sunrise-test", *sender.as_bytes(), Epoch::new(7));
+        let persisted_nonce: VersionedStateValue = store
+            .get_versioned_durable(&context, object_domain, &nonce_key)
+            .unwrap();
+        let nonce_record: SenderNonceRecord =
+            SenderNonceRecord::decode(persisted_nonce.value().unwrap()).unwrap();
+        assert_eq!(nonce_record.next_nonce, 1);
+    }
+
+    #[test]
+    fn memory_store_authenticated_owned_consume_commits_tombstone_with_nonce() {
+        let store: MemoryDurableStateStore =
+            MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let node_config: NodeConfig = config("sunrise-test");
+        let protocol_config: ProtocolConfig = active_protocol_config(0xFB);
+        let signing_key: SigningKey = dev_signing_key(0xCB);
+        let sender: Address = dev_sender_address(&signing_key);
+        let context: DurableOperationContext = durable_context();
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let object_domain: AtomicityDomainId = domain(0xFB);
+        let object_id: ObjectId = ObjectId::new([0x85; 32]);
+        let object_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            test_object(object_id, 1, Owner::Address(sender), 0x85),
+            "sunrise-test",
+            5,
+            0x37,
+        );
+        let manifest: AccessManifest = manifest_with(vec![AccessEntry {
+            object_ref,
+            mode: AccessMode::Consume,
+        }]);
+        let submission: AuthenticatedSubmitTransaction = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xE9),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        let machine: OwnedObjectEffectMachine = OwnedObjectEffectMachine {
+            expected_inputs: vec![(object_id, AccessMode::Consume)],
+            replacement_byte: 0,
+            calls: AtomicUsize::new(0),
+        };
+
+        handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+            &store,
+            &context,
+            &hash_resolver,
+            submission,
+            6,
+            &machine,
+        )
+        .unwrap();
+
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        let head: DurableObjectHead = store
+            .get_object_head(&context, object_domain, object_id)
+            .unwrap();
+        assert!(matches!(head, DurableObjectHead::Tombstoned { .. }));
+        let nonce_key: Vec<u8> =
+            sender_nonce_key_for("sunrise-test", *sender.as_bytes(), Epoch::new(7));
+        let persisted_nonce: VersionedStateValue = store
+            .get_versioned_durable(&context, object_domain, &nonce_key)
+            .unwrap();
+        let nonce_record: SenderNonceRecord =
+            SenderNonceRecord::decode(persisted_nonce.value().unwrap()).unwrap();
+        assert_eq!(nonce_record.next_nonce, 1);
+    }
+
+    #[test]
+    fn authenticated_owned_write_requires_exact_effect_before_commit() {
+        let store: ScriptedDurableStore =
+            ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let node_config: NodeConfig = config("sunrise-test");
+        let protocol_config: ProtocolConfig = active_protocol_config(0xFC);
+        let signing_key: SigningKey = dev_signing_key(0xCC);
+        let sender: Address = dev_sender_address(&signing_key);
+        let object_id: ObjectId = ObjectId::new([0x86; 32]);
+        let (object_ref, _): (ObjectRef, DurableObjectHead) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            object_id,
+            Owner::Address(sender),
+            0x86,
+        );
+        let submission: AuthenticatedSubmitTransaction = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xEA),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest_with(vec![AccessEntry {
+                object_ref,
+                mode: AccessMode::Write,
+            }]),
+            &node_config,
+            &protocol_config,
+        );
+        let machine: IdempotentMachine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        let error: NodeCoreError =
+            handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+                &store,
+                &durable_context(),
+                &resolver("sunrise-test"),
+                submission,
+                2,
+                &machine,
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::ObjectEffectMismatch {
+                object_id,
+                reason: "write access requires exactly one mutated effect",
+            }
+        );
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        assert!(store.commits.lock().unwrap().is_empty());
+        assert!(store.receipt.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn generic_durable_handler_rejects_object_effects_without_dispatch() {
+        let store: ScriptedDurableStore =
+            ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let object_id: ObjectId = ObjectId::new([0xA1; 32]);
+
+        let error: NodeCoreError = handle_resolved_durable_idempotent_event(
+            &store,
+            &durable_context(),
+            &placement(0xFD, 7),
+            &config("sunrise-test"),
+            &resolver("sunrise-test"),
+            event("sunrise-test", request(0xEB)),
+            &UndeclaredObjectEffectMachine,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::UndeclaredObjectEffect { object_id });
+        assert!(store.commits.lock().unwrap().is_empty());
     }
 
     /// One machine implementation used only to inject a genuine, deterministic

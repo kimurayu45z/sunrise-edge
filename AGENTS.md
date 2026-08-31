@@ -235,12 +235,14 @@ serializable state/object/receipt/outbox commit, and indexed
 claim/ack with retained attempt history As-Is. Object-head reads validate
 strict immutable metadata and inline presence/length without selecting inline
 bodies. Head owner/routing projections are routing data, never authorization.
-The authenticated structured durable path now loads every signed read-only
-manifest entry through its exact head and immutable inline version, matches the
-typed owner to the verified sender, and commits the complete head assertions.
-Write/Consume, Shared/System ownership, blob bodies, and module loading remain
-fail-closed on the live path; a private verified-input/effect translator exists
-but is not yet wired to execution or commit. Every immutable object version now
+The authenticated structured durable path now loads every signed manifest entry
+through its exact head and immutable inline version and matches the typed owner
+to the verified sender. A separate additive owned-effects entrypoint supplies
+those inputs to a pure transition in canonical order and atomically commits
+strict Write/Consume Update/Delete effects with exact head assertions, sender
+nonce, state, receipt, and outbox. The read-only and native HTTP paths still
+reject Write/Consume before storage I/O; Shared/System ownership, blob bodies,
+and module loading remain fail-closed. Every immutable object version now
 carries its creating chain/protocol-version provenance (`DurableObjectProvenance`,
 DR-0068), and node-core independently recomputes and verifies each
 authenticated object's digest from that provenance and the stored `Digest32`
@@ -269,13 +271,11 @@ one, then check same-identity reconciliation, with pool recovery proven
 afterward. This shows the backend acknowledged commit before the driver lost
 it, not crash durability under abrupt process/power loss, and it says nothing
 about TLS-path loss. Native structured requests now support explicit
-cancellation only before first storage dispatch. Node-core also has a private
-fail-closed foundation that translates deterministic effects for already-
-verified owned Address objects to bounded durable Update/Delete mutations, but
-the live handler still rejects Write/Consume before storage I/O and supplies no
-execution effects or trusted checkpoint context. Next, wire those effects into
-the existing atomic nonce/state/object/receipt/outbox invocation, then connect
-one preinstalled bounded deterministic contract, local devnet/query APIs, a
+cancellation only before first storage dispatch. The additive node-core
+owned-effects composition is implemented As-Is, including trusted checkpoint
+regression rejection and exact-replay non-reapplication, but native still uses
+the read-only entrypoint. Next, connect one preinstalled bounded deterministic
+contract as its trusted caller, then add local devnet/query APIs, a
 TypeScript client, a counter UI, and restart/duplicate E2E evidence. Create,
 Shared/System ownership, blob transfer, fees, fast certificates, and production
 object migrations remain deferred. The opaque SQLite table and prefix scanner

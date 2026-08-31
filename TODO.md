@@ -1756,10 +1756,11 @@ Developer MVP completion criteria:
 現在のMVP実装順序:
 
 1. verified owned-object inputとdeterministic effectのfail-closed対応、およびruntime durable
-   mutationへのpure translation（implemented As-Is）。このfoundationはprivateで、live handlerは
-   引き続きWrite/Consumeをstorage I/O前に拒否する。
+   mutationへのpure translation（implemented As-Is）。
 2. trusted executionから得たWrite/Consume effectsをstructured durable invocationへ接続し、
-   exact object head assertionとmutationをnonce/state/receipt/outboxとatomic commitする。
+   exact object head assertionとmutationをnonce/state/receipt/outboxとatomic commitする
+   additive node-core entrypoint（implemented As-Is）。generic/read-only/native HTTP経路は
+   引き続きWrite/Consumeをstorage I/O前に拒否する。
 3. preinstalled module loadとbounded deterministic WASM executionを接続する。
 4. local devnet/query API、TypeScript client、counter demo UI、restart/duplicate E2Eを順に追加する。
 
@@ -2015,16 +2016,21 @@ Phase 15 As-Is scope:
   （`SchemaMismatch`）する（object digest provenance/recomputation implemented As-Is;
   DR-0067の該当pending itemを解消した）。
   verified inputとdeterministic `ObjectEffect`をstrictに対応付け、owned Address objectのUpdate/Deleteを
-  bounded durable mutationへ変換するprivate foundationはimplemented As-Isである。Create、owner/type/schema変更、
+  bounded durable mutationへ変換するadditive handlerはimplemented As-Isである。Create、owner/type/schema変更、
   version不整合、undeclared/duplicate effect、overflow、untrusted mutation contextはfail closedにする。
-  ただしlive handlerは引き続きWrite/Consumeをstorage I/O前に拒否し、execution effectやtrusted checkpoint contextを
-  durable invocationへ接続していない。Shared/System owner、blob body、module load、fee debit、owned fast pathも未実装である。
+  verified objectはcanonical manifest順でtransitionへ渡し、composition-trusted checkpointのregressionを拒否し、
+  exact head assertion、Update/Delete、nonce、state、receipt、outboxを同じstructured durable invocationでcommitする。
+  exact request replayはobject I/Oやtransitionより先にreceiptからreconcileするためeffectを再適用しない。
+  generic handlerはresolved objectを渡さず、返されたeffectを黙って捨てずにfail closedにする。
+  ただしnative HTTPはread-only entrypointを使い続け、preinstalled module loadとbounded deterministic WASMを
+  trusted callerとして接続するまでWrite/Consumeをstorage I/O前に拒否する。Shared/System owner、blob body、
+  module load、fee debit、owned fast path certificateも未実装である。
   node-core additive handlerはmanifest domainをI/O前にresolveし、typed receipt replayをstate readより先に行い、
   read-only assertionを含むstate/receipt/outboxをこのenvelopeへ構築する。definite commitまたはexact replay以外では
   outputを返さない。single-lock memoryとnormalized PostgreSQL conformance storeでatomic publication、object lifecycle/ABA、
   conflict rollback、read-only、bound domain、fence、deadline、object read-count bound、blob round-trip、replayを検証する
-  （runtime/memory/PostgreSQLとnode-core authenticated read-only object authorization implemented As-Is;
-  object effectsとprovider certification pending）。
+  （runtime/memory/PostgreSQLとnode-core authenticated owned-object atomic effects implemented As-Is;
+  native module executionとprovider certification pending）。
 - owned transaction fast pathの認証基盤として、`crypto`にexact-pinned
   `ed25519-zebra` 4.2.0（`[workspace.dependencies]`でdefault features無効を
   一箇所宣言。committed `Cargo.lock`はその依存`curve25519-dalek`を4.1.3で
