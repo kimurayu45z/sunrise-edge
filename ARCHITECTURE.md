@@ -1456,18 +1456,36 @@ implemented) rather than introducing new protocol behavior:
   `transfer` entrypoint has a same-sender source and destination account to
   exercise immediately after boot. Their object IDs remain distinct and
   deterministic for that owner and slot.
-- **Bounded asset-account transition.** An asset-account body is exactly 50
-  little-endian bytes: `body_version: u16 = 1`, `asset_id: [u8; 32]`,
-  `balance: u64`, and `sequence: u64`. `transfer` arguments are exactly 10
-  bytes: `args_version: u16 = 1` and a non-zero `amount: u64`. The signed
-  manifest declares exactly two `Write` objects in source/destination order.
-  Execution rejects unknown versions or lengths, unequal asset IDs,
-  insufficient source balance, destination overflow, and sequence overflow;
-  otherwise it writes both objects, increments both sequences, preserves the
-  combined balance, and emits `sunrise.devnet.asset_account.transferred.v1`
-  with the asset ID, amount, and resulting balances. The event and both
-  effects enter the same durable receipt and an exact duplicate replays that
-  receipt without applying either effect again.
+- **Bounded asset-account transition.** The dev profile reserves the otherwise
+  unused local type-ID block `0xF001`-`0xF003`, all at encoding version 1. An
+  asset-account body is one 76-byte `CanonicalStruct` (`0xF001`) with fields
+  `1: asset_id[32]`, `2: balance u64`, and `3: sequence u64`. `transfer`
+  arguments are one 24-byte `CanonicalStruct` (`0xF002`) with field
+  `1: non-zero amount u64`. Transfer event data is one 90-byte
+  `CanonicalStruct` (`0xF003`) with fields `1: asset_id[32]`, `2: amount u64`,
+  `3: resulting source balance u64`, and `4: resulting destination balance
+  u64`. These exact frames, including magic, type/version, field count,
+  ordered field IDs, lengths, and little-endian fixed-width values, are shared
+  as stable vectors; the WAT verifies constant framing bytes and patches only
+  the declared values. The signed manifest declares exactly two `Write`
+  objects in source/destination order. Execution rejects unknown framing,
+  unequal asset IDs, zero amount, insufficient source balance, destination
+  overflow, and sequence overflow; otherwise it writes both objects,
+  increments both sequences, preserves the combined balance, and emits
+  `sunrise.devnet.asset_account.transferred.v1`. The event and both effects
+  enter the same durable receipt and an exact duplicate replays that receipt
+  without applying either effect again.
+- **Structural type boundary.** The current WASM host ABI exposes object data
+  but not `type_hash`, `schema_version`, or owner metadata. Node-core still
+  proves both inputs are Address-owned by the authenticated sender and freezes
+  their metadata across each update, while the module verifies the complete
+  self-describing `0xF001` body frame. Therefore this devnet, which seeds no
+  other application object type, has a bounded structural asset-account check,
+  not a general proof that an arbitrary existing object's `type_hash` denotes
+  this module. Revisit a read-only metadata host ABI or a catalog-declared
+  expected type constraint before cross-owner transfer or a second devnet
+  application object type is introduced; neither expansion belongs to this
+  MVP slice.
 - **Dev-profile identities are not protocol claims.** The seeded `AssetId` and
   asset-account `type_hash` are fixed, non-zero dev-profile identifiers so
   clients can render and exercise the local fixture. No mint/metadata object
@@ -2719,7 +2737,14 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   sender's own asset accounts. It does not implement, and must not be
   described as, user-to-user transfer. The devnet's fee registry stays empty
   and every devnet transaction commits with `fee_payment: None`; this module
-  charges, computes, or debits no fee.
+  charges, computes, or debits no fee. Its body, arguments, and event use the
+  devnet-local canonical type IDs `0xF001`, `0xF002`, and `0xF003`; no raw
+  hand-framed event or object bytes are accepted. The current host ABI does
+  not expose object metadata to WASM, so this MVP verifies the complete
+  canonical body structure while node-core separately verifies sender
+  ownership and frozen metadata. A metadata-readable ABI or trusted catalog
+  type constraint remains deferred until cross-owner transfer or another
+  devnet application object type makes structural checking insufficient.
 
   **Deferred beyond this MVP surface.** Cross-owner transfer authorization and
   any change of object ownership; `Create` and any notion of "associated" or
