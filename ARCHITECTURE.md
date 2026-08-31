@@ -1475,6 +1475,15 @@ implemented) rather than introducing new protocol behavior:
   `sunrise.devnet.asset_account.transferred.v1`. The event and both effects
   enter the same durable receipt and an exact duplicate replays that receipt
   without applying either effect again.
+- **Canonical catalog declarations.** The dev profile also reserves local
+  declaration type IDs `0xF010` for the asset-account schema declaration and
+  `0xF011` for its execution-semantics declaration, both at encoding version
+  1. These declarations are complete `CanonicalStruct` frames and are hashed
+  under the existing `SystemModule` purpose when deriving the preinstalled
+  catalog commitments. They describe the `0xF001` body, `0xF002` arguments,
+  `0xF003` event, exact two-object write manifest, rejection conditions, and
+  conservation/sequence invariants. They are dev-profile catalog metadata,
+  not an alternate balance, transfer, or fee-asset protocol path.
 - **Structural type boundary.** The current WASM host ABI exposes object data
   but not `type_hash`, `schema_version`, or owner metadata. Node-core still
   proves both inputs are Address-owned by the authenticated sender and freezes
