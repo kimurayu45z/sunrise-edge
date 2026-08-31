@@ -1871,10 +1871,10 @@ explicit dev limitations）:
    bounded native routerのstartup wiringまで実装済み（implemented As-Is）。binaryはloopbackで
    HTTPをserveし、live smokeで`204` livenessと、同一account IDを保った次writer generationでの
    再起動を検証済み。WASM単体実行は同一`AssetId`の送金成功と異なる`AssetId`のeffectなし拒否を
-   直接検証する。bounded query APIはDR-0082で設計を固定し、次の実装sliceとする。signed
+   直接検証する。bounded query APIはDR-0082の設計のとおりstep 6で実装済み（implemented As-Is）。signed
    duplicate-transfer HTTP E2Eは未実装で、後続sliceに残る。
 6. DR-0082のbounded canonical query APIを、両方のstructured durable routerへadditiveに
-   実装する。`GET /v1/context`、`/v1/objects/{object_id}`、
+   実装した（implemented As-Is）。`GET /v1/context`、`/v1/objects/{object_id}`、
    `/v1/receipts/{request_id}`、`/v1/senders/{sender}/next-nonce`だけを公開し、64文字の
    lowercase hex selector以外をstorage I/O前に拒否する。contextはtrusted chain/epoch、exact
    canonical `ProtocolConfig`、committed logical domainを返す。objectはabsence/tombstone/
@@ -1887,6 +1887,37 @@ explicit dev limitations）:
    `0xE102`-`0xE105`、`Cache-Control: no-store`、typed absenceを200で返し、既存のblocking
    admission、trusted fence/deadline/correlation identity、bounded object/receipt sizesを再利用する。
    scan/list/prefix/arbitrary state key、blob fetch、historical version selector、proof/indexerはMVP外。
+   node-core側は`query_sender_next_nonce`/`query_object`/`query_request_receipt`を公開する
+   （内部実装はprivate moduleに置き、crate rootからre-exportする。`node_core::query`は
+   public moduleではない）。private `SenderNonceRecord`framingは外部へ漏らさない。`ObjectQueryResult`/
+   `ReceiptQueryResult`はすべてのstatus（absence/tombstoneを含む）で要求されたexact selector
+   （`object_id`/`request_id`）自体を型として保持し、HTTP層が別のlookupの結果を取り違えて
+   bindできないようにする。`query_object`はinline/blobで分岐する前に version の
+   creating-chain provenanceをtrusted chainと照合するため、cross-chainなblob recordも
+   inlineと同様にfail closedする。blob referenceの`digest`/`blob_digest`はhead/versionで
+   相互チェックされた値であり、fetchしていないbody自体をverifiedとは主張しない。
+   native-http側は`0xE102`-`0xE105`の4つのcanonical codec（`HttpContextQueryResult`/
+   `HttpObjectQueryResult`/`HttpReceiptQueryResult`/`HttpNextNonceQueryResult`）を追加し、
+   すべてのresultに対応するselector（`object_id`/`request_id`/`sender`）を全statusへ持たせた。
+   `CurrentInline`/`Present`のnested canonical bytes（`objects::Object`/`NodeDedupRecord`）は
+   decode時にサイズ上限（`MAX_AUTHENTICATED_OBJECT_BODY_BYTES`/`MAX_DURABLE_RECEIPT_BYTES`）・
+   decodability・outer selector/digestとのidentity一致・（receiptは）exact re-encodingまで
+   strictに検証する。contextはzero id（protocol version/hash suite/profile/scheme/binding）・
+   長すぎるchain id（`node_core::MAX_CHAIN_ID_BYTES`超過）・空のcanonical `ProtocolConfig` bytes
+   を拒否する。storage-backedな3 routeは`DomainPlacementManifest::resolve_domain`を
+   authenticated write pathと同じactivation-epoch-checkedな経路で呼び出し、
+   `placement.domain()`を無条件には使わない。operational statusは、identity source
+   unavailable・clock/runtime failure・durable readのwriter fenced/deadline/unavailable・
+   committed ProtocolConfigのinactivity/misconfigurationをopaque `503 query-unavailable`、
+   corrupt/invalid persisted content・result encoding failure・identity source exhaustedを
+   opaque `500 query-state-invalid`として区別する（capacity exhaustionは既存の`429`のまま）。
+   `structured_durable_router`と`preinstalled_wasm_structured_durable_router`の両方へ
+   GET routeとして配線した。stable literal vectors、round-trip/unknown-tag/selector-mismatch
+   decoderテスト、4 routeすべてのboth-router parity、malformed-path-before-side-effectsテスト、
+   object absent/tombstone/current-inline/current-blob/tamper/wrong-chainテスト、receipt
+   absent/present/corruptテスト、nonce zero/advanced/deleted-corruptテスト、
+   inactive-placement-before-side-effectsテスト、503/500 operational classificationテスト、
+   admission/cancellationテストを両crateのtest suiteに追加済み。
 
 **Repository-boundary decision**（ARCHITECTURE.md DR-0081；DR-0080の同名決定のうち
 repository-boundary/counter-demo deliverableのみを置き換える。DR-0080に記録された

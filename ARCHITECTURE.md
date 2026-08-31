@@ -1527,8 +1527,10 @@ generation. A signed duplicate-transfer HTTP E2E is still planned; direct WASM
 tests already prove successful same-asset movement and effect-free rejection
 of mixed asset IDs. No other `clients/*`/`apps/*` path from DR-0081 exists.
 The bounded query API (chain/context info, object reads, receipts, and an
-authenticated sender's next nonce) is the next separate implementation slice
-defined below. Known current limitations that
+authenticated sender's next nonce) is implemented As-Is per the design defined
+below; a Rust/TypeScript client, CLI, explorer, wallet, and restart/duplicate
+E2E coverage remain the next separate implementation slices. Known current
+limitations that
 must stay visible at devnet startup and in documentation once implemented:
 single validator; owned-object only (Create, Shared/System ownership, and
 blob bodies remain fail-closed); fee-free (`fee_payment: None`, empty fee
@@ -1582,13 +1584,69 @@ accepted remains corruption and fails closed; true absence at initial revision
 returns zero.
 
 All storage-backed queries allocate a restart-safe correlation identity and a
-bounded deadline from the embedding host, resolve the domain solely from the
-committed manifest, and run through the same bounded blocking executor as
-submission. Capacity exhaustion is `429`; malformed paths are `400`; corrupt,
-unverifiable, or otherwise invalid durable state is an opaque `500`. Query
-responses are bounded by the existing maximum canonical object/receipt sizes;
-there is no scan, list, prefix, pagination, proof, historical-version selector,
-or arbitrary state-key endpoint in this MVP slice.
+bounded deadline from the embedding host, resolve the domain from the
+committed manifest through the same activation-epoch-checked
+`DomainPlacementManifest::resolve_domain` path the authenticated write path
+uses (at the trusted current epoch, with one bounded access rather than a real
+application plan), and run through the same bounded blocking executor as
+submission. An inactive placement therefore rejects before identity
+allocation, clock access, or storage I/O; it remains an opaque `503`, while a
+malformed selector is a `400` rejected at the HTTP boundary.
+Capacity exhaustion is `429`; malformed paths are `400`; a transient host or
+storage-availability condition (identity-source unavailability, clock/runtime
+failure, a durable read that proves writer fencing/deadline exhaustion/
+backend unavailability, or committed `ProtocolConfig`
+inactivity/misconfiguration) is an opaque `503`; corrupt or unverifiable
+persisted content, result-encoding failure, and identity-source exhaustion are
+an opaque `500`. Query responses are bounded by the existing maximum canonical
+object/receipt sizes; there is no scan, list, prefix, pagination, proof,
+historical-version selector, or arbitrary state-key endpoint in this MVP
+slice.
+
+Every one of the four result types except `/v1/context` (which has no request
+selector) carries the exact selector it answers — `object_id`, `request_id`,
+or `sender` — in every status, including absence and tombstone. Node-core's
+`ObjectQueryResult` and `ReceiptQueryResult` bind this selector at the type
+level so the HTTP layer cannot construct a canonical result for one selector
+from a lookup keyed by another; `native-http`'s wire codecs re-assert the same
+binding as an always-present field, and the adapter independently re-checks
+the selector on the result node-core returns before encoding it, as defense
+in depth against a future regression.
+
+Current vs. planned: this slice is implemented As-Is. `node-core` adds public
+`query_sender_next_nonce`, `query_object`, and `query_request_receipt`
+functions — implemented in a private internal module but re-exported from the
+crate root, so `node_core::query_object` etc. are the stable public paths, not
+a public `query` module — as the only entrypoints that can observe a
+next-nonce value, an object, or a receipt outside node-core; the private
+`SenderNonceRecord` framing never crosses that boundary, and the object/receipt
+checks reuse the same cross-check/re-encoding rules as the authenticated write
+and replay paths. `query_object` checks the immutable version's creating-chain
+provenance against the trusted chain before branching on inline versus blob
+payload, so a cross-chain blob record fails closed exactly like a cross-chain
+inline record; a `CurrentBlobReference` result's `digest` and `blob_digest`
+are the values recorded on the immutable version and cross-checked against the
+head, never verified against fetched body bytes, since this MVP never fetches
+a blob body. `native-http` adds the four canonical
+`application/vnd.sunrise-edge.query-result` codecs (`0xE102`-`0xE105`) —
+including strict decode validation of the nested canonical `objects::Object`
+(id/version match, `MAX_AUTHENTICATED_OBJECT_BODY_BYTES`) and nested
+`NodeDedupRecord` (request-id/event-digest match, exact re-encoding) carried
+inside a `CurrentInline`/`Present` result, and rejection of a zero protocol
+version/hash-suite/profile/scheme/binding id, an over-length chain id, or
+empty canonical `ProtocolConfig` bytes in the context result — and wires
+`GET /v1/context`, `/v1/objects/{object_id}`, `/v1/receipts/{request_id}`,
+and `/v1/senders/{sender}/next-nonce` into both `structured_durable_router` and
+`preinstalled_wasm_structured_durable_router`, sharing their
+`NativeBlockingExecutor`, admission, and pre-storage cancellation semantics.
+Every path selector is validated as exactly 64 lowercase ASCII hex characters
+(and, for receipts, non-zero) before any identity allocation, clock access, or
+storage I/O. Stable vectors, round-trip/unknown-tag/mismatched-selector decode
+tests, both-router parity across all four routes, malformed-path-before-side-
+effects, object absent/tombstone/current-inline/current-blob/tamper/wrong-chain,
+receipt absent/present/corrupt, nonce zero/advanced/deleted-corrupt, an
+inactive-placement-before-side-effects case, and the `503`/`500` operational
+classification are covered in both crates' test suites.
 
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
