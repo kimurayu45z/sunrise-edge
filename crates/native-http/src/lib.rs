@@ -2568,10 +2568,12 @@ fn execution_error_response(error: &ExecutionError) -> (StatusCode, &'static str
             StatusCode::UNPROCESSABLE_ENTITY,
             "preinstalled-module-resource-limit-exceeded",
         ),
-        // The trusted catalog module itself failed to parse, instantiate, or
-        // link, or its resolved entrypoint export has the wrong signature: a
-        // host/catalog defect (malformed trusted catalog WASM), never
-        // something the caller can control. Bounded only by this route's
+        // The trusted catalog module itself failed fuel setup, compilation,
+        // host-function linking, instantiation, or start: a host/catalog
+        // defect (malformed trusted catalog WASM), never something the
+        // caller can control. A wrong-signature entrypoint does not reach
+        // this arm; it normalizes as a deterministic execution
+        // failure/trap instead. Bounded only by this route's
         // admission/pre-activation limits, not production fee accounting.
         ExecutionError::WasmEngine(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,

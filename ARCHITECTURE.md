@@ -2457,10 +2457,12 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   entrypoint name absent from an otherwise trusted, catalog-verified module)
   and `ResourceLimitExceeded` (deterministic bounds that scale with the
   caller's own manifest/args) are opaque `422` client faults; `WasmEngine`
-  (the trusted catalog module itself failing to parse/instantiate/link, or an
-  entrypoint with the wrong signature — a malformed-trusted-catalog-WASM host
-  failure, bounded only by this route's admission/pre-activation limits, not
-  production fee accounting) and every remaining internal
+  (the trusted catalog module itself failing fuel setup, compilation,
+  host-function linking, instantiation, or start — a
+  malformed-trusted-catalog-WASM host failure, bounded only by this route's
+  admission/pre-activation limits, not production fee accounting; a
+  wrong-signature entrypoint instead normalizes as a deterministic execution
+  failure/trap, never this variant) and every remaining internal
   encoding/hashing/context variant (unreachable in practice once
   authentication has already re-encoded/re-hashed the same transaction once)
   are opaque `500`s. `NodeCoreError::ObjectVersionOverflow` and
@@ -2506,8 +2508,12 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   own initial check plus the two checks inside the shared core) exactly like
   the pre-existing `structured_durable_router` coverage; Shared/System
   ownership and blob-transfer coverage stays at node-core rather than being
-  duplicated at the HTTP layer, since neither is reachable through this MVP
-  object-access surface. The two axum handlers (`submit_structured_durable_event`
+  duplicated at the HTTP layer, since neither can succeed on this MVP
+  object-access surface — their fail-closed rejections
+  (`ObjectOwnerKindUnsupported`/`ObjectBodyUnavailable`) already originate in
+  shared node-core code, and the native HTTP boundary maps those errors to
+  `501`, so duplicating the same
+  node-core tests at HTTP would add no discrimination. The two axum handlers (`submit_structured_durable_event`
   and `submit_preinstalled_wasm_structured_durable_event`) no longer duplicate
   their content-type/body-extraction/admission/cancellation-observation/blocking-dispatch
   logic: both are now thin wrappers around one private

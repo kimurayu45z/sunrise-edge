@@ -422,8 +422,13 @@ cross-provider ingress milestones implemented through Phase 17:
   trusted time, fencing, conflicts, lifecycle ABA safety, the object read-count
   bound, blob round-trip, and exact replay. PostgreSQL now
   implements the same object boundary As-Is. Node-core now consumes it for
-  authenticated read-only manifest authorization; object mutations/effects
-  and blob upload/fetch verification remain deferred.
+  authenticated read-only manifest authorization plus an additive
+  owned-effects path that validates signed Address-object Update/Delete
+  effects and, through a separate additive preinstalled-WASM entrypoint,
+  deterministic bounded WASM execution against an exact-committed module
+  catalog; Create, Shared/System ownership, blob transfer verification,
+  native binary/devnet startup composition, and fee/gas metering remain
+  deferred.
 - An additive indexed durable-outbox repository contract that claims at most
   one due message in stable availability/request order, installs a bounded
   restart-safe lease atomically, and makes same-lease claim and acknowledgement
