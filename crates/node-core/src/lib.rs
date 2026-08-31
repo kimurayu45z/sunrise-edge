@@ -12,7 +12,6 @@ use canonical_encoding::{
     CanonicalDecodingError, CanonicalEncodingError, CanonicalStruct, decode_canonical_frame,
 };
 use core::fmt;
-use execution::{ObjectEffect, ResolvedObject};
 use hashing::{HashSuiteResolver, HashingError};
 use objects::{AccessMode, Address, Object, ObjectId, ObjectRef, Owner};
 use protocol_config::{DomainPlacementManifest, ProtocolConfig, ProtocolConfigError};
@@ -32,7 +31,7 @@ use runtime::{
     StateMutation, StateMutationEntry, StateReadAssertion, StateRevision, StateStore, StateWrite,
     StructuredDurableDomainStateStore, TransactionalStateStore, VersionedStateValue,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 
 mod authenticated_object_effects;
@@ -42,6 +41,7 @@ use authenticated_object_effects::{
     LoadedAuthenticatedObjects, translate_authenticated_object_effects,
 };
 
+pub use execution::{ObjectEffect, ResolvedObject};
 pub use transaction_auth::{
     AuthenticatedTransaction, MAX_TRANSACTION_SIGNABLE_BYTES, TransactionAuthError,
     TrustedTransactionContext, authenticate_transaction_bytes,
@@ -1161,10 +1161,10 @@ struct AuthenticatedObjectAccess {
 /// The fields are private and there is no public constructor. The only way to
 /// obtain a value is [`Self::from_authenticated_transaction`], so a caller can
 /// never authorize an object access against an authority or manifest it did
-/// not cryptographically authenticate. `accesses` is sorted by
-/// [`ObjectId`] and deduplicated, and every entry's version and access mode
-/// have already been validated, so later per-entry storage I/O never needs to
-/// re-check them.
+/// not cryptographically authenticate. `accesses` retains the signed manifest
+/// declaration order, is deduplicated by [`ObjectId`], and has every entry's
+/// version and access mode validated, so later per-entry storage I/O never
+/// needs to re-check them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AuthenticatedObjectDispatch {
     authority: Address,
@@ -1174,7 +1174,7 @@ struct AuthenticatedObjectDispatch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AuthenticatedObjectPolicy {
     ReadOnly,
-    OwnedMutations,
+    OwnedMutations { created_checkpoint: u64 },
 }
 
 impl AuthenticatedObjectDispatch {
@@ -1182,11 +1182,11 @@ impl AuthenticatedObjectDispatch {
     /// inner transaction's sender and declared object-access manifest.
     ///
     /// Every check here is pure and requires zero storage I/O: bounding the
-    /// declared access count, sorting and rejecting a duplicate object
-    /// identifier, requiring a non-zero object version, and enforcing the
-    /// selected internal access policy. The established public entrypoint uses
-    /// read-only policy; only the additive owned-effects entrypoint enables
-    /// Write/Consume.
+    /// declared access count, rejecting a duplicate object identifier without
+    /// changing signed declaration order, requiring a non-zero object version,
+    /// and enforcing the selected internal access policy. The established
+    /// public entrypoint uses read-only policy; only the additive owned-effects
+    /// entrypoint enables Write/Consume.
     fn from_authenticated_transaction(
         transaction: &AuthenticatedTransaction,
         policy: AuthenticatedObjectPolicy,
@@ -1203,9 +1203,9 @@ impl AuthenticatedObjectDispatch {
 
 /// Pure, zero-I/O validation of one declared object-access manifest.
 ///
-/// Bounds the declared access count, sorts and rejects a duplicate object
-/// identifier, requires a non-zero object version, and enforces the selected
-/// internal access policy.
+/// Bounds the declared access count, rejects a duplicate object identifier
+/// without changing signed declaration order, requires a non-zero object
+/// version, and enforces the selected internal access policy.
 ///
 /// Split out of [`AuthenticatedObjectDispatch::from_authenticated_transaction`]
 /// so it can be exercised directly with hand-built entries: the authenticated
@@ -1224,21 +1224,20 @@ fn validate_object_entries(
         });
     }
 
-    let mut accesses: Vec<AuthenticatedObjectAccess> = entries
+    let accesses: Vec<AuthenticatedObjectAccess> = entries
         .iter()
         .map(|entry: &AccessEntry| AuthenticatedObjectAccess {
             object_ref: entry.object_ref.clone(),
             mode: entry.mode,
         })
         .collect();
-    accesses.sort_by_key(|access: &AuthenticatedObjectAccess| access.object_ref.id);
-    if let Some(pair) = accesses
-        .windows(2)
-        .find(|pair| pair[0].object_ref.id == pair[1].object_ref.id)
-    {
-        return Err(NodeCoreError::DuplicateObjectAccess {
-            object_id: pair[0].object_ref.id,
-        });
+    let mut seen_ids: BTreeSet<ObjectId> = BTreeSet::new();
+    for access in &accesses {
+        if !seen_ids.insert(access.object_ref.id) {
+            return Err(NodeCoreError::DuplicateObjectAccess {
+                object_id: access.object_ref.id,
+            });
+        }
     }
 
     for access in &accesses {
@@ -1248,7 +1247,8 @@ fn validate_object_entries(
                 version: access.object_ref.version,
             });
         }
-        if policy == AuthenticatedObjectPolicy::ReadOnly && access.mode != AccessMode::Read {
+        if matches!(policy, AuthenticatedObjectPolicy::ReadOnly) && access.mode != AccessMode::Read
+        {
             return Err(NodeCoreError::ObjectAccessModeUnsupported {
                 object_id: access.object_ref.id,
                 mode: access.mode,
@@ -1957,8 +1957,9 @@ impl NodeStateSnapshot {
             .map(|(key, value)| (key.as_slice(), value))
     }
 
-    /// Returns authenticated, integrity-checked object inputs in canonical
-    /// manifest order. Generic event handlers always provide an empty slice.
+    /// Returns authenticated, integrity-checked object inputs in signed
+    /// manifest declaration order. Generic event handlers always provide an
+    /// empty slice.
     #[must_use]
     pub fn resolved_objects(&self) -> &[ResolvedObject] {
         &self.resolved_objects
@@ -2656,7 +2657,6 @@ where
         submission,
         machine,
         AuthenticatedObjectPolicy::ReadOnly,
-        None,
     )
 }
 
@@ -2687,8 +2687,7 @@ where
         resolver,
         submission,
         machine,
-        AuthenticatedObjectPolicy::OwnedMutations,
-        Some(created_checkpoint),
+        AuthenticatedObjectPolicy::OwnedMutations { created_checkpoint },
     )
 }
 
@@ -2700,12 +2699,17 @@ fn handle_authenticated_submit_transaction_with_policy<S, M>(
     submission: AuthenticatedSubmitTransaction,
     machine: &M,
     object_policy: AuthenticatedObjectPolicy,
-    created_checkpoint: Option<u64>,
 ) -> Result<ResolvedNodeOutput, NodeCoreError>
 where
     S: StructuredDurableDomainStateStore,
     M: TransactionalNodeStateMachine,
 {
+    let created_checkpoint: Option<u64> = match object_policy {
+        AuthenticatedObjectPolicy::ReadOnly => None,
+        AuthenticatedObjectPolicy::OwnedMutations { created_checkpoint } => {
+            Some(created_checkpoint)
+        }
+    };
     let plan = machine.access_plan(submission.event())?;
     let domain = submission
         .placement
@@ -2959,7 +2963,8 @@ where
 
 /// Loads and authorizes every entry in `dispatch.accesses` against
 /// `dispatch.authority`, returning one exact [`runtime::DurableObjectHeadRead`] per
-/// entry in the same canonical order.
+/// entry in the same signed manifest declaration order. The runtime durable
+/// envelope canonicalizes storage assertions independently before commit.
 ///
 /// Every check fails closed:
 ///
@@ -6182,6 +6187,40 @@ mod tests {
         }
     }
 
+    struct ReadObjectEffectMachine;
+
+    impl TransactionalNodeStateMachine for ReadObjectEffectMachine {
+        fn access_plan(&self, _event: &NodeEvent) -> Result<NodeStateAccessPlan, NodeCoreError> {
+            NodeStateAccessPlan::new(vec![NodeStateAccess::new(
+                b"state/read-object-effect".to_vec(),
+                NodeStateAccessMode::ReadOnly,
+            )?])
+        }
+
+        fn transition(
+            &self,
+            state: &NodeStateSnapshot,
+            event: &NodeEvent,
+        ) -> Result<TransactionalNodeTransition, NodeCoreError> {
+            let [input]: &[ResolvedObject] = state.resolved_objects() else {
+                panic!("expected one authenticated read object");
+            };
+            let effect: ObjectEffect = ObjectEffect::Deleted {
+                id: input.object.id,
+                version: input.object.version,
+            };
+            let output: NodeOutput = NodeOutput::new(
+                vec![NodeResponse::new(
+                    event.request_id(),
+                    NodeResponseStatus::Accepted,
+                    None,
+                )?],
+                Vec::new(),
+            )?;
+            TransactionalNodeTransition::with_object_effects(Vec::new(), vec![effect], output)
+        }
+    }
+
     #[test]
     fn authenticated_read_only_manifest_commits_sorted_exact_head_assertions() {
         let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
@@ -6342,13 +6381,17 @@ mod tests {
 
         let owned_modes = validate_object_entries(
             &[
-                entry(0x0C, 1, AccessMode::Write),
                 entry(0x0D, 1, AccessMode::Consume),
+                entry(0x0C, 1, AccessMode::Write),
             ],
-            AuthenticatedObjectPolicy::OwnedMutations,
+            AuthenticatedObjectPolicy::OwnedMutations {
+                created_checkpoint: 1,
+            },
         )
         .unwrap();
         assert_eq!(owned_modes.len(), 2);
+        assert_eq!(owned_modes[0].object_ref.id, ObjectId::new([0x0D; 32]));
+        assert_eq!(owned_modes[1].object_ref.id, ObjectId::new([0x0C; 32]));
     }
 
     /// Every storage-facing branch of `load_and_authorize_objects` that only
@@ -7437,7 +7480,7 @@ mod tests {
         );
         let replay_submission: AuthenticatedSubmitTransaction = submission.clone();
         let machine: OwnedObjectEffectMachine = OwnedObjectEffectMachine {
-            expected_inputs: vec![(read_id, AccessMode::Read), (write_id, AccessMode::Write)],
+            expected_inputs: vec![(write_id, AccessMode::Write), (read_id, AccessMode::Read)],
             replacement_byte: 0xA4,
             calls: AtomicUsize::new(0),
         };
@@ -7621,6 +7664,180 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_read_only_object_rejects_machine_effect_before_commit() {
+        let store: ScriptedDurableStore =
+            ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let node_config: NodeConfig = config("sunrise-test");
+        let protocol_config: ProtocolConfig = active_protocol_config(0xFC);
+        let signing_key: SigningKey = dev_signing_key(0xCE);
+        let sender: Address = dev_sender_address(&signing_key);
+        let object_id: ObjectId = ObjectId::new([0xA1; 32]);
+        let (object_ref, _): (ObjectRef, DurableObjectHead) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            object_id,
+            Owner::Address(sender),
+            0xA1,
+        );
+        let submission: AuthenticatedSubmitTransaction = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xEC),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest_with(vec![AccessEntry {
+                object_ref,
+                mode: AccessMode::Read,
+            }]),
+            &node_config,
+            &protocol_config,
+        );
+
+        let error: NodeCoreError = handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &ReadObjectEffectMachine,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::ObjectEffectMismatch {
+                object_id,
+                reason: "read access produced a mutation effect",
+            }
+        );
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn authenticated_owned_modes_reject_immutable_object_before_transition() {
+        for (mode, request_byte) in [(AccessMode::Write, 0xED_u8), (AccessMode::Consume, 0xEE_u8)] {
+            let store: ScriptedDurableStore =
+                ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+            let node_config: NodeConfig = config("sunrise-test");
+            let protocol_config: ProtocolConfig = active_protocol_config(0xFC);
+            let signing_key: SigningKey = dev_signing_key(0xCF);
+            let object_id: ObjectId = ObjectId::new([request_byte; 32]);
+            let (object_ref, _): (ObjectRef, DurableObjectHead) = preload_inline_object(
+                &store,
+                "sunrise-test",
+                object_id,
+                Owner::Immutable,
+                request_byte,
+            );
+            let submission: AuthenticatedSubmitTransaction = authenticated_submission_with_manifest(
+                "sunrise-test",
+                request(request_byte),
+                &signing_key,
+                Epoch::new(7),
+                0,
+                manifest_with(vec![AccessEntry { object_ref, mode }]),
+                &node_config,
+                &protocol_config,
+            );
+            let machine: IdempotentMachine = IdempotentMachine {
+                calls: AtomicUsize::new(0),
+            };
+
+            let error: NodeCoreError =
+                handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+                    &store,
+                    &durable_context(),
+                    &resolver("sunrise-test"),
+                    submission,
+                    2,
+                    &machine,
+                )
+                .unwrap_err();
+
+            assert_eq!(
+                error,
+                NodeCoreError::ObjectOwnerKindUnsupported { object_id }
+            );
+            assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+            assert!(store.commits.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn authenticated_owned_write_checkpoint_regression_commits_nothing() {
+        let store: MemoryDurableStateStore =
+            MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let node_config: NodeConfig = config("sunrise-test");
+        let protocol_config: ProtocolConfig = active_protocol_config(0xF9);
+        let signing_key: SigningKey = dev_signing_key(0xCD);
+        let sender: Address = dev_sender_address(&signing_key);
+        let context: DurableOperationContext = durable_context();
+        let object_domain: AtomicityDomainId = domain(0xF9);
+        let object_id: ObjectId = ObjectId::new([0x87; 32]);
+        let object_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            test_object(object_id, 1, Owner::Address(sender), 0x87),
+            "sunrise-test",
+            18,
+            0x3A,
+        );
+        let submission: AuthenticatedSubmitTransaction = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xEF),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest_with(vec![AccessEntry {
+                object_ref,
+                mode: AccessMode::Write,
+            }]),
+            &node_config,
+            &protocol_config,
+        );
+        let machine: OwnedObjectEffectMachine = OwnedObjectEffectMachine {
+            expected_inputs: vec![(object_id, AccessMode::Write)],
+            replacement_byte: 0xA7,
+            calls: AtomicUsize::new(0),
+        };
+
+        let error: NodeCoreError =
+            handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+                &store,
+                &context,
+                &resolver("sunrise-test"),
+                submission,
+                17,
+                &machine,
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::ObjectCreatedCheckpointRegression {
+                object_id,
+                previous_created_checkpoint: 18,
+                attempted_created_checkpoint: 17,
+            }
+        );
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        let head: DurableObjectHead = store
+            .get_object_head(&context, object_domain, object_id)
+            .unwrap();
+        assert_eq!(head.object_version(), DurableObjectVersion::new(1));
+        let nonce_key: Vec<u8> =
+            sender_nonce_key_for("sunrise-test", *sender.as_bytes(), Epoch::new(7));
+        assert!(
+            store
+                .get_versioned_durable(&context, object_domain, &nonce_key)
+                .unwrap()
+                .value()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn generic_durable_handler_rejects_object_effects_without_dispatch() {
         let store: ScriptedDurableStore =
             ScriptedDurableStore::new(DurableCommitOutcome::Committed);
@@ -7642,12 +7859,11 @@ mod tests {
     }
 
     /// One machine implementation used only to inject a genuine, deterministic
-    /// TOCTOU race into a single-threaded test: `transition()` runs strictly
-    /// after `load_and_authorize_objects` has already captured its object-head
-    /// snapshot (see the ordering documented on
-    /// `handle_durable_idempotent_event_with_plan`) and strictly before the
-    /// outer invocation commits, so committing a competing update to the same
-    /// object here reproduces a real stale-head race without threads.
+    /// TOCTOU race into a single-threaded owned-object Write test:
+    /// `transition()` runs strictly after `load_and_authorize_objects` has
+    /// captured its object-head snapshot and strictly before the outer
+    /// invocation commits. It commits a competing update, then returns its own
+    /// conflicting update effect against the stale verified input.
     struct StaleHeadRaceMachine<'a> {
         store: &'a MemoryDurableStateStore,
         context: DurableOperationContext,
@@ -7665,7 +7881,7 @@ mod tests {
 
         fn transition(
             &self,
-            _state: &NodeStateSnapshot,
+            state: &NodeStateSnapshot,
             event: &NodeEvent,
         ) -> Result<TransactionalNodeTransition, NodeCoreError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -7680,14 +7896,28 @@ mod tests {
                     .commit_invocation(&self.context, racing_invocation),
                 DurableCommitOutcome::Committed
             );
-            Ok(TransactionalNodeTransition::read_only(NodeOutput::new(
-                vec![NodeResponse::new(
-                    event.request_id(),
-                    NodeResponseStatus::Accepted,
-                    None,
-                )?],
+            let [input]: &[ResolvedObject] = state.resolved_objects() else {
+                panic!("expected one authenticated Write object");
+            };
+            assert_eq!(input.mode, AccessMode::Write);
+            let mut new_object: Object = input.object.clone();
+            new_object.version = new_object.version.checked_add(1).unwrap();
+            new_object.data = vec![0x84];
+            TransactionalNodeTransition::with_object_effects(
                 Vec::new(),
-            )?))
+                vec![ObjectEffect::Mutated {
+                    previous_version: input.object.version,
+                    new_object,
+                }],
+                NodeOutput::new(
+                    vec![NodeResponse::new(
+                        event.request_id(),
+                        NodeResponseStatus::Accepted,
+                        None,
+                    )?],
+                    Vec::new(),
+                )?,
+            )
         }
     }
 
@@ -7788,7 +8018,7 @@ mod tests {
                 version: 1,
                 digest: digest_v1,
             },
-            mode: AccessMode::Read,
+            mode: AccessMode::Write,
         }]);
         let stale_submission = authenticated_submission_with_manifest(
             "sunrise-test",
@@ -7801,14 +8031,16 @@ mod tests {
             &protocol_config,
         );
 
-        let race_error = handle_authenticated_resolved_durable_submit_transaction(
-            &store,
-            &context,
-            &resolver,
-            stale_submission,
-            &racing_machine,
-        )
-        .unwrap_err();
+        let race_error =
+            handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+                &store,
+                &context,
+                &resolver,
+                stale_submission,
+                2,
+                &racing_machine,
+            )
+            .unwrap_err();
         assert_eq!(race_error, NodeCoreError::ObjectConflict { object_id });
         assert_eq!(racing_machine.calls.load(Ordering::SeqCst), 1);
 
@@ -8869,6 +9101,35 @@ mod tests {
         assert_eq!(
             TransactionalNodeTransition::new(Vec::new(), NodeOutput::default()),
             Err(NodeCoreError::EmptyStateUpdates)
+        );
+        assert_eq!(
+            TransactionalNodeTransition::with_object_effects(
+                Vec::new(),
+                Vec::new(),
+                NodeOutput::default(),
+            ),
+            Err(NodeCoreError::EmptyStateUpdates)
+        );
+        let effects: Vec<ObjectEffect> = (0..=MAX_AUTHENTICATED_OBJECT_READS)
+            .map(|index: usize| {
+                ObjectEffect::Created(test_object(
+                    ObjectId::new([u8::try_from(index).unwrap(); 32]),
+                    1,
+                    Owner::Immutable,
+                    u8::try_from(index).unwrap(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            TransactionalNodeTransition::with_object_effects(
+                Vec::new(),
+                effects,
+                NodeOutput::default(),
+            ),
+            Err(NodeCoreError::TooManyObjectEffects {
+                actual: MAX_AUTHENTICATED_OBJECT_READS + 1,
+                maximum: MAX_AUTHENTICATED_OBJECT_READS,
+            })
         );
     }
 

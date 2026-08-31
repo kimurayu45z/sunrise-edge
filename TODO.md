@@ -2018,7 +2018,7 @@ Phase 15 As-Is scope:
   verified inputとdeterministic `ObjectEffect`をstrictに対応付け、owned Address objectのUpdate/Deleteを
   bounded durable mutationへ変換するadditive handlerはimplemented As-Isである。Create、owner/type/schema変更、
   version不整合、undeclared/duplicate effect、overflow、untrusted mutation contextはfail closedにする。
-  verified objectはcanonical manifest順でtransitionへ渡し、composition-trusted checkpointのregressionを拒否し、
+  verified objectはsigned manifestの宣言順でtransitionへ渡し、composition-trusted checkpointのregressionを拒否し、
   exact head assertion、Update/Delete、nonce、state、receipt、outboxを同じstructured durable invocationでcommitする。
   exact request replayはobject I/Oやtransitionより先にreceiptからreconcileするためeffectを再適用しない。
   generic handlerはresolved objectを渡さず、返されたeffectを黙って捨てずにfail closedにする。

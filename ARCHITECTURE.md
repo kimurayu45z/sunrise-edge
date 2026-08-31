@@ -300,10 +300,10 @@ hashed with the active Object suite from trusted chain/protocol/epoch context,
 and translated into a new immutable version plus Update mutation while
 preserving its routing projection; Consume translates to Delete. The additive
 owned-effects handler supplies the verified objects to the pure transition in
-canonical manifest order, accepts Write/Consume only on that explicit policy,
-and supplies a composition-trusted checkpoint that cannot come from request
-bytes. It atomically composes the returned Update/Delete mutations and exact
-head assertions with sender nonce, application state, receipt, and outbox.
+signed manifest declaration order, accepts Write/Consume only on that explicit
+policy, and supplies a composition-trusted checkpoint that cannot come from
+request bytes. It atomically composes the returned Update/Delete mutations and
+exact head assertions with sender nonce, application state, receipt, and outbox.
 Checkpoint regression relative to the prior immutable version fails closed;
 an exact request replay reconciles the receipt before object reads or execution
 and therefore cannot reapply an effect. Generic handlers receive no resolved
@@ -2224,11 +2224,11 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   non-production limitations.
 - DR-0077: Expose owned Address-object Write/Consume as a separate additive
   authenticated node-core entrypoint rather than weakening the existing
-  read-only path. Supply verified objects to the pure transition in canonical
-  manifest order and require exact signed-access/effect correspondence. Treat
-  the creation checkpoint as trusted composition input, reject checkpoint
-  regression, and commit object head/version changes with nonce, state,
-  receipt, and outbox in one structured durable invocation. Reconcile exact
+  read-only path. Supply verified objects to the pure transition in signed
+  manifest declaration order and require exact signed-access/effect
+  correspondence. Treat the creation checkpoint as trusted composition input,
+  reject checkpoint regression, and commit object head/version changes with
+  nonce, state, receipt, and outbox in one structured durable invocation. Reconcile exact
   request replay before object I/O or execution. Generic handlers receive no
   objects and reject effects. Keep native HTTP on the read-only entrypoint
   until the preinstalled module commitment and bounded deterministic WASM

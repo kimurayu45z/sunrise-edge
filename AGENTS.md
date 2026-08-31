@@ -238,11 +238,12 @@ bodies. Head owner/routing projections are routing data, never authorization.
 The authenticated structured durable path now loads every signed manifest entry
 through its exact head and immutable inline version and matches the typed owner
 to the verified sender. A separate additive owned-effects entrypoint supplies
-those inputs to a pure transition in canonical order and atomically commits
-strict Write/Consume Update/Delete effects with exact head assertions, sender
-nonce, state, receipt, and outbox. The read-only and native HTTP paths still
-reject Write/Consume before storage I/O; Shared/System ownership, blob bodies,
-and module loading remain fail-closed. Every immutable object version now
+those inputs to a pure transition in signed manifest declaration order and
+atomically commits strict Write/Consume Update/Delete effects with exact head
+assertions, sender nonce, state, receipt, and outbox. The read-only and native
+HTTP paths still reject Write/Consume before storage I/O; Shared/System
+ownership, blob bodies, and module loading remain fail-closed. Every immutable
+object version now
 carries its creating chain/protocol-version provenance (`DurableObjectProvenance`,
 DR-0068), and node-core independently recomputes and verifies each
 authenticated object's digest from that provenance and the stored `Digest32`
