@@ -8,7 +8,7 @@
 use axum::{
     Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, State, rejection::BytesRejection},
+    extract::{DefaultBodyLimit, Path, State, rejection::BytesRejection},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -20,28 +20,34 @@ use core::fmt;
 use execution::{ExecutionError, WasmExecutionEngine};
 use hashing::HashSuiteResolver;
 use node_core::{
-    AuthenticatedSubmitTransaction, MAX_NODE_OUTPUT_ITEMS, MAX_NODE_PAYLOAD_BYTES, NodeConfig,
-    NodeCoreError, NodeEvent, NodeEventKind, NodeOutboxBatch, NodeOutboxDelivery, NodeResponse,
-    OutboxClaim, OutboxLeaseId, PreinstalledModuleCatalog, RequestId, TransactionAuthError,
-    TransactionalNodeStateMachine, acknowledge_outbox_message,
+    AuthenticatedSubmitTransaction, MAX_AUTHENTICATED_OBJECT_BODY_BYTES, MAX_CHAIN_ID_BYTES,
+    MAX_NODE_OUTPUT_ITEMS, MAX_NODE_PAYLOAD_BYTES, NodeConfig, NodeCoreError, NodeDedupRecord,
+    NodeEvent, NodeEventKind, NodeOutboxBatch, NodeOutboxDelivery, NodeResponse,
+    ObjectQueryResult as NodeObjectQueryResult, OutboxClaim, OutboxLeaseId,
+    PreinstalledModuleCatalog, ReceiptQueryResult as NodeReceiptQueryResult, RequestId,
+    TransactionAuthError, TransactionalNodeStateMachine, acknowledge_outbox_message,
     acknowledge_outbox_message_in_domain, authenticate_submit_transaction_event,
     claim_next_outbox_message, claim_next_outbox_message_in_domain,
     handle_authenticated_resolved_durable_submit_transaction,
     handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution,
     handle_idempotent_event, handle_resolved_durable_idempotent_event,
-    handle_resolved_idempotent_event,
+    handle_resolved_idempotent_event, query_object, query_request_receipt, query_sender_next_nonce,
 };
-use protocol_config::{DomainPlacementManifest, ProtocolConfig, ProtocolConfigError};
-use protocol_types::ProtocolVersion;
+use objects::{Address, ObjectId, decode_object};
+use protocol_config::{
+    DomainPlacementManifest, ProtocolConfig, ProtocolConfigError, resolve_transaction_auth_profile,
+};
+use protocol_types::{ChainId, Digest32, Epoch, HashAlgorithmId, HashSuiteId, ProtocolVersion};
 use runtime::{
     AtomicityDomainId, Clock, DomainTransactionalStateStore, DueOutboxClaimRequest,
-    DurableOperationContext, DurableOutboxAcknowledgement, DurableOutboxAcknowledgementOutcome,
-    DurableOutboxAcknowledgementRejection, DurableOutboxClaimOutcome, DurableOutboxClaimRejection,
-    DurableOutboxLeaseId, IndeterminateCommitReason, IndexedOutboxContractError,
-    IndexedOutboxRepository, InvocationCancellation, MAX_DURABLE_OUTBOX_LEASE_MILLIS,
-    OutboxRequestId, PersistenceLayout, RequestOutboxClaimRequest, Runtime, RuntimeError,
-    StateKeyScan, StateKeyScanner, StorageCorrelationId, StorageDeadline, TransactionalStateStore,
-    Transport, WriterFenceGeneration,
+    DurableObjectVersion, DurableOperationContext, DurableOutboxAcknowledgement,
+    DurableOutboxAcknowledgementOutcome, DurableOutboxAcknowledgementRejection,
+    DurableOutboxClaimOutcome, DurableOutboxClaimRejection, DurableOutboxLeaseId,
+    IndeterminateCommitReason, IndexedOutboxContractError, IndexedOutboxRepository,
+    InvocationCancellation, MAX_DURABLE_OUTBOX_LEASE_MILLIS, MAX_DURABLE_RECEIPT_BYTES,
+    ObjectHeadRevision, OutboxRequestId, PersistenceLayout, RequestOutboxClaimRequest, Runtime,
+    RuntimeError, StateKeyScan, StateKeyScanner, StorageCorrelationId, StorageDeadline,
+    StructuredDurableDomainStateStore, TransactionalStateStore, Transport, WriterFenceGeneration,
 };
 use std::{
     error::Error,
@@ -53,6 +59,27 @@ use tokio::sync::{Semaphore, TryAcquireError};
 
 const HTTP_RESULT_TYPE_ID: u16 = 0xE101;
 const HTTP_RESULT_ENCODING_VERSION: u16 = 1;
+const QUERY_RESULT_ENCODING_VERSION: u16 = 1;
+
+/// Canonical type identifier for [`HttpContextQueryResult`] (DR-0082).
+pub const CONTEXT_QUERY_RESULT_TYPE_ID: u16 = 0xE102;
+/// Canonical type identifier for [`HttpObjectQueryResult`] (DR-0082).
+pub const OBJECT_QUERY_RESULT_TYPE_ID: u16 = 0xE103;
+/// Canonical type identifier for [`HttpReceiptQueryResult`] (DR-0082).
+pub const RECEIPT_QUERY_RESULT_TYPE_ID: u16 = 0xE104;
+/// Canonical type identifier for [`HttpNextNonceQueryResult`] (DR-0082).
+pub const NEXT_NONCE_QUERY_RESULT_TYPE_ID: u16 = 0xE105;
+
+/// Versioned media type returned by every bounded query route (DR-0082).
+pub const QUERY_RESULT_MEDIA_TYPE: &str = "application/vnd.sunrise-edge.query-result";
+/// Bounded query route returning trusted chain/protocol/domain context.
+pub const QUERY_CONTEXT_PATH: &str = "/v1/context";
+/// Bounded query route returning one durable object by identifier.
+pub const QUERY_OBJECT_PATH: &str = "/v1/objects/{object_id}";
+/// Bounded query route returning one durable receipt by request identifier.
+pub const QUERY_RECEIPT_PATH: &str = "/v1/receipts/{request_id}";
+/// Bounded query route returning one sender's current-epoch next nonce.
+pub const QUERY_NEXT_NONCE_PATH: &str = "/v1/senders/{sender}/next-nonce";
 
 /// Versioned media type accepted by the event endpoint.
 pub const NODE_EVENT_MEDIA_TYPE: &str = "application/vnd.sunrise-edge.node-event";
@@ -650,6 +677,961 @@ impl HttpNodeResult {
     }
 }
 
+/// Errors from encoding or decoding a bounded query-result frame (DR-0082).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryResultError {
+    /// Canonical encoding failed.
+    CanonicalEncoding(CanonicalEncodingError),
+    /// Canonical decoding failed.
+    CanonicalDecoding(CanonicalDecodingError),
+    /// A decoded chain identifier was invalid.
+    InvalidChainId(protocol_types::TypeError),
+    /// A chain identifier exceeded node-core's ingress resource bound.
+    ChainIdTooLong(usize),
+    /// A decoded atomicity-domain identifier was invalid.
+    InvalidDomain(protocol_types::TypeError),
+    /// A decoded atomicity-domain field had the wrong byte length.
+    InvalidDomainLength(usize),
+    /// A decoded object identifier field had the wrong byte length.
+    InvalidObjectIdLength(usize),
+    /// A decoded request identifier field had the wrong byte length.
+    InvalidRequestIdLength(usize),
+    /// A decoded sender address field had the wrong byte length.
+    InvalidSenderLength(usize),
+    /// A decoded digest named an unknown hash algorithm.
+    InvalidDigestAlgorithm(protocol_types::TypeError),
+    /// A decoded digest field had the wrong byte length.
+    InvalidDigestLength(usize),
+    /// A decoded object-head revision was zero.
+    InvalidHeadRevision(u64),
+    /// A decoded immutable object version was zero.
+    InvalidObjectVersion(u64),
+    /// An object query-result status identifier is unknown.
+    UnknownObjectStatus(u16),
+    /// A receipt query-result status identifier is unknown.
+    UnknownReceiptStatus(u16),
+    /// The context's protocol version was zero.
+    ZeroProtocolVersion,
+    /// The context's active hash-suite identifier was zero.
+    ZeroHashSuiteId,
+    /// The context's transaction-authentication profile identifier was zero.
+    ZeroTransactionAuthProfileId,
+    /// The context's signature-scheme identifier was zero.
+    ZeroSignatureSchemeId,
+    /// The context's address-binding identifier was zero.
+    ZeroAddressBindingId,
+    /// The context's canonical `ProtocolConfig` bytes were empty.
+    EmptyProtocolConfigBytes,
+    /// An inline object body exceeded the pre-activation verification bound.
+    ObjectBodyTooLarge {
+        /// Actual inline body length in bytes.
+        actual: usize,
+        /// Maximum accepted inline body length in bytes.
+        maximum: usize,
+    },
+    /// The nested canonical `objects::Object` failed to decode.
+    InvalidCanonicalObject(objects::ObjectError),
+    /// The nested canonical object's identifier disagreed with the outer selector.
+    ObjectIdentityMismatch {
+        /// Object identifier carried by the outer result.
+        expected: ObjectId,
+        /// Object identifier decoded from the nested canonical body.
+        actual: ObjectId,
+    },
+    /// The nested canonical object's version disagreed with the outer field.
+    ObjectVersionMismatch {
+        /// Version carried by the outer result.
+        expected: u64,
+        /// Version decoded from the nested canonical body.
+        actual: u64,
+    },
+    /// A durable receipt body exceeded the durable receipt resource bound.
+    ReceiptTooLarge {
+        /// Actual receipt length in bytes.
+        actual: usize,
+        /// Maximum accepted receipt length in bytes.
+        maximum: usize,
+    },
+    /// The nested canonical `NodeDedupRecord` failed to decode or re-encode.
+    InvalidDedupRecord(NodeCoreError),
+    /// The nested dedup record's request id disagreed with the outer selector.
+    RequestIdentityMismatch {
+        /// Request identifier carried by the outer result.
+        expected: RequestId,
+        /// Request identifier decoded from the nested dedup record.
+        actual: RequestId,
+    },
+    /// The nested dedup record's event digest disagreed with the outer field.
+    EventDigestMismatch,
+    /// The nested dedup record did not re-encode to exactly its persisted bytes.
+    NonCanonicalReEncoding,
+}
+
+impl fmt::Display for QueryResultError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CanonicalEncoding(error) => write!(f, "canonical encoding failed: {error}"),
+            Self::CanonicalDecoding(error) => write!(f, "canonical decoding failed: {error}"),
+            Self::InvalidChainId(error) => write!(f, "invalid chain id: {error}"),
+            Self::ChainIdTooLong(length) => {
+                write!(
+                    f,
+                    "chain id is {length} bytes, maximum is {MAX_CHAIN_ID_BYTES}"
+                )
+            }
+            Self::InvalidDomain(error) => write!(f, "invalid atomicity domain id: {error}"),
+            Self::InvalidDomainLength(length) => {
+                write!(f, "atomicity domain field is {length} bytes, expected 32")
+            }
+            Self::InvalidObjectIdLength(length) => {
+                write!(f, "object id field is {length} bytes, expected 32")
+            }
+            Self::InvalidRequestIdLength(length) => {
+                write!(f, "request id field is {length} bytes, expected 32")
+            }
+            Self::InvalidSenderLength(length) => {
+                write!(f, "sender field is {length} bytes, expected 32")
+            }
+            Self::InvalidDigestAlgorithm(error) => write!(f, "invalid digest algorithm: {error}"),
+            Self::InvalidDigestLength(length) => {
+                write!(f, "digest field is {length} bytes, expected 32")
+            }
+            Self::InvalidHeadRevision(value) => {
+                write!(f, "object head revision must not be zero, got {value}")
+            }
+            Self::InvalidObjectVersion(value) => {
+                write!(f, "object version must not be zero, got {value}")
+            }
+            Self::UnknownObjectStatus(id) => write!(f, "unknown object query status id: {id}"),
+            Self::UnknownReceiptStatus(id) => write!(f, "unknown receipt query status id: {id}"),
+            Self::ZeroProtocolVersion => f.write_str("context protocol version must not be zero"),
+            Self::ZeroHashSuiteId => f.write_str("context hash suite id must not be zero"),
+            Self::ZeroTransactionAuthProfileId => {
+                f.write_str("context transaction auth profile id must not be zero")
+            }
+            Self::ZeroSignatureSchemeId => {
+                f.write_str("context signature scheme id must not be zero")
+            }
+            Self::ZeroAddressBindingId => {
+                f.write_str("context address binding id must not be zero")
+            }
+            Self::EmptyProtocolConfigBytes => {
+                f.write_str("context canonical protocol config bytes must not be empty")
+            }
+            Self::ObjectBodyTooLarge { actual, maximum } => write!(
+                f,
+                "inline object body is {actual} bytes, maximum is {maximum}"
+            ),
+            Self::InvalidCanonicalObject(error) => {
+                write!(f, "nested canonical object is invalid: {error}")
+            }
+            Self::ObjectIdentityMismatch { expected, actual } => write!(
+                f,
+                "nested canonical object id {actual} disagrees with outer selector {expected}"
+            ),
+            Self::ObjectVersionMismatch { expected, actual } => write!(
+                f,
+                "nested canonical object version {actual} disagrees with outer field {expected}"
+            ),
+            Self::ReceiptTooLarge { actual, maximum } => {
+                write!(f, "receipt body is {actual} bytes, maximum is {maximum}")
+            }
+            Self::InvalidDedupRecord(error) => {
+                write!(f, "nested dedup record is invalid: {error}")
+            }
+            Self::RequestIdentityMismatch { expected, actual } => write!(
+                f,
+                "nested dedup record request id {actual} disagrees with outer selector {expected}"
+            ),
+            Self::EventDigestMismatch => {
+                f.write_str("nested dedup record event digest disagrees with outer field")
+            }
+            Self::NonCanonicalReEncoding => {
+                f.write_str("nested dedup record does not re-encode to its persisted bytes")
+            }
+        }
+    }
+}
+
+impl Error for QueryResultError {}
+
+impl From<CanonicalEncodingError> for QueryResultError {
+    fn from(value: CanonicalEncodingError) -> Self {
+        Self::CanonicalEncoding(value)
+    }
+}
+
+impl From<CanonicalDecodingError> for QueryResultError {
+    fn from(value: CanonicalDecodingError) -> Self {
+        Self::CanonicalDecoding(value)
+    }
+}
+
+fn encode_digest_fields(
+    frame: &mut CanonicalStruct,
+    algorithm_field_id: u16,
+    bytes_field_id: u16,
+    digest: Digest32,
+) -> Result<(), QueryResultError> {
+    frame.field_u16(algorithm_field_id, digest.algorithm().as_u16())?;
+    frame.field_bytes(bytes_field_id, digest.bytes().to_vec())?;
+    Ok(())
+}
+
+fn decode_digest_fields(
+    frame: &canonical_encoding::CanonicalFrame<'_>,
+    algorithm_field_id: u16,
+    bytes_field_id: u16,
+) -> Result<Digest32, QueryResultError> {
+    let algorithm = HashAlgorithmId::try_from(frame.required_u16(algorithm_field_id)?)
+        .map_err(QueryResultError::InvalidDigestAlgorithm)?;
+    let bytes = frame.required_field(bytes_field_id)?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| QueryResultError::InvalidDigestLength(bytes.len()))?;
+    Ok(Digest32::new(algorithm, bytes))
+}
+
+fn decode_object_id_field(
+    frame: &canonical_encoding::CanonicalFrame<'_>,
+    field_id: u16,
+) -> Result<ObjectId, QueryResultError> {
+    let bytes = frame.required_field(field_id)?;
+    let array: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| QueryResultError::InvalidObjectIdLength(bytes.len()))?;
+    Ok(ObjectId::new(array))
+}
+
+fn decode_request_id_field(
+    frame: &canonical_encoding::CanonicalFrame<'_>,
+    field_id: u16,
+) -> Result<RequestId, QueryResultError> {
+    let bytes = frame.required_field(field_id)?;
+    let array: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| QueryResultError::InvalidRequestIdLength(bytes.len()))?;
+    RequestId::new(array).map_err(|_| QueryResultError::InvalidRequestIdLength(32))
+}
+
+fn decode_sender_field(
+    frame: &canonical_encoding::CanonicalFrame<'_>,
+    field_id: u16,
+) -> Result<Address, QueryResultError> {
+    let bytes = frame.required_field(field_id)?;
+    let array: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| QueryResultError::InvalidSenderLength(bytes.len()))?;
+    Ok(Address::new(array))
+}
+
+/// Stable status identifiers for [`HttpObjectQueryResult`] (DR-0082).
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectQueryStatus {
+    /// No head row has ever existed for the queried object identifier.
+    Absent = 1,
+    /// A delete retained the last immutable version and head revision.
+    Tombstoned = 2,
+    /// A current, independently verified inline object.
+    CurrentInline = 3,
+    /// A current version whose body is stored externally as a blob.
+    CurrentBlobReference = 4,
+}
+
+impl ObjectQueryStatus {
+    /// Returns the stable wire identifier.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        self as u16
+    }
+}
+
+impl TryFrom<u16> for ObjectQueryStatus {
+    type Error = QueryResultError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Absent),
+            2 => Ok(Self::Tombstoned),
+            3 => Ok(Self::CurrentInline),
+            4 => Ok(Self::CurrentBlobReference),
+            other => Err(QueryResultError::UnknownObjectStatus(other)),
+        }
+    }
+}
+
+/// Stable status identifiers for [`HttpReceiptQueryResult`] (DR-0082).
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiptQueryStatus {
+    /// No durable receipt exists for the queried request identifier.
+    Absent = 1,
+    /// A durable receipt exists and was independently re-verified.
+    Present = 2,
+}
+
+impl ReceiptQueryStatus {
+    /// Returns the stable wire identifier.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        self as u16
+    }
+}
+
+impl TryFrom<u16> for ReceiptQueryStatus {
+    type Error = QueryResultError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Absent),
+            2 => Ok(Self::Present),
+            other => Err(QueryResultError::UnknownReceiptStatus(other)),
+        }
+    }
+}
+
+/// Canonical `GET /v1/context` result (DR-0082, type `0xE102`).
+///
+/// This is a directly useful, self-contained client snapshot of trusted
+/// composition: the chain/protocol/epoch replay boundary, the active
+/// cryptographic and transaction-authentication configuration, the single
+/// committed logical atomicity domain, and the exact canonical
+/// `ProtocolConfig` bytes a client can hash or archive verbatim. `/v1/context`
+/// has no request selector to bind against; the other three query results
+/// each bind to their exact requested selector instead (see
+/// [`HttpObjectQueryResult`], [`HttpReceiptQueryResult`], and
+/// [`HttpNextNonceQueryResult`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpContextQueryResult {
+    chain_id: ChainId,
+    protocol_version: ProtocolVersion,
+    epoch: Epoch,
+    hash_suite_id: HashSuiteId,
+    transaction_auth_profile_id: u16,
+    signature_scheme_id: u16,
+    address_binding_id: u16,
+    domain: AtomicityDomainId,
+    protocol_config_bytes: Vec<u8>,
+}
+
+impl HttpContextQueryResult {
+    /// Creates a context query result from already-trusted composition
+    /// values, rejecting a zero protocol version, hash-suite id,
+    /// transaction-auth-profile id, signature-scheme id, or address-binding
+    /// id; a chain id beyond node-core's `MAX_CHAIN_ID_BYTES`; and empty
+    /// canonical `ProtocolConfig` bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        chain_id: ChainId,
+        protocol_version: ProtocolVersion,
+        epoch: Epoch,
+        hash_suite_id: HashSuiteId,
+        transaction_auth_profile_id: u16,
+        signature_scheme_id: u16,
+        address_binding_id: u16,
+        domain: AtomicityDomainId,
+        protocol_config_bytes: Vec<u8>,
+    ) -> Result<Self, QueryResultError> {
+        let result = Self {
+            chain_id,
+            protocol_version,
+            epoch,
+            hash_suite_id,
+            transaction_auth_profile_id,
+            signature_scheme_id,
+            address_binding_id,
+            domain,
+            protocol_config_bytes,
+        };
+        result.validate()?;
+        Ok(result)
+    }
+
+    fn validate(&self) -> Result<(), QueryResultError> {
+        if self.protocol_version.get() == 0 {
+            return Err(QueryResultError::ZeroProtocolVersion);
+        }
+        if self.hash_suite_id.get() == 0 {
+            return Err(QueryResultError::ZeroHashSuiteId);
+        }
+        if self.transaction_auth_profile_id == 0 {
+            return Err(QueryResultError::ZeroTransactionAuthProfileId);
+        }
+        if self.signature_scheme_id == 0 {
+            return Err(QueryResultError::ZeroSignatureSchemeId);
+        }
+        if self.address_binding_id == 0 {
+            return Err(QueryResultError::ZeroAddressBindingId);
+        }
+        let chain_id_length = self.chain_id.as_str().len();
+        if chain_id_length > MAX_CHAIN_ID_BYTES {
+            return Err(QueryResultError::ChainIdTooLong(chain_id_length));
+        }
+        if self.protocol_config_bytes.is_empty() {
+            return Err(QueryResultError::EmptyProtocolConfigBytes);
+        }
+        Ok(())
+    }
+
+    /// Returns the trusted chain identifier.
+    #[must_use]
+    pub const fn chain_id(&self) -> &ChainId {
+        &self.chain_id
+    }
+
+    /// Returns the trusted protocol version.
+    #[must_use]
+    pub const fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_version
+    }
+
+    /// Returns the trusted current epoch.
+    #[must_use]
+    pub const fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    /// Returns the active hash-suite identifier.
+    #[must_use]
+    pub const fn hash_suite_id(&self) -> HashSuiteId {
+        self.hash_suite_id
+    }
+
+    /// Returns the committed transaction-authentication profile identifier.
+    #[must_use]
+    pub const fn transaction_auth_profile_id(&self) -> u16 {
+        self.transaction_auth_profile_id
+    }
+
+    /// Returns the committed signature-scheme identifier.
+    #[must_use]
+    pub const fn signature_scheme_id(&self) -> u16 {
+        self.signature_scheme_id
+    }
+
+    /// Returns the committed address-binding identifier.
+    #[must_use]
+    pub const fn address_binding_id(&self) -> u16 {
+        self.address_binding_id
+    }
+
+    /// Returns the single committed logical atomicity domain.
+    #[must_use]
+    pub const fn domain(&self) -> AtomicityDomainId {
+        self.domain
+    }
+
+    /// Returns the exact canonical `ProtocolConfig` bytes.
+    #[must_use]
+    pub fn protocol_config_bytes(&self) -> &[u8] {
+        &self.protocol_config_bytes
+    }
+
+    /// Encodes the canonical `0xE102` context query result.
+    pub fn encode(&self) -> Result<Vec<u8>, QueryResultError> {
+        let mut frame =
+            CanonicalStruct::new(CONTEXT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
+        frame.field_str(1, self.chain_id.as_str())?;
+        frame.field_u32(2, self.protocol_version.get())?;
+        frame.field_u64(3, self.epoch.get())?;
+        frame.field_u16(4, self.hash_suite_id.get())?;
+        frame.field_u16(5, self.transaction_auth_profile_id)?;
+        frame.field_u16(6, self.signature_scheme_id)?;
+        frame.field_u16(7, self.address_binding_id)?;
+        frame.field_bytes(8, self.domain.as_bytes().to_vec())?;
+        frame.field_bytes(9, self.protocol_config_bytes.clone())?;
+        Ok(frame.finish()?)
+    }
+
+    /// Decodes and strictly validates one canonical context query result.
+    pub fn decode(bytes: &[u8]) -> Result<Self, QueryResultError> {
+        let frame = decode_canonical_frame(bytes)?;
+        frame.require_type(CONTEXT_QUERY_RESULT_TYPE_ID)?;
+        frame.require_version(QUERY_RESULT_ENCODING_VERSION)?;
+        frame.require_only_fields(&[1, 2, 3, 4, 5, 6, 7, 8, 9])?;
+
+        let chain_id =
+            ChainId::new(frame.required_str(1)?).map_err(QueryResultError::InvalidChainId)?;
+        let protocol_version = ProtocolVersion::new(frame.required_u32(2)?);
+        let epoch = Epoch::new(frame.required_u64(3)?);
+        let hash_suite_id = HashSuiteId::new(frame.required_u16(4)?);
+        let transaction_auth_profile_id = frame.required_u16(5)?;
+        let signature_scheme_id = frame.required_u16(6)?;
+        let address_binding_id = frame.required_u16(7)?;
+        let domain_bytes = frame.required_field(8)?;
+        let domain_array: [u8; 32] = domain_bytes
+            .try_into()
+            .map_err(|_| QueryResultError::InvalidDomainLength(domain_bytes.len()))?;
+        let domain =
+            AtomicityDomainId::new(domain_array).map_err(QueryResultError::InvalidDomain)?;
+        let protocol_config_bytes = frame.required_field(9)?.to_vec();
+
+        Self::new(
+            chain_id,
+            protocol_version,
+            epoch,
+            hash_suite_id,
+            transaction_auth_profile_id,
+            signature_scheme_id,
+            address_binding_id,
+            domain,
+            protocol_config_bytes,
+        )
+    }
+}
+
+/// Canonical `GET /v1/objects/{object_id}` result (DR-0082, type `0xE103`).
+///
+/// Absence, a retained tombstone, a verified current inline object, and a
+/// current blob reference are represented explicitly; a blob-backed version
+/// never claims to have verified an unavailable blob body. Every status
+/// carries the exact `object_id` this result answers, so a caller can never
+/// mistake it for the answer to a different selector.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HttpObjectQueryResult {
+    /// No head row has ever existed for the queried object identifier.
+    Absent {
+        /// The exact object identifier this result answers.
+        object_id: ObjectId,
+    },
+    /// A delete retained the last immutable version and head revision.
+    Tombstoned {
+        /// The exact object identifier this result answers.
+        object_id: ObjectId,
+        /// ABA-safe revision installed by the delete.
+        head_revision: ObjectHeadRevision,
+        /// Last immutable version reconstructed from retained history.
+        last_object_version: DurableObjectVersion,
+    },
+    /// A current, independently verified inline object.
+    CurrentInline {
+        /// The exact object identifier this result answers.
+        object_id: ObjectId,
+        /// ABA-safe revision installed by the latest write.
+        head_revision: ObjectHeadRevision,
+        /// Current immutable object version.
+        object_version: DurableObjectVersion,
+        /// Self-describing digest of the current object version, independently
+        /// recomputed and verified against the returned canonical body.
+        digest: Digest32,
+        /// Exact canonical `objects::Object` bytes, digest-verified.
+        canonical_object_bytes: Vec<u8>,
+    },
+    /// A current version whose body is stored externally as a blob.
+    ///
+    /// Neither `digest` nor `blob_digest` is verified against fetched bytes:
+    /// both are the values recorded on the immutable version, cross-checked
+    /// against the head.
+    CurrentBlobReference {
+        /// The exact object identifier this result answers.
+        object_id: ObjectId,
+        /// ABA-safe revision installed by the latest write.
+        head_revision: ObjectHeadRevision,
+        /// Current immutable object version.
+        object_version: DurableObjectVersion,
+        /// Self-describing digest of the current object version, as recorded
+        /// on the immutable version and cross-checked against the head. Not
+        /// body-verified: the referenced body is never fetched.
+        digest: Digest32,
+        /// Self-describing digest of the externally stored blob content, as
+        /// recorded on the immutable version. Never fetched or verified.
+        blob_digest: Digest32,
+    },
+}
+
+impl HttpObjectQueryResult {
+    /// Returns the exact object identifier this result answers, regardless
+    /// of status.
+    #[must_use]
+    pub const fn object_id(&self) -> ObjectId {
+        match self {
+            Self::Absent { object_id }
+            | Self::Tombstoned { object_id, .. }
+            | Self::CurrentInline { object_id, .. }
+            | Self::CurrentBlobReference { object_id, .. } => *object_id,
+        }
+    }
+}
+
+impl From<NodeObjectQueryResult> for HttpObjectQueryResult {
+    fn from(value: NodeObjectQueryResult) -> Self {
+        match value {
+            NodeObjectQueryResult::Absent { object_id } => Self::Absent { object_id },
+            NodeObjectQueryResult::Tombstoned {
+                object_id,
+                head_revision,
+                last_object_version,
+            } => Self::Tombstoned {
+                object_id,
+                head_revision,
+                last_object_version,
+            },
+            NodeObjectQueryResult::CurrentInline {
+                object_id,
+                head_revision,
+                object_version,
+                digest,
+                canonical_object_bytes,
+            } => Self::CurrentInline {
+                object_id,
+                head_revision,
+                object_version,
+                digest,
+                canonical_object_bytes,
+            },
+            NodeObjectQueryResult::CurrentBlobReference {
+                object_id,
+                head_revision,
+                object_version,
+                digest,
+                blob_digest,
+            } => Self::CurrentBlobReference {
+                object_id,
+                head_revision,
+                object_version,
+                digest,
+                blob_digest,
+            },
+        }
+    }
+}
+
+impl HttpObjectQueryResult {
+    /// Encodes the canonical `0xE103` object query result.
+    pub fn encode(&self) -> Result<Vec<u8>, QueryResultError> {
+        let mut frame =
+            CanonicalStruct::new(OBJECT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
+        match self {
+            Self::Absent { object_id } => {
+                frame.field_u16(1, ObjectQueryStatus::Absent.as_u16())?;
+                frame.field_bytes(2, object_id.as_bytes().to_vec())?;
+            }
+            Self::Tombstoned {
+                object_id,
+                head_revision,
+                last_object_version,
+            } => {
+                frame.field_u16(1, ObjectQueryStatus::Tombstoned.as_u16())?;
+                frame.field_bytes(2, object_id.as_bytes().to_vec())?;
+                frame.field_u64(3, head_revision.get())?;
+                frame.field_u64(4, last_object_version.get())?;
+            }
+            Self::CurrentInline {
+                object_id,
+                head_revision,
+                object_version,
+                digest,
+                canonical_object_bytes,
+            } => {
+                frame.field_u16(1, ObjectQueryStatus::CurrentInline.as_u16())?;
+                frame.field_bytes(2, object_id.as_bytes().to_vec())?;
+                frame.field_u64(3, head_revision.get())?;
+                frame.field_u64(4, object_version.get())?;
+                encode_digest_fields(&mut frame, 5, 6, *digest)?;
+                frame.field_bytes(7, canonical_object_bytes.clone())?;
+            }
+            Self::CurrentBlobReference {
+                object_id,
+                head_revision,
+                object_version,
+                digest,
+                blob_digest,
+            } => {
+                frame.field_u16(1, ObjectQueryStatus::CurrentBlobReference.as_u16())?;
+                frame.field_bytes(2, object_id.as_bytes().to_vec())?;
+                frame.field_u64(3, head_revision.get())?;
+                frame.field_u64(4, object_version.get())?;
+                encode_digest_fields(&mut frame, 5, 6, *digest)?;
+                encode_digest_fields(&mut frame, 8, 9, *blob_digest)?;
+            }
+        }
+        Ok(frame.finish()?)
+    }
+
+    /// Decodes and strictly validates one canonical object query result.
+    ///
+    /// A `CurrentInline` frame is rejected if its inline body exceeds
+    /// node-core's `MAX_AUTHENTICATED_OBJECT_BODY_BYTES`, fails to decode as
+    /// a canonical `objects::Object`, or decodes to an id/version other than
+    /// the outer `object_id`/`object_version` fields.
+    pub fn decode(bytes: &[u8]) -> Result<Self, QueryResultError> {
+        let frame = decode_canonical_frame(bytes)?;
+        frame.require_type(OBJECT_QUERY_RESULT_TYPE_ID)?;
+        frame.require_version(QUERY_RESULT_ENCODING_VERSION)?;
+        frame.require_only_fields(&[1, 2, 3, 4, 5, 6, 7, 8, 9])?;
+
+        let status = ObjectQueryStatus::try_from(frame.required_u16(1)?)?;
+        let object_id = decode_object_id_field(&frame, 2)?;
+        match status {
+            ObjectQueryStatus::Absent => {
+                frame.require_only_fields(&[1, 2])?;
+                Ok(Self::Absent { object_id })
+            }
+            ObjectQueryStatus::Tombstoned => {
+                frame.require_only_fields(&[1, 2, 3, 4])?;
+                let head_revision = decode_head_revision(frame.required_u64(3)?)?;
+                let last_object_version = decode_object_version(frame.required_u64(4)?)?;
+                Ok(Self::Tombstoned {
+                    object_id,
+                    head_revision,
+                    last_object_version,
+                })
+            }
+            ObjectQueryStatus::CurrentInline => {
+                frame.require_only_fields(&[1, 2, 3, 4, 5, 6, 7])?;
+                let head_revision = decode_head_revision(frame.required_u64(3)?)?;
+                let object_version = decode_object_version(frame.required_u64(4)?)?;
+                let digest = decode_digest_fields(&frame, 5, 6)?;
+                let canonical_object_bytes = frame.required_field(7)?.to_vec();
+                if canonical_object_bytes.len() > MAX_AUTHENTICATED_OBJECT_BODY_BYTES {
+                    return Err(QueryResultError::ObjectBodyTooLarge {
+                        actual: canonical_object_bytes.len(),
+                        maximum: MAX_AUTHENTICATED_OBJECT_BODY_BYTES,
+                    });
+                }
+                let nested = decode_object(&canonical_object_bytes)
+                    .map_err(QueryResultError::InvalidCanonicalObject)?;
+                if nested.id != object_id {
+                    return Err(QueryResultError::ObjectIdentityMismatch {
+                        expected: object_id,
+                        actual: nested.id,
+                    });
+                }
+                if nested.version != object_version.get() {
+                    return Err(QueryResultError::ObjectVersionMismatch {
+                        expected: object_version.get(),
+                        actual: nested.version,
+                    });
+                }
+                Ok(Self::CurrentInline {
+                    object_id,
+                    head_revision,
+                    object_version,
+                    digest,
+                    canonical_object_bytes,
+                })
+            }
+            ObjectQueryStatus::CurrentBlobReference => {
+                frame.require_only_fields(&[1, 2, 3, 4, 5, 6, 8, 9])?;
+                let head_revision = decode_head_revision(frame.required_u64(3)?)?;
+                let object_version = decode_object_version(frame.required_u64(4)?)?;
+                let digest = decode_digest_fields(&frame, 5, 6)?;
+                let blob_digest = decode_digest_fields(&frame, 8, 9)?;
+                Ok(Self::CurrentBlobReference {
+                    object_id,
+                    head_revision,
+                    object_version,
+                    digest,
+                    blob_digest,
+                })
+            }
+        }
+    }
+}
+
+fn decode_head_revision(value: u64) -> Result<ObjectHeadRevision, QueryResultError> {
+    ObjectHeadRevision::new(value).ok_or(QueryResultError::InvalidHeadRevision(value))
+}
+
+fn decode_object_version(value: u64) -> Result<DurableObjectVersion, QueryResultError> {
+    DurableObjectVersion::new(value).ok_or(QueryResultError::InvalidObjectVersion(value))
+}
+
+/// Canonical `GET /v1/receipts/{request_id}` result (DR-0082, type `0xE104`).
+///
+/// Both statuses carry the exact `request_id` this result answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HttpReceiptQueryResult {
+    /// No durable receipt exists for the queried request identifier.
+    Absent {
+        /// The exact request identifier this result answers.
+        request_id: RequestId,
+    },
+    /// A durable receipt exists and was independently re-verified.
+    Present {
+        /// The exact request identifier this result answers.
+        request_id: RequestId,
+        /// Digest of the complete canonical input event that produced this receipt.
+        event_digest: Digest32,
+        /// The exact canonical `NodeDedupRecord` bytes, re-encoding-checked.
+        dedup_record_bytes: Vec<u8>,
+    },
+}
+
+impl HttpReceiptQueryResult {
+    /// Returns the exact request identifier this result answers, regardless
+    /// of status.
+    #[must_use]
+    pub const fn request_id(&self) -> RequestId {
+        match self {
+            Self::Absent { request_id } | Self::Present { request_id, .. } => *request_id,
+        }
+    }
+
+    /// Encodes the canonical `0xE104` receipt query result.
+    pub fn encode(&self) -> Result<Vec<u8>, QueryResultError> {
+        let mut frame =
+            CanonicalStruct::new(RECEIPT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
+        match self {
+            Self::Absent { request_id } => {
+                frame.field_u16(1, ReceiptQueryStatus::Absent.as_u16())?;
+                frame.field_bytes(2, request_id.as_bytes().to_vec())?;
+            }
+            Self::Present {
+                request_id,
+                event_digest,
+                dedup_record_bytes,
+            } => {
+                frame.field_u16(1, ReceiptQueryStatus::Present.as_u16())?;
+                frame.field_bytes(2, request_id.as_bytes().to_vec())?;
+                encode_digest_fields(&mut frame, 3, 4, *event_digest)?;
+                frame.field_bytes(5, dedup_record_bytes.clone())?;
+            }
+        }
+        Ok(frame.finish()?)
+    }
+
+    /// Decodes and strictly validates one canonical receipt query result.
+    ///
+    /// A `Present` frame is rejected if its dedup-record body exceeds
+    /// `runtime::MAX_DURABLE_RECEIPT_BYTES`, fails to decode as a canonical
+    /// `NodeDedupRecord`, decodes to a request id/event digest other than the
+    /// outer fields, or does not re-encode to exactly its persisted bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, QueryResultError> {
+        let frame = decode_canonical_frame(bytes)?;
+        frame.require_type(RECEIPT_QUERY_RESULT_TYPE_ID)?;
+        frame.require_version(QUERY_RESULT_ENCODING_VERSION)?;
+        frame.require_only_fields(&[1, 2, 3, 4, 5])?;
+
+        let status = ReceiptQueryStatus::try_from(frame.required_u16(1)?)?;
+        let request_id = decode_request_id_field(&frame, 2)?;
+        match status {
+            ReceiptQueryStatus::Absent => {
+                frame.require_only_fields(&[1, 2])?;
+                Ok(Self::Absent { request_id })
+            }
+            ReceiptQueryStatus::Present => {
+                frame.require_only_fields(&[1, 2, 3, 4, 5])?;
+                let event_digest = decode_digest_fields(&frame, 3, 4)?;
+                let dedup_record_bytes = frame.required_field(5)?.to_vec();
+                if dedup_record_bytes.len() > MAX_DURABLE_RECEIPT_BYTES {
+                    return Err(QueryResultError::ReceiptTooLarge {
+                        actual: dedup_record_bytes.len(),
+                        maximum: MAX_DURABLE_RECEIPT_BYTES,
+                    });
+                }
+                let nested = NodeDedupRecord::decode(&dedup_record_bytes)
+                    .map_err(QueryResultError::InvalidDedupRecord)?;
+                if nested.request_id() != request_id {
+                    return Err(QueryResultError::RequestIdentityMismatch {
+                        expected: request_id,
+                        actual: nested.request_id(),
+                    });
+                }
+                if nested.event_digest() != event_digest {
+                    return Err(QueryResultError::EventDigestMismatch);
+                }
+                let re_encoded = nested
+                    .encode()
+                    .map_err(QueryResultError::InvalidDedupRecord)?;
+                if re_encoded != dedup_record_bytes {
+                    return Err(QueryResultError::NonCanonicalReEncoding);
+                }
+                Ok(Self::Present {
+                    request_id,
+                    event_digest,
+                    dedup_record_bytes,
+                })
+            }
+        }
+    }
+}
+
+fn http_receipt_query_result(
+    result: NodeReceiptQueryResult,
+) -> Result<HttpReceiptQueryResult, NodeCoreError> {
+    match result {
+        NodeReceiptQueryResult::Absent { request_id } => {
+            Ok(HttpReceiptQueryResult::Absent { request_id })
+        }
+        NodeReceiptQueryResult::Present {
+            request_id,
+            event_digest,
+            record,
+        } => Ok(HttpReceiptQueryResult::Present {
+            request_id,
+            event_digest,
+            dedup_record_bytes: record.encode()?,
+        }),
+    }
+}
+
+/// Canonical `GET /v1/senders/{sender}/next-nonce` result (DR-0082, type `0xE105`).
+///
+/// Carries the exact `sender` this result answers alongside the trusted
+/// epoch it was resolved under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HttpNextNonceQueryResult {
+    sender: Address,
+    epoch: Epoch,
+    next_nonce: u64,
+}
+
+impl HttpNextNonceQueryResult {
+    /// Creates a next-nonce query result.
+    #[must_use]
+    pub const fn new(sender: Address, epoch: Epoch, next_nonce: u64) -> Self {
+        Self {
+            sender,
+            epoch,
+            next_nonce,
+        }
+    }
+
+    /// Returns the exact sender this result answers.
+    #[must_use]
+    pub const fn sender(&self) -> Address {
+        self.sender
+    }
+
+    /// Returns the current trusted epoch this next nonce was resolved under.
+    #[must_use]
+    pub const fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    /// Returns the next nonce expected from this sender at this epoch.
+    #[must_use]
+    pub const fn next_nonce(&self) -> u64 {
+        self.next_nonce
+    }
+
+    /// Encodes the canonical `0xE105` next-nonce query result.
+    pub fn encode(&self) -> Result<Vec<u8>, QueryResultError> {
+        let mut frame = CanonicalStruct::new(
+            NEXT_NONCE_QUERY_RESULT_TYPE_ID,
+            QUERY_RESULT_ENCODING_VERSION,
+        );
+        frame.field_bytes(1, self.sender.as_bytes().to_vec())?;
+        frame.field_u64(2, self.epoch.get())?;
+        frame.field_u64(3, self.next_nonce)?;
+        Ok(frame.finish()?)
+    }
+
+    /// Decodes and strictly validates one canonical next-nonce query result.
+    pub fn decode(bytes: &[u8]) -> Result<Self, QueryResultError> {
+        let frame = decode_canonical_frame(bytes)?;
+        frame.require_type(NEXT_NONCE_QUERY_RESULT_TYPE_ID)?;
+        frame.require_version(QUERY_RESULT_ENCODING_VERSION)?;
+        frame.require_only_fields(&[1, 2, 3])?;
+        let sender = decode_sender_field(&frame, 1)?;
+        let epoch = Epoch::new(frame.required_u64(2)?);
+        let next_nonce = frame.required_u64(3)?;
+        Ok(Self::new(sender, epoch, next_nonce))
+    }
+}
+
 struct NativeHttpState<R, M, L> {
     runtime: Arc<R>,
     config: NodeConfig,
@@ -901,6 +1883,22 @@ where
             NODE_EVENT_PATH,
             post(submit_structured_durable_event::<S, M, T, C, I>),
         )
+        .route(
+            QUERY_CONTEXT_PATH,
+            get(get_structured_durable_context::<S, M, T, C, I>),
+        )
+        .route(
+            QUERY_OBJECT_PATH,
+            get(get_structured_durable_object::<S, M, T, C, I>),
+        )
+        .route(
+            QUERY_RECEIPT_PATH,
+            get(get_structured_durable_receipt::<S, M, T, C, I>),
+        )
+        .route(
+            QUERY_NEXT_NONCE_PATH,
+            get(get_structured_durable_next_nonce::<S, M, T, C, I>),
+        )
         .layer(DefaultBodyLimit::max(MAX_HTTP_EVENT_BODY_BYTES))
         .with_state(state))
 }
@@ -985,6 +1983,22 @@ where
         .route(
             NODE_EVENT_PATH,
             post(submit_preinstalled_wasm_structured_durable_event::<S, M, T, C, I>),
+        )
+        .route(
+            QUERY_CONTEXT_PATH,
+            get(get_preinstalled_wasm_structured_durable_context::<S, M, T, C, I>),
+        )
+        .route(
+            QUERY_OBJECT_PATH,
+            get(get_preinstalled_wasm_structured_durable_object::<S, M, T, C, I>),
+        )
+        .route(
+            QUERY_RECEIPT_PATH,
+            get(get_preinstalled_wasm_structured_durable_receipt::<S, M, T, C, I>),
+        )
+        .route(
+            QUERY_NEXT_NONCE_PATH,
+            get(get_preinstalled_wasm_structured_durable_next_nonce::<S, M, T, C, I>),
         )
         .layer(DefaultBodyLimit::max(MAX_HTTP_EVENT_BODY_BYTES))
         .with_state(state))
@@ -1710,6 +2724,578 @@ where
         body,
         move |body| invoke_preinstalled_wasm_structured_durable_event(state.as_ref(), &body),
     )
+    .await
+}
+
+/// Failures from one bounded query invocation (DR-0082).
+///
+/// A syntactically valid, admitted query maps transient host/storage
+/// conditions to an opaque `503` and invalid persisted state or permanent
+/// host failures to an opaque `500`; caller-supplied malformed selectors are
+/// rejected before this point.
+enum QueryInvocationError {
+    CancelledBeforeStorage,
+    /// The restart-safe identity source could not allocate an identity right
+    /// now: a transient host condition, classified `503`.
+    IdentityUnavailable,
+    /// The restart-safe identity source permanently exhausted its identity
+    /// space: a host/operator failure distinct from transient unavailability,
+    /// classified `500`.
+    IdentityExhausted,
+    Node(NodeCoreError),
+    ResultEncoding,
+}
+
+async fn query_structured_durable_common<F>(
+    initial_cancelled: bool,
+    blocking_executor: NativeBlockingExecutor,
+    work: F,
+) -> Response
+where
+    F: FnOnce() -> Result<Vec<u8>, QueryInvocationError> + Send + 'static,
+{
+    if initial_cancelled {
+        return cancelled_before_storage_response();
+    }
+    let permit = match blocking_executor.try_acquire() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => return overload_response(),
+        Err(TryAcquireError::Closed) => {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "blocking-admission-closed");
+        }
+    };
+    let blocking_work = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    });
+    let result = match blocking_work.await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => return query_invocation_error_response(&error),
+        Err(_) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "blocking-task-failed");
+        }
+    };
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, QUERY_RESULT_MEDIA_TYPE),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        result,
+    )
+        .into_response()
+}
+
+fn query_invocation_error_response(error: &QueryInvocationError) -> Response {
+    match error {
+        QueryInvocationError::CancelledBeforeStorage => cancelled_before_storage_response(),
+        QueryInvocationError::IdentityUnavailable => {
+            error_response(StatusCode::SERVICE_UNAVAILABLE, "query-unavailable")
+        }
+        QueryInvocationError::IdentityExhausted | QueryInvocationError::ResultEncoding => {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "query-state-invalid")
+        }
+        QueryInvocationError::Node(error) => {
+            let (status, code) = query_node_error_response_parts(error);
+            error_response(status, code)
+        }
+    }
+}
+
+/// Classifies a query-path [`NodeCoreError`] into one of exactly two opaque
+/// query responses (DR-0082).
+///
+/// `503 query-unavailable` covers a transient host or storage-availability
+/// condition: clock/runtime failure, a durable read that proves writer
+/// fencing, deadline exhaustion, or backend unavailability, an unsupported
+/// durable schema identity/generation
+/// (`runtime::DurableReadError::SchemaMismatch`), or committed
+/// `ProtocolConfig` inactivity/misconfiguration (missing domain placement,
+/// an inactive placement at the current epoch, or a missing/invalid
+/// transaction-auth profile). `500 query-state-invalid` covers everything
+/// else: corrupt or unverifiable persisted content and result-encoding
+/// failure, which by construction can only arise from storage corruption or
+/// a host bug, never from caller-supplied input (malformed selectors are
+/// rejected before any of this runs).
+///
+/// `SchemaMismatch` is deliberately grouped with `503`, not `500`: it proves
+/// the adapter's durable schema generation disagrees with what was persisted
+/// — an operator/deployment condition an operator can resolve by restoring a
+/// compatible adapter or completing a migration — never that the persisted
+/// bytes themselves are corrupt or unverifiable.
+fn query_node_error_response_parts(error: &NodeCoreError) -> (StatusCode, &'static str) {
+    let unavailable = matches!(
+        error,
+        NodeCoreError::Runtime(_)
+            | NodeCoreError::ProtocolConfig(_)
+            | NodeCoreError::DurableRead(
+                runtime::DurableReadError::WriterFenced { .. }
+                    | runtime::DurableReadError::DeadlineExceeded
+                    | runtime::DurableReadError::Unavailable
+                    | runtime::DurableReadError::SchemaMismatch,
+            )
+    );
+    if unavailable {
+        (StatusCode::SERVICE_UNAVAILABLE, "query-unavailable")
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, "query-state-invalid")
+    }
+}
+
+/// Decodes exactly 64 lowercase ASCII hex characters into 32 bytes.
+///
+/// Every path selector accepted by the bounded query API must be validated
+/// through this function before any identity allocation, clock access, or
+/// storage I/O runs.
+fn decode_hex64_selector(input: &str) -> Option<[u8; 32]> {
+    let bytes = input.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0_u8; 32];
+    for (index, chunk) in bytes.chunks_exact(2).enumerate() {
+        out[index] = (hex_nibble(chunk[0])? << 4) | hex_nibble(chunk[1])?;
+    }
+    Some(out)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// Resolves the logical domain for a query request through
+/// [`DomainPlacementManifest::resolve_domain`] at `config.epoch()` with one
+/// bounded access — the same activation-epoch-checked path the authenticated
+/// write path uses — rather than reading `placement.domain()`
+/// unconditionally, so an inactive placement classifies identically across
+/// every query route, including `/v1/context`, instead of only where storage
+/// I/O happens to run.
+fn resolve_query_domain(
+    placement: &DomainPlacementManifest,
+    config: &NodeConfig,
+) -> Result<AtomicityDomainId, QueryInvocationError> {
+    placement
+        .resolve_domain(config.epoch(), 1)
+        .map_err(NodeCoreError::from)
+        .map_err(QueryInvocationError::Node)
+}
+
+fn invoke_query_context(
+    config: &NodeConfig,
+    protocol_config: &ProtocolConfig,
+) -> Result<Vec<u8>, QueryInvocationError> {
+    let placement = protocol_config
+        .domain_placement
+        .as_ref()
+        .ok_or(ProtocolConfigError::MissingDomainPlacement)
+        .map_err(NodeCoreError::from)
+        .map_err(QueryInvocationError::Node)?;
+    let domain = resolve_query_domain(placement, config)?;
+    let profile = resolve_transaction_auth_profile(protocol_config)
+        .map_err(NodeCoreError::from)
+        .map_err(QueryInvocationError::Node)?;
+    let protocol_config_bytes = protocol_config
+        .canonical_bytes()
+        .map_err(NodeCoreError::from)
+        .map_err(QueryInvocationError::Node)?;
+    let result = HttpContextQueryResult::new(
+        config.chain_id().clone(),
+        config.protocol_version(),
+        config.epoch(),
+        protocol_config.hash_suite_id,
+        profile.profile_id(),
+        profile.signature_scheme_id().as_u16(),
+        profile.address_binding().as_u16(),
+        domain,
+        protocol_config_bytes,
+    )
+    .map_err(|_| QueryInvocationError::ResultEncoding)?;
+    result
+        .encode()
+        .map_err(|_| QueryInvocationError::ResultEncoding)
+}
+
+/// Allocates the same trusted storage authority every storage-backed query
+/// route shares: a resolved logical domain, a restart-safe correlation
+/// identity, and a bounded deadline, all from trusted composition rather
+/// than the HTTP request.
+///
+/// The domain is resolved through [`resolve_query_domain`], so an inactive
+/// placement rejects before identity allocation, clock access, or storage
+/// I/O exactly like every other storage-backed query failure.
+fn prepare_query_storage_context<S, T, C, I>(
+    components: &StructuredDurableNativeComponents<S, T, C, I>,
+    protocol_config: &ProtocolConfig,
+    authority: &StructuredDurableRequestAuthority,
+    config: &NodeConfig,
+) -> Result<(AtomicityDomainId, DurableOperationContext), QueryInvocationError>
+where
+    I: IndexedOutboxIdentitySource,
+    C: Clock,
+{
+    let placement = protocol_config
+        .domain_placement
+        .as_ref()
+        .ok_or(ProtocolConfigError::MissingDomainPlacement)
+        .map_err(NodeCoreError::from)
+        .map_err(QueryInvocationError::Node)?;
+    let domain = resolve_query_domain(placement, config)?;
+    let identity = components
+        .identities
+        .next_attempt_identity()
+        .map_err(|error| match error {
+            IndexedOutboxIdentitySourceError::Unavailable => {
+                QueryInvocationError::IdentityUnavailable
+            }
+            IndexedOutboxIdentitySourceError::Exhausted => QueryInvocationError::IdentityExhausted,
+        })?;
+    let now_unix_millis = components
+        .clock
+        .now_unix_millis()
+        .map_err(|error| QueryInvocationError::Node(NodeCoreError::Runtime(error)))?;
+    let deadline_unix_millis = now_unix_millis
+        .checked_add(authority.operation_timeout_millis.get())
+        .ok_or(QueryInvocationError::Node(
+            NodeCoreError::PersistenceInvariant("query deadline arithmetic overflowed"),
+        ))?;
+    let deadline = StorageDeadline::new(deadline_unix_millis).ok_or(QueryInvocationError::Node(
+        NodeCoreError::PersistenceInvariant("query deadline arithmetic overflowed"),
+    ))?;
+    let context =
+        DurableOperationContext::new(authority.writer_fence, deadline, identity.correlation_id);
+    Ok((domain, context))
+}
+
+fn invoke_query_object<S, T, C, I>(
+    components: &StructuredDurableNativeComponents<S, T, C, I>,
+    protocol_config: &ProtocolConfig,
+    authority: &StructuredDurableRequestAuthority,
+    config: &NodeConfig,
+    object_id: ObjectId,
+) -> Result<Vec<u8>, QueryInvocationError>
+where
+    S: StructuredDurableDomainStateStore,
+    T: Transport,
+    C: Clock,
+    I: IndexedOutboxIdentitySource,
+{
+    if components.is_cancelled() {
+        return Err(QueryInvocationError::CancelledBeforeStorage);
+    }
+    let (domain, context) =
+        prepare_query_storage_context(components, protocol_config, authority, config)?;
+    if components.is_cancelled() {
+        return Err(QueryInvocationError::CancelledBeforeStorage);
+    }
+    let result = query_object(
+        components.store.as_ref(),
+        &context,
+        domain,
+        config.chain_id(),
+        object_id,
+    )
+    .map_err(QueryInvocationError::Node)?;
+    // Defense in depth: never bind the answer to a different selector than
+    // was requested, even under a future node-core regression.
+    if result.object_id() != object_id {
+        return Err(QueryInvocationError::Node(
+            NodeCoreError::PersistenceInvariant(
+                "query result object id disagreed with the requested selector",
+            ),
+        ));
+    }
+    HttpObjectQueryResult::from(result)
+        .encode()
+        .map_err(|_| QueryInvocationError::ResultEncoding)
+}
+
+fn invoke_query_receipt<S, T, C, I>(
+    components: &StructuredDurableNativeComponents<S, T, C, I>,
+    protocol_config: &ProtocolConfig,
+    authority: &StructuredDurableRequestAuthority,
+    config: &NodeConfig,
+    request_id: RequestId,
+) -> Result<Vec<u8>, QueryInvocationError>
+where
+    S: StructuredDurableDomainStateStore,
+    T: Transport,
+    C: Clock,
+    I: IndexedOutboxIdentitySource,
+{
+    if components.is_cancelled() {
+        return Err(QueryInvocationError::CancelledBeforeStorage);
+    }
+    let (domain, context) =
+        prepare_query_storage_context(components, protocol_config, authority, config)?;
+    if components.is_cancelled() {
+        return Err(QueryInvocationError::CancelledBeforeStorage);
+    }
+    let result = query_request_receipt(components.store.as_ref(), &context, domain, request_id)
+        .map_err(QueryInvocationError::Node)?;
+    // Defense in depth: never bind the answer to a different selector than
+    // was requested, even under a future node-core regression.
+    if result.request_id() != request_id {
+        return Err(QueryInvocationError::Node(
+            NodeCoreError::PersistenceInvariant(
+                "query result request id disagreed with the requested selector",
+            ),
+        ));
+    }
+    let wire = http_receipt_query_result(result).map_err(QueryInvocationError::Node)?;
+    wire.encode()
+        .map_err(|_| QueryInvocationError::ResultEncoding)
+}
+
+fn invoke_query_next_nonce<S, T, C, I>(
+    components: &StructuredDurableNativeComponents<S, T, C, I>,
+    protocol_config: &ProtocolConfig,
+    authority: &StructuredDurableRequestAuthority,
+    config: &NodeConfig,
+    sender: [u8; 32],
+) -> Result<Vec<u8>, QueryInvocationError>
+where
+    S: StructuredDurableDomainStateStore,
+    T: Transport,
+    C: Clock,
+    I: IndexedOutboxIdentitySource,
+{
+    if components.is_cancelled() {
+        return Err(QueryInvocationError::CancelledBeforeStorage);
+    }
+    let (domain, context) =
+        prepare_query_storage_context(components, protocol_config, authority, config)?;
+    if components.is_cancelled() {
+        return Err(QueryInvocationError::CancelledBeforeStorage);
+    }
+    let epoch = config.epoch();
+    let next_nonce = query_sender_next_nonce(
+        components.store.as_ref(),
+        &context,
+        domain,
+        config.chain_id().clone(),
+        config.protocol_version(),
+        epoch,
+        sender,
+    )
+    .map_err(QueryInvocationError::Node)?;
+    HttpNextNonceQueryResult::new(Address::new(sender), epoch, next_nonce)
+        .encode()
+        .map_err(|_| QueryInvocationError::ResultEncoding)
+}
+
+async fn get_structured_durable_context<S, M, T, C, I>(
+    State(state): State<SharedStructuredDurableNativeHttpState<S, M, T, C, I>>,
+) -> Response
+where
+    S: IndexedOutboxRepository + Send + Sync + 'static,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    T: Transport + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+    I: IndexedOutboxIdentitySource + Send + Sync + 'static,
+{
+    let initial_cancelled = state.components.is_cancelled();
+    let blocking_executor = state.blocking_executor.clone();
+    query_structured_durable_common(initial_cancelled, blocking_executor, move || {
+        invoke_query_context(&state.config, &state.protocol_config)
+    })
+    .await
+}
+
+async fn get_structured_durable_object<S, M, T, C, I>(
+    State(state): State<SharedStructuredDurableNativeHttpState<S, M, T, C, I>>,
+    Path(object_id_hex): Path<String>,
+) -> Response
+where
+    S: IndexedOutboxRepository + Send + Sync + 'static,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    T: Transport + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+    I: IndexedOutboxIdentitySource + Send + Sync + 'static,
+{
+    let object_id = match decode_hex64_selector(&object_id_hex) {
+        Some(bytes) => ObjectId::new(bytes),
+        None => return error_response(StatusCode::BAD_REQUEST, "invalid-object-id"),
+    };
+    let initial_cancelled = state.components.is_cancelled();
+    let blocking_executor = state.blocking_executor.clone();
+    query_structured_durable_common(initial_cancelled, blocking_executor, move || {
+        invoke_query_object(
+            &state.components,
+            &state.protocol_config,
+            &state.authority,
+            &state.config,
+            object_id,
+        )
+    })
+    .await
+}
+
+async fn get_structured_durable_receipt<S, M, T, C, I>(
+    State(state): State<SharedStructuredDurableNativeHttpState<S, M, T, C, I>>,
+    Path(request_id_hex): Path<String>,
+) -> Response
+where
+    S: IndexedOutboxRepository + Send + Sync + 'static,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    T: Transport + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+    I: IndexedOutboxIdentitySource + Send + Sync + 'static,
+{
+    let request_id =
+        match decode_hex64_selector(&request_id_hex).and_then(|bytes| RequestId::new(bytes).ok()) {
+            Some(request_id) => request_id,
+            None => return error_response(StatusCode::BAD_REQUEST, "invalid-request-id"),
+        };
+    let initial_cancelled = state.components.is_cancelled();
+    let blocking_executor = state.blocking_executor.clone();
+    query_structured_durable_common(initial_cancelled, blocking_executor, move || {
+        invoke_query_receipt(
+            &state.components,
+            &state.protocol_config,
+            &state.authority,
+            &state.config,
+            request_id,
+        )
+    })
+    .await
+}
+
+async fn get_structured_durable_next_nonce<S, M, T, C, I>(
+    State(state): State<SharedStructuredDurableNativeHttpState<S, M, T, C, I>>,
+    Path(sender_hex): Path<String>,
+) -> Response
+where
+    S: IndexedOutboxRepository + Send + Sync + 'static,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    T: Transport + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+    I: IndexedOutboxIdentitySource + Send + Sync + 'static,
+{
+    let sender = match decode_hex64_selector(&sender_hex) {
+        Some(sender) => sender,
+        None => return error_response(StatusCode::BAD_REQUEST, "invalid-sender"),
+    };
+    let initial_cancelled = state.components.is_cancelled();
+    let blocking_executor = state.blocking_executor.clone();
+    query_structured_durable_common(initial_cancelled, blocking_executor, move || {
+        invoke_query_next_nonce(
+            &state.components,
+            &state.protocol_config,
+            &state.authority,
+            &state.config,
+            sender,
+        )
+    })
+    .await
+}
+
+async fn get_preinstalled_wasm_structured_durable_context<S, M, T, C, I>(
+    State(state): State<SharedPreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I>>,
+) -> Response
+where
+    S: IndexedOutboxRepository + Send + Sync + 'static,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    T: Transport + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+    I: IndexedOutboxIdentitySource + Send + Sync + 'static,
+{
+    let initial_cancelled = state.components.is_cancelled();
+    let blocking_executor = state.blocking_executor.clone();
+    query_structured_durable_common(initial_cancelled, blocking_executor, move || {
+        invoke_query_context(&state.config, &state.protocol_config)
+    })
+    .await
+}
+
+async fn get_preinstalled_wasm_structured_durable_object<S, M, T, C, I>(
+    State(state): State<SharedPreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I>>,
+    Path(object_id_hex): Path<String>,
+) -> Response
+where
+    S: IndexedOutboxRepository + Send + Sync + 'static,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    T: Transport + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+    I: IndexedOutboxIdentitySource + Send + Sync + 'static,
+{
+    let object_id = match decode_hex64_selector(&object_id_hex) {
+        Some(bytes) => ObjectId::new(bytes),
+        None => return error_response(StatusCode::BAD_REQUEST, "invalid-object-id"),
+    };
+    let initial_cancelled = state.components.is_cancelled();
+    let blocking_executor = state.blocking_executor.clone();
+    query_structured_durable_common(initial_cancelled, blocking_executor, move || {
+        invoke_query_object(
+            &state.components,
+            &state.protocol_config,
+            &state.authority,
+            &state.config,
+            object_id,
+        )
+    })
+    .await
+}
+
+async fn get_preinstalled_wasm_structured_durable_receipt<S, M, T, C, I>(
+    State(state): State<SharedPreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I>>,
+    Path(request_id_hex): Path<String>,
+) -> Response
+where
+    S: IndexedOutboxRepository + Send + Sync + 'static,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    T: Transport + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+    I: IndexedOutboxIdentitySource + Send + Sync + 'static,
+{
+    let request_id =
+        match decode_hex64_selector(&request_id_hex).and_then(|bytes| RequestId::new(bytes).ok()) {
+            Some(request_id) => request_id,
+            None => return error_response(StatusCode::BAD_REQUEST, "invalid-request-id"),
+        };
+    let initial_cancelled = state.components.is_cancelled();
+    let blocking_executor = state.blocking_executor.clone();
+    query_structured_durable_common(initial_cancelled, blocking_executor, move || {
+        invoke_query_receipt(
+            &state.components,
+            &state.protocol_config,
+            &state.authority,
+            &state.config,
+            request_id,
+        )
+    })
+    .await
+}
+
+async fn get_preinstalled_wasm_structured_durable_next_nonce<S, M, T, C, I>(
+    State(state): State<SharedPreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I>>,
+    Path(sender_hex): Path<String>,
+) -> Response
+where
+    S: IndexedOutboxRepository + Send + Sync + 'static,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    T: Transport + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+    I: IndexedOutboxIdentitySource + Send + Sync + 'static,
+{
+    let sender = match decode_hex64_selector(&sender_hex) {
+        Some(sender) => sender,
+        None => return error_response(StatusCode::BAD_REQUEST, "invalid-sender"),
+    };
+    let initial_cancelled = state.components.is_cancelled();
+    let blocking_executor = state.blocking_executor.clone();
+    query_structured_durable_common(initial_cancelled, blocking_executor, move || {
+        invoke_query_next_nonce(
+            &state.components,
+            &state.protocol_config,
+            &state.authority,
+            &state.config,
+            sender,
+        )
+    })
     .await
 }
 
@@ -2690,9 +4276,9 @@ mod tests {
         Transaction, decode_transaction, encode_transaction, encode_transaction_signable,
     };
     use node_core::{
-        NodeOutboxDelivery, NodeOutput, NodeResponseStatus, NodeStateAccess, NodeStateAccessMode,
-        NodeStateAccessPlan, NodeStateSnapshot, NodeStateUpdate, OutboundMessage,
-        PreinstalledModuleCatalogEntry, TransactionalNodeTransition,
+        NodeDedupRecord, NodeOutboxDelivery, NodeOutput, NodeResponseStatus, NodeStateAccess,
+        NodeStateAccessMode, NodeStateAccessPlan, NodeStateSnapshot, NodeStateUpdate,
+        OutboundMessage, PreinstalledModuleCatalogEntry, TransactionalNodeTransition,
     };
     use objects::{AccessMode, Address, Object, ObjectId, ObjectRef, Owner, encode_object};
     use protocol_config::TransactionAuthProfile;
@@ -2701,17 +4287,18 @@ mod tests {
         ProtocolVersion, SignatureSchemeId, ValidatorId,
     };
     use runtime::{
-        AtomicStateTransaction, CompareAndSwapResult, ComposedRuntime, DurableCommitOutcome,
-        DurableCommitRejection, DurableDomainStateStore, DurableInvocationTransaction,
-        DurableObjectChanges, DurableObjectHead, DurableObjectHeadRead, DurableObjectMutation,
-        DurableObjectMutationEntry, DurableObjectOwnerProjection, DurableObjectProvenance,
-        DurableObjectRoutingProjection, DurableObjectVersion, DurableObjectVersionRecord,
-        DurableOutboxClaim, DurableReadError, DurableRequestId, DurableRequestReceipt,
-        IndexedOutboxRepository, ManualClock, MemoryBlobStore, MemoryDurableStateStore,
-        MemoryRuntime, MemoryScheduler, MemorySigner, MemoryStateStore, MemoryTransport,
-        OutboxRequestId, RequestOutboxClaimRequest, RuntimeError, StateStore,
-        StructuredDurableDomainStateStore, SystemClock, TransactionalStateStore,
-        VersionedStateValue,
+        AtomicStateMutationSet, AtomicStateReadSet, AtomicStateTransaction, CompareAndSwapResult,
+        ComposedRuntime, DurableCommitOutcome, DurableCommitRejection, DurableDomainStateStore,
+        DurableInvocationTransaction, DurableObjectChanges, DurableObjectHead,
+        DurableObjectHeadRead, DurableObjectMutation, DurableObjectMutationEntry,
+        DurableObjectOwnerProjection, DurableObjectProvenance, DurableObjectRoutingProjection,
+        DurableObjectVersion, DurableObjectVersionRecord, DurableOutboxClaim, DurableReadError,
+        DurableRequestId, DurableRequestReceipt, IndexedOutboxRepository, ManualClock,
+        MemoryBlobStore, MemoryDurableStateStore, MemoryRuntime, MemoryScheduler, MemorySigner,
+        MemoryStateStore, MemoryTransport, ObjectHeadRevision, OutboxRequestId,
+        RequestOutboxClaimRequest, RuntimeError, StateMutation, StateMutationEntry,
+        StateReadAssertion, StateRevision, StateStore, StructuredDurableDomainStateStore,
+        SystemClock, TransactionalStateStore, VersionedStateValue,
     };
     use runtime_sqlite::{SqliteDurableStore, SqliteNamespace, SqliteStateStore};
     use std::{
@@ -3275,13 +4862,23 @@ mod tests {
             )],
         )
         .unwrap();
+        let receipt_request_id: RequestId = request_id(receipt_byte);
+        let receipt_event_digest: Digest32 = Digest32::new(
+            HashAlgorithmId::Sha2_256,
+            [receipt_byte.wrapping_add(1); 32],
+        );
+        let receipt_response: NodeResponse =
+            NodeResponse::new(receipt_request_id, NodeResponseStatus::Accepted, None).unwrap();
+        let receipt_record: NodeDedupRecord = NodeDedupRecord::new(
+            receipt_request_id,
+            receipt_event_digest,
+            vec![receipt_response],
+        )
+        .unwrap();
         let receipt = DurableRequestReceipt::new(
-            DurableRequestId::new([receipt_byte; 32]).unwrap(),
-            Digest32::new(
-                HashAlgorithmId::Sha2_256,
-                [receipt_byte.wrapping_add(1); 32],
-            ),
-            vec![receipt_byte.wrapping_add(2)],
+            DurableRequestId::new(*receipt_request_id.as_bytes()).unwrap(),
+            receipt_event_digest,
+            receipt_record.encode().unwrap(),
         )
         .unwrap();
         let invocation =
@@ -3544,6 +5141,30 @@ mod tests {
         fn now_unix_millis(&self) -> Result<u64, RuntimeError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.now_unix_millis)
+        }
+    }
+
+    /// An identity source that always fails with a fixed, chosen error, for
+    /// exercising the query path's `Unavailable`/`Exhausted` classification.
+    struct FailingIndexedIdentities {
+        error: IndexedOutboxIdentitySourceError,
+    }
+
+    impl IndexedOutboxIdentitySource for FailingIndexedIdentities {
+        fn next_attempt_identity(
+            &self,
+        ) -> Result<IndexedOutboxAttemptIdentity, IndexedOutboxIdentitySourceError> {
+            Err(self.error)
+        }
+    }
+
+    /// A clock that always fails, for exercising the query path's
+    /// `NodeCoreError::Runtime` classification.
+    struct FailingClock;
+
+    impl Clock for FailingClock {
+        fn now_unix_millis(&self) -> Result<u64, RuntimeError> {
+            Err(RuntimeError::EmptyKey)
         }
     }
 
@@ -5047,6 +6668,522 @@ mod tests {
              00000100030018000000534e524512ef010001000100080000000400000000000000"
                 .replace(' ', "")
         );
+    }
+
+    // --- DR-0082 bounded query-result codecs -----------------------------
+
+    #[test]
+    fn context_query_result_round_trip_is_bounded_and_stable() {
+        let result = HttpContextQueryResult::new(
+            ChainId::new("sunrise-test").unwrap(),
+            ProtocolVersion::new(3),
+            Epoch::new(7),
+            HashSuiteId::new(1),
+            1,
+            1,
+            1,
+            AtomicityDomainId::new([0x11; 32]).unwrap(),
+            vec![0xAA, 0xBB, 0xCC],
+        )
+        .unwrap();
+        let encoded = result.encode().unwrap();
+
+        assert_eq!(HttpContextQueryResult::decode(&encoded).unwrap(), result);
+        let expected_hex = concat!(
+            "534e524502e10100090001000c00000073756e726973652d746573740200040000000300000003000800",
+            "00000700000000000000040002000000010005000200000001000600020000000100070002000000010008",
+            "0020000000111111111111111111111111111111111111111111111111111111111111111109000300000",
+            "0aabbcc",
+        );
+        assert_eq!(hex(&encoded), expected_hex);
+    }
+
+    #[test]
+    fn context_query_result_rejects_unexpected_field() {
+        let mut frame =
+            CanonicalStruct::new(CONTEXT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
+        frame.field_str(1, "sunrise-test").unwrap();
+        frame.field_u32(2, 3).unwrap();
+        frame.field_u64(3, 7).unwrap();
+        frame.field_u16(4, 1).unwrap();
+        frame.field_u16(5, 1).unwrap();
+        frame.field_u16(6, 1).unwrap();
+        frame.field_u16(7, 1).unwrap();
+        frame.field_bytes(8, vec![0x11; 32]).unwrap();
+        frame.field_bytes(9, vec![0xAA]).unwrap();
+        frame.field_u16(10, 0).unwrap();
+        let bytes = frame.finish().unwrap();
+
+        assert!(matches!(
+            HttpContextQueryResult::decode(&bytes),
+            Err(QueryResultError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedField(10)
+            ))
+        ));
+    }
+
+    #[test]
+    fn context_query_result_rejects_zero_ids_long_chain_id_and_empty_config_bytes() {
+        fn build(
+            protocol_version: u32,
+            hash_suite_id: u16,
+            profile: u16,
+            scheme: u16,
+            binding: u16,
+            chain: &str,
+            config_bytes: Vec<u8>,
+        ) -> Result<HttpContextQueryResult, QueryResultError> {
+            HttpContextQueryResult::new(
+                ChainId::new(chain).unwrap(),
+                ProtocolVersion::new(protocol_version),
+                Epoch::new(7),
+                HashSuiteId::new(hash_suite_id),
+                profile,
+                scheme,
+                binding,
+                AtomicityDomainId::new([0x11; 32]).unwrap(),
+                config_bytes,
+            )
+        }
+
+        assert_eq!(
+            build(0, 1, 1, 1, 1, "sunrise-test", vec![0xAA]),
+            Err(QueryResultError::ZeroProtocolVersion)
+        );
+        assert_eq!(
+            build(3, 0, 1, 1, 1, "sunrise-test", vec![0xAA]),
+            Err(QueryResultError::ZeroHashSuiteId)
+        );
+        assert_eq!(
+            build(3, 1, 0, 1, 1, "sunrise-test", vec![0xAA]),
+            Err(QueryResultError::ZeroTransactionAuthProfileId)
+        );
+        assert_eq!(
+            build(3, 1, 1, 0, 1, "sunrise-test", vec![0xAA]),
+            Err(QueryResultError::ZeroSignatureSchemeId)
+        );
+        assert_eq!(
+            build(3, 1, 1, 1, 0, "sunrise-test", vec![0xAA]),
+            Err(QueryResultError::ZeroAddressBindingId)
+        );
+        let long_chain = "x".repeat(MAX_CHAIN_ID_BYTES + 1);
+        assert_eq!(
+            build(3, 1, 1, 1, 1, &long_chain, vec![0xAA]),
+            Err(QueryResultError::ChainIdTooLong(MAX_CHAIN_ID_BYTES + 1))
+        );
+        assert_eq!(
+            build(3, 1, 1, 1, 1, "sunrise-test", Vec::new()),
+            Err(QueryResultError::EmptyProtocolConfigBytes)
+        );
+        assert!(build(3, 1, 1, 1, 1, "sunrise-test", vec![0xAA]).is_ok());
+    }
+
+    fn sample_inline_object_bytes(object_id: ObjectId, version: u64) -> Vec<u8> {
+        let object = Object {
+            id: object_id,
+            version,
+            owner: Owner::Address(Address::new([0x21; 32])),
+            type_hash: Digest32::new(HashAlgorithmId::Sha2_256, [0x99; 32]),
+            schema_version: 1,
+            data: vec![0xDD, 0xEE],
+        };
+        encode_object(&object).unwrap()
+    }
+
+    fn sample_object_query_results() -> Vec<HttpObjectQueryResult> {
+        let object_id = ObjectId::new([0x20; 32]);
+        vec![
+            HttpObjectQueryResult::Absent { object_id },
+            HttpObjectQueryResult::Tombstoned {
+                object_id,
+                head_revision: ObjectHeadRevision::new(2).unwrap(),
+                last_object_version: DurableObjectVersion::new(1).unwrap(),
+            },
+            HttpObjectQueryResult::CurrentInline {
+                object_id,
+                head_revision: ObjectHeadRevision::new(1).unwrap(),
+                object_version: DurableObjectVersion::new(1).unwrap(),
+                digest: Digest32::new(HashAlgorithmId::Sha2_256, [0x22; 32]),
+                canonical_object_bytes: sample_inline_object_bytes(object_id, 1),
+            },
+            HttpObjectQueryResult::CurrentBlobReference {
+                object_id,
+                head_revision: ObjectHeadRevision::new(3).unwrap(),
+                object_version: DurableObjectVersion::new(2).unwrap(),
+                digest: Digest32::new(HashAlgorithmId::Sha2_256, [0x23; 32]),
+                blob_digest: Digest32::new(HashAlgorithmId::Sha3_256, [0x24; 32]),
+            },
+        ]
+    }
+
+    #[test]
+    fn object_query_result_round_trips_every_status() {
+        for case in sample_object_query_results() {
+            let encoded = case.encode().unwrap();
+            let decoded = HttpObjectQueryResult::decode(&encoded).unwrap();
+            assert_eq!(decoded, case);
+            assert_eq!(decoded.object_id(), case.object_id());
+        }
+    }
+
+    #[test]
+    fn object_query_result_current_inline_matches_pinned_stable_vector() {
+        let result = &sample_object_query_results()[2];
+        let encoded = result.encode().unwrap();
+
+        let expected_hex = "534e524503e1010007000100020000000300020020000000202020202020202020202020202020202020202020202020202020202020202003000800000001000000000000000400080000000100000000000000050002000000010006002000000022222222222222222222222222222222222222222222222222222222222222220700ec000000534e5245054001000600010030000000534e524501400100010001002000000020202020202020202020202020202020202020202020202020202020202020200200080000000100000000000000030048000000534e52450340010002000100020000000100020030000000534e52450240010001000100200000002121212121212121212121212121212121212121212121212121212121212121040038000000534e52450301010002000100020000000100020020000000999999999999999999999999999999999999999999999999999999999999999905000400000001000000060002000000ddee";
+        assert_eq!(hex(&encoded), expected_hex);
+    }
+
+    #[test]
+    fn object_query_result_binds_the_exact_requested_selector() {
+        let a = ObjectId::new([0x30; 32]);
+        let b = ObjectId::new([0x31; 32]);
+        let result_a = HttpObjectQueryResult::Absent { object_id: a };
+        let result_b = HttpObjectQueryResult::Absent { object_id: b };
+
+        assert_eq!(result_a.object_id(), a);
+        assert_eq!(result_b.object_id(), b);
+        assert_ne!(result_a.encode().unwrap(), result_b.encode().unwrap());
+        assert_eq!(
+            HttpObjectQueryResult::decode(&result_a.encode().unwrap())
+                .unwrap()
+                .object_id(),
+            a
+        );
+        assert_ne!(
+            HttpObjectQueryResult::decode(&result_a.encode().unwrap())
+                .unwrap()
+                .object_id(),
+            b
+        );
+    }
+
+    #[test]
+    fn object_query_result_rejects_unknown_status_id() {
+        let mut frame =
+            CanonicalStruct::new(OBJECT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
+        frame.field_u16(1, 99).unwrap();
+        frame
+            .field_bytes(2, ObjectId::new([0x01; 32]).as_bytes().to_vec())
+            .unwrap();
+        let bytes = frame.finish().unwrap();
+
+        assert_eq!(
+            HttpObjectQueryResult::decode(&bytes),
+            Err(QueryResultError::UnknownObjectStatus(99))
+        );
+    }
+
+    #[test]
+    fn object_query_result_absent_rejects_a_field_only_valid_for_another_status() {
+        let object_id = ObjectId::new([0x32; 32]);
+        let mut frame =
+            CanonicalStruct::new(OBJECT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
+        frame
+            .field_u16(1, ObjectQueryStatus::Absent.as_u16())
+            .unwrap();
+        frame.field_bytes(2, object_id.as_bytes().to_vec()).unwrap();
+        frame.field_u64(3, 1).unwrap();
+        let bytes = frame.finish().unwrap();
+
+        assert!(matches!(
+            HttpObjectQueryResult::decode(&bytes),
+            Err(QueryResultError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedField(3)
+            ))
+        ));
+    }
+
+    #[test]
+    fn object_query_result_rejects_mismatched_canonical_type_id() {
+        let request_id = request_id(0x01);
+        let receipt_bytes = HttpReceiptQueryResult::Absent { request_id }
+            .encode()
+            .unwrap();
+
+        assert!(matches!(
+            HttpObjectQueryResult::decode(&receipt_bytes),
+            Err(QueryResultError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedTypeId { .. }
+            ))
+        ));
+    }
+
+    fn current_inline_object_frame(
+        object_id: ObjectId,
+        object_version: u64,
+        canonical_object_bytes: Vec<u8>,
+    ) -> Vec<u8> {
+        let mut frame =
+            CanonicalStruct::new(OBJECT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
+        frame
+            .field_u16(1, ObjectQueryStatus::CurrentInline.as_u16())
+            .unwrap();
+        frame.field_bytes(2, object_id.as_bytes().to_vec()).unwrap();
+        frame.field_u64(3, 1).unwrap();
+        frame.field_u64(4, object_version).unwrap();
+        frame
+            .field_u16(5, HashAlgorithmId::Sha2_256.as_u16())
+            .unwrap();
+        frame.field_bytes(6, vec![0x22; 32]).unwrap();
+        frame.field_bytes(7, canonical_object_bytes).unwrap();
+        frame.finish().unwrap()
+    }
+
+    #[test]
+    fn object_query_result_current_inline_rejects_oversized_body() {
+        let object_id = ObjectId::new([0x25; 32]);
+        let bytes = current_inline_object_frame(
+            object_id,
+            1,
+            vec![0_u8; MAX_AUTHENTICATED_OBJECT_BODY_BYTES + 1],
+        );
+
+        assert_eq!(
+            HttpObjectQueryResult::decode(&bytes),
+            Err(QueryResultError::ObjectBodyTooLarge {
+                actual: MAX_AUTHENTICATED_OBJECT_BODY_BYTES + 1,
+                maximum: MAX_AUTHENTICATED_OBJECT_BODY_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn object_query_result_current_inline_rejects_invalid_nested_object_bytes() {
+        let object_id = ObjectId::new([0x26; 32]);
+        let bytes = current_inline_object_frame(object_id, 1, vec![0xFF, 0x00]);
+
+        assert!(matches!(
+            HttpObjectQueryResult::decode(&bytes),
+            Err(QueryResultError::InvalidCanonicalObject(_))
+        ));
+    }
+
+    #[test]
+    fn object_query_result_current_inline_rejects_nested_identity_mismatch() {
+        let object_id = ObjectId::new([0x27; 32]);
+        let other_id = ObjectId::new([0x28; 32]);
+        let nested_bytes = sample_inline_object_bytes(other_id, 1);
+        let bytes = current_inline_object_frame(object_id, 1, nested_bytes);
+
+        assert_eq!(
+            HttpObjectQueryResult::decode(&bytes),
+            Err(QueryResultError::ObjectIdentityMismatch {
+                expected: object_id,
+                actual: other_id,
+            })
+        );
+    }
+
+    #[test]
+    fn object_query_result_current_inline_rejects_nested_version_mismatch() {
+        let object_id = ObjectId::new([0x29; 32]);
+        let nested_bytes = sample_inline_object_bytes(object_id, 2);
+        let bytes = current_inline_object_frame(object_id, 1, nested_bytes);
+
+        assert_eq!(
+            HttpObjectQueryResult::decode(&bytes),
+            Err(QueryResultError::ObjectVersionMismatch {
+                expected: 1,
+                actual: 2,
+            })
+        );
+    }
+
+    fn sample_receipt_query_results() -> Vec<HttpReceiptQueryResult> {
+        let request_id = request_id(0x50);
+        let event_digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x55; 32]);
+        let response = NodeResponse::new(request_id, NodeResponseStatus::Accepted, None).unwrap();
+        let dedup_record_bytes = NodeDedupRecord::new(request_id, event_digest, vec![response])
+            .unwrap()
+            .encode()
+            .unwrap();
+        vec![
+            HttpReceiptQueryResult::Absent { request_id },
+            HttpReceiptQueryResult::Present {
+                request_id,
+                event_digest,
+                dedup_record_bytes,
+            },
+        ]
+    }
+
+    #[test]
+    fn receipt_query_result_round_trips_every_status() {
+        for case in sample_receipt_query_results() {
+            let encoded = case.encode().unwrap();
+            let decoded = HttpReceiptQueryResult::decode(&encoded).unwrap();
+            assert_eq!(decoded, case);
+            assert_eq!(decoded.request_id(), case.request_id());
+        }
+    }
+
+    #[test]
+    fn receipt_query_result_present_matches_pinned_stable_vector() {
+        let result = &sample_receipt_query_results()[1];
+        let encoded = result.encode().unwrap();
+
+        let expected_hex = "534e524504e10100050001000200000002000200200000005050505050505050505050505050505050505050505050505050505050505050030002000000010004002000000055555555555555555555555555555555555555555555555555555555555555550500aa000000534e524503e0010005000100200000005050505050505050505050505050505050505050505050505050505050505050020002000000010003002000000055555555555555555555555555555555555555555555555555555555555555550400040000000100000005003c00000038000000534e524502e00100020001002000000050505050505050505050505050505050505050505050505050505050505050500200020000000100";
+        assert_eq!(hex(&encoded), expected_hex);
+    }
+
+    #[test]
+    fn receipt_query_result_binds_the_exact_requested_selector() {
+        let a = request_id(0x60);
+        let b = request_id(0x61);
+        let result_a = HttpReceiptQueryResult::Absent { request_id: a };
+        let result_b = HttpReceiptQueryResult::Absent { request_id: b };
+
+        assert_eq!(result_a.request_id(), a);
+        assert_eq!(result_b.request_id(), b);
+        assert_ne!(result_a.encode().unwrap(), result_b.encode().unwrap());
+        assert_eq!(
+            HttpReceiptQueryResult::decode(&result_a.encode().unwrap())
+                .unwrap()
+                .request_id(),
+            a
+        );
+    }
+
+    #[test]
+    fn receipt_query_result_rejects_unknown_status_id() {
+        let mut frame =
+            CanonicalStruct::new(RECEIPT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
+        frame.field_u16(1, 7).unwrap();
+        frame
+            .field_bytes(2, request_id(0x01).as_bytes().to_vec())
+            .unwrap();
+        let bytes = frame.finish().unwrap();
+
+        assert_eq!(
+            HttpReceiptQueryResult::decode(&bytes),
+            Err(QueryResultError::UnknownReceiptStatus(7))
+        );
+    }
+
+    fn present_receipt_frame(
+        request_id: RequestId,
+        event_digest: Digest32,
+        dedup_record_bytes: Vec<u8>,
+    ) -> Vec<u8> {
+        let mut frame =
+            CanonicalStruct::new(RECEIPT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
+        frame
+            .field_u16(1, ReceiptQueryStatus::Present.as_u16())
+            .unwrap();
+        frame
+            .field_bytes(2, request_id.as_bytes().to_vec())
+            .unwrap();
+        frame
+            .field_u16(3, event_digest.algorithm().as_u16())
+            .unwrap();
+        frame.field_bytes(4, event_digest.bytes().to_vec()).unwrap();
+        frame.field_bytes(5, dedup_record_bytes).unwrap();
+        frame.finish().unwrap()
+    }
+
+    // `receipt_query_result_rejects_oversized_body` is not constructible as a
+    // unit test: `runtime::MAX_DURABLE_RECEIPT_BYTES` currently equals
+    // `canonical_encoding::MAX_CANONICAL_FRAME_BYTES`, so any field that large
+    // already fails to canonically frame (`FrameTooLarge`) before this
+    // decoder's own `ReceiptTooLarge` bound ever runs. The check is kept as
+    // defense in depth in case the two bounds diverge in the future.
+
+    #[test]
+    fn receipt_query_result_rejects_invalid_nested_dedup_record_bytes() {
+        let request_id = request_id(0x53);
+        let event_digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x54; 32]);
+        let bytes = present_receipt_frame(request_id, event_digest, vec![0xFF, 0x00]);
+
+        assert!(matches!(
+            HttpReceiptQueryResult::decode(&bytes),
+            Err(QueryResultError::InvalidDedupRecord(_))
+        ));
+    }
+
+    #[test]
+    fn receipt_query_result_rejects_nested_request_id_mismatch() {
+        let request_id_outer = request_id(0x56);
+        let request_id_nested = request_id(0x57);
+        let event_digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x58; 32]);
+        let response =
+            NodeResponse::new(request_id_nested, NodeResponseStatus::Accepted, None).unwrap();
+        let dedup_record_bytes =
+            NodeDedupRecord::new(request_id_nested, event_digest, vec![response])
+                .unwrap()
+                .encode()
+                .unwrap();
+        let bytes = present_receipt_frame(request_id_outer, event_digest, dedup_record_bytes);
+
+        assert_eq!(
+            HttpReceiptQueryResult::decode(&bytes),
+            Err(QueryResultError::RequestIdentityMismatch {
+                expected: request_id_outer,
+                actual: request_id_nested,
+            })
+        );
+    }
+
+    #[test]
+    fn receipt_query_result_rejects_nested_event_digest_mismatch() {
+        let request_id = request_id(0x59);
+        let event_digest_outer = Digest32::new(HashAlgorithmId::Sha2_256, [0x5A; 32]);
+        let event_digest_nested = Digest32::new(HashAlgorithmId::Sha2_256, [0x5B; 32]);
+        let response = NodeResponse::new(request_id, NodeResponseStatus::Accepted, None).unwrap();
+        let dedup_record_bytes =
+            NodeDedupRecord::new(request_id, event_digest_nested, vec![response])
+                .unwrap()
+                .encode()
+                .unwrap();
+        let bytes = present_receipt_frame(request_id, event_digest_outer, dedup_record_bytes);
+
+        assert_eq!(
+            HttpReceiptQueryResult::decode(&bytes),
+            Err(QueryResultError::EventDigestMismatch)
+        );
+    }
+
+    #[test]
+    fn next_nonce_query_result_round_trip_is_bounded_and_stable() {
+        let result = HttpNextNonceQueryResult::new(Address::new([0x61; 32]), Epoch::new(7), 42);
+        let encoded = result.encode().unwrap();
+
+        assert_eq!(HttpNextNonceQueryResult::decode(&encoded).unwrap(), result);
+        let expected_hex = "534e524505e1010003000100200000006161616161616161616161616161616161616161616161616161616161616161020008000000070000000000000003000800000\
+02a00000000000000";
+        assert_eq!(hex(&encoded), expected_hex);
+    }
+
+    #[test]
+    fn next_nonce_query_result_binds_the_exact_requested_sender() {
+        let a = HttpNextNonceQueryResult::new(Address::new([0x70; 32]), Epoch::new(7), 1);
+        let b = HttpNextNonceQueryResult::new(Address::new([0x71; 32]), Epoch::new(7), 1);
+
+        assert_eq!(a.sender(), Address::new([0x70; 32]));
+        assert_ne!(a.encode().unwrap(), b.encode().unwrap());
+        assert_eq!(
+            HttpNextNonceQueryResult::decode(&a.encode().unwrap())
+                .unwrap()
+                .sender(),
+            Address::new([0x70; 32])
+        );
+    }
+
+    #[test]
+    fn next_nonce_query_result_rejects_mismatched_canonical_type_id() {
+        let object_bytes = HttpObjectQueryResult::Absent {
+            object_id: ObjectId::new([0x01; 32]),
+        }
+        .encode()
+        .unwrap();
+
+        assert!(matches!(
+            HttpNextNonceQueryResult::decode(&object_bytes),
+            Err(QueryResultError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedTypeId { .. }
+            ))
+        ));
     }
 
     #[test]
@@ -7410,5 +9547,1247 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert_eq!(runtime.state_store().get(b"http/node-state").unwrap(), None);
+    }
+
+    // --- DR-0082 bounded query API: router integration --------------------
+
+    fn query_object_path(object_id: ObjectId) -> String {
+        format!("/v1/objects/{}", hex(object_id.as_bytes()))
+    }
+
+    fn query_receipt_path(id: RequestId) -> String {
+        format!("/v1/receipts/{}", hex(id.as_bytes()))
+    }
+
+    fn query_next_nonce_path(sender: &Address) -> String {
+        format!("/v1/senders/{}/next-nonce", hex(sender.as_bytes()))
+    }
+
+    #[tokio::test]
+    async fn context_route_returns_trusted_composition() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xD1; 32]).unwrap();
+        let protocol_config = active_protocol_config(domain);
+        let expected_bytes = protocol_config.canonical_bytes().unwrap();
+        let app = structured_app(
+            store,
+            transport,
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+        );
+
+        let response = app
+            .oneshot(
+                Request::get(QUERY_CONTEXT_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            QUERY_RESULT_MEDIA_TYPE
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let bytes = to_bytes(response.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+            .await
+            .unwrap();
+        let result = HttpContextQueryResult::decode(&bytes).unwrap();
+        assert_eq!(result.chain_id(), &ChainId::new("sunrise-test").unwrap());
+        assert_eq!(result.protocol_version(), ProtocolVersion::new(3));
+        assert_eq!(result.epoch(), Epoch::new(7));
+        assert_eq!(result.domain(), domain);
+        assert_eq!(result.protocol_config_bytes(), expected_bytes.as_slice());
+    }
+
+    #[tokio::test]
+    async fn context_route_rejects_inactive_domain_placement_before_any_side_effect() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let config = config();
+        // `config()`'s epoch is 7; an activation epoch of 100 makes this
+        // placement inactive at the trusted current epoch, exactly like the
+        // storage-backed routes' inactive-placement rejection.
+        let mut protocol_config =
+            active_protocol_config(AtomicityDomainId::new([0xFC; 32]).unwrap());
+        protocol_config.domain_placement = Some(placement(0xFC, 100));
+        let clock = Arc::new(CountingClock::new(10_000));
+        let identities = Arc::new(CountingIndexedIdentities::default());
+        let machine = Arc::new(IncrementMachine::new(config.state_key()));
+        let app = structured_durable_router(
+            StructuredDurableNativeComponents::new(
+                store,
+                Arc::new(MemoryTransport::default()),
+                Arc::clone(&clock),
+                Arc::clone(&identities),
+            ),
+            protocol_config,
+            structured_request_authority(),
+            config,
+            resolver(),
+            machine,
+            NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+        )
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::get(QUERY_CONTEXT_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "query-unavailable"
+        );
+        assert_eq!(clock.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(identities.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn object_route_returns_true_absence() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xD2; 32]).unwrap();
+        let protocol_config = active_protocol_config(domain);
+        let app = structured_app(
+            store,
+            transport,
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+        );
+        let object_id = ObjectId::new([0x01; 32]);
+
+        let response = app
+            .oneshot(
+                Request::get(query_object_path(object_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            HttpObjectQueryResult::decode(&bytes).unwrap(),
+            HttpObjectQueryResult::Absent { object_id }
+        );
+    }
+
+    #[tokio::test]
+    async fn object_route_returns_verified_current_inline() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let domain = AtomicityDomainId::new([0xD3; 32]).unwrap();
+        let setup_context = DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(20_000).unwrap(),
+            StorageCorrelationId::new([0xD3; 16]).unwrap(),
+        );
+        let owner = dev_sender_address(&dev_signing_key(0xD3));
+        let object = owned_object(ObjectId::new([0xD4; 32]), owner, 0x40);
+        let object_ref = commit_owned_object(
+            store.as_ref(),
+            &setup_context,
+            domain,
+            object,
+            "sunrise-test",
+            1,
+            0x41,
+        );
+
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let protocol_config = active_protocol_config(domain);
+        let app = structured_app(
+            Arc::clone(&store),
+            transport,
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+        );
+
+        let response = app
+            .oneshot(
+                Request::get(query_object_path(object_ref.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+            .await
+            .unwrap();
+        match HttpObjectQueryResult::decode(&bytes).unwrap() {
+            HttpObjectQueryResult::CurrentInline {
+                object_id,
+                digest,
+                canonical_object_bytes,
+                ..
+            } => {
+                assert_eq!(object_id, object_ref.id);
+                assert_eq!(digest, object_ref.digest);
+                let decoded = objects::decode_object(&canonical_object_bytes).unwrap();
+                assert_eq!(decoded.id, object_ref.id);
+            }
+            other => panic!("expected current inline object, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn object_route_returns_retained_tombstone() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let domain = AtomicityDomainId::new([0xD5; 32]).unwrap();
+        let setup_context = DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(20_000).unwrap(),
+            StorageCorrelationId::new([0xD5; 16]).unwrap(),
+        );
+        let owner = dev_sender_address(&dev_signing_key(0xD5));
+        let object = owned_object(ObjectId::new([0xD6; 32]), owner, 0x42);
+        let object_id = object.id;
+        commit_owned_object(
+            store.as_ref(),
+            &setup_context,
+            domain,
+            object,
+            "sunrise-test",
+            1,
+            0x43,
+        );
+        let current_head = store
+            .get_object_head(&setup_context, domain, object_id)
+            .unwrap();
+        let changes = DurableObjectChanges::new(
+            vec![DurableObjectHeadRead::new(object_id, current_head)],
+            vec![DurableObjectMutationEntry::new(
+                object_id,
+                DurableObjectMutation::Delete,
+            )],
+        )
+        .unwrap();
+        let receipt = DurableRequestReceipt::new(
+            DurableRequestId::new([0x44; 32]).unwrap(),
+            Digest32::new(HashAlgorithmId::Sha2_256, [0x45; 32]),
+            vec![0x46],
+        )
+        .unwrap();
+        let invocation =
+            DurableInvocationTransaction::new(domain, None, changes, receipt, None).unwrap();
+        assert_eq!(
+            store.commit_invocation(&setup_context, invocation),
+            DurableCommitOutcome::Committed
+        );
+
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let protocol_config = active_protocol_config(domain);
+        let app = structured_app(
+            Arc::clone(&store),
+            transport,
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+        );
+
+        let response = app
+            .oneshot(
+                Request::get(query_object_path(object_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            HttpObjectQueryResult::decode(&bytes).unwrap(),
+            HttpObjectQueryResult::Tombstoned {
+                object_id,
+                head_revision: ObjectHeadRevision::new(2).unwrap(),
+                last_object_version: DurableObjectVersion::FIRST,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn object_route_returns_current_blob_reference_without_fetching_body() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let domain = AtomicityDomainId::new([0xD7; 32]).unwrap();
+        let setup_context = DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(20_000).unwrap(),
+            StorageCorrelationId::new([0xD7; 16]).unwrap(),
+        );
+        let object_id = ObjectId::new([0xD8; 32]);
+        let digest = Digest32::new(HashAlgorithmId::Sha2_256, [0xD9; 32]);
+        let blob_digest = Digest32::new(HashAlgorithmId::Sha3_256, [0xDA; 32]);
+        let record = DurableObjectVersionRecord::from_blob_reference(
+            object_id,
+            DurableObjectVersion::FIRST,
+            digest,
+            1,
+            DurableObjectProvenance::new(
+                ChainId::new("sunrise-test").unwrap(),
+                ProtocolVersion::new(3),
+            ),
+            1,
+            blob_digest,
+        );
+        let owner = dev_sender_address(&dev_signing_key(0xDB));
+        let changes = DurableObjectChanges::new(
+            vec![DurableObjectHeadRead::new(
+                object_id,
+                DurableObjectHead::Absent,
+            )],
+            vec![DurableObjectMutationEntry::new(
+                object_id,
+                DurableObjectMutation::Create {
+                    version: record,
+                    owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Address(
+                        owner,
+                    ))
+                    .unwrap(),
+                    routing_projection: DurableObjectRoutingProjection::default(),
+                },
+            )],
+        )
+        .unwrap();
+        let receipt = DurableRequestReceipt::new(
+            DurableRequestId::new([0xDC; 32]).unwrap(),
+            Digest32::new(HashAlgorithmId::Sha2_256, [0xDD; 32]),
+            vec![0xDE],
+        )
+        .unwrap();
+        let invocation =
+            DurableInvocationTransaction::new(domain, None, changes, receipt, None).unwrap();
+        assert_eq!(
+            store.commit_invocation(&setup_context, invocation),
+            DurableCommitOutcome::Committed
+        );
+
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let protocol_config = active_protocol_config(domain);
+        let app = structured_app(
+            Arc::clone(&store),
+            transport,
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+        );
+
+        let response = app
+            .oneshot(
+                Request::get(query_object_path(object_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            HttpObjectQueryResult::decode(&bytes).unwrap(),
+            HttpObjectQueryResult::CurrentBlobReference {
+                object_id,
+                head_revision: ObjectHeadRevision::FIRST,
+                object_version: DurableObjectVersion::FIRST,
+                digest,
+                blob_digest,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn object_route_tampered_digest_is_opaque_server_error() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let domain = AtomicityDomainId::new([0xE1; 32]).unwrap();
+        let setup_context = DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(20_000).unwrap(),
+            StorageCorrelationId::new([0xE1; 16]).unwrap(),
+        );
+        let owner = dev_sender_address(&dev_signing_key(0xE2));
+        let object_id = ObjectId::new([0xE3; 32]);
+        let object = owned_object(object_id, owner, 0x50);
+        let canonical_bytes = encode_object(&object).unwrap();
+        let tampered_digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x00; 32]);
+        let record = DurableObjectVersionRecord::from_inline_canonical_bytes(
+            canonical_bytes,
+            tampered_digest,
+            DurableObjectProvenance::new(
+                ChainId::new("sunrise-test").unwrap(),
+                ProtocolVersion::new(3),
+            ),
+            1,
+        )
+        .unwrap();
+        let changes = DurableObjectChanges::new(
+            vec![DurableObjectHeadRead::new(
+                object_id,
+                DurableObjectHead::Absent,
+            )],
+            vec![DurableObjectMutationEntry::new(
+                object_id,
+                DurableObjectMutation::Create {
+                    version: record,
+                    owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Address(
+                        owner,
+                    ))
+                    .unwrap(),
+                    routing_projection: DurableObjectRoutingProjection::default(),
+                },
+            )],
+        )
+        .unwrap();
+        let receipt = DurableRequestReceipt::new(
+            DurableRequestId::new([0xE4; 32]).unwrap(),
+            Digest32::new(HashAlgorithmId::Sha2_256, [0xE5; 32]),
+            vec![0xE6],
+        )
+        .unwrap();
+        let invocation =
+            DurableInvocationTransaction::new(domain, None, changes, receipt, None).unwrap();
+        assert_eq!(
+            store.commit_invocation(&setup_context, invocation),
+            DurableCommitOutcome::Committed
+        );
+
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let protocol_config = active_protocol_config(domain);
+        let app = structured_app(
+            Arc::clone(&store),
+            transport,
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+        );
+
+        let response = app
+            .oneshot(
+                Request::get(query_object_path(object_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "query-state-invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn object_route_writer_fence_mismatch_is_opaque_unavailable() {
+        let authority_fence = WriterFenceGeneration::new(3).unwrap();
+        // The store's own active fence differs from the authority's fence
+        // that `structured_app` fixes via `structured_request_authority()`,
+        // so the durable read proves `WriterFenced` rather than corruption.
+        let store_fence = WriterFenceGeneration::new(9).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(store_fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xF6; 32]).unwrap();
+        let protocol_config = active_protocol_config(domain);
+        let app = structured_app(
+            store,
+            transport,
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+        );
+        let _ = authority_fence;
+
+        let response = app
+            .oneshot(
+                Request::get(query_object_path(ObjectId::new([0x01; 32])))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "query-unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn object_route_identity_unavailable_is_opaque_unavailable() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xF7; 32]).unwrap();
+        let protocol_config = active_protocol_config(domain);
+        let machine = Arc::new(IncrementMachine::new(config.state_key()));
+        let app = structured_durable_router(
+            StructuredDurableNativeComponents::new(
+                store,
+                transport,
+                Arc::new(ManualClock::new(10_000)),
+                Arc::new(FailingIndexedIdentities {
+                    error: IndexedOutboxIdentitySourceError::Unavailable,
+                }),
+            ),
+            protocol_config,
+            structured_request_authority(),
+            config,
+            resolver(),
+            machine,
+            NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+        )
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::get(query_object_path(ObjectId::new([0x01; 32])))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "query-unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn object_route_identity_exhausted_is_opaque_invalid() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xF9; 32]).unwrap();
+        let protocol_config = active_protocol_config(domain);
+        let machine = Arc::new(IncrementMachine::new(config.state_key()));
+        let app = structured_durable_router(
+            StructuredDurableNativeComponents::new(
+                store,
+                transport,
+                Arc::new(ManualClock::new(10_000)),
+                Arc::new(FailingIndexedIdentities {
+                    error: IndexedOutboxIdentitySourceError::Exhausted,
+                }),
+            ),
+            protocol_config,
+            structured_request_authority(),
+            config,
+            resolver(),
+            machine,
+            NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+        )
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::get(query_object_path(ObjectId::new([0x01; 32])))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "query-state-invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn object_route_clock_failure_is_opaque_unavailable() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xFA; 32]).unwrap();
+        let protocol_config = active_protocol_config(domain);
+        let machine = Arc::new(IncrementMachine::new(config.state_key()));
+        let app = structured_durable_router(
+            StructuredDurableNativeComponents::new(
+                store,
+                transport,
+                Arc::new(FailingClock),
+                Arc::new(SequenceIndexedIdentities::default()),
+            ),
+            protocol_config,
+            structured_request_authority(),
+            config,
+            resolver(),
+            machine,
+            NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+        )
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::get(query_object_path(ObjectId::new([0x01; 32])))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "query-unavailable"
+        );
+    }
+
+    #[test]
+    fn query_node_error_response_parts_classifies_durable_read_variants() {
+        let cases: Vec<(NodeCoreError, StatusCode, &str)> = vec![
+            (
+                NodeCoreError::DurableRead(DurableReadError::WriterFenced {
+                    active_generation: WriterFenceGeneration::new(3).unwrap(),
+                }),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "query-unavailable",
+            ),
+            (
+                NodeCoreError::DurableRead(DurableReadError::DeadlineExceeded),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "query-unavailable",
+            ),
+            (
+                NodeCoreError::DurableRead(DurableReadError::Unavailable),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "query-unavailable",
+            ),
+            // `SchemaMismatch` is an explicit decision (DR-0082): it proves an
+            // adapter/deployment schema disagreement, not corrupted persisted
+            // bytes, so it is grouped with the other availability conditions
+            // rather than with `query-state-invalid`.
+            (
+                NodeCoreError::DurableRead(DurableReadError::SchemaMismatch),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "query-unavailable",
+            ),
+            (
+                NodeCoreError::DurableRead(DurableReadError::InvalidPersistedState),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "query-state-invalid",
+            ),
+            (
+                NodeCoreError::DurableRead(DurableReadError::InvalidRequest(
+                    RuntimeError::UnsupportedObjectStorage,
+                )),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "query-state-invalid",
+            ),
+        ];
+        for (error, expected_status, expected_code) in cases {
+            let (status, code) = query_node_error_response_parts(&error);
+            assert_eq!(status, expected_status, "error: {error:?}");
+            assert_eq!(code, expected_code, "error: {error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn object_route_rejects_inactive_domain_placement_before_any_side_effect() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let config = config();
+        // `config()`'s epoch is 7; an activation epoch of 100 makes this
+        // placement inactive at the trusted current epoch.
+        let mut protocol_config =
+            active_protocol_config(AtomicityDomainId::new([0xFB; 32]).unwrap());
+        protocol_config.domain_placement = Some(placement(0xFB, 100));
+        let clock = Arc::new(CountingClock::new(10_000));
+        let identities = Arc::new(CountingIndexedIdentities::default());
+        let machine = Arc::new(IncrementMachine::new(config.state_key()));
+        let app = structured_durable_router(
+            StructuredDurableNativeComponents::new(
+                store,
+                Arc::new(MemoryTransport::default()),
+                Arc::clone(&clock),
+                Arc::clone(&identities),
+            ),
+            protocol_config,
+            structured_request_authority(),
+            config,
+            resolver(),
+            machine,
+            NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+        )
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::get(query_object_path(ObjectId::new([0x01; 32])))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "query-unavailable"
+        );
+        assert_eq!(clock.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(identities.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn receipt_route_returns_true_absence() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xE7; 32]).unwrap();
+        let protocol_config = active_protocol_config(domain);
+        let app = structured_app(
+            store,
+            transport,
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+        );
+        let id = request_id(0x01);
+
+        let response = app
+            .oneshot(
+                Request::get(query_receipt_path(id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            HttpReceiptQueryResult::decode(&bytes).unwrap(),
+            HttpReceiptQueryResult::Absent { request_id: id }
+        );
+    }
+
+    #[tokio::test]
+    async fn receipt_route_corrupt_receipt_is_opaque_server_error() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let domain = AtomicityDomainId::new([0xE9; 32]).unwrap();
+        let setup_context = DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(20_000).unwrap(),
+            StorageCorrelationId::new([0xE9; 16]).unwrap(),
+        );
+        let id = request_id(0x02);
+        let receipt = DurableRequestReceipt::new(
+            DurableRequestId::new(*id.as_bytes()).unwrap(),
+            Digest32::new(HashAlgorithmId::Sha2_256, [0xEA; 32]),
+            vec![0xEB, 0x00],
+        )
+        .unwrap();
+        let invocation = DurableInvocationTransaction::new(
+            domain,
+            None,
+            DurableObjectChanges::empty(),
+            receipt,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            store.commit_invocation(&setup_context, invocation),
+            DurableCommitOutcome::Committed
+        );
+
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let protocol_config = active_protocol_config(domain);
+        let app = structured_app(
+            Arc::clone(&store),
+            transport,
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+        );
+
+        let response = app
+            .oneshot(
+                Request::get(query_receipt_path(id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "query-state-invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn receipt_and_next_nonce_routes_reflect_a_real_submission() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xE8; 32]).unwrap();
+        let protocol_config = active_protocol_config(domain);
+        let app = structured_app(
+            Arc::clone(&store),
+            transport,
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+        );
+        let signing_key = dev_signing_key(0xE9);
+        let sender = dev_sender_address(&signing_key);
+        let id = request_id(0xEA);
+        let event = signed_submit_transaction_event(&signing_key, id, 0);
+
+        let submit_response = app
+            .clone()
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event.encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(submit_response.status(), StatusCode::OK);
+
+        let receipt_response = app
+            .clone()
+            .oneshot(
+                Request::get(query_receipt_path(id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt_response.status(), StatusCode::OK);
+        let receipt_bytes = to_bytes(receipt_response.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+            .await
+            .unwrap();
+        match HttpReceiptQueryResult::decode(&receipt_bytes).unwrap() {
+            HttpReceiptQueryResult::Present {
+                request_id,
+                dedup_record_bytes,
+                ..
+            } => {
+                assert_eq!(request_id, id);
+                let record = NodeDedupRecord::decode(&dedup_record_bytes).unwrap();
+                assert_eq!(record.request_id(), id);
+            }
+            other => panic!("expected present receipt, got {other:?}"),
+        }
+
+        let nonce_response = app
+            .oneshot(
+                Request::get(query_next_nonce_path(&sender))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(nonce_response.status(), StatusCode::OK);
+        let nonce_bytes = to_bytes(nonce_response.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+            .await
+            .unwrap();
+        let nonce_result = HttpNextNonceQueryResult::decode(&nonce_bytes).unwrap();
+        assert_eq!(nonce_result.sender(), sender);
+        assert_eq!(nonce_result.epoch(), Epoch::new(7));
+        assert_eq!(nonce_result.next_nonce(), 1);
+    }
+
+    #[tokio::test]
+    async fn next_nonce_route_true_absence_returns_zero() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xEB; 32]).unwrap();
+        let protocol_config = active_protocol_config(domain);
+        let app = structured_app(
+            store,
+            transport,
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+        );
+        let sender = Address::new([0x01; 32]);
+
+        let response = app
+            .oneshot(
+                Request::get(query_next_nonce_path(&sender))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+            .await
+            .unwrap();
+        let result = HttpNextNonceQueryResult::decode(&bytes).unwrap();
+        assert_eq!(result.sender(), sender);
+        assert_eq!(result.next_nonce(), 0);
+        assert_eq!(result.epoch(), Epoch::new(7));
+    }
+
+    #[tokio::test]
+    async fn next_nonce_route_deleted_record_is_opaque_server_error() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let domain = AtomicityDomainId::new([0xEC; 32]).unwrap();
+        let setup_context = DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(20_000).unwrap(),
+            StorageCorrelationId::new([0xEC; 16]).unwrap(),
+        );
+        let sender = [0x02; 32];
+        let key = PersistenceLayout::new(
+            ChainId::new("sunrise-test").unwrap(),
+            ProtocolVersion::new(3),
+        )
+        .sender_nonce_key(sender, Epoch::new(7));
+        let transaction = AtomicStateTransaction::new(
+            domain,
+            AtomicStateReadSet::new(vec![
+                StateReadAssertion::new(key.clone(), StateRevision::INITIAL).unwrap(),
+            ])
+            .unwrap(),
+            AtomicStateMutationSet::new(vec![
+                StateMutationEntry::new(key, StateMutation::Delete).unwrap(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.commit_durable(&setup_context, transaction),
+            DurableCommitOutcome::Committed
+        );
+
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let protocol_config = active_protocol_config(domain);
+        let app = structured_app(
+            Arc::clone(&store),
+            transport,
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+        );
+
+        let response = app
+            .oneshot(
+                Request::get(query_next_nonce_path(&Address::new(sender)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "query-state-invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_routes_reject_malformed_selectors_before_any_side_effect() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xED; 32]).unwrap();
+        let protocol_config = active_protocol_config(domain);
+        let clock = Arc::new(CountingClock::new(10_000));
+        let identities = Arc::new(CountingIndexedIdentities::default());
+        let machine = Arc::new(IncrementMachine::new(config.state_key()));
+        let app = structured_durable_router(
+            StructuredDurableNativeComponents::new(
+                Arc::clone(&store),
+                transport,
+                Arc::clone(&clock),
+                Arc::clone(&identities),
+            ),
+            protocol_config,
+            structured_request_authority(),
+            config,
+            resolver(),
+            machine,
+            NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+        )
+        .unwrap();
+
+        let malformed_paths: Vec<String> = vec![
+            "/v1/objects/too-short".to_string(),
+            format!("/v1/objects/{}", "A".repeat(64)),
+            format!("/v1/receipts/{}", "0".repeat(64)),
+            format!("/v1/receipts/{}", "g".repeat(64)),
+            "/v1/senders/short/next-nonce".to_string(),
+        ];
+        for path in malformed_paths {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path.as_str()).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "path: {path}");
+        }
+
+        assert_eq!(clock.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(identities.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn both_routers_return_identical_results_for_all_four_query_routes() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let domain = AtomicityDomainId::new([0xEE; 32]).unwrap();
+        let config = config();
+        let protocol_config = active_protocol_config(domain);
+        let catalog = Arc::new(PreinstalledModuleCatalog::new(Vec::new()).unwrap());
+
+        // Populate one verified current-inline object and one present receipt
+        // so parity is checked against real content, not only absence.
+        // Tombstone and blob-reference results are covered by dedicated
+        // structured-router tests and need not be duplicated here.
+        let setup_context = DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(20_000).unwrap(),
+            StorageCorrelationId::new([0xEE; 16]).unwrap(),
+        );
+        let owner = dev_sender_address(&dev_signing_key(0xEE));
+        let object = owned_object(ObjectId::new([0xEF; 32]), owner, 0x46);
+        let object_ref = commit_owned_object(
+            store.as_ref(),
+            &setup_context,
+            domain,
+            object,
+            "sunrise-test",
+            1,
+            0x47,
+        );
+
+        let structured = structured_app(
+            Arc::clone(&store),
+            Arc::new(MemoryTransport::default()),
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config.clone(),
+            config.clone(),
+        );
+        let preinstalled = preinstalled_app(
+            Arc::clone(&store),
+            Arc::new(MemoryTransport::default()),
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+            catalog,
+            9,
+        );
+
+        let populated_object_path: String = query_object_path(object_ref.id);
+        let populated_receipt_path: String = query_receipt_path(request_id(0x47));
+        let paths: [String; 6] = [
+            QUERY_CONTEXT_PATH.to_string(),
+            query_object_path(ObjectId::new([0x01; 32])),
+            populated_object_path.clone(),
+            query_receipt_path(request_id(0x02)),
+            populated_receipt_path.clone(),
+            query_next_nonce_path(&Address::new([0x03; 32])),
+        ];
+        for path in paths {
+            let structured_response = structured
+                .clone()
+                .oneshot(Request::get(path.as_str()).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let preinstalled_response = preinstalled
+                .clone()
+                .oneshot(Request::get(path.as_str()).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                structured_response.status(),
+                preinstalled_response.status(),
+                "path: {path}"
+            );
+            assert_eq!(
+                structured_response.headers().get(header::CONTENT_TYPE),
+                preinstalled_response.headers().get(header::CONTENT_TYPE),
+                "path: {path}"
+            );
+            assert_eq!(
+                structured_response.headers().get(header::CACHE_CONTROL),
+                preinstalled_response.headers().get(header::CACHE_CONTROL),
+                "path: {path}"
+            );
+            let structured_bytes =
+                to_bytes(structured_response.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+                    .await
+                    .unwrap();
+            let preinstalled_bytes =
+                to_bytes(preinstalled_response.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+                    .await
+                    .unwrap();
+            assert_eq!(structured_bytes, preinstalled_bytes, "path: {path}");
+            if path == populated_object_path {
+                assert!(matches!(
+                    HttpObjectQueryResult::decode(&structured_bytes).unwrap(),
+                    HttpObjectQueryResult::CurrentInline { .. }
+                ));
+            } else if path == populated_receipt_path {
+                assert!(matches!(
+                    HttpReceiptQueryResult::decode(&structured_bytes).unwrap(),
+                    HttpReceiptQueryResult::Present { .. }
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn object_route_admission_rejects_when_blocking_capacity_exhausted() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xEF; 32]).unwrap();
+        let protocol_config = active_protocol_config(domain);
+        let blocking_executor =
+            NativeBlockingExecutor::new(NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap()));
+        let machine = Arc::new(IncrementMachine::new(config.state_key()));
+        let app = structured_durable_router_with_executor(
+            StructuredDurableNativeComponents::new(
+                store,
+                transport,
+                Arc::new(ManualClock::new(10_000)),
+                Arc::new(SequenceIndexedIdentities::default()),
+            ),
+            protocol_config,
+            structured_request_authority(),
+            config,
+            resolver(),
+            machine,
+            blocking_executor.clone(),
+        )
+        .unwrap();
+        let held_permit = blocking_executor.try_acquire().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::get(query_object_path(ObjectId::new([0x01; 32])))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        drop(held_permit);
+    }
+
+    #[tokio::test]
+    async fn object_route_rejects_cancellation_at_each_pre_storage_checkpoint() {
+        for cancel_at_call in 1_usize..=3_usize {
+            let fence = WriterFenceGeneration::new(3).unwrap();
+            let store = Arc::new(MemoryDurableStateStore::new(fence));
+            store.set_time(10_000);
+            let transport = Arc::new(MemoryTransport::default());
+            let clock = Arc::new(ManualClock::new(10_000));
+            let config = config();
+            let domain = AtomicityDomainId::new([0xF5; 32]).unwrap();
+            let protocol_config = active_protocol_config(domain);
+            let cancellation: Arc<StepCancellation> =
+                Arc::new(StepCancellation::new(cancel_at_call));
+            let app = structured_app_with_cancellation(
+                store,
+                transport,
+                clock,
+                protocol_config,
+                config,
+                cancellation.clone(),
+            );
+
+            let response = app
+                .oneshot(
+                    Request::get(query_object_path(ObjectId::new([0x01; 32])))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                to_bytes(response.into_body(), 128).await.unwrap(),
+                "invocation-cancelled-before-storage"
+            );
+            assert_eq!(cancellation.calls(), cancel_at_call);
+        }
     }
 }

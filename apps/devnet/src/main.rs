@@ -4,9 +4,9 @@ use native_http::serve;
 use runtime::{Clock, DurableOperationContext, StorageCorrelationId, StorageDeadline, SystemClock};
 use std::{error::Error, process::ExitCode, sync::Arc};
 use sunrise_edge_devnet::{
-    ASSET_ACCOUNT_WASM, DEVNET_ASSET_ID, DEVNET_DATABASE_FILE, DevnetConfig,
-    SeedAssetAccountsOutcome, asset_account_type_hash, boot_local_store, build_asset_module,
-    build_devnet_protocol_context, compose_devnet_router, seed_asset_accounts,
+    ASSET_ACCOUNT_WASM, DEVNET_ASSET_ID, DEVNET_DATABASE_FILE, DEVNET_STARTUP_LIMITATIONS_BANNER,
+    DevnetConfig, SeedAssetAccountsOutcome, asset_account_type_hash, boot_local_store,
+    build_asset_module, build_devnet_protocol_context, compose_devnet_router, seed_asset_accounts,
 };
 
 const SEED_OPERATION_TIMEOUT_MILLIS: u64 = 30_000;
@@ -85,9 +85,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     );
     println!("dev_owners={}", config.dev_owners().len());
     println!("max_concurrent={}", config.max_concurrent());
-    println!(
-        "limitations=single-validator,owned-objects-only,cross-owner-transfer-fail-closed,fee-free,local-sqlite,non-production"
-    );
+    println!("limitations={DEVNET_STARTUP_LIMITATIONS_BANNER}");
     println!("Press Ctrl-C to stop.");
 
     serve(listener, router, async {
