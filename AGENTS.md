@@ -271,11 +271,16 @@ mutations/effects, fees, blob transfer verification, owned fast routing, and
 production object migrations remain deferred. Started work, client
 disconnect, and shutdown budgets remain uncancellable. Next, implement
 the remaining fault evidence after the bounded pre-commit data-tablespace
-ENOSPC (DR-0070), pre-commit WAL-filesystem ENOSPC (DR-0071), and server
-connection-slot exhaustion (DR-0072) scenarios: abrupt process/power fault,
-commit-boundary and real storage-device ENOSPC, TLS-path connection loss,
-backup/restore, capacity/load/soak, connection-pool behavior under a
-provider-managed pooler, real writer failover, and provider
+ENOSPC (DR-0070), pre-commit WAL-filesystem ENOSPC (DR-0071), server
+connection-slot exhaustion (DR-0072), database-snapshot restore rehearsal
+(DR-0073), client/driver-to-test-terminator TLS commit-loss (DR-0074), and
+bounded local PgBouncer transaction-pooling rehearsal (DR-0075) scenarios:
+abrupt process/power fault,
+commit-boundary and real storage-device ENOSPC, PostgreSQL-server/provider
+TLS beyond DR-0074's bounded client leg, production backup/restore beyond
+DR-0073's bounded rehearsal, capacity/load/soak, provider-managed pooler
+service certification beyond DR-0075's bounded rehearsal, real writer
+failover, and provider
 implementations. Do not spend further
 effort treating the opaque SQLite table or prefix scanner as the production
 schema. The adapter must not infer normalized rows from opaque key prefixes.

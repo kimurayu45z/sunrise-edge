@@ -2245,8 +2245,9 @@ Phase 15 As-Is scope:
   adapter pool自身が解放されたslotを奪ったことを確定的に証明する。同じinvocationのrecovery、
   exact replay/claim/ack、pool usabilityも同じpool/storeで証明できる（bounded
   connection-exhaustion evidenceのみimplemented As-Is; ARCHITECTURE.md DR-0072）。real-device
-  resource exhaustion、load/soak capacity、provider-managed pooler（例: PgBouncer）下での
-  connection-pool挙動、production certificationは未実装のままである。別のrequired live testは
+  resource exhaustion、load/soak capacity、production certificationは未実装のままである
+  （provider-managed poolerの挙動はDR-0075のbounded rehearsalとして下記の通り一部implemented
+  As-Isだが、production certification/load/failoverは引き続き未実装）。別のrequired live testは
   digest-pinnedなsourceとtargetの2つの独立したdisposable containerを起動し、sourceで1件の
   structured invocation（state、receipt、1 pending outbox message）をcommitした後、
   `pg_dump -d <db> --no-owner --no-privileges --inserts`でsnapshotを取得する。`--inserts`は
@@ -2271,6 +2272,48 @@ Phase 15 As-Is scope:
   `pg_basebackup`/replicationベースのbackup、backup encryption/off-host storage、
   checkpoint publication（`sunrise_edge.checkpoints`は未使用）、blob-manifest/state-root/
   encryption-key verification、production certificationは未実装のままである。
+  さらに別のrequired live testはdigest-pinned PostgreSQL 18.6とdigest-pinned
+  `ghcr.io/icoretech/pgbouncer-docker` 1.25.2を1つのisolatedかつ生成済みDocker bridge
+  networkへ起動し、PgBouncerはnetwork alias経由でのみPostgreSQLを解決する（host-published
+  addressは使わない）。このtest自身のdirect verification connectionはproxyを経由せず
+  PostgreSQL自身の別のpublished portへ直接張るため、proxyの単一backendが意図的にblockされて
+  いる間も使い続けられる。`pgbouncer.ini`/`userlist.txt`はcontainerへ`docker exec ... tee`の
+  stdin経由で書き込み、shellもhost bind mountも使わない。credentialはgenerated passwordであり、
+  `password_encryption=md5`を設定したPostgreSQL自身の`pg_authid.rolpassword`を読み戻して
+  userlistのMD5 credential hashとしてそのまま使う（testが自前で計算しない）。設定は
+  `pool_mode = transaction`、対象database/user poolに対して`pool_size`/`default_pool_size`/
+  `max_db_connections`/`max_user_connections = 1`、nonzeroな`max_prepared_statements`、
+  boundedな`query_wait_timeout`であり、いずれもPgBouncer自身のadmin console
+  （`SHOW CONFIG`/`SHOW POOLS`/`SHOW SERVERS`/`SHOW CLIENTS`、simple query protocol経由）
+  で直接証明し、client側の挙動から推測しない。同時にopenな2つのdistinct client connectionが
+  それぞれ1回のtransactionを順に実行し、`SHOW SERVERS`の`remote_pid`が両方で同一であることから
+  transaction poolingが実際に同一のPostgreSQL backendを再利用したことを証明する。実際のadapter
+  （genuineな`r2d2` poolと`PostgresDurableStore`、専用の`application_name`で識別）をproxy経由に
+  向け、別のdirect proxied clientがCOMMIT/ROLLBACKを送らずtransactionを開いたままpoolの唯一の
+  backendを保持している間に、PgBouncer自身の`query_wait_timeout`より十分長いcontext deadlineで
+  1回のadapter structured invocationを実行する。live evidenceとして、PgBouncerのqueue
+  timeoutはPostgreSQL protocol SQLSTATE `08P01`（`query_wait_timeout`）としてadapterの最初の
+  文（transaction開始の`BEGIN`）に現れ、このcrateの`PreCommitFailure::from_sqlstate`には専用の
+  分類がないためdefaultの`Unavailable`扱いとなり、definite pre-commit
+  `Rejected(UnavailableBeforeCommit)`として観測される（`Indeterminate`ではない）。観測された
+  経過時間はPgBouncer自身の`query_wait_timeout`を基準に上下からboundし、このtestの持つより大きな
+  context budgetではなくproxy自身のqueue timeoutに起因することを証明する。state/receipt/outbox行の
+  非公開はproxyを経由しないdirect operator connectionを通じて証明する。blocking transactionを
+  解放した後、同じadapter pool/storeで同一invocationを再試行する。この再試行はexplicitに
+  文書化されたひとつの既知のtransientのみを許容する ——
+  `r2d2`はblocked probeのconnectionをevictする代わりrecycleすることがあり得る（local
+  `is_closed()`がPgBouncerのasynchronousなsocket closeにまだ追随していない場合）ため、次の
+  checkoutがすでに死んでいるそのconnectionを受け取りsub-millisecondでlocalかつunclassifiedな
+  I/O errorとして失敗することがある（timingの点でgenuineなproxy rejectionとは明確に区別できる）。
+  このretryはその狭い形状だけを許容し、loopの最終結果は必ず`Committed`でなければならない。
+  recoveryは`Committed`を証明し、`SHOW CLIENTS`をadapter poolの`application_name`で絞り込むことで
+  adapter pool自身のproxy connectionが解放されたbackendを奪ったことを証明し、同一invocationの
+  replayはexact `RequestAlreadyCommitted`を返し、exact outbox messageはclaim/ackを経て
+  `NoDueWork`となり、poolはさらなるreadにも使い続けられる（bounded local PgBouncer
+  transaction-pooling rehearsal evidenceのみimplemented As-Is; ARCHITECTURE.md DR-0075）。これは
+  provider-managed pooler service certification、load/soak capacity、PgBouncerのhigh
+  availability/connection draining、client/backendいずれのlegのTLS、real writer failover、
+  production readinessの証明ではない。
 - ComposedRuntimeはStateStore、BlobStore、Signer、Transport、Clock、Schedulerをhidden defaultなしで
   明示的に所有・合成する。SQLiteへstate/dedup/outboxをcommit後にruntimeをdropし、同じDBを別compositionで
   reopenしてstateを再適用せずoutboxを送ること、send failure leaseがreopen後もexpiry前は抑止されexpiry時だけ
@@ -2399,11 +2442,24 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
    SIGKILL/WAL recovery、bounded pre-commit data-tablespace ENOSPC（DR-0070）、bounded pre-commit
    WAL-filesystem ENOSPC（DR-0071）、bounded server connection-slot exhaustion（DR-0072）、bounded
    `pg_dump`ベースのdatabase-snapshot restore rehearsal（DR-0073）、bounded
-   client/driver-to-test-terminator TLS commit-loss evidence（DR-0074）以外は
+   client/driver-to-test-terminator TLS commit-loss evidence（DR-0074）、bounded local PgBouncer
+   transaction-pooling rehearsal（DR-0075）以外は
    このstep 5の全項目が未実装のまま残っている。connection exhaustionはDR-0072でserverが飽和した
    際にadapter poolがdefinite pre-commit `Rejected(DeadlineExceededBeforeCommit)`を返すことを
    bounded disposable containerで証明したが、real-device resource exhaustion、load/soak capacity、
-   provider-managed pooler下での挙動、production certificationは未実装のままである。DR-0073は
+   production certificationは未実装のままである。DR-0075は digest-pinned PostgreSQL 18.6と
+   digest-pinned `ghcr.io/icoretech/pgbouncer-docker` 1.25.2をisolatedなDocker networkへ起動し、
+   PgBouncer admin console evidence（`SHOW CONFIG`/`SHOW POOLS`/`SHOW SERVERS`/`SHOW CLIENTS`）で
+   configured transaction modeと、2つのsimultaneously openなclient connectionが同一backendを
+   sequential transactionで再利用することを直接証明し、real adapterをproxy経由に向けた上で、
+   direct proxied clientがproxyの唯一のbackendをtransaction中に保持している間、adapter
+   invocationがPgBouncer自身の`query_wait_timeout`満了によりdefinite pre-commit
+   `Rejected(UnavailableBeforeCommit)`となることと非公開を証明し、release後は同一invocationの
+   commit、`RequestAlreadyCommitted` replay、exact outbox claim/ack、pool usabilityを証明した
+   （bounded local PgBouncer transaction-pooling rehearsal evidenceのみimplemented As-Is;
+   ARCHITECTURE.md DR-0075）。これはprovider-managed pooler service certification、load/soak
+   capacity、PgBouncerのhigh availability、TLS、real writer failover、production readinessの
+   証明ではない。DR-0073は
    digest-pinnedなsourceとtargetの2つの独立したdisposable containerで`pg_dump --inserts`
    snapshotを取得し、PostgreSQL 18の`pg_dump`が付与する`psql`専用の`\restrict`/`\unrestrict`行
    （SQLではない）を除去した上でadapter自身のdriver connection経由で別isolated targetへ

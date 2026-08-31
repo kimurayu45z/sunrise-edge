@@ -16,7 +16,7 @@ use std::{
     fmt, fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -795,8 +795,40 @@ fn run_docker_command_bounded_output(command: Command, label: &str) -> io::Resul
 /// so it needs its own, still-bounded, still-explicit cap rather than
 /// silently reusing the generic one.
 fn run_docker_command_bounded_output_capped(
+    command: Command,
+    label: &str,
+    max_bytes: u64,
+) -> io::Result<String> {
+    run_docker_command_bounded_output_capped_with_stdin(command, label, None, max_bytes)
+}
+
+/// Same as [`run_docker_command_bounded_output_capped`], but first writes
+/// `stdin_bytes` to the child's stdin and closes it before entering the same
+/// bounded poll loop. Used only to hand a small, fully Rust-controlled
+/// in-memory config file to a container-side `tee` via direct argv, with no
+/// shell and no host bind mount involved on either side. The write happens
+/// before the poll loop, not concurrently with it: every caller's
+/// `stdin_bytes` is small enough (a few hundred bytes, well under a pipe
+/// buffer) that the write cannot block on the child draining its own stdout,
+/// so this cannot deadlock the way an unbounded interleaved read/write could.
+fn run_docker_command_bounded_output_with_stdin(
+    command: Command,
+    label: &str,
+    stdin_bytes: &[u8],
+    max_bytes: u64,
+) -> io::Result<String> {
+    run_docker_command_bounded_output_capped_with_stdin(
+        command,
+        label,
+        Some(stdin_bytes),
+        max_bytes,
+    )
+}
+
+fn run_docker_command_bounded_output_capped_with_stdin(
     mut command: Command,
     label: &str,
+    stdin_bytes: Option<&[u8]>,
     max_bytes: u64,
 ) -> io::Result<String> {
     let stdout_path = unique_temp_file_path(label, "stdout");
@@ -818,6 +850,11 @@ fn run_docker_command_bounded_output_capped(
     };
     command.stdout(stdout_file);
     command.stderr(stderr_file);
+    if stdin_bytes.is_some() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
     let mut child: Child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -826,6 +863,23 @@ fn run_docker_command_bounded_output_capped(
             return Err(error);
         }
     };
+    if let Some(bytes) = stdin_bytes {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("failed to open piped stdin for bounded command"))?;
+        if let Err(error) = stdin.write_all(bytes) {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&stdout_path);
+            let _ = fs::remove_file(&stderr_path);
+            return Err(error);
+        }
+        // Dropping the handle closes the write end, signaling EOF to the
+        // child (`tee` only exits once it has seen EOF on stdin).
+        drop(stdin);
+    }
     let deadline = Instant::now() + DOCKER_COMMAND_TIMEOUT;
     let status_result: io::Result<()> = loop {
         let stdout_len: u64 = fs::metadata(&stdout_path)
@@ -2069,6 +2123,695 @@ impl Drop for BackupRestorePostgresContainer {
     }
 }
 
+// --- PgBouncer transaction-pooling rehearsal: strict environment parsing ---
+
+/// Environment variable naming the digest-pinned PostgreSQL image the
+/// PgBouncer rehearsal starts as its own disposable backend container (never
+/// the shared CI service container, and never another scenario's own
+/// container).
+pub const PGBOUNCER_POSTGRES_IMAGE_ENV: &str =
+    "SUNRISE_EDGE_TEST_POSTGRES_PGBOUNCER_POSTGRES_IMAGE";
+
+/// Environment variable naming the digest-pinned `ghcr.io/icoretech/pgbouncer-docker`
+/// image the rehearsal starts as its own disposable proxy container.
+pub const PGBOUNCER_IMAGE_ENV: &str = "SUNRISE_EDGE_TEST_POSTGRES_PGBOUNCER_IMAGE";
+
+/// Environment variable that, when set to exactly `"1"`, forbids the
+/// PgBouncer rehearsal from silently skipping.
+pub const PGBOUNCER_REQUIRED_ENV: &str = "SUNRISE_EDGE_TEST_POSTGRES_PGBOUNCER_REQUIRED";
+
+/// Outcome of strictly resolving whether the bounded PgBouncer
+/// transaction-pooling rehearsal runs in this process.
+///
+/// Unlike the single-image scenarios ([`DiskFullScenario`] and friends), this
+/// scenario needs two independently pinned images (the PostgreSQL backend and
+/// the PgBouncer proxy), so it follows [`CrashScenario`]'s partial-configuration
+/// rule instead: only "both absent" skips. One image configured without the
+/// other always fails loudly, rather than silently skipping on half-broken
+/// configuration or silently running against a wrong/missing proxy image.
+#[derive(Debug)]
+pub enum PgBouncerScenario {
+    /// Neither image is configured: the scenario is skipped.
+    Skip,
+    /// Run the scenario against disposable containers started from these
+    /// pinned images.
+    Run {
+        postgres_image: PinnedImage,
+        pgbouncer_image: PinnedImage,
+    },
+}
+
+/// Strictly resolves [`PgBouncerScenario`] from [`PGBOUNCER_POSTGRES_IMAGE_ENV`],
+/// [`PGBOUNCER_IMAGE_ENV`], and [`PGBOUNCER_REQUIRED_ENV`]; see this type's doc
+/// comment for the exact rules.
+pub fn resolve_pgbouncer_scenario() -> PgBouncerScenario {
+    resolve_pgbouncer_scenario_from(
+        env::var_os(PGBOUNCER_REQUIRED_ENV),
+        env::var_os(PGBOUNCER_POSTGRES_IMAGE_ENV),
+        env::var_os(PGBOUNCER_IMAGE_ENV),
+    )
+}
+
+/// Pure decision logic behind [`resolve_pgbouncer_scenario`]; split out for
+/// unit tests for the same reason as [`resolve_crash_scenario_from`].
+fn resolve_pgbouncer_scenario_from(
+    required_raw: Option<OsString>,
+    postgres_image_raw: Option<OsString>,
+    pgbouncer_image_raw: Option<OsString>,
+) -> PgBouncerScenario {
+    let required = parse_pgbouncer_required_flag(required_raw);
+    match (postgres_image_raw, pgbouncer_image_raw) {
+        (None, None) => {
+            if required {
+                panic!(
+                    "{PGBOUNCER_REQUIRED_ENV} is set but neither {PGBOUNCER_POSTGRES_IMAGE_ENV} \
+                     nor {PGBOUNCER_IMAGE_ENV} is configured"
+                );
+            }
+            PgBouncerScenario::Skip
+        }
+        (Some(_), None) => panic!(
+            "{PGBOUNCER_POSTGRES_IMAGE_ENV} is set but {PGBOUNCER_IMAGE_ENV} is not; partial \
+             live PgBouncer rehearsal configuration is not allowed"
+        ),
+        (None, Some(_)) => panic!(
+            "{PGBOUNCER_IMAGE_ENV} is set but {PGBOUNCER_POSTGRES_IMAGE_ENV} is not; partial \
+             live PgBouncer rehearsal configuration is not allowed"
+        ),
+        (Some(postgres_raw), Some(pgbouncer_raw)) => PgBouncerScenario::Run {
+            postgres_image: parse_pgbouncer_postgres_pinned_image(postgres_raw),
+            pgbouncer_image: parse_pgbouncer_pinned_image(pgbouncer_raw),
+        },
+    }
+}
+
+fn parse_pgbouncer_postgres_pinned_image(raw: OsString) -> PinnedImage {
+    let text = raw
+        .to_str()
+        .unwrap_or_else(|| panic!("{PGBOUNCER_POSTGRES_IMAGE_ENV} must be valid UTF-8"));
+    PinnedImage::parse(text)
+        .unwrap_or_else(|error| panic!("{PGBOUNCER_POSTGRES_IMAGE_ENV} is invalid: {error}"))
+}
+
+fn parse_pgbouncer_pinned_image(raw: OsString) -> PinnedImage {
+    let text = raw
+        .to_str()
+        .unwrap_or_else(|| panic!("{PGBOUNCER_IMAGE_ENV} must be valid UTF-8"));
+    PinnedImage::parse(text)
+        .unwrap_or_else(|error| panic!("{PGBOUNCER_IMAGE_ENV} is invalid: {error}"))
+}
+
+fn parse_pgbouncer_required_flag(raw: Option<OsString>) -> bool {
+    match raw {
+        None => false,
+        Some(raw) => {
+            let text = raw
+                .to_str()
+                .unwrap_or_else(|| panic!("{PGBOUNCER_REQUIRED_ENV} must be valid UTF-8"));
+            match text {
+                "1" => true,
+                other => {
+                    panic!("{PGBOUNCER_REQUIRED_ENV} must be exactly \"1\" when set, got {other:?}")
+                }
+            }
+        }
+    }
+}
+
+// --- PgBouncer transaction-pooling rehearsal: isolated Docker network ------
+
+/// A disposable, generated-name Docker bridge network. The PgBouncer
+/// rehearsal's PostgreSQL backend and PgBouncer proxy containers are attached
+/// to one of these, isolating the proxy-to-backend traffic this scenario
+/// proves from Docker's default bridge and from every other live-test
+/// scenario's own containers. [`Drop`] force-removes the network and never
+/// panics; the caller must ensure every attached container is already
+/// removed first (Docker refuses to remove a network with live attachments),
+/// which the scenario achieves by declaring this guard before either
+/// container so Rust's reverse-drop-order unwinds containers first.
+pub struct DockerNetwork {
+    name: String,
+}
+
+impl DockerNetwork {
+    /// Creates a fresh, uniquely named bridge network. Panics on failure: a
+    /// scenario that cannot even create its own isolated network proves
+    /// nothing about PgBouncer running on one.
+    pub fn create() -> Self {
+        let name = format!(
+            "sunrise-edge-pgbouncer-{}-{}",
+            std::process::id(),
+            random_hex_token(16)
+        );
+        run_docker_command_bounded(
+            docker_argv_command(&[
+                "network",
+                "create",
+                "--driver",
+                "bridge",
+                "--label",
+                "sunrise-edge-test=pgbouncer",
+                "--",
+                &name,
+            ]),
+            "docker network create (pgbouncer rehearsal)",
+        )
+        .unwrap_or_else(|error| panic!("docker network create failed: {error}"));
+        Self { name }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Drop for DockerNetwork {
+    fn drop(&mut self) {
+        if let Err(error) = run_docker_command_bounded(
+            docker_argv_command(&["network", "rm", "--", &self.name]),
+            "docker network rm (pgbouncer rehearsal)",
+        ) {
+            eprintln!(
+                "DockerNetwork: failed to remove network {} (label sunrise-edge-test=pgbouncer): \
+                 {error}; remove it by hand",
+                self.name
+            );
+        }
+    }
+}
+
+// --- PgBouncer transaction-pooling rehearsal: rendered config content ------
+
+/// Exact PgBouncer `pool_size`/`default_pool_size`/`max_db_connections`/
+/// `max_user_connections` this rehearsal configures for the tested
+/// database/user pool: this scenario's whole point is proving
+/// transaction-pooling multiplexing of multiple client connections over
+/// exactly one physical PostgreSQL backend.
+pub const PGBOUNCER_POOL_SIZE: u32 = 1;
+
+/// Upper bound on simultaneously connected PgBouncer clients. Generous
+/// relative to the handful of direct/adapter connections this scenario ever
+/// opens at once; it exists so a client-count bug in the test would fail
+/// loudly against a real cap instead of silently succeeding under an
+/// effectively unbounded default.
+pub const PGBOUNCER_MAX_CLIENT_CONN: u32 = 20;
+
+/// Nonzero `max_prepared_statements` this rehearsal configures, proving the
+/// scenario does not merely leave PgBouncer's prepared-statement support at
+/// its default.
+pub const PGBOUNCER_MAX_PREPARED_STATEMENTS: u32 = 16;
+
+/// Bounded `query_wait_timeout`, in whole seconds, this rehearsal configures.
+/// Short so the blocked-adapter phase of the live test stays fast; PgBouncer
+/// enforces this server-side, independent of any client- or adapter-side
+/// deadline.
+pub const PGBOUNCER_QUERY_WAIT_TIMEOUT_SECS: u32 = 3;
+
+/// Explicit, typed inputs to [`render_pgbouncer_ini`]. Every field is
+/// program-controlled (a fixed database/role name, an internal Docker
+/// network alias, and generated port numbers), never attacker- or
+/// operator-supplied input, so the renderer performs no escaping; see
+/// [`render_pgbouncer_ini`]'s doc comment for the exact invariant this
+/// relies on.
+#[derive(Debug, Clone, Copy)]
+pub struct PgBouncerIniConfig<'a> {
+    pub database: &'a str,
+    pub backend_host: &'a str,
+    pub backend_port: u16,
+    pub listen_port: u16,
+    pub admin_user: &'a str,
+}
+
+/// Renders the exact `pgbouncer.ini` this rehearsal writes into its proxy
+/// container: transaction pooling, exactly one backend connection for the
+/// tested database/user pool, a nonzero `max_prepared_statements`, and a
+/// bounded `query_wait_timeout`.
+///
+/// None of `config`'s fields may legally contain a newline, `=`, `[`, `]`, or
+/// leading/trailing whitespace (an INI-breaking value), so this function
+/// panics rather than silently emitting a malformed file if one does; every
+/// call site passes only fixed literals or a generated alphanumeric network
+/// alias, never external input.
+pub fn render_pgbouncer_ini(config: &PgBouncerIniConfig<'_>) -> String {
+    for (field, value) in [
+        ("database", config.database),
+        ("backend_host", config.backend_host),
+        ("admin_user", config.admin_user),
+    ] {
+        assert!(
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'),
+            "PgBouncer ini field {field:?} must be non-empty alphanumeric/underscore/hyphen, got \
+             {value:?}"
+        );
+    }
+    format!(
+        "[databases]\n\
+         {database} = host={backend_host} port={backend_port} dbname={database} pool_size={pool_size}\n\
+         \n\
+         [pgbouncer]\n\
+         listen_addr = 0.0.0.0\n\
+         listen_port = {listen_port}\n\
+         auth_type = md5\n\
+         auth_file = /etc/pgbouncer/userlist.txt\n\
+         pool_mode = transaction\n\
+         max_client_conn = {max_client_conn}\n\
+         default_pool_size = {pool_size}\n\
+         max_db_connections = {pool_size}\n\
+         max_user_connections = {pool_size}\n\
+         max_prepared_statements = {max_prepared_statements}\n\
+         query_wait_timeout = {query_wait_timeout}\n\
+         admin_users = {admin_user}\n\
+         stats_users = {admin_user}\n\
+         logfile = /tmp/pgbouncer.log\n\
+         pidfile = /tmp/pgbouncer.pid\n",
+        database = config.database,
+        backend_host = config.backend_host,
+        backend_port = config.backend_port,
+        pool_size = PGBOUNCER_POOL_SIZE,
+        listen_port = config.listen_port,
+        max_client_conn = PGBOUNCER_MAX_CLIENT_CONN,
+        max_prepared_statements = PGBOUNCER_MAX_PREPARED_STATEMENTS,
+        query_wait_timeout = PGBOUNCER_QUERY_WAIT_TIMEOUT_SECS,
+        admin_user = config.admin_user,
+    )
+}
+
+/// Renders one `userlist.txt` line binding `user` to `credential_hash` (an
+/// `md5<32 lowercase hex>` string read back from PostgreSQL's own
+/// `pg_authid.rolpassword` after the role's password is set with
+/// `password_encryption = md5` in effect, never a plaintext password and
+/// never computed by this test). That alphabet (lowercase hex plus the fixed
+/// `md5` prefix) and every call site's `user` never contain a double quote or
+/// backslash, so no escaping is required for PgBouncer's simple
+/// double-quoted userlist format; this function panics rather than silently
+/// emitting a corrupt entry if either ever did.
+pub fn render_userlist_entry(user: &str, credential_hash: &str) -> String {
+    for (field, value) in [("user", user), ("credential_hash", credential_hash)] {
+        assert!(
+            !value
+                .bytes()
+                .any(|byte| byte == b'"' || byte == b'\\' || byte == b'\n'),
+            "PgBouncer userlist field {field:?} must not contain a quote, backslash, or newline, \
+             got {value:?}"
+        );
+    }
+    format!("\"{user}\" \"{credential_hash}\"\n")
+}
+
+// --- PgBouncer transaction-pooling rehearsal: disposable containers --------
+
+const PGBOUNCER_POSTGRES_PGDATA_TMPFS_BYTES: u64 = 512 * 1024 * 1024;
+
+/// A disposable, RAM-backed PostgreSQL container for the PgBouncer
+/// rehearsal, attached to a [`DockerNetwork`] under a fixed network alias so
+/// the PgBouncer proxy container can resolve it by name, and also published
+/// on the host loopback interface for this test's own direct, PgBouncer-
+/// bypassing verification connections (schema bootstrap, ground-truth reads
+/// while the proxy's sole backend is held by a blocker). [`Drop`]
+/// force-removes the container and never panics.
+pub struct PgBouncerPostgresContainer {
+    container_id: ContainerId,
+    published_port: u16,
+    postgres_password: String,
+}
+
+impl PgBouncerPostgresContainer {
+    /// The fixed internal network alias/port every PgBouncer proxy container
+    /// this scenario starts resolves this container by, over the shared
+    /// [`DockerNetwork`].
+    pub const NETWORK_ALIAS: &'static str = "sunrise-edge-pgbouncer-backend";
+    const INTERNAL_PORT: u16 = 5432;
+
+    pub fn start(image: &PinnedImage, network: &DockerNetwork) -> Self {
+        let postgres_password: String = os_random_secret_hex(32).unwrap_or_else(|error| {
+            panic!("failed to read PostgreSQL test password from OS randomness: {error}")
+        });
+        let container_name = format!(
+            "sunrise-edge-pgbouncer-pg-{}-{}",
+            std::process::id(),
+            random_hex_token(16)
+        );
+        let pgdata_mount = format!(
+            "type=tmpfs,destination=/var/lib/postgresql,tmpfs-size={PGBOUNCER_POSTGRES_PGDATA_TMPFS_BYTES}"
+        );
+        let password_env = format!("POSTGRES_PASSWORD={postgres_password}");
+        let run_output_result = run_docker_command_bounded_output(
+            docker_argv_command(&[
+                "run",
+                "--detach",
+                "--name",
+                &container_name,
+                "--label",
+                "sunrise-edge-test=pgbouncer-postgres",
+                "--network",
+                network.name(),
+                "--network-alias",
+                Self::NETWORK_ALIAS,
+                "--publish",
+                "127.0.0.1::5432",
+                "--memory",
+                "1g",
+                "--memory-swap",
+                "1g",
+                "--pids-limit",
+                "512",
+                "--mount",
+                &pgdata_mount,
+                "--env",
+                &password_env,
+                "--env",
+                "POSTGRES_DB=postgres",
+                "--",
+                image.as_str(),
+                // PgBouncer's server-side (proxy-to-backend) authentication
+                // needs the plaintext-derived password hash it can relay
+                // itself; MD5 is the simple, universally interoperable choice
+                // here (this scenario's client leg is plaintext already, so
+                // MD5-vs-SCRAM buys no additional confidentiality either
+                // way). Applied via `-c` so every password this scenario
+                // sets afterward (`ALTER ROLE ... PASSWORD`) is stored in
+                // that exact format.
+                "-c",
+                "password_encryption=md5",
+            ]),
+            "docker run (pgbouncer-rehearsal postgres container)",
+        );
+        let run_output = run_output_result.unwrap_or_else(|error| {
+            let cleanup_error = run_docker_command_bounded(
+                docker_argv_command(&["rm", "--force", "--volumes", &container_name]),
+                "docker rm after failed run",
+            )
+            .err();
+            panic!(
+                "docker run (pgbouncer-rehearsal postgres container) failed: {error}; cleanup by \
+                 exact generated name returned {cleanup_error:?}"
+            )
+        });
+        let container_id = ContainerId::parse(run_output.trim()).unwrap_or_else(|error| {
+            let cleanup_error = run_docker_command_bounded(
+                docker_argv_command(&["rm", "--force", "--volumes", &container_name]),
+                "docker rm after invalid run output",
+            )
+            .err();
+            panic!(
+                "docker run produced an invalid container id {run_output:?}: {error}; cleanup by \
+                 exact generated name returned {cleanup_error:?}"
+            )
+        });
+        let mut container = Self {
+            container_id,
+            published_port: 0,
+            postgres_password,
+        };
+        let port_output = run_docker_command_bounded_output(
+            docker_argv_command(&["port", container.container_id.as_str(), "5432/tcp"]),
+            "docker port (pgbouncer-rehearsal postgres container)",
+        )
+        .unwrap_or_else(|error| panic!("docker port failed: {error}"));
+        container.published_port = parse_published_port(&port_output);
+        wait_for_database_ready(
+            &format!(
+                "pgbouncer-rehearsal postgres container {}",
+                container.container_id.as_str()
+            ),
+            &container.url("postgres"),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        container
+    }
+
+    /// Builds the direct, PgBouncer-bypassing `postgresql://` URL for
+    /// `database` against this container's published port.
+    pub fn url(&self, database: &str) -> String {
+        format!(
+            "postgresql://postgres:{}@127.0.0.1:{}/{database}",
+            self.postgres_password, self.published_port
+        )
+    }
+
+    /// The plaintext password every PgBouncer client this scenario opens
+    /// (through the proxy) authenticates with; PgBouncer itself validates it
+    /// via an MD5 challenge against the credential hash in `userlist.txt`,
+    /// never this string directly.
+    pub fn password(&self) -> &str {
+        &self.postgres_password
+    }
+
+    pub const fn internal_port() -> u16 {
+        Self::INTERNAL_PORT
+    }
+}
+
+impl Drop for PgBouncerPostgresContainer {
+    fn drop(&mut self) {
+        let result = run_docker_command_bounded(
+            docker_argv_command(&["rm", "--force", "--volumes", self.container_id.as_str()]),
+            "docker rm (pgbouncer-rehearsal postgres container)",
+        );
+        if let Err(error) = result {
+            eprintln!(
+                "PgBouncerPostgresContainer: failed to remove container {} (label \
+                 sunrise-edge-test=pgbouncer-postgres): {error}; remove it by hand",
+                self.container_id.as_str()
+            );
+        }
+    }
+}
+
+/// Bound on how long [`PgBouncerProxyContainer::start`] waits for the proxy
+/// process to accept an admin-console login before giving up.
+const PGBOUNCER_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Poll interval while waiting for [`PGBOUNCER_READY_TIMEOUT`] to elapse.
+const PGBOUNCER_READY_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// A disposable PgBouncer proxy container for the transaction-pooling
+/// rehearsal, attached to a [`DockerNetwork`] and configured (via
+/// [`render_pgbouncer_ini`]/[`render_userlist_entry`], written in with no
+/// shell and no host bind mount) to route exactly one database/user pool,
+/// using transaction pooling, to a [`PgBouncerPostgresContainer`] resolved by
+/// its network alias. Published on the host loopback interface so this
+/// test's own direct and adapter-pool clients can reach it. [`Drop`]
+/// force-removes the container and never panics.
+pub struct PgBouncerProxyContainer {
+    container_id: ContainerId,
+    published_port: u16,
+    admin_user: String,
+    password: String,
+}
+
+impl PgBouncerProxyContainer {
+    /// Starts the proxy container idling on a bare `sleep`, writes its config
+    /// files in over stdin via `tee` (direct argv, no shell, no host bind
+    /// mount), starts `pgbouncer` itself as a detached in-container exec, and
+    /// boundedly waits for its admin console to accept a login. Panics on any
+    /// failure.
+    pub fn start(
+        image: &PinnedImage,
+        network: &DockerNetwork,
+        database: &str,
+        admin_user: &str,
+        password: &str,
+        credential_hash: &str,
+    ) -> Self {
+        let container_name = format!(
+            "sunrise-edge-pgbouncer-proxy-{}-{}",
+            std::process::id(),
+            random_hex_token(16)
+        );
+        let run_output_result = run_docker_command_bounded_output(
+            docker_argv_command(&[
+                "run",
+                "--detach",
+                "--name",
+                &container_name,
+                "--label",
+                "sunrise-edge-test=pgbouncer-proxy",
+                "--network",
+                network.name(),
+                "--publish",
+                "127.0.0.1::6432",
+                "--memory",
+                "256m",
+                "--memory-swap",
+                "256m",
+                "--pids-limit",
+                "64",
+                "--entrypoint",
+                "sleep",
+                "--",
+                image.as_str(),
+                "infinity",
+            ]),
+            "docker run (pgbouncer proxy container)",
+        );
+        let run_output = run_output_result.unwrap_or_else(|error| {
+            let cleanup_error = run_docker_command_bounded(
+                docker_argv_command(&["rm", "--force", "--volumes", &container_name]),
+                "docker rm after failed run",
+            )
+            .err();
+            panic!(
+                "docker run (pgbouncer proxy container) failed: {error}; cleanup by exact \
+                 generated name returned {cleanup_error:?}"
+            )
+        });
+        let container_id = ContainerId::parse(run_output.trim()).unwrap_or_else(|error| {
+            let cleanup_error = run_docker_command_bounded(
+                docker_argv_command(&["rm", "--force", "--volumes", &container_name]),
+                "docker rm after invalid run output",
+            )
+            .err();
+            panic!(
+                "docker run produced an invalid container id {run_output:?}: {error}: cleanup by \
+                 exact generated name returned {cleanup_error:?}"
+            )
+        });
+        let mut container = Self {
+            container_id,
+            published_port: 0,
+            admin_user: admin_user.to_owned(),
+            password: password.to_owned(),
+        };
+        let port_output = run_docker_command_bounded_output(
+            docker_argv_command(&["port", container.container_id.as_str(), "6432/tcp"]),
+            "docker port (pgbouncer proxy container)",
+        )
+        .unwrap_or_else(|error| panic!("docker port failed: {error}"));
+        container.published_port = parse_published_port(&port_output);
+
+        let userlist = render_userlist_entry(admin_user, credential_hash);
+        container
+            .exec_with_stdin(&["tee", "/etc/pgbouncer/userlist.txt"], userlist.as_bytes())
+            .unwrap_or_else(|error| panic!("writing pgbouncer userlist.txt failed: {error}"));
+
+        let ini = render_pgbouncer_ini(&PgBouncerIniConfig {
+            database,
+            backend_host: PgBouncerPostgresContainer::NETWORK_ALIAS,
+            backend_port: PgBouncerPostgresContainer::internal_port(),
+            listen_port: 6432,
+            admin_user,
+        });
+        container
+            .exec_with_stdin(&["tee", "/etc/pgbouncer/pgbouncer.ini"], ini.as_bytes())
+            .unwrap_or_else(|error| panic!("writing pgbouncer.ini failed: {error}"));
+
+        run_docker_command_bounded(
+            docker_argv_command(&[
+                "exec",
+                "-d",
+                "--user",
+                "postgres",
+                "--",
+                container.container_id.as_str(),
+                "pgbouncer",
+                "/etc/pgbouncer/pgbouncer.ini",
+            ]),
+            "docker exec -d (pgbouncer start)",
+        )
+        .unwrap_or_else(|error| panic!("starting pgbouncer process failed: {error}"));
+
+        container.wait_ready();
+        container
+    }
+
+    fn exec_with_stdin(&self, args: &[&str], stdin_bytes: &[u8]) -> io::Result<String> {
+        let mut full_args: Vec<&str> = vec![
+            "exec",
+            "-i",
+            "--user",
+            "postgres",
+            "--",
+            self.container_id.as_str(),
+        ];
+        full_args.extend_from_slice(args);
+        run_docker_command_bounded_output_with_stdin(
+            docker_argv_command(&full_args),
+            "docker exec (pgbouncer config write)",
+            stdin_bytes,
+            DOCKER_COMMAND_OUTPUT_MAX_BYTES,
+        )
+    }
+
+    fn wait_ready(&self) {
+        let deadline = Instant::now() + PGBOUNCER_READY_TIMEOUT;
+        loop {
+            let mut config: Config = self
+                .admin_url()
+                .parse()
+                .unwrap_or_else(|error| panic!("invalid pgbouncer admin URL: {error}"));
+            config.connect_timeout(Duration::from_secs(2));
+            if let Ok(mut client) = config.connect(NoTls)
+                && client.simple_query("SHOW VERSION").is_ok()
+            {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let log_tail = run_docker_command_bounded_output(
+                    docker_argv_command(&[
+                        "exec",
+                        "--user",
+                        "postgres",
+                        "--",
+                        self.container_id.as_str(),
+                        "cat",
+                        "/tmp/pgbouncer.log",
+                    ]),
+                    "docker exec (pgbouncer log tail on readiness failure)",
+                )
+                .unwrap_or_else(|error| format!("<failed to read log: {error}>"));
+                panic!(
+                    "pgbouncer proxy container {} did not accept an admin-console login within \
+                     {PGBOUNCER_READY_TIMEOUT:?}; log: {log_tail}",
+                    self.container_id.as_str()
+                );
+            }
+            thread::sleep(PGBOUNCER_READY_POLL_INTERVAL);
+        }
+    }
+
+    /// Builds a `postgresql://` URL for `database` through this proxy, using
+    /// this scenario's single generated admin/pool user and password.
+    pub fn url(&self, database: &str) -> String {
+        format!(
+            "postgresql://{}:{}@127.0.0.1:{}/{database}",
+            self.admin_user, self.password, self.published_port
+        )
+    }
+
+    /// Builds the URL for PgBouncer's own virtual admin console database.
+    /// Connecting here always gets a dedicated session outside the pooled
+    /// backend machinery this scenario's `pool_size=1` otherwise governs, so
+    /// admin evidence queries never contend with the tested database/user
+    /// pool for its one backend.
+    pub fn admin_url(&self) -> String {
+        self.url("pgbouncer")
+    }
+
+    pub fn container_id(&self) -> &ContainerId {
+        &self.container_id
+    }
+}
+
+impl Drop for PgBouncerProxyContainer {
+    fn drop(&mut self) {
+        let result = run_docker_command_bounded(
+            docker_argv_command(&["rm", "--force", "--volumes", self.container_id.as_str()]),
+            "docker rm (pgbouncer proxy container)",
+        );
+        if let Err(error) = result {
+            eprintln!(
+                "PgBouncerProxyContainer: failed to remove container {} (label \
+                 sunrise-edge-test=pgbouncer-proxy): {error}; remove it by hand",
+                self.container_id.as_str()
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2526,5 +3269,162 @@ mod tests {
             BackupRestoreScenario::Run(image) => assert_eq!(image.as_str(), raw_image),
             BackupRestoreScenario::Skip => panic!("expected Run"),
         }
+    }
+
+    const PGBOUNCER_TEST_POSTGRES_IMAGE: &str =
+        "postgres@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2";
+    const PGBOUNCER_TEST_PROXY_IMAGE: &str = "ghcr.io/icoretech/pgbouncer-docker@sha256:53dc42879de6b87efed6ad239558cfa6fef6f08c5fa4acc109da5f5af1868b89";
+
+    #[test]
+    fn resolve_pgbouncer_scenario_skips_when_both_absent() {
+        assert!(matches!(
+            resolve_pgbouncer_scenario_from(None, None, None),
+            PgBouncerScenario::Skip
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "must be exactly")]
+    fn resolve_pgbouncer_scenario_fails_on_malformed_required_flag() {
+        resolve_pgbouncer_scenario_from(Some(OsString::from("true")), None, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "is set but neither")]
+    fn resolve_pgbouncer_scenario_fails_when_required_but_both_absent() {
+        resolve_pgbouncer_scenario_from(Some(OsString::from("1")), None, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "partial live PgBouncer rehearsal configuration is not allowed")]
+    fn resolve_pgbouncer_scenario_fails_on_partial_configuration_postgres_only() {
+        resolve_pgbouncer_scenario_from(
+            None,
+            Some(OsString::from(PGBOUNCER_TEST_POSTGRES_IMAGE)),
+            None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "partial live PgBouncer rehearsal configuration is not allowed")]
+    fn resolve_pgbouncer_scenario_fails_on_partial_configuration_proxy_only() {
+        resolve_pgbouncer_scenario_from(
+            None,
+            None,
+            Some(OsString::from(PGBOUNCER_TEST_PROXY_IMAGE)),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is invalid")]
+    fn resolve_pgbouncer_scenario_fails_on_malformed_postgres_image() {
+        resolve_pgbouncer_scenario_from(
+            None,
+            Some(OsString::from("bad")),
+            Some(OsString::from(PGBOUNCER_TEST_PROXY_IMAGE)),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is invalid")]
+    fn resolve_pgbouncer_scenario_fails_on_malformed_proxy_image() {
+        resolve_pgbouncer_scenario_from(
+            None,
+            Some(OsString::from(PGBOUNCER_TEST_POSTGRES_IMAGE)),
+            Some(OsString::from("bad")),
+        );
+    }
+
+    #[test]
+    fn resolve_pgbouncer_scenario_runs_with_only_images_configured() {
+        match resolve_pgbouncer_scenario_from(
+            None,
+            Some(OsString::from(PGBOUNCER_TEST_POSTGRES_IMAGE)),
+            Some(OsString::from(PGBOUNCER_TEST_PROXY_IMAGE)),
+        ) {
+            PgBouncerScenario::Run {
+                postgres_image,
+                pgbouncer_image,
+            } => {
+                assert_eq!(postgres_image.as_str(), PGBOUNCER_TEST_POSTGRES_IMAGE);
+                assert_eq!(pgbouncer_image.as_str(), PGBOUNCER_TEST_PROXY_IMAGE);
+            }
+            PgBouncerScenario::Skip => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn resolve_pgbouncer_scenario_runs_with_required_and_both_images_configured() {
+        match resolve_pgbouncer_scenario_from(
+            Some(OsString::from("1")),
+            Some(OsString::from(PGBOUNCER_TEST_POSTGRES_IMAGE)),
+            Some(OsString::from(PGBOUNCER_TEST_PROXY_IMAGE)),
+        ) {
+            PgBouncerScenario::Run {
+                postgres_image,
+                pgbouncer_image,
+            } => {
+                assert_eq!(postgres_image.as_str(), PGBOUNCER_TEST_POSTGRES_IMAGE);
+                assert_eq!(pgbouncer_image.as_str(), PGBOUNCER_TEST_PROXY_IMAGE);
+            }
+            PgBouncerScenario::Skip => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn render_pgbouncer_ini_contains_required_settings() {
+        let rendered = render_pgbouncer_ini(&PgBouncerIniConfig {
+            database: "sunrise_edge_pgbouncer",
+            backend_host: "sunrise-edge-pgbouncer-backend",
+            backend_port: 5432,
+            listen_port: 6432,
+            admin_user: "postgres",
+        });
+        assert!(rendered.contains(
+            "sunrise_edge_pgbouncer = host=sunrise-edge-pgbouncer-backend port=5432 \
+             dbname=sunrise_edge_pgbouncer pool_size=1"
+        ));
+        assert!(rendered.contains("pool_mode = transaction"));
+        assert!(rendered.contains("max_prepared_statements = 16"));
+        assert!(rendered.contains("query_wait_timeout = 3"));
+        assert!(rendered.contains("default_pool_size = 1"));
+        assert!(rendered.contains("max_db_connections = 1"));
+        assert!(rendered.contains("max_user_connections = 1"));
+        assert!(rendered.contains("listen_port = 6432"));
+        assert!(rendered.contains("admin_users = postgres"));
+        assert!(rendered.contains("stats_users = postgres"));
+        assert!(rendered.contains("auth_type = md5"));
+    }
+
+    #[test]
+    #[should_panic(expected = "must be non-empty alphanumeric")]
+    fn render_pgbouncer_ini_rejects_unsafe_database_field() {
+        render_pgbouncer_ini(&PgBouncerIniConfig {
+            database: "bad db\n[pgbouncer]",
+            backend_host: "sunrise-edge-pgbouncer-backend",
+            backend_port: 5432,
+            listen_port: 6432,
+            admin_user: "postgres",
+        });
+    }
+
+    #[test]
+    fn render_userlist_entry_produces_exact_double_quoted_line() {
+        assert_eq!(
+            render_userlist_entry("postgres", "md56914d066bef7dc5511d9bb50d9d81da4"),
+            "\"postgres\" \"md56914d066bef7dc5511d9bb50d9d81da4\"\n"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must not contain a quote, backslash, or newline")]
+    fn render_userlist_entry_rejects_embedded_quote_in_credential_hash() {
+        render_userlist_entry("postgres", "md56914d0\"66bef7dc5511d9bb50d9d81da4");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not contain a quote, backslash, or newline")]
+    fn render_userlist_entry_rejects_embedded_newline_in_user() {
+        render_userlist_entry("post\ngres", "md56914d066bef7dc5511d9bb50d9d81da4");
     }
 }

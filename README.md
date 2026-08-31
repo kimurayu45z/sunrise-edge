@@ -298,10 +298,35 @@ cross-provider ingress milestones implemented through Phase 17:
   and receipt. This is a bounded
   database-snapshot restore rehearsal for one `pg_dump`/SQL-execute cycle
   only, not a production backup/restore capability: it does not close the
-  backup/restore evidence criterion. Together, DR-0070/DR-0071/DR-0072/DR-0073
+  backup/restore evidence criterion.
+- A separate required CI scenario (see `ARCHITECTURE.md` DR-0075) starts a
+  digest-pinned PostgreSQL 18.6 container and a digest-pinned
+  `ghcr.io/icoretech/pgbouncer-docker` 1.25.2 proxy container on one
+  isolated, freshly generated Docker network, with PgBouncer configured for
+  transaction pooling, exactly one backend connection for the tested
+  database/user pool, a nonzero `max_prepared_statements`, and a bounded
+  `query_wait_timeout` — every setting asserted directly through PgBouncer's
+  own admin console, never inferred. It proves two simultaneously open,
+  distinct client connections reuse the exact same PostgreSQL backend across
+  sequential transactions, then points the real adapter (a genuine `r2d2`
+  pool plus `PostgresDurableStore`) at the proxy. While a direct proxied
+  client holds the pool's only backend inside an open transaction, one
+  adapter invocation gets the definite pre-commit
+  `Rejected(UnavailableBeforeCommit)` once PgBouncer's own
+  `query_wait_timeout` elapses (PostgreSQL SQLSTATE `08P01`, which this
+  adapter's classifier treats as `Unavailable`, never `Indeterminate`), with
+  no state/receipt/outbox publication. After release, the identical
+  invocation commits through the same pool/store, `SHOW CLIENTS` proves the
+  adapter pool's own connection reclaimed the freed backend, a replay
+  returns exact `RequestAlreadyCommitted`, and the exact outbox message
+  claims and acknowledges through `NoDueWork`. This is a bounded local
+  PgBouncer transaction-pooling rehearsal only, not provider-managed pooler
+  service certification, load/soak, failover, or TLS evidence. Together,
+  DR-0070/DR-0071/DR-0072/DR-0073/DR-0075
   leave literal-`COMMIT` WAL/data ENOSPC, real storage-device ENOSPC and
-  block-device faults, load/soak capacity, connection-pool behavior under a
-  provider-managed pooler, PostgreSQL-server/provider TLS beyond DR-0074,
+  block-device faults, load/soak capacity, provider-managed pooler service
+  certification beyond DR-0075's bounded rehearsal,
+  PostgreSQL-server/provider TLS beyond DR-0074,
   point-in-time recovery,
   continuous WAL archiving, hot/concurrent backup, checkpoint publication,
   blob-manifest/state-root/encryption-key verification, real writer failover,
@@ -429,12 +454,14 @@ Important remaining work includes the owned-object fast path, concrete
 node-event dispatch and protocol handlers, in-flight durable-I/O cancellation,
 real provider trigger wiring, abrupt host/power-fault recovery conformance
 (database-process SIGKILL/WAL recovery, bounded pre-commit data-tablespace
-and WAL-filesystem ENOSPC, bounded server connection-slot exhaustion, and a
-bounded `pg_dump`-based database-snapshot restore rehearsal and bounded
-client/driver-to-test-terminator TLS commit-loss behavior are covered As-Is;
-see DR-0069/DR-0070/DR-0071/DR-0072/DR-0073/DR-0074 — DR-0073 is a
+and WAL-filesystem ENOSPC, bounded server connection-slot exhaustion, a
+bounded `pg_dump`-based database-snapshot restore rehearsal, bounded
+client/driver-to-test-terminator TLS commit-loss behavior, and a bounded
+local PgBouncer transaction-pooling rehearsal are covered As-Is;
+see DR-0069/DR-0070/DR-0071/DR-0072/DR-0073/DR-0074/DR-0075 — DR-0073 is a
 rehearsal for one snapshot cycle, not a production backup/restore
-capability),
+capability, and DR-0075 is a bounded local rehearsal, not provider-managed
+pooler service certification),
 portable system-module execution, cryptographic slashing proof verification,
 fee-object debiting,
 provider persistence bindings, runtime adapters, networking/RPC surfaces, and
@@ -451,8 +478,9 @@ cooperative cancellation signal only before first storage dispatch;
 client-disconnect cancellation, abrupt host/power fault (beyond the
 database-process SIGKILL/WAL recovery evidence in DR-0069),
 literal-`COMMIT` WAL/data ENOSPC and real storage-device ENOSPC beyond
-DR-0070/DR-0071, connection-pool behavior under a provider-managed pooler and
-load/soak capacity beyond DR-0072's bounded evidence,
+DR-0070/DR-0071, load/soak capacity beyond DR-0072's bounded evidence,
+provider-managed pooler service certification, high availability, and
+load/soak beyond DR-0075's bounded rehearsal,
 PostgreSQL-server/provider TLS behavior beyond DR-0074's bounded
 client-to-terminator evidence, point-in-time recovery, continuous WAL archiving,
 hot/concurrent backup, checkpoint publication, blob-manifest/state-root/

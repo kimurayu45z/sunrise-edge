@@ -324,3 +324,93 @@ off-host transfer faults, capacity/load/soak, TLS-path connection loss, real
 writer failover beyond the one bounded fence advance proven here (the copied
 target fence does not fence or stop the still-isolated source database), or
 production certification.
+
+### Live bounded PgBouncer transaction-pooling rehearsal test
+
+`tests/postgres_pgbouncer.rs` starts and owns **two** separate digest-pinned
+disposable containers — a PostgreSQL 18.6 backend and a `ghcr.io/icoretech/
+pgbouncer-docker` 1.25.2 proxy — on one isolated, freshly generated Docker
+bridge network. Set all three variables to make it required locally:
+
+```bash
+SUNRISE_EDGE_TEST_POSTGRES_PGBOUNCER_POSTGRES_IMAGE=postgres:18.6-alpine3.24@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2 \
+SUNRISE_EDGE_TEST_POSTGRES_PGBOUNCER_IMAGE=ghcr.io/icoretech/pgbouncer-docker:1.25.2@sha256:53dc42879de6b87efed6ad239558cfa6fef6f08c5fa4acc109da5f5af1868b89 \
+SUNRISE_EDGE_TEST_POSTGRES_PGBOUNCER_REQUIRED=1 \
+  cargo test -p runtime-postgres --all-features --test postgres_pgbouncer -- --nocapture
+```
+
+Leaving all three unset skips the test; configuring only one of the two
+pinned images (with or without the required flag) always fails rather than
+skipping, since a scenario needing two images can't safely infer intent from
+half a configuration. PgBouncer resolves PostgreSQL only by its Docker
+network alias, never a host-published address; this test's own direct
+verification connections bypass the proxy entirely and talk straight to
+PostgreSQL's own separately published port, so they stay usable even while
+the proxy's single backend is deliberately held busy.
+
+The proxy's `pgbouncer.ini`/`userlist.txt` are written into the already-running
+container over stdin via `docker exec -i ... tee` — one direct-argv call per
+file, no shell, no host bind mount. The pool credential is a freshly
+generated password; with `password_encryption=md5` pinned on the PostgreSQL
+container, `pg_authid.rolpassword` is read back after setting it and used
+directly as the userlist's MD5 credential hash, never invented or hashed by
+the test itself. The rendered configuration sets `pool_mode = transaction`,
+`pool_size`/`default_pool_size`/`max_db_connections`/`max_user_connections =
+1` for the one tested database/user pool, a nonzero
+`max_prepared_statements`, and a bounded `query_wait_timeout` — every one of
+these is asserted through PgBouncer's own admin console (`SHOW CONFIG`/`SHOW
+POOLS`/`SHOW SERVERS`/`SHOW CLIENTS`, queried over the simple query protocol,
+the only protocol PgBouncer's admin console answers), never inferred from
+client-side behavior.
+
+Two distinct client connections, open simultaneously, each run one
+sequential transaction; `SHOW SERVERS`' `remote_pid` is identical after
+both, proving transaction pooling actually reused one physical PostgreSQL
+backend rather than opening a second. The real adapter (a genuine `r2d2`
+pool plus `PostgresDurableStore`, distinguished by its own
+`application_name`) is then pointed at the proxy, not PostgreSQL directly.
+While a separate direct proxied client holds the pool's only backend inside
+an open transaction (left open by simply withholding `COMMIT`/`ROLLBACK`,
+never a timed sleep), one adapter structured invocation is driven with a
+context deadline well longer than PgBouncer's own `query_wait_timeout`.
+Live evidence, not an assumed classification: PgBouncer's queue timeout
+surfaces as PostgreSQL protocol SQLSTATE `08P01` (`query_wait_timeout`) on
+the adapter's first statement (its transaction-opening `BEGIN`); this
+crate's `PreCommitFailure::from_sqlstate` has no dedicated arm for
+connection-exception class `08` and so falls through to its default
+`Unavailable` bucket — the definite pre-commit
+`Rejected(UnavailableBeforeCommit)`, never `Indeterminate`. The observed
+elapsed time is bounded from both directions around PgBouncer's own
+`query_wait_timeout` specifically (not this probe's own much larger context
+budget), proving the rejection's timing tracks the proxy's queue timeout.
+No state/receipt/outbox row is published, checked through the direct,
+proxy-bypassing verification connection, which the proxy's contention
+cannot affect.
+
+After the blocking transaction is released, the identical invocation is
+retried through the same adapter pool/store. A bounded, explicitly
+documented retry tolerates one specific, live-verified transient, distinct
+from a genuine proxy rejection by its timing alone: `r2d2` can occasionally
+recycle, rather than evict, the blocked probe's connection if its local
+closed-state check has not yet caught up with PgBouncer's asynchronous
+socket close, so the very next checkout can be handed that already-dead
+connection and fail near-instantly with a local, unclassified I/O error —
+also `Rejected(UnavailableBeforeCommit)` by the same default classification,
+but resolved in sub-millisecond time rather than tracking
+`query_wait_timeout`. The retry only tolerates that exact narrow shape (a
+sub-second `UnavailableBeforeCommit`); the loop's final outcome must still
+be `Committed`, and any other outcome fails the test immediately. Recovery
+proves `Committed`; `SHOW CLIENTS` filtered by the adapter pool's own
+`application_name` proves specifically that the adapter pool's own proxy
+connection reclaimed the freed backend; a replay of the identical invocation
+returns exact `RequestAlreadyCommitted`; the exact outbox message claims and
+acknowledges through `NoDueWork`; and the pool remains usable for a further
+read.
+
+It force-removes both of its exact created containers, and the generated
+Docker network, on normal return or panic (containers before the network,
+since Docker refuses to remove a network with live attachments). This is
+explicitly a bounded local PgBouncer transaction-pooling rehearsal only, not
+provider-managed pooler service certification: it does not cover load/soak
+capacity, PgBouncer high availability or connection draining, TLS on either
+the client or backend leg, real writer failover, or production readiness.
