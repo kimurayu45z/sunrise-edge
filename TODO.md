@@ -1778,14 +1778,25 @@ Developer MVP completion criteria:
    one trusted bound `(chain, validator, atomicity domain)` namespace、永続化されたfenced writer
    generation、deadline check、object/receipt/outbox/stateのatomic commit、immutable object
    version、indexed request/due outbox claim、idempotentなacknowledgementをprocess-local mutex +
-   1つの`BEGIN IMMEDIATE` transactionの上に実装。digest・canonical record type ID・boolean列は
-   すべて厳密にdecodeし、不明なalgorithm、長さ不一致、algorithm/bytesの片方欠落、想定と異なる
-   type ID、0/1以外のcompleted値、current専用列を持つtombstoneはすべてInvalidPersistedStateとして
-   fail closedする。object versionのprovenance chainはbound namespaceのchainとcommit時・read時の
-   両方で照合する。PostgreSQLと共有するconformance suiteおよび、実際のdurable state
-   read/mutation・exact request replayでの`RequestAlreadyCommitted`・reopen後のoutbox
-   acknowledgement冪等性を含むrestart persistence testで検証済み。native devnet/node-coreへの
-   接続は次のPRで行う。
+   1つのSQLite transaction（複数statementから成るreadはmetadata/fence checkとpayloadを1つの
+   snapshotで観測する`Deferred` transaction、writeは`BEGIN IMMEDIATE`）の上に実装。`advance_writer_fence`
+   はoperator-only seamとしてBEGIN IMMEDIATE内でschema identityとchain/validator/domain
+   namespaceを再検証してからfenceを読み書きする。各transaction開始前にcaller側の残り
+   deadlineをそのconnectionのSQLite busy_timeoutへ伝播し、`[1ms, 5000ms]`にclampする。writer
+   fenceはBEGIN IMMEDIATE直後に一度だけ検証され、write lockによりCOMMITまで有効性が保たれる
+   （COMMIT直前に再検証されるのはdeadlineのみ）。digest・canonical record type ID・outbox
+   attempt status・boolean列は型付き内部表現ですべて厳密にdecodeし、不明なalgorithm、長さ
+   不一致、algorithm/bytesの片方欠落、想定と異なるtype ID、未知のoutbox attempt status、0/1
+   以外のcompleted値、current専用列を持つtombstoneはすべてInvalidPersistedStateとしてfail
+   closedする。object versionのprovenance chainはbound namespaceのchainとcommit時・read時の
+   両方で照合する。current object headはexact validated immutable version rowと突き合わせ、
+   それがmaximum retained versionであることとdigestの一致を確認してから信頼する
+   （load_object_headはload_object_versionを呼ぶだけで、再帰はしない）。PostgreSQLと共有する
+   conformance suite、実際のdurable state read/mutation・exact request replayでの
+   `RequestAlreadyCommitted`・reopen後のoutbox acknowledgement冪等性を含むrestart persistence
+   test、short deadlineがfixed busy timeoutを待たないことを示すbounded contention testで検証済み。
+   corruption testはrepresentativeなstrict-decode/cross-checkルールを検証するものであり、
+   すべてのルールを網羅しているわけではない。native devnet/node-coreへの接続は次のPRで行う。
 
 Phase 1:
 - workspace

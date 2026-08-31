@@ -9,17 +9,18 @@ use runtime::conformance::{
     run_durable_object_conformance, run_durable_store_conformance, run_schema_skew_conformance,
 };
 use runtime::{
-    AtomicStateReadSet, AtomicityDomainId, DueOutboxClaimRequest, DurableCommitOutcome,
-    DurableCommitRejection, DurableDomainStateStore, DurableInvocationTransaction,
-    DurableObjectChanges, DurableObjectHead, DurableObjectHeadRead, DurableObjectMutation,
-    DurableObjectMutationEntry, DurableObjectOwnerProjection, DurableObjectProvenance,
-    DurableObjectRoutingProjection, DurableObjectVersion, DurableObjectVersionRecord,
-    DurableOperationContext, DurableOutboxAcknowledgement, DurableOutboxBatch,
-    DurableOutboxClaimOutcome, DurableOutboxClaimRejection, DurableOutboxLeaseId,
-    DurableOutboxMessage, DurableReadError, DurableRequestReceipt, DurableStateTransaction,
-    IndexedOutboxRepository, ObjectId, OutboxRequestId, RequestOutboxClaimRequest, StateMutation,
-    StateMutationEntry, StateReadAssertion, StateRevision, StorageCorrelationId, StorageDeadline,
-    StructuredDurableDomainStateStore, WriterFenceGeneration,
+    AtomicStateMutationSet, AtomicStateReadSet, AtomicStateTransaction, AtomicityDomainId,
+    DueOutboxClaimRequest, DurableCommitOutcome, DurableCommitRejection, DurableDomainStateStore,
+    DurableInvocationTransaction, DurableObjectChanges, DurableObjectHead, DurableObjectHeadRead,
+    DurableObjectMutation, DurableObjectMutationEntry, DurableObjectOwnerProjection,
+    DurableObjectProvenance, DurableObjectRoutingProjection, DurableObjectVersion,
+    DurableObjectVersionRecord, DurableOperationContext, DurableOutboxAcknowledgement,
+    DurableOutboxBatch, DurableOutboxClaimOutcome, DurableOutboxClaimRejection,
+    DurableOutboxLeaseId, DurableOutboxMessage, DurableReadError, DurableRequestReceipt,
+    DurableStateTransaction, IndexedOutboxRepository, ObjectId, OutboxRequestId,
+    RequestOutboxClaimRequest, StateMutation, StateMutationEntry, StateReadAssertion,
+    StateRevision, StorageCorrelationId, StorageDeadline, StructuredDurableDomainStateStore,
+    WriterFenceGeneration,
 };
 use runtime_sqlite::{
     SQLITE_STRUCTURED_SCHEMA_IDENTITY, SqliteDurableStore, SqliteDurableStoreError, SqliteNamespace,
@@ -32,7 +33,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
@@ -274,6 +275,14 @@ fn build_object_version(
 }
 
 fn live_context(fence: WriterFenceGeneration, correlation_byte: u8) -> DurableOperationContext {
+    live_context_with_budget(fence, correlation_byte, Duration::from_millis(60_000))
+}
+
+fn live_context_with_budget(
+    fence: WriterFenceGeneration,
+    correlation_byte: u8,
+    budget: Duration,
+) -> DurableOperationContext {
     let now: u64 = u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -281,9 +290,10 @@ fn live_context(fence: WriterFenceGeneration, correlation_byte: u8) -> DurableOp
             .as_millis(),
     )
     .unwrap();
+    let budget_millis: u64 = u64::try_from(budget.as_millis()).unwrap();
     DurableOperationContext::new(
         fence,
-        StorageDeadline::new(now + 60_000).unwrap(),
+        StorageDeadline::new(now + budget_millis).unwrap(),
         StorageCorrelationId::new([correlation_byte; 16]).unwrap(),
     )
 }
@@ -872,5 +882,155 @@ fn sqlite_structured_outbox_claim_rejects_non_boolean_completed() {
     assert_eq!(
         claim_outcome,
         DurableOutboxClaimOutcome::Rejected(DurableOutboxClaimRejection::InvalidPersistedState)
+    );
+}
+
+#[test]
+fn sqlite_structured_object_head_rejects_valid_length_digest_mismatch() {
+    let database = TestDatabase::new();
+    let namespace = namespace("sqlite-head-digest-mismatch", 0x60, 0x61);
+    let chain_id = namespace.chain_id().clone();
+    let object_id = ObjectId::new([0x62; 32]);
+    let fence = WriterFenceGeneration::new(1).unwrap();
+    let context = live_context(fence, 0x63);
+    let request_id = OutboxRequestId::new([0x64; 32]).unwrap();
+
+    let store = SqliteDurableStore::open(&database.path, namespace.clone(), fence).unwrap();
+    commit_one_object(
+        &store, &context, &namespace, &chain_id, object_id, request_id,
+    );
+
+    // Replace the head's digest with a different value of the same valid
+    // length (32 bytes, a known algorithm): it decodes without error on its
+    // own, so only a cross-check against the retained immutable version's
+    // own digest can catch that it no longer matches.
+    let admin = Connection::open(&database.path).unwrap();
+    let updated = admin
+        .execute(
+            "UPDATE durable_object_heads SET digest_bytes = ?1 WHERE object_id = ?2",
+            params![[0x65_u8; 32].as_slice(), object_id.as_bytes().as_slice()],
+        )
+        .unwrap();
+    assert_eq!(updated, 1);
+    drop(admin);
+
+    let result = store.get_object_head(&context, namespace.domain(), object_id);
+    assert_eq!(result, Err(DurableReadError::InvalidPersistedState));
+}
+
+#[test]
+fn sqlite_structured_outbox_attempt_rejects_unknown_status() {
+    let database = TestDatabase::new();
+    let namespace = namespace("sqlite-outbox-status-corruption", 0x66, 0x67);
+    let fence = WriterFenceGeneration::new(1).unwrap();
+    let context = live_context(fence, 0x68);
+    let request_id = OutboxRequestId::new([0x69; 32]).unwrap();
+    let lease_id = DurableOutboxLeaseId::new([0x6A; 32]).unwrap();
+
+    let store = SqliteDurableStore::open(&database.path, namespace.clone(), fence).unwrap();
+    let event_digest =
+        protocol_types::Digest32::new(protocol_types::HashAlgorithmId::Sha2_256, [0x6B; 32]);
+    let receipt = DurableRequestReceipt::new(request_id, event_digest, vec![0x6C]).unwrap();
+    let message = DurableOutboxMessage::new(
+        protocol_types::Digest32::new(protocol_types::HashAlgorithmId::Sha3_256, [0x6D; 32]),
+        vec![0x6E],
+    )
+    .unwrap();
+    let outbox = DurableOutboxBatch::new(request_id, event_digest, vec![message]).unwrap();
+    let invocation = DurableInvocationTransaction::new(
+        namespace.domain(),
+        None,
+        DurableObjectChanges::empty(),
+        receipt,
+        Some(outbox),
+    )
+    .unwrap();
+    let outcome = store.commit_invocation(&context, invocation);
+    assert_eq!(outcome, DurableCommitOutcome::Committed);
+
+    let claim_outcome = store.claim_due_outbox(
+        &context,
+        DueOutboxClaimRequest::new(namespace.domain(), 0, lease_id, 60_000).unwrap(),
+    );
+    assert!(matches!(
+        claim_outcome,
+        DurableOutboxClaimOutcome::Claimed(_)
+    ));
+
+    // No status value this binary ever writes is outside {1, 2, 3}: this
+    // must fail closed rather than being coerced into one of the three.
+    let admin = Connection::open(&database.path).unwrap();
+    let updated = admin
+        .execute(
+            "UPDATE durable_outbox_attempts SET status = 42 WHERE lease_id = ?1",
+            params![lease_id.as_bytes().as_slice()],
+        )
+        .unwrap();
+    assert_eq!(updated, 1);
+    drop(admin);
+
+    let ack_outcome = store.acknowledge_outbox(
+        &context,
+        DurableOutboxAcknowledgement::new(namespace.domain(), request_id, 0, lease_id),
+    );
+    assert_eq!(
+        ack_outcome,
+        runtime::DurableOutboxAcknowledgementOutcome::Rejected(
+            runtime::DurableOutboxAcknowledgementRejection::InvalidPersistedState
+        )
+    );
+}
+
+/// Proves that a short operation deadline bounds how long a write waits for
+/// SQLite's write lock, rather than always waiting the fixed connection-level
+/// `busy_timeout` set at [`SqliteDurableStore::open`].
+#[test]
+fn sqlite_structured_write_does_not_wait_full_busy_timeout_past_short_deadline() {
+    let database = TestDatabase::new();
+    let namespace = namespace("sqlite-busy-timeout-contention", 0x6F, 0x70);
+    let fence = WriterFenceGeneration::new(1).unwrap();
+
+    let store = SqliteDurableStore::open(&database.path, namespace.clone(), fence).unwrap();
+
+    // Hold the write lock on an independent second connection to the same
+    // file without releasing it, so the store's own BEGIN IMMEDIATE must
+    // contend for it.
+    let blocker = Connection::open(&database.path).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let key = b"contention/key".to_vec();
+    let transaction = AtomicStateTransaction::new(
+        namespace.domain(),
+        AtomicStateReadSet::new(vec![
+            StateReadAssertion::new(key.clone(), StateRevision::INITIAL).unwrap(),
+        ])
+        .unwrap(),
+        AtomicStateMutationSet::new(vec![
+            StateMutationEntry::new(key, StateMutation::Put(vec![0x01])).unwrap(),
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+
+    let short_budget = Duration::from_millis(200);
+    let context = live_context_with_budget(fence, 0x71, short_budget);
+
+    let started = Instant::now();
+    let outcome = store.commit_durable(&context, transaction);
+    let elapsed = started.elapsed();
+
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+
+    assert_eq!(
+        outcome,
+        DurableCommitOutcome::Rejected(DurableCommitRejection::UnavailableBeforeCommit)
+    );
+    // The fixed connection-level default is five seconds; a 200ms deadline
+    // must bound the wait far below that, proving the deadline (not the
+    // fixed default) governed how long BEGIN IMMEDIATE waited for the lock.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "commit_durable took {elapsed:?}, expected well under the fixed 5s busy timeout"
     );
 }

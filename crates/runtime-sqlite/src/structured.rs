@@ -15,8 +15,19 @@
 //!
 //! This adapter is for the single-node Developer MVP only. It is bound at
 //! construction to exactly one trusted `(chain, validator, atomicity domain)`
-//! namespace, serializes every operation behind one process-local [`Mutex`]
-//! plus a SQLite `BEGIN IMMEDIATE` transaction, and has none of
+//! namespace, and serializes every operation behind one process-local
+//! [`Mutex`] plus one SQLite transaction: a `Deferred` transaction wraps each
+//! multi-statement read (the metadata/fence check and the requested payload
+//! are observed from one consistent snapshot, then explicitly rolled back),
+//! and a `BEGIN IMMEDIATE` transaction wraps each write (the writer fence is
+//! validated once, right after the write lock is acquired, and stays valid
+//! through `COMMIT` because that lock excludes any other writer from
+//! advancing it meanwhile; only the deadline is rechecked immediately before
+//! `COMMIT`). The caller's remaining `DurableOperationContext` deadline is
+//! propagated into that connection's SQLite `busy_timeout`, clamped to
+//! `[1ms, 5000ms]`, immediately before each transaction is acquired, so a
+//! blocked write fails closed near the caller's own deadline instead of
+//! always waiting the fixed default. This adapter has none of
 //! `runtime-postgres`'s connection pooling, serialization-conflict retries,
 //! or live fault-injected evidence. It is not suitable for multi-writer or
 //! production deployments.
@@ -49,7 +60,8 @@ use std::{
 
 const STRUCTURED_APPLICATION_ID: i64 = 0x5352_4453;
 const STRUCTURED_SCHEMA_VERSION: i64 = 1;
-const STRUCTURED_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const STRUCTURED_MAX_BUSY_TIMEOUT_MILLIS: u64 = 5_000;
+const STRUCTURED_BUSY_TIMEOUT: Duration = Duration::from_millis(STRUCTURED_MAX_BUSY_TIMEOUT_MILLIS);
 
 /// Stable identity of the local-only structured SQLite schema, generation one.
 ///
@@ -64,6 +76,36 @@ const OBJECT_HEAD_STATUS_TOMBSTONED: i64 = 2;
 const OUTBOX_ATTEMPT_CLAIMED: i64 = 1;
 const OUTBOX_ATTEMPT_ACKNOWLEDGED: i64 = 2;
 const OUTBOX_ATTEMPT_EXPIRED: i64 = 3;
+
+/// Typed, strictly decoded status of one `durable_outbox_attempts` row.
+///
+/// Any persisted value other than the three known statuses is corruption,
+/// never coerced to one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutboxAttemptStatus {
+    Claimed,
+    Acknowledged,
+    Expired,
+}
+
+impl OutboxAttemptStatus {
+    fn decode(value: i64) -> Result<Self, SqlitePreCommitFailure> {
+        match value {
+            OUTBOX_ATTEMPT_CLAIMED => Ok(Self::Claimed),
+            OUTBOX_ATTEMPT_ACKNOWLEDGED => Ok(Self::Acknowledged),
+            OUTBOX_ATTEMPT_EXPIRED => Ok(Self::Expired),
+            _ => Err(SqlitePreCommitFailure::InvalidPersistedState),
+        }
+    }
+
+    const fn encode(self) -> i64 {
+        match self {
+            Self::Claimed => OUTBOX_ATTEMPT_CLAIMED,
+            Self::Acknowledged => OUTBOX_ATTEMPT_ACKNOWLEDGED,
+            Self::Expired => OUTBOX_ATTEMPT_EXPIRED,
+        }
+    }
+}
 
 /// The exact trusted `(chain, validator, atomicity domain)` namespace one
 /// local SQLite structured database file is bound to.
@@ -276,7 +318,12 @@ impl SqliteDurableStore {
     /// Atomically advances the persisted writer fence.
     ///
     /// This is an explicit operator-only failover seam, not part of any
-    /// runtime trait. Request handling must never be able to reach it.
+    /// runtime trait. Request handling must never be able to reach it. Unlike
+    /// the request path, this method carries no `DurableOperationContext`
+    /// deadline, so it resets the connection's SQLite `busy_timeout` back to
+    /// the fixed operator default before acquiring `BEGIN IMMEDIATE`: a
+    /// previous request-path operation may have left a much shorter budget
+    /// installed on this shared connection.
     pub fn advance_writer_fence(
         &self,
         expected: WriterFenceGeneration,
@@ -289,7 +336,14 @@ impl SqliteDurableStore {
             });
         }
         let mut connection = self.connection()?;
+        connection.busy_timeout(STRUCTURED_BUSY_TIMEOUT)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Revalidate the exact schema identity and chain/validator/domain
+        // namespace inside the write lock, before trusting or mutating the
+        // fence: a namespace check performed before BEGIN IMMEDIATE would not
+        // be held by that lock and could be stale by the time the fence is
+        // read.
+        verify_namespace(&transaction, &self.namespace)?;
         let actual = read_writer_fence(&transaction)?;
         if actual != expected {
             return Err(SqliteDurableStoreError::WriterFenceMismatch { expected, actual });
@@ -572,6 +626,43 @@ fn check_deadline(context: &DurableOperationContext) -> Result<(), SqlitePreComm
     Ok(())
 }
 
+/// Computes the exact remaining wall-clock budget until `context`'s
+/// deadline, clamped to `[1ms, STRUCTURED_MAX_BUSY_TIMEOUT_MILLIS]`.
+///
+/// An already-expired deadline is a definite pre-commit rejection here, not a
+/// zero-length busy wait: SQLite would otherwise interpret a zero timeout as
+/// "return immediately on any contention" rather than "the caller is out of
+/// budget," which are different failures.
+fn remaining_busy_timeout(
+    context: &DurableOperationContext,
+) -> Result<Duration, SqlitePreCommitFailure> {
+    let now = now_unix_millis()?;
+    let remaining_millis = context
+        .deadline()
+        .unix_millis()
+        .checked_sub(now)
+        .filter(|remaining| *remaining > 0)
+        .ok_or(SqlitePreCommitFailure::Deadline)?;
+    Ok(Duration::from_millis(
+        remaining_millis.clamp(1, STRUCTURED_MAX_BUSY_TIMEOUT_MILLIS),
+    ))
+}
+
+/// Propagates `context`'s remaining deadline into this connection's SQLite
+/// `busy_timeout` immediately before acquiring a transaction, so a lock wait
+/// (for example another connection holding `BEGIN IMMEDIATE`) cannot block
+/// past the caller's own deadline even though the connection-level default
+/// set at [`SqliteDurableStore::open`] is a fixed five seconds.
+fn apply_busy_timeout(
+    connection: &Connection,
+    context: &DurableOperationContext,
+) -> Result<(), SqlitePreCommitFailure> {
+    let timeout = remaining_busy_timeout(context)?;
+    connection
+        .busy_timeout(timeout)
+        .map_err(database_unavailable)
+}
+
 struct SqliteNamespaceMetadata {
     writer_fence: WriterFenceGeneration,
 }
@@ -625,6 +716,31 @@ fn validate_authority(
         return Err(SqlitePreCommitFailure::WriterFenced(metadata.writer_fence));
     }
     check_deadline(context)
+}
+
+/// Runs one multi-statement read operation inside a single SQLite `Deferred`
+/// transaction, so the metadata/fence check and the requested payload are
+/// observed from one consistent snapshot instead of two independent
+/// autocommit statements that another connection could interleave a write
+/// between. The transaction is explicitly rolled back (read-only, so this is
+/// exactly equivalent to a commit) and any rollback failure is propagated
+/// rather than silently dropped.
+fn read_in_snapshot<T>(
+    connection: &mut Connection,
+    namespace: &SqliteNamespace,
+    context: &DurableOperationContext,
+    load: impl FnOnce(&Transaction<'_>) -> Result<T, SqlitePreCommitFailure>,
+) -> Result<T, SqlitePreCommitFailure> {
+    apply_busy_timeout(connection, context)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(database_unavailable)?;
+    let metadata = load_metadata(&transaction, namespace)?;
+    validate_authority(&metadata, context)?;
+    let value = load(&transaction)?;
+    check_deadline(context)?;
+    transaction.rollback().map_err(database_unavailable)?;
+    Ok(value)
 }
 
 /// Strictly decodes one required `(algorithm, bytes)` digest column pair.
@@ -759,8 +875,47 @@ fn apply_state_mutations(
     Ok(())
 }
 
+/// Returns the maximum retained immutable object version for `object_id`, or
+/// `None` if no version row exists.
+///
+/// This only resolves which version number to look up next; it does not
+/// substitute for the full validation `load_object_version` performs on the
+/// row it names.
+fn max_object_version(
+    connection: &Connection,
+    object_id: ObjectId,
+) -> Result<Option<DurableObjectVersion>, SqlitePreCommitFailure> {
+    let max_version: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT MAX(object_version) FROM durable_object_versions WHERE object_id = ?1",
+            params![object_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(database_unavailable)?;
+    let Some(max_version) = max_version else {
+        return Ok(None);
+    };
+    let max_version = decode_u64(&max_version)
+        .and_then(DurableObjectVersion::new)
+        .ok_or(SqlitePreCommitFailure::InvalidPersistedState)?;
+    Ok(Some(max_version))
+}
+
+/// Reads and cross-validates one object head against its exact immutable
+/// version history.
+///
+/// This function never calls itself, directly or indirectly: it may call
+/// [`load_object_version`], but that function never calls back into this one,
+/// so there is no recursion. A `Current` head is trusted only after the
+/// object version it names is loaded through the fully validated
+/// [`load_object_version`] path (digest, canonical-record-type ID, and
+/// creating-chain checks included) and confirmed to be the maximum retained
+/// version, with its digest matching the head row's own digest columns. A
+/// `Tombstoned` head resolves its last version through that same fully
+/// validated path rather than trusting the raw `MAX(object_version)` value.
 fn load_object_head(
     connection: &Connection,
+    namespace: &SqliteNamespace,
     object_id: ObjectId,
 ) -> Result<DurableObjectHead, SqlitePreCommitFailure> {
     type HeadRow = (
@@ -829,21 +984,17 @@ fn load_object_head(
             {
                 return Err(SqlitePreCommitFailure::InvalidPersistedState);
             }
-            let last_object_version: Option<Vec<u8>> = connection
-                .query_row(
-                    "SELECT MAX(object_version) FROM durable_object_versions WHERE object_id = ?1",
-                    params![object_id.as_bytes().as_slice()],
-                    |row| row.get(0),
-                )
-                .map_err(database_unavailable)?;
-            let last_object_version = last_object_version
-                .as_deref()
-                .and_then(decode_u64)
-                .and_then(DurableObjectVersion::new)
+            let last_object_version = max_object_version(connection, object_id)?
                 .ok_or(SqlitePreCommitFailure::InvalidPersistedState)?;
+            // Resolve the retained last version through the same fully
+            // validated read path a direct lookup would use, rather than
+            // trusting the raw MAX() value's row shape.
+            let last_object_version_record =
+                load_object_version(connection, namespace, object_id, last_object_version)?
+                    .ok_or(SqlitePreCommitFailure::InvalidPersistedState)?;
             Ok(DurableObjectHead::Tombstoned {
                 head_revision,
-                last_object_version,
+                last_object_version: last_object_version_record.object_version(),
             })
         }
         OBJECT_HEAD_STATUS_CURRENT => {
@@ -854,6 +1005,20 @@ fn load_object_head(
                 .ok_or(SqlitePreCommitFailure::InvalidPersistedState)?;
             let digest = decode_optional_digest(digest_algorithm, digest_bytes.as_deref())?
                 .ok_or(SqlitePreCommitFailure::InvalidPersistedState)?;
+            // Cross-check against the exact validated immutable version: its
+            // digest must match, and it must be the maximum retained version
+            // for this object, or the head is not trustworthy.
+            let version_record =
+                load_object_version(connection, namespace, object_id, object_version)?
+                    .ok_or(SqlitePreCommitFailure::InvalidPersistedState)?;
+            if version_record.digest() != digest {
+                return Err(SqlitePreCommitFailure::InvalidPersistedState);
+            }
+            let max_version = max_object_version(connection, object_id)?
+                .ok_or(SqlitePreCommitFailure::InvalidPersistedState)?;
+            if max_version != object_version {
+                return Err(SqlitePreCommitFailure::InvalidPersistedState);
+            }
             let owner_projection =
                 DurableObjectOwnerProjection::from_canonical_bytes(owner_projection)
                     .map_err(|_| SqlitePreCommitFailure::InvalidPersistedState)?;
@@ -1027,10 +1192,11 @@ fn receipt_exists(
 
 fn validate_object_reads(
     connection: &Connection,
+    namespace: &SqliteNamespace,
     reads: &[DurableObjectHeadRead],
 ) -> Result<(), DurableCommitRejection> {
     for read in reads {
-        let current = load_object_head(connection, read.object_id())
+        let current = load_object_head(connection, namespace, read.object_id())
             .map_err(SqlitePreCommitFailure::into_commit_rejection)?;
         if &current != read.expected() {
             return Err(DurableCommitRejection::ObjectConflict {
@@ -1293,7 +1459,7 @@ struct PersistedOutboxAttempt {
     request_id: OutboxRequestId,
     message_index: u32,
     lease_expires_at_unix_millis: u64,
-    status: i64,
+    status: OutboxAttemptStatus,
 }
 
 /// One raw `durable_outbox_attempts` row, aliased so `clippy::type_complexity`
@@ -1325,6 +1491,7 @@ fn load_outbox_attempt(
         u32::try_from(message_index).map_err(|_| SqlitePreCommitFailure::InvalidPersistedState)?;
     let lease_expires_at_unix_millis =
         decode_u64(&lease_expires).ok_or(SqlitePreCommitFailure::InvalidPersistedState)?;
+    let status = OutboxAttemptStatus::decode(status)?;
     Ok(Some(PersistedOutboxAttempt {
         request_id,
         message_index,
@@ -1476,7 +1643,7 @@ fn reconcile_outbox_claim(
     attempt: PersistedOutboxAttempt,
     now_unix_millis: u64,
 ) -> Result<DurableOutboxClaim, DurableOutboxClaimRejection> {
-    if attempt.status != OUTBOX_ATTEMPT_CLAIMED
+    if attempt.status != OutboxAttemptStatus::Claimed
         || attempt.lease_expires_at_unix_millis <= now_unix_millis
     {
         return Err(DurableOutboxClaimRejection::LeaseIdReuse);
@@ -1531,7 +1698,7 @@ fn install_outbox_claim(
             if expired_attempt.request_id != delivery.request_id
                 || expired_attempt.message_index != delivery.next_message_index
                 || expired_attempt.lease_expires_at_unix_millis != expired_at
-                || expired_attempt.status != OUTBOX_ATTEMPT_CLAIMED
+                || expired_attempt.status != OutboxAttemptStatus::Claimed
             {
                 return Err(DurableOutboxClaimRejection::InvalidPersistedState);
             }
@@ -1539,9 +1706,9 @@ fn install_outbox_claim(
                 .execute(
                     "UPDATE durable_outbox_attempts SET status = ?1 WHERE lease_id = ?2 AND status = ?3",
                     params![
-                        OUTBOX_ATTEMPT_EXPIRED,
+                        OutboxAttemptStatus::Expired.encode(),
                         expired_lease_id.as_bytes().as_slice(),
-                        OUTBOX_ATTEMPT_CLAIMED
+                        OutboxAttemptStatus::Claimed.encode()
                     ],
                 )
                 .map_err(|error| database_unavailable(error).into_claim_rejection())?;
@@ -1583,7 +1750,7 @@ fn install_outbox_claim(
                 delivery.request_id.as_bytes().as_slice(),
                 i64::from(delivery.next_message_index),
                 encode_u64(lease_expires_at_unix_millis).as_slice(),
-                OUTBOX_ATTEMPT_CLAIMED,
+                OutboxAttemptStatus::Claimed.encode(),
             ],
         )
         .map_err(|error| database_unavailable(error).into_claim_rejection())?;
@@ -1661,16 +1828,13 @@ impl DurableDomainStateStore for SqliteDurableStore {
             ));
         }
         check_deadline(context).map_err(SqlitePreCommitFailure::into_read_error)?;
-        let connection = self
+        let mut connection = self
             .connection()
             .map_err(|_| DurableReadError::Unavailable)?;
-        let metadata = load_metadata(&connection, &self.namespace)
-            .map_err(SqlitePreCommitFailure::into_read_error)?;
-        validate_authority(&metadata, context).map_err(SqlitePreCommitFailure::into_read_error)?;
-        let value =
-            load_state_value(&connection, key).map_err(SqlitePreCommitFailure::into_read_error)?;
-        check_deadline(context).map_err(SqlitePreCommitFailure::into_read_error)?;
-        Ok(value)
+        read_in_snapshot(&mut connection, &self.namespace, context, |transaction| {
+            load_state_value(transaction, key)
+        })
+        .map_err(SqlitePreCommitFailure::into_read_error)
     }
 
     fn commit_durable(
@@ -1692,6 +1856,9 @@ impl DurableDomainStateStore for SqliteDurableStore {
                 );
             }
         };
+        if let Err(reason) = apply_busy_timeout(&connection, context) {
+            return DurableCommitOutcome::Rejected(reason.into_commit_rejection());
+        }
         let sqlite_transaction =
             match connection.transaction_with_behavior(TransactionBehavior::Immediate) {
                 Ok(transaction) => transaction,
@@ -1738,16 +1905,13 @@ impl StructuredDurableDomainStateStore for SqliteDurableStore {
             ));
         }
         check_deadline(context).map_err(SqlitePreCommitFailure::into_read_error)?;
-        let connection = self
+        let mut connection = self
             .connection()
             .map_err(|_| DurableReadError::Unavailable)?;
-        let metadata = load_metadata(&connection, &self.namespace)
-            .map_err(SqlitePreCommitFailure::into_read_error)?;
-        validate_authority(&metadata, context).map_err(SqlitePreCommitFailure::into_read_error)?;
-        let head = load_object_head(&connection, object_id)
-            .map_err(SqlitePreCommitFailure::into_read_error)?;
-        check_deadline(context).map_err(SqlitePreCommitFailure::into_read_error)?;
-        Ok(head)
+        read_in_snapshot(&mut connection, &self.namespace, context, |transaction| {
+            load_object_head(transaction, &self.namespace, object_id)
+        })
+        .map_err(SqlitePreCommitFailure::into_read_error)
     }
 
     fn get_object_version(
@@ -1763,16 +1927,13 @@ impl StructuredDurableDomainStateStore for SqliteDurableStore {
             ));
         }
         check_deadline(context).map_err(SqlitePreCommitFailure::into_read_error)?;
-        let connection = self
+        let mut connection = self
             .connection()
             .map_err(|_| DurableReadError::Unavailable)?;
-        let metadata = load_metadata(&connection, &self.namespace)
-            .map_err(SqlitePreCommitFailure::into_read_error)?;
-        validate_authority(&metadata, context).map_err(SqlitePreCommitFailure::into_read_error)?;
-        let version = load_object_version(&connection, &self.namespace, object_id, object_version)
-            .map_err(SqlitePreCommitFailure::into_read_error)?;
-        check_deadline(context).map_err(SqlitePreCommitFailure::into_read_error)?;
-        Ok(version)
+        read_in_snapshot(&mut connection, &self.namespace, context, |transaction| {
+            load_object_version(transaction, &self.namespace, object_id, object_version)
+        })
+        .map_err(SqlitePreCommitFailure::into_read_error)
     }
 
     fn get_request_receipt(
@@ -1787,16 +1948,13 @@ impl StructuredDurableDomainStateStore for SqliteDurableStore {
             ));
         }
         check_deadline(context).map_err(SqlitePreCommitFailure::into_read_error)?;
-        let connection = self
+        let mut connection = self
             .connection()
             .map_err(|_| DurableReadError::Unavailable)?;
-        let metadata = load_metadata(&connection, &self.namespace)
-            .map_err(SqlitePreCommitFailure::into_read_error)?;
-        validate_authority(&metadata, context).map_err(SqlitePreCommitFailure::into_read_error)?;
-        let receipt = load_receipt(&connection, request_id)
-            .map_err(SqlitePreCommitFailure::into_read_error)?;
-        check_deadline(context).map_err(SqlitePreCommitFailure::into_read_error)?;
-        Ok(receipt)
+        read_in_snapshot(&mut connection, &self.namespace, context, |transaction| {
+            load_receipt(transaction, request_id)
+        })
+        .map_err(SqlitePreCommitFailure::into_read_error)
     }
 
     fn commit_invocation(
@@ -1818,6 +1976,9 @@ impl StructuredDurableDomainStateStore for SqliteDurableStore {
                 );
             }
         };
+        if let Err(reason) = apply_busy_timeout(&connection, context) {
+            return DurableCommitOutcome::Rejected(reason.into_commit_rejection());
+        }
         let transaction = match connection.transaction_with_behavior(TransactionBehavior::Immediate)
         {
             Ok(transaction) => transaction,
@@ -1849,9 +2010,11 @@ impl StructuredDurableDomainStateStore for SqliteDurableStore {
         {
             return DurableCommitOutcome::Rejected(reason);
         }
-        if let Err(reason) =
-            validate_object_reads(&transaction, invocation.object_changes().reads())
-        {
+        if let Err(reason) = validate_object_reads(
+            &transaction,
+            &self.namespace,
+            invocation.object_changes().reads(),
+        ) {
             return DurableCommitOutcome::Rejected(reason);
         }
         let prepared = match prepare_object_mutations(&transaction, invocation.object_changes()) {
@@ -1902,6 +2065,9 @@ impl IndexedOutboxRepository for SqliteDurableStore {
                 );
             }
         };
+        if let Err(reason) = apply_busy_timeout(&connection, context) {
+            return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+        }
         let transaction = match connection.transaction_with_behavior(TransactionBehavior::Immediate)
         {
             Ok(transaction) => transaction,
@@ -1992,6 +2158,9 @@ impl IndexedOutboxRepository for SqliteDurableStore {
                 );
             }
         };
+        if let Err(reason) = apply_busy_timeout(&connection, context) {
+            return DurableOutboxClaimOutcome::Rejected(reason.into_claim_rejection());
+        }
         let transaction = match connection.transaction_with_behavior(TransactionBehavior::Immediate)
         {
             Ok(transaction) => transaction,
@@ -2073,6 +2242,11 @@ impl IndexedOutboxRepository for SqliteDurableStore {
                 );
             }
         };
+        if let Err(reason) = apply_busy_timeout(&connection, context) {
+            return DurableOutboxAcknowledgementOutcome::Rejected(
+                reason.into_acknowledgement_rejection(),
+            );
+        }
         let transaction = match connection.transaction_with_behavior(TransactionBehavior::Immediate)
         {
             Ok(transaction) => transaction,
@@ -2128,7 +2302,7 @@ impl IndexedOutboxRepository for SqliteDurableStore {
                 );
             }
         };
-        if attempt.status == OUTBOX_ATTEMPT_ACKNOWLEDGED {
+        if attempt.status == OutboxAttemptStatus::Acknowledged {
             if attempt.message_index >= delivery.message_count
                 || delivery.next_message_index <= attempt.message_index
                 || delivery.next_message_index > delivery.message_count
@@ -2139,7 +2313,7 @@ impl IndexedOutboxRepository for SqliteDurableStore {
             }
             return DurableOutboxAcknowledgementOutcome::Acknowledged;
         }
-        if attempt.status != OUTBOX_ATTEMPT_CLAIMED {
+        if attempt.status != OutboxAttemptStatus::Claimed {
             return DurableOutboxAcknowledgementOutcome::Rejected(
                 DurableOutboxAcknowledgementRejection::LeaseMismatch,
             );
@@ -2174,9 +2348,9 @@ impl IndexedOutboxRepository for SqliteDurableStore {
         let attempt_updated = match transaction.execute(
             "UPDATE durable_outbox_attempts SET status = ?1 WHERE lease_id = ?2 AND status = ?3",
             params![
-                OUTBOX_ATTEMPT_ACKNOWLEDGED,
+                OutboxAttemptStatus::Acknowledged.encode(),
                 acknowledgement.lease_id().as_bytes().as_slice(),
-                OUTBOX_ATTEMPT_CLAIMED
+                OutboxAttemptStatus::Claimed.encode()
             ],
         ) {
             Ok(updated) => updated,

@@ -177,21 +177,31 @@ cross-provider ingress milestones implemented through Phase 17:
   their own database file. It is bound at construction to one trusted `(chain,
   validator, atomicity domain)` namespace, persists a fenced writer generation
   and a documented schema identity, and serializes every operation behind one
-  process-local mutex plus a `BEGIN IMMEDIATE` transaction (no connection
-  pool, no serialization-conflict retries, no live fault-injected evidence).
-  Every digest, canonical-record-type identity, and boolean column is decoded
-  strictly and fails closed on corruption rather than being coerced, and an
-  object version's persisted creating chain is checked against the store's
-  bound chain on both commit and read. The same feature-gated shared
-  conformance suite used by PostgreSQL — complete-read write skew, object
-  head/version lifecycle, lease/writer fencing, and schema skew — passes
-  against it, plus a dedicated restart test that closes and reopens the file
-  to prove durable state, immutable object versions, receipts, and an
-  in-flight outbox lease all survive, that exact request replay after reopen
-  returns `RequestAlreadyCommitted`, and that outbox acknowledgement stays
-  idempotent after reopen. It exists so the preinstalled-WASM native devnet
-  can use one local durable structured store; it is not provider-hardened and
-  is not exposed through native HTTP.
+  process-local mutex plus one SQLite transaction — `Deferred` for a
+  multi-statement read's consistent snapshot, `Immediate` for a write's
+  `BEGIN IMMEDIATE` write lock — with no connection pool and no live
+  fault-injected evidence. The caller's remaining `DurableOperationContext`
+  deadline is propagated into that connection's SQLite `busy_timeout` before
+  each transaction starts, clamped to a five-second maximum, so a blocked
+  write fails closed near the caller's own deadline rather than always
+  waiting the fixed default. Every digest, canonical-record-type identity,
+  outbox-attempt status, and boolean column is decoded strictly through a
+  typed representation and fails closed on corruption rather than being
+  coerced; an object version's persisted creating chain is checked against
+  the store's bound chain on both commit and read; and a current object head
+  is trusted only after cross-checking it against its exact validated
+  immutable version row and confirming that version is the maximum retained
+  one. The same feature-gated shared conformance suite used by PostgreSQL —
+  complete-read write skew, object head/version lifecycle, lease/writer
+  fencing, and schema skew — passes against it, plus a dedicated restart test
+  that closes and reopens the file to prove durable state, immutable object
+  versions, receipts, and an in-flight outbox lease all survive, that exact
+  request replay after reopen returns `RequestAlreadyCommitted`, and that
+  outbox acknowledgement stays idempotent after reopen, and a bounded
+  contention test proving a short deadline does not wait the fixed default.
+  It exists so the preinstalled-WASM native devnet can use one local durable
+  structured store; it is not provider-hardened and is not exposed through
+  native HTTP.
 - An accepted [production persistence architecture](PERSISTENCE.md) that makes
   validator-local atomicity domains, complete read-set validation, normalized
   object/receipt/outbox data, indexed recovery, writer fencing, migration, and
