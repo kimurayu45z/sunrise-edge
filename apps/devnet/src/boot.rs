@@ -125,6 +125,14 @@ impl Error for DevnetBootError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        asset_account::ASSET_ACCOUNT_WASM,
+        catalog::build_asset_module,
+        config::DevOwner,
+        genesis::build_devnet_protocol_context,
+        seed::{SeedAssetAccountsOutcome, seed_asset_accounts},
+    };
+    use runtime::{DurableOperationContext, StorageCorrelationId, StorageDeadline};
     use std::{
         ffi::OsString,
         sync::atomic::{AtomicU64, Ordering},
@@ -201,5 +209,58 @@ mod tests {
                 SqliteDurableStoreError::NamespaceMismatch
             ))
         ));
+    }
+
+    #[test]
+    fn sqlite_reopen_verifies_the_same_seeded_account_refs() {
+        let directory = TestDirectory::new();
+        let config = config(&directory.0, "devnet-seed-reopen-test");
+        let owner: DevOwner = config.dev_owners()[0];
+
+        let first = boot_local_store(&config).unwrap();
+        let first_generation = first.boot_generation();
+        let first_context = DurableOperationContext::new(
+            first_generation,
+            StorageDeadline::new(u64::MAX).unwrap(),
+            StorageCorrelationId::new([0x31; 16]).unwrap(),
+        );
+        let first_protocol =
+            build_devnet_protocol_context(config.chain_id().clone(), config.epoch()).unwrap();
+        let first_module = build_asset_module(first_protocol, ASSET_ACCOUNT_WASM.to_vec()).unwrap();
+        let created = seed_asset_accounts(
+            first.store(),
+            first_module.resolver(),
+            config.epoch(),
+            owner,
+            first_generation,
+            &first_context,
+        )
+        .unwrap();
+        assert!(matches!(created, SeedAssetAccountsOutcome::Created(_)));
+        drop(first);
+
+        let second = boot_local_store(&config).unwrap();
+        let second_generation = second.boot_generation();
+        let second_context = DurableOperationContext::new(
+            second_generation,
+            StorageDeadline::new(u64::MAX).unwrap(),
+            StorageCorrelationId::new([0x32; 16]).unwrap(),
+        );
+        let second_protocol =
+            build_devnet_protocol_context(config.chain_id().clone(), config.epoch()).unwrap();
+        let second_module =
+            build_asset_module(second_protocol, ASSET_ACCOUNT_WASM.to_vec()).unwrap();
+        let existing = seed_asset_accounts(
+            second.store(),
+            second_module.resolver(),
+            config.epoch(),
+            owner,
+            second_generation,
+            &second_context,
+        )
+        .unwrap();
+
+        assert!(matches!(existing, SeedAssetAccountsOutcome::Existing(_)));
+        assert_eq!(created.accounts(), existing.accounts());
     }
 }

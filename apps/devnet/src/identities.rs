@@ -17,9 +17,21 @@ impl DevnetOutboxIdentitySource {
     /// Starts an identity source for one exclusively claimed boot generation.
     #[must_use]
     pub const fn new(boot_generation: WriterFenceGeneration) -> Self {
+        Self::new_after(boot_generation, 0)
+    }
+
+    /// Starts after a caller-reserved sequence range.
+    ///
+    /// The devnet seed path reserves `1..=owner_count`, so its operational
+    /// correlation IDs cannot collide with later outbox-attempt IDs.
+    #[must_use]
+    pub const fn new_after(
+        boot_generation: WriterFenceGeneration,
+        reserved_sequences: u64,
+    ) -> Self {
         Self {
             boot_generation,
-            sequence: AtomicU64::new(0),
+            sequence: AtomicU64::new(reserved_sequences),
         }
     }
 
@@ -93,6 +105,18 @@ mod tests {
 
         assert_ne!(first, second);
         assert_ne!(first, next_boot);
+    }
+
+    #[test]
+    fn reserved_seed_sequences_are_disjoint_from_outbox_attempts() {
+        let unreserved = DevnetOutboxIdentitySource::new(generation(2));
+        let sequence_one = unreserved.next_attempt_identity().unwrap();
+        let sequence_two = unreserved.next_attempt_identity().unwrap();
+        let reserved = DevnetOutboxIdentitySource::new_after(generation(2), 1);
+        let first_outbox = reserved.next_attempt_identity().unwrap();
+
+        assert_ne!(first_outbox, sequence_one);
+        assert_eq!(first_outbox, sequence_two);
     }
 
     #[test]

@@ -256,7 +256,8 @@ fn decode_asset_id(
 mod tests {
     use super::*;
     use execution::{
-        ExecutionEngine, ExecutionStatus, ObjectEffect, ResolvedObject, WasmExecutionEngine,
+        ExecutionEffects, ExecutionEngine, ExecutionStatus, ObjectEffect, ResolvedObject,
+        WasmExecutionEngine,
     };
     use objects::{AccessMode, Address, Object, ObjectId, Owner};
     use protocol_types::ProtocolVersion;
@@ -323,6 +324,13 @@ mod tests {
             decode_transfer_args(&zero.finish().unwrap()),
             Err(AssetAccountCodecError::ZeroTransferAmount)
         );
+
+        let mut trailing: Vec<u8> = ACCOUNT_VECTOR.to_vec();
+        trailing.push(0);
+        assert!(matches!(
+            decode_asset_account(&trailing),
+            Err(AssetAccountCodecError::CanonicalDecoding(_))
+        ));
     }
 
     #[test]
@@ -343,6 +351,26 @@ mod tests {
             },
             mode: AccessMode::Write,
         }
+    }
+
+    fn execute_committed_module(inputs: &[ResolvedObject], args: &[u8]) -> ExecutionEffects {
+        WasmExecutionEngine
+            .execute(
+                ProtocolVersion::new(3),
+                Digest32::new(HashAlgorithmId::Sha2_256, [0x57; 32]),
+                ASSET_ACCOUNT_WASM,
+                TRANSFER_ENTRYPOINT,
+                inputs,
+                args,
+                1_000_000,
+            )
+            .expect("module traps are deterministic execution outcomes")
+    }
+
+    fn assert_effect_free_rejection(effects: &ExecutionEffects) {
+        assert!(matches!(effects.status, ExecutionStatus::Failure { .. }));
+        assert!(effects.object_effects.is_empty());
+        assert!(effects.events.is_empty());
     }
 
     #[test]
@@ -382,6 +410,9 @@ mod tests {
                 } => {
                     assert_eq!(*previous_version, 1);
                     assert_eq!(new_object.version, 2);
+                    assert_eq!(new_object.owner, Owner::Address(Address::new([0xA1; 32])));
+                    assert_eq!(new_object.type_hash, asset_account_type_hash());
+                    assert_eq!(new_object.schema_version, 1);
                     assert_eq!(decode_asset_account(&new_object.data).unwrap(), expected);
                 }
                 other => panic!("expected mutated asset account, got {other:?}"),
@@ -411,20 +442,57 @@ mod tests {
             encode_transfer_args(TransferArgs::new(250).expect("non-zero transfer amount"))
                 .expect("valid canonical arguments");
 
-        let effects = WasmExecutionEngine
-            .execute(
-                ProtocolVersion::new(3),
-                Digest32::new(HashAlgorithmId::Sha2_256, [0x56; 32]),
-                ASSET_ACCOUNT_WASM,
-                TRANSFER_ENTRYPOINT,
-                &[source, destination],
-                &args,
-                1_000_000,
-            )
-            .expect("module traps are deterministic execution outcomes");
+        let effects: ExecutionEffects = execute_committed_module(&[source, destination], &args);
 
-        assert!(matches!(effects.status, ExecutionStatus::Failure { .. }));
-        assert!(effects.object_effects.is_empty());
-        assert!(effects.events.is_empty());
+        assert_effect_free_rejection(&effects);
+    }
+
+    #[test]
+    fn committed_wasm_rejects_every_conservation_boundary_without_effects() {
+        let valid_args: Vec<u8> =
+            encode_transfer_args(TransferArgs::new(1).expect("non-zero transfer amount")).unwrap();
+
+        let mut zero_args: CanonicalStruct =
+            CanonicalStruct::new(TRANSFER_ARGS_TYPE_ID, ENCODING_VERSION);
+        zero_args.field_u64(1, 0).unwrap();
+        let zero_args: Vec<u8> = zero_args.finish().unwrap();
+        let source = resolved_account(0x11, AssetAccount::new(DEVNET_ASSET_ID, 1, 0));
+        let destination = resolved_account(0x22, AssetAccount::new(DEVNET_ASSET_ID, 0, 0));
+        assert_effect_free_rejection(&execute_committed_module(
+            &[source.clone(), destination.clone()],
+            &zero_args,
+        ));
+
+        let empty_source = resolved_account(0x11, AssetAccount::new(DEVNET_ASSET_ID, 0, 0));
+        assert_effect_free_rejection(&execute_committed_module(
+            &[empty_source, destination.clone()],
+            &valid_args,
+        ));
+
+        let full_destination =
+            resolved_account(0x22, AssetAccount::new(DEVNET_ASSET_ID, u64::MAX, 0));
+        assert_effect_free_rejection(&execute_committed_module(
+            &[source.clone(), full_destination],
+            &valid_args,
+        ));
+
+        let exhausted_sequence =
+            resolved_account(0x11, AssetAccount::new(DEVNET_ASSET_ID, 1, u64::MAX));
+        assert_effect_free_rejection(&execute_committed_module(
+            &[exhausted_sequence, destination.clone()],
+            &valid_args,
+        ));
+
+        let mut malformed_body = source.clone();
+        malformed_body.object.data[0] ^= 0xFF;
+        assert_effect_free_rejection(&execute_committed_module(
+            &[malformed_body, destination.clone()],
+            &valid_args,
+        ));
+        assert_effect_free_rejection(&execute_committed_module(
+            &[source.clone(), destination],
+            &[0; TRANSFER_ARGS_ENCODED_LEN],
+        ));
+        assert_effect_free_rejection(&execute_committed_module(&[source], &valid_args));
     }
 }

@@ -1442,13 +1442,14 @@ protocol behavior:
   the opaque legacy `SqliteStateStore`; the two require separate files because
   `PRAGMA application_id` is a whole-file SQLite property.
 - **Registry/catalog reconciliation at startup.** Before serving any request,
-  startup iterates and cross-checks every active `SystemModuleRegistry` entry
-  against every entry in the bounded immutable `PreinstalledModuleCatalog`
-  composed into the process. This closes, for the devnet only, the
-  request-time-only reconciliation gap left open by DR-0078/DR-0080 (on the
-  general preinstalled-WASM route, a mismatch discovered only at request time
-  remains an opaque `500`); a devnet startup mismatch instead fails devnet
-  boot outright with an operator-legible error.
+  startup constructs its dev-profile `SystemModuleRegistry` and bounded
+  immutable `PreinstalledModuleCatalog` from the same committed in-process
+  artifact, then validates their code/manifest/semantics commitments before
+  router construction. This proves internal composition consistency and fails
+  boot with an operator-legible error if either representation is altered; it
+  is not an independent comparison with persisted governance configuration.
+  The general preinstalled-WASM route's request-time mismatch behavior remains
+  unchanged.
 - **Seeded asset accounts.** Startup seeds exactly two ordinary
   `sunrise.devnet.asset_account.v1` objects (`Owner::Address`) per configured
   development owner. Both accounts carry the same fixed, non-placeholder
@@ -1468,7 +1469,9 @@ protocol behavior:
   ordered field IDs, lengths, and little-endian fixed-width values, are shared
   as stable vectors; the WAT verifies constant framing bytes and patches only
   the declared values. The signed manifest declares exactly two `Write`
-  objects in source/destination order. Execution rejects unknown framing,
+  distinct objects in source/destination order; canonical transaction decode
+  and node-core both reject duplicate object IDs before WASM execution.
+  Execution rejects unknown framing,
   unequal asset IDs, zero amount, insufficient source balance, destination
   overflow, and sequence overflow; otherwise it writes both objects,
   increments both sequences, preserves the combined balance, and emits
@@ -1507,6 +1510,10 @@ protocol behavior:
   way the native binary already exposes it (see "Serverless runtime
   constraints" and the scheduler-callable recovery API above), consistent with
   treating process lifetime as a non-requirement.
+  The current generic machine and asset transition produce responses but no
+  outbound messages, so the local transport queue does not grow on this route;
+  its fixed capacity remains a fail-closed bound for a future message-producing
+  transition.
 
 Current vs. planned: `apps/devnet` now has strict loopback-only configuration,
 persisted writer-fence advancement across SQLite reopen, a restart-safe

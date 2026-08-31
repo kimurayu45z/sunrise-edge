@@ -1866,7 +1866,8 @@ explicit dev limitations）:
    すべてのルールを網羅しているわけではない。native-http経路への接続はstep 4で実装済み
    （implemented As-Is）。`apps/devnet`はstrict config、SQLite writer-fence boot、restart-safe
    identity source、canonical asset-account codec/stable vector、preinstalled WASM/catalog、
-   2-accountのatomicかつrestart-idempotentなseed、startup registry/catalog reconciliation、
+   2-accountのatomicかつrestart-idempotentなseed、同じin-process artifactから構成した
+   registry/catalog commitmentのstartup整合性検証、
    bounded native routerのstartup wiringまで実装済み（implemented As-Is）。binaryはloopbackで
    HTTPをserveし、live smokeで`204` livenessと、同一account IDを保った次writer generationでの
    再起動を検証済み。WASM単体実行は同一`AssetId`の送金成功と異なる`AssetId`のeffectなし拒否を

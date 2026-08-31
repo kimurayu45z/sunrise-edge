@@ -578,7 +578,8 @@ and explicitly non-production.
 SQLite writer-fence advancement on every boot, restart-safe bounded outbox
 identities, canonical asset-account frames and stable vectors, a committed
 preinstalled WASM module/catalog, idempotent two-account seeding, and the
-bounded native HTTP router. Startup reconciles the registry/catalog and
+bounded native HTTP router. Startup validates the internally constructed
+registry/catalog commitments and
 verifies existing seed lineage instead of resetting balances. Live local
 smoke evidence covers a `204` liveness response and restart with the same
 account IDs under the next writer generation. The bounded query API and a

@@ -1,22 +1,15 @@
 #![forbid(unsafe_code)]
 
-use native_http::{
-    NativeBlockingPolicy, PreinstalledWasmComposition, StructuredDurableNativeComponents,
-    StructuredDurableRequestAuthority, preinstalled_wasm_structured_durable_router, serve,
-};
-use node_core::NodeConfig;
+use native_http::serve;
 use runtime::{Clock, DurableOperationContext, StorageCorrelationId, StorageDeadline, SystemClock};
-use std::{error::Error, num::NonZeroUsize, process::ExitCode, sync::Arc};
+use std::{error::Error, process::ExitCode, sync::Arc};
 use sunrise_edge_devnet::{
-    ASSET_ACCOUNT_WASM, DEVNET_DATABASE_FILE, DevnetConfig, DevnetMachine,
-    DevnetOutboxIdentitySource, DevnetTransport, SeedAssetAccountsOutcome, boot_local_store,
-    build_asset_module, build_devnet_protocol_context, seed_asset_accounts,
+    ASSET_ACCOUNT_WASM, DEVNET_ASSET_ID, DEVNET_DATABASE_FILE, DevnetConfig,
+    SeedAssetAccountsOutcome, asset_account_type_hash, boot_local_store, build_asset_module,
+    build_devnet_protocol_context, compose_devnet_router, seed_asset_accounts,
 };
 
-const REQUEST_OPERATION_TIMEOUT_MILLIS: u64 = 5_000;
-const OUTBOX_LEASE_MILLIS: u64 = 30_000;
 const SEED_OPERATION_TIMEOUT_MILLIS: u64 = 30_000;
-const DEVNET_STATE_KEY: &[u8] = b"devnet/generic-events/v1";
 
 async fn run() -> Result<(), Box<dyn Error>> {
     let config: DevnetConfig = DevnetConfig::parse_from(std::env::args_os().skip(1))?;
@@ -26,6 +19,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let protocol_context =
         build_devnet_protocol_context(config.chain_id().clone(), config.epoch())?;
     let asset_module = build_asset_module(protocol_context, ASSET_ACCOUNT_WASM.to_vec())?;
+    let module_ref = asset_module.module_ref().clone();
     for (index, owner) in config.dev_owners().iter().copied().enumerate() {
         let now_unix_millis: u64 = SystemClock.now_unix_millis()?;
         let seed_deadline_unix_millis: u64 = now_unix_millis
@@ -64,44 +58,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let (chain_id, epoch, _domain, protocol_config, resolver, catalog, _module_ref) =
-        asset_module.into_parts();
-    let node_config = NodeConfig::new(
-        chain_id,
-        protocol_config.protocol_version,
-        epoch,
-        DEVNET_STATE_KEY.to_vec(),
-    )?;
-    let admission = NonZeroUsize::new(config.max_concurrent())
-        .ok_or("validated concurrency unexpectedly became zero")?;
     let store = Arc::new(boot.into_store());
-    let transport = Arc::new(DevnetTransport::new(admission));
-    let identities = Arc::new(DevnetOutboxIdentitySource::new(boot_generation));
-    let components = StructuredDurableNativeComponents::new(
-        Arc::clone(&store),
-        transport,
-        Arc::new(SystemClock),
-        identities,
-    );
-    let preinstalled_wasm = PreinstalledWasmComposition::new(
-        Arc::new(catalog),
-        execution::WasmExecutionEngine,
-        boot_generation.get(),
-    );
-    let authority = StructuredDurableRequestAuthority::new(
+    let router = compose_devnet_router(
+        store,
+        asset_module,
         boot_generation,
-        REQUEST_OPERATION_TIMEOUT_MILLIS,
-        OUTBOX_LEASE_MILLIS,
-    )?;
-    let router = preinstalled_wasm_structured_durable_router(
-        components,
-        preinstalled_wasm,
-        protocol_config,
-        authority,
-        node_config,
-        resolver,
-        Arc::new(DevnetMachine),
-        NativeBlockingPolicy::new(admission),
+        config.max_concurrent(),
+        config.dev_owners().len(),
     )?;
     let listener = tokio::net::TcpListener::bind(config.listen()).await?;
 
@@ -112,10 +75,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
     println!("database={}", database_path.display());
     println!("database_file={DEVNET_DATABASE_FILE}");
     println!("boot_generation={}", boot_generation.get());
+    println!(
+        "asset_id={} asset_account_type={} module_id={} module_version={} module_digest={}",
+        DEVNET_ASSET_ID,
+        asset_account_type_hash(),
+        module_ref.id,
+        module_ref.version,
+        module_ref.digest
+    );
     println!("dev_owners={}", config.dev_owners().len());
     println!("max_concurrent={}", config.max_concurrent());
     println!(
-        "limitations=single-validator,same-sender-owned-objects,fee-free,local-sqlite,non-production"
+        "limitations=single-validator,owned-objects-only,cross-owner-transfer-fail-closed,fee-free,local-sqlite,non-production"
     );
     println!("Press Ctrl-C to stop.");
 
