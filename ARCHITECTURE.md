@@ -2394,12 +2394,18 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   idempotent; and that the persisted writer fence — not anything held in
   process memory — is what fences a stale context after an operator advance.
   A bounded contention test proves a short deadline lets a blocked write fail
-  closed in roughly that deadline, not the fixed five-second default. Focused
-  corruption tests directly tamper with persisted columns through a second
-  raw connection to prove representative strict-decode and cross-check rules
-  above fail closed (not an exhaustive enumeration of every rule: for
-  example, a non-32-byte digest length and a stale non-maximum current
-  version are not separately covered). This adapter has none of
-  `runtime-postgres`'s connection pooling, disk/WAL/connection-exhaustion
-  fault evidence, PgBouncer/backup-restore rehearsal, or TLS commit-loss
-  evidence, and is not suitable for multi-writer or production deployments.
+  closed in roughly that deadline (with an explicit lower bound as well as an
+  upper one, so the wait is shown to actually approach the requested budget
+  rather than returning near-instantly), not the fixed five-second default.
+  Focused corruption tests directly tamper with persisted columns through a
+  second raw connection to prove representative strict-decode and
+  cross-check rules above fail closed, including a discriminating case that
+  inserts a complete, well-formed second immutable version row while leaving
+  the head at the first version, proving the head is rejected specifically
+  because it no longer names the maximum retained version rather than
+  because of any individually malformed column (not an exhaustive
+  enumeration of every rule: for example, a non-32-byte digest length is not
+  separately covered). This adapter has none of `runtime-postgres`'s
+  connection pooling, disk/WAL/connection-exhaustion fault evidence,
+  PgBouncer/backup-restore rehearsal, or TLS commit-loss evidence, and is not
+  suitable for multi-writer or production deployments.

@@ -13,14 +13,14 @@ use runtime::{
     DueOutboxClaimRequest, DurableCommitOutcome, DurableCommitRejection, DurableDomainStateStore,
     DurableInvocationTransaction, DurableObjectChanges, DurableObjectHead, DurableObjectHeadRead,
     DurableObjectMutation, DurableObjectMutationEntry, DurableObjectOwnerProjection,
-    DurableObjectProvenance, DurableObjectRoutingProjection, DurableObjectVersion,
-    DurableObjectVersionRecord, DurableOperationContext, DurableOutboxAcknowledgement,
-    DurableOutboxBatch, DurableOutboxClaimOutcome, DurableOutboxClaimRejection,
-    DurableOutboxLeaseId, DurableOutboxMessage, DurableReadError, DurableRequestReceipt,
-    DurableStateTransaction, IndexedOutboxRepository, ObjectId, OutboxRequestId,
-    RequestOutboxClaimRequest, StateMutation, StateMutationEntry, StateReadAssertion,
-    StateRevision, StorageCorrelationId, StorageDeadline, StructuredDurableDomainStateStore,
-    WriterFenceGeneration,
+    DurableObjectPayload, DurableObjectProvenance, DurableObjectRoutingProjection,
+    DurableObjectVersion, DurableObjectVersionRecord, DurableOperationContext,
+    DurableOutboxAcknowledgement, DurableOutboxBatch, DurableOutboxClaimOutcome,
+    DurableOutboxClaimRejection, DurableOutboxLeaseId, DurableOutboxMessage, DurableReadError,
+    DurableRequestReceipt, DurableStateTransaction, IndexedOutboxRepository, ObjectId,
+    OutboxRequestId, RequestOutboxClaimRequest, StateMutation, StateMutationEntry,
+    StateReadAssertion, StateRevision, StorageCorrelationId, StorageDeadline,
+    StructuredDurableDomainStateStore, WriterFenceGeneration,
 };
 use runtime_sqlite::{
     SQLITE_STRUCTURED_SCHEMA_IDENTITY, SqliteDurableStore, SqliteDurableStoreError, SqliteNamespace,
@@ -240,6 +240,13 @@ fn sqlite_structured_schema_skew_conformance() {
         WriterFenceGeneration::new(11).unwrap(),
     );
     run_schema_skew_conformance(&fixture).unwrap();
+}
+
+/// Encodes a `u64` as the same order-preserving 8-byte big-endian value the
+/// store persists in its `BLOB` version/checkpoint columns, so a raw admin
+/// insert can construct a row byte-for-byte the way the store itself would.
+fn encode_u64(value: u64) -> [u8; 8] {
+    value.to_be_bytes()
 }
 
 fn build_object_version(
@@ -918,6 +925,68 @@ fn sqlite_structured_object_head_rejects_valid_length_digest_mismatch() {
     assert_eq!(result, Err(DurableReadError::InvalidPersistedState));
 }
 
+/// A head naming a version that is no longer the maximum retained one is
+/// corruption even when every individual column, including the named
+/// version's own digest, decodes cleanly and cross-checks correctly on its
+/// own: only comparing against `MAX(object_version)` catches it.
+#[test]
+fn sqlite_structured_object_head_rejects_stale_non_maximum_current_version() {
+    let database = TestDatabase::new();
+    let namespace = namespace("sqlite-head-stale-max-version", 0x78, 0x79);
+    let chain_id = namespace.chain_id().clone();
+    let object_id = ObjectId::new([0x7A; 32]);
+    let fence = WriterFenceGeneration::new(1).unwrap();
+    let context = live_context(fence, 0x7B);
+    let request_id = OutboxRequestId::new([0x7C; 32]).unwrap();
+
+    let store = SqliteDurableStore::open(&database.path, namespace.clone(), fence).unwrap();
+    // Commits a valid v1 and leaves the head pointing at it.
+    commit_one_object(
+        &store, &context, &namespace, &chain_id, object_id, request_id,
+    );
+
+    // Build a complete, well-formed immutable v2 record with the same
+    // helper and conventions every other test uses (correct digest, chain,
+    // canonical-record-type ID, and inline payload), then insert its exact
+    // row directly through a raw admin connection, mirroring column-for-
+    // column what a real commit would write. The head row itself is left
+    // untouched at v1, so its own digest still matches v1's version row
+    // exactly: no earlier digest/type/chain validation branch can catch
+    // this, only the "head names the maximum retained version" check can.
+    let version_two = build_object_version(&chain_id, object_id, 2, 0x7D, 6);
+    let digest = version_two.digest();
+    let DurableObjectPayload::Inline(inline) = version_two.payload() else {
+        panic!("expected an inline payload from build_object_version");
+    };
+    let admin = Connection::open(&database.path).unwrap();
+    let inserted = admin
+        .execute(
+            "INSERT INTO durable_object_versions (
+                 object_id, object_version, digest_algorithm, digest_bytes, schema_version,
+                 type_id, created_chain_id, created_protocol_version, created_checkpoint,
+                 inline_canonical_bytes, blob_digest_algorithm, blob_digest_bytes
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL)",
+            params![
+                object_id.as_bytes().as_slice(),
+                encode_u64(version_two.object_version().get()).as_slice(),
+                i64::from(digest.algorithm().as_u16()),
+                digest.bytes().as_slice(),
+                i64::from(version_two.schema_version()),
+                i64::from(version_two.canonical_record_type_id()),
+                version_two.provenance().chain_id().as_str(),
+                i64::from(version_two.provenance().protocol_version().get()),
+                encode_u64(version_two.created_checkpoint()).as_slice(),
+                inline.canonical_bytes(),
+            ],
+        )
+        .unwrap();
+    assert_eq!(inserted, 1);
+    drop(admin);
+
+    let result = store.get_object_head(&context, namespace.domain(), object_id);
+    assert_eq!(result, Err(DurableReadError::InvalidPersistedState));
+}
+
 #[test]
 fn sqlite_structured_outbox_attempt_rejects_unknown_status() {
     let database = TestDatabase::new();
@@ -1032,5 +1101,15 @@ fn sqlite_structured_write_does_not_wait_full_busy_timeout_past_short_deadline()
     assert!(
         elapsed < Duration::from_secs(2),
         "commit_durable took {elapsed:?}, expected well under the fixed 5s busy timeout"
+    );
+    // A conservative lower bound: the call must not return near-instantly
+    // either, which would indicate the ~200ms budget was not actually
+    // propagated into SQLite's busy_timeout (for example a silently-zeroed
+    // or ignored timeout that fails BEGIN IMMEDIATE immediately instead of
+    // waiting for the lock).
+    assert!(
+        elapsed >= Duration::from_millis(150),
+        "commit_durable took only {elapsed:?}, expected it to wait close to the ~200ms deadline \
+         budget before failing closed"
     );
 }
