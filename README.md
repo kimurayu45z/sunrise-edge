@@ -140,12 +140,17 @@ cross-provider ingress milestones implemented through Phase 17:
   the self-describing stored digest algorithm — never the reader's epoch hash
   suite — under bounded inline-body budgets, so it no longer trusts the
   storage adapter for object-body integrity (see `ARCHITECTURE.md` DR-0068).
-  A private node-core foundation now strictly translates effects for already
-  verified owned Address objects into bounded durable Update/Delete mutations,
-  rejecting creation, undeclared or duplicate effects, version/identity/shape
-  changes, overflow, unsupported owners, and missing trusted mutation context.
-  The live handler still rejects Write/Consume before storage I/O and does not
-  yet connect execution effects to the atomic invocation. Shared/system
+  An additive node-core owned-effects entrypoint now strictly translates
+  effects for already verified owned Address objects into bounded durable
+  Update/Delete mutations. It rejects creation, undeclared or duplicate
+  effects, version/identity/shape changes, overflow, unsupported owners, and
+  missing trusted mutation context, then atomically commits valid effects with
+  exact head assertions, sender nonce,
+  application state, receipt, and outbox. Exact request replay returns the
+  persisted result without re-running or reapplying execution. The native HTTP
+  composition still calls the read-only entrypoint and therefore rejects
+  Write/Consume before storage I/O until bounded module execution is connected.
+  Shared/system
   ownership, blob bodies, module loading, fee debit, FastVote/FastCertificate,
   and certificate publication also remain unimplemented, so the owned fast
   path is not yet safe to activate on a live chain. The other externally
@@ -480,10 +485,10 @@ independent security review.
 
 The next milestone is the explicit [Developer MVP Gate](TODO.md#developer-mvp-gate),
 so client-library and front-end work can exercise a real end-to-end product
-before further production hardening. The immediate sequence is to wire the
-verified owned-object Write/Consume translation into the same atomic durable
-invocation as nonce, state, receipt, and outbox; connect one bounded
-preinstalled deterministic WASM contract; expose local devnet query APIs; then
+before further production hardening. The owned-object Write/Consume durable
+composition is now available as an additive node-core entrypoint; the immediate
+sequence is to connect one bounded preinstalled deterministic WASM contract to
+that entrypoint, expose local devnet query APIs, then
 build a TypeScript client and counter demo with restart and duplicate-request
 E2E coverage. The MVP remains single-validator, owned-object only, fee-free,
 local-SQLite, and explicitly non-production.

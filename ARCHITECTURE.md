@@ -283,7 +283,7 @@ normalized state table and changes no database schema generation or
 Transaction wire field/version, but it allocates persisted record type ID
 `0xE006`.
 
-The Developer MVP object-effect foundation keeps the verified storage result
+The Developer MVP owned-effects entrypoint keeps the verified storage result
 private inside node-core. After the signed reference, exact current head,
 immutable inline version, provenance-bound digest, typed owner, and body bounds
 have all been checked, the loader retains the exact typed `Object` beside its
@@ -298,12 +298,21 @@ shares the same 8 MiB invocation budget already charged by verified input
 bodies rather than receiving a second independent allowance. It is then
 hashed with the active Object suite from trusted chain/protocol/epoch context,
 and translated into a new immutable version plus Update mutation while
-preserving its routing projection; Consume translates to Delete. The live
-handler currently invokes this boundary only for the already-supported
-read-only case with no effects. Its existing dispatch validation still rejects
-Write/Consume before storage I/O, so no new mutation is reachable until a later
-slice supplies trusted execution effects/checkpoint context and atomically
-composes the returned mutations with nonce, state, receipt, and outbox.
+preserving its routing projection; Consume translates to Delete. The additive
+owned-effects handler supplies the verified objects to the pure transition in
+signed manifest declaration order, accepts Write/Consume only on that explicit
+policy, and supplies a composition-trusted checkpoint that cannot come from
+request bytes. It atomically composes the returned Update/Delete mutations and
+exact head assertions with sender nonce, application state, receipt, and outbox.
+Checkpoint regression relative to the prior immutable version fails closed;
+an exact request replay reconciles the receipt before object reads or execution
+and therefore cannot reapply an effect. Generic handlers receive no resolved
+objects and reject any returned object effect instead of silently discarding
+it. The existing read-only entrypoint and native HTTP composition retain the
+read-only policy and still reject Write/Consume before storage I/O. Connecting
+the bounded preinstalled module loader and deterministic WASM engine is the
+next MVP slice; only that trusted composition may select the checkpoint and
+call the owned-effects entrypoint.
 
 Protocol version 3 MUST NOT be activated on any live chain until fee debit,
 module access, mutating/consuming object effects, shared-object ordering,
@@ -2213,3 +2222,15 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   TypeScript client, a counter UI, and restart/duplicate E2E evidence; retain
   explicit single-validator, owned-only, fee-free, local-SQLite,
   non-production limitations.
+- DR-0077: Expose owned Address-object Write/Consume as a separate additive
+  authenticated node-core entrypoint rather than weakening the existing
+  read-only path. Supply verified objects to the pure transition in signed
+  manifest declaration order and require exact signed-access/effect
+  correspondence. Treat the creation checkpoint as trusted composition input,
+  reject checkpoint regression, and commit object head/version changes with
+  nonce, state, receipt, and outbox in one structured durable invocation. Reconcile exact
+  request replay before object I/O or execution. Generic handlers receive no
+  objects and reject effects. Keep native HTTP on the read-only entrypoint
+  until the preinstalled module commitment and bounded deterministic WASM
+  execution provide the trusted caller; this changes no canonical bytes or
+  storage schema.
