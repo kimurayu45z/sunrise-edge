@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 axum.workspace = true
 canonical-encoding.workspace = true
+execution.workspace = true
 hashing.workspace = true
 node-core.workspace = true
 protocol-config.workspace = true
@@ -18,7 +19,8 @@ tokio.workspace = true
 abi.workspace = true
 crypto.workspace = true
 ed25519-zebra.workspace = true
-execution.workspace = true
 objects.workspace = true
 runtime-sqlite.workspace = true
+system-modules.workspace = true
 tower.workspace = true
+wat.workspace = true

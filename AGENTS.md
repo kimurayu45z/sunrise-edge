@@ -240,10 +240,13 @@ through its exact head and immutable inline version and matches the typed owner
 to the verified sender. A separate additive owned-effects entrypoint supplies
 those inputs to a pure transition in signed manifest declaration order and
 atomically commits strict Write/Consume Update/Delete effects with exact head
-assertions, sender nonce, state, receipt, and outbox. The read-only and native
-HTTP paths still reject Write/Consume before storage I/O; Shared/System
-ownership, blob bodies, and module loading remain fail-closed. Every immutable
-object version now
+assertions, sender nonce, state, receipt, and outbox. `structured_durable_router`
+still rejects Write/Consume before storage I/O; a separate additive
+`preinstalled_wasm_structured_durable_router` composes a trusted preinstalled
+catalog/engine/checkpoint and now accepts signed owned Write/Consume through
+the preinstalled-WASM entrypoint instead. Shared/System ownership, blob
+bodies, and arbitrary module upload remain fail-closed on every route. Every
+immutable object version now
 carries its creating chain/protocol-version provenance (`DurableObjectProvenance`,
 DR-0068), and node-core independently recomputes and verifies each
 authenticated object's digest from that provenance and the stored `Digest32`
@@ -272,14 +275,21 @@ one, then check same-identity reconciliation, with pool recovery proven
 afterward. This shows the backend acknowledged commit before the driver lost
 it, not crash durability under abrupt process/power loss, and it says nothing
 about TLS-path loss. Native structured requests now support explicit
-cancellation only before first storage dispatch. The additive node-core
+cancellation only before first storage dispatch, and this holds identically
+on the new preinstalled-WASM router. The additive node-core
 owned-effects composition is implemented As-Is, including trusted checkpoint
-regression rejection and exact-replay non-reapplication, but native still uses
-the read-only entrypoint. Next, connect one preinstalled bounded deterministic
-contract as its trusted caller, then add local devnet/query APIs, a
-TypeScript client, a counter UI, and restart/duplicate E2E evidence. Create,
-Shared/System ownership, blob transfer, fees, fast certificates, and production
-object migrations remain deferred. The opaque SQLite table and prefix scanner
-remain local compatibility/reference paths, not production schema. Started
-blocking work remains uncancellable and its configured admission limit is not
+regression rejection and exact-replay non-reapplication, and `native-http`
+now exposes DR-0078's preinstalled-WASM entrypoint through an additive
+`preinstalled_wasm_structured_durable_router` (DR-0080); `structured_durable_router`
+is unaffected and still uses the read-only entrypoint. Next, wire local
+devnet binary/startup around the additive SQLite structured store, add
+bounded query APIs, then build a TypeScript client and counter demo with
+restart/duplicate E2E evidence; both stay in this monorepo through the
+Developer MVP Gate (top-level `clients/typescript`/`demo/counter` once
+implemented) rather than extracting to separate repositories yet. Create,
+Shared/System ownership, blob transfer, arbitrary module upload, fees, fast
+certificates, and production object migrations remain deferred. The opaque
+SQLite table and prefix scanner remain local compatibility/reference paths,
+not production schema. Started blocking work remains uncancellable and its
+configured admission limit is not
 a validated capacity budget.

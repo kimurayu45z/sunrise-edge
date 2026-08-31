@@ -308,8 +308,13 @@ Checkpoint regression relative to the prior immutable version fails closed;
 an exact request replay reconciles the receipt before object reads or execution
 and therefore cannot reapply an effect. Generic handlers receive no resolved
 objects and reject any returned object effect instead of silently discarding
-it. The existing read-only entrypoint and native HTTP composition retain the
-read-only policy and still reject Write/Consume before storage I/O.
+it. The existing read-only entrypoint (and `native-http`'s
+`structured_durable_router`, which still calls only that entrypoint) retain
+the read-only policy and still reject Write/Consume before storage I/O; a
+separate additive `native-http` composition,
+`preinstalled_wasm_structured_durable_router`, now accepts signed owned
+Write/Consume through the preinstalled-WASM entrypoint below instead (see
+DR-0080).
 
 An additive trusted preinstalled-WASM composition now captures the exact
 matching `SystemModule` record (or its committed absence) from the same
@@ -344,9 +349,11 @@ normalized value is encoded and committed as a deterministic rejected receipt
 and nonce with exact object head assertions but no mutation. Exact receipt
 replay returns before module resolution, object reads, or execution. The
 composition is object-only and uses the signed object-access count for
-logical-domain placement without a dummy application key. Native HTTP
-activation, arbitrary uploads, JIT/AOT, and production metering remain
-deferred; see DR-0078.
+logical-domain placement without a dummy application key. This entrypoint was
+initially added to node-core only (DR-0078, historical: at that point native
+HTTP activation was still deferred); a later additive `native-http` router
+now wires it up (see DR-0080). Arbitrary uploads, JIT/AOT, and production
+metering remain deferred.
 
 Protocol version 3 MUST NOT be activated on any live chain until fee debit,
 module access, mutating/consuming object effects, shared-object ordering,
@@ -1211,7 +1218,9 @@ canonical Object record ID rather than the logical `Object::type_hash` retained
 inside canonical bytes. Memory and PostgreSQL apply object/state/receipt/outbox
 sections atomically, preventing an adapter from hiding object writes in generic
 state. Node-core now uses the object section for authenticated read-only
-manifest authorization and exact head assertions; object mutations/effects
+manifest authorization and exact head assertions, plus an additive
+owned-effects path that commits validated signed Address-object Update/Delete
+mutations; Create, Shared/System ownership, and blob transfer verification
 remain deferred. Indexed outbox
 repositories now refine the structured store trait so one implementation owns
 initial commit and later delivery state. An additive node-core handler now
@@ -2409,3 +2418,128 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   connection pooling, disk/WAL/connection-exhaustion fault evidence,
   PgBouncer/backup-restore rehearsal, or TLS commit-loss evidence, and is not
   suitable for multi-writer or production deployments.
+- DR-0080: Expose DR-0078's preinstalled-WASM entrypoint through a new
+  additive `native-http` composition (`preinstalled_wasm_structured_durable_router`
+  / `_with_executor`) rather than changing `structured_durable_router`, which
+  stays on the read-only entrypoint and is behaviorally unchanged; both
+  routers now share one private core (`invoke_structured_durable_event_with_execution`)
+  parameterized by a small private `StructuredDurableAuthenticatedExecution`
+  policy enum (`ReadOnly` vs `PreinstalledWasm`), so the authenticated
+  preparation, storage context construction, and exact request-scoped outbox
+  claim/send/ack path is implemented once, not duplicated per router. A new
+  public `PreinstalledWasmComposition` holds only `Arc<PreinstalledModuleCatalog>`,
+  the zero-sized `execution::WasmExecutionEngine`, and a `created_checkpoint: u64`
+  fixed at router-composition time; none of the three is ever read from HTTP
+  body bytes, and `created_checkpoint` is never derived from wall-clock time.
+  `SubmitTransaction` on the new route calls
+  `handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution`;
+  every other event kind still runs through the same generic
+  `TransactionalNodeStateMachine` path as every other native route. Blocking
+  admission and pre-storage-dispatch cancellation are unchanged, because both
+  routers dispatch through the identical shared core. `native-http` gained a
+  normal (not dev-only) dependency on `execution`, needed only to name
+  `WasmExecutionEngine` in `PreinstalledWasmComposition`'s public signature.
+  Coarse HTTP error classification (`node_error_response`) was extended:
+  malformed/inactive/unknown module reference
+  (`PreinstalledModuleUnknown`/`Inactive`/`NotYetActive`/`ReferenceDigestMismatch`)
+  and args/gas/zero-object request faults
+  (`PreinstalledModuleArgsTooLarge`/`GasLimitExceedsCeiling`/`ZeroObjectAccess`)
+  remain deterministic, opaque-coded client errors (`422`/`400`); catalog/commitment
+  mismatch (`PreinstalledModuleNotCataloged`/`CodeHashMismatch`/`ManifestHashMismatch`/
+  `SemanticsHashMismatch`) and `ObjectCreatedCheckpointRegression` are now
+  classified as host/operator failures (`500`, opaque codes), because they can
+  only mean the trusted composition-time catalog disagrees with the
+  governance-committed registry or the trusted `created_checkpoint` regressed,
+  never something the caller controls; no variant's `Display` text or internal
+  digest/hash values are ever put in the response body. A follow-up review
+  pass extended this same classification to every other execution/effect
+  family the preinstalled route newly makes HTTP-reachable, matching
+  `execution::ExecutionError` explicitly (no wildcard) in a dedicated
+  `execution_error_response` helper: `MissingEntrypoint` (a client-chosen
+  entrypoint name absent from an otherwise trusted, catalog-verified module)
+  and `ResourceLimitExceeded` (deterministic bounds that scale with the
+  caller's own manifest/args) are opaque `422` client faults; `WasmEngine`
+  (the trusted catalog module itself failing fuel setup, compilation,
+  host-function linking, instantiation, or start — a
+  malformed-trusted-catalog-WASM host failure, bounded only by this route's
+  admission/pre-activation limits, not production fee accounting; a
+  wrong-signature entrypoint instead normalizes as a deterministic execution
+  failure/trap, never this variant) and every remaining internal
+  encoding/hashing/context variant (unreachable in practice once
+  authentication has already re-encoded/re-hashed the same transaction once)
+  are opaque `500`s. `NodeCoreError::ObjectVersionOverflow` and
+  `ExecutionError::ObjectVersionOverflow` both map to `409` (an object at its
+  maximum version is a real conflict); `ObjectCreationUnsupported` maps to
+  `501`, consistent with every other `*Unsupported` object variant;
+  `ObjectEffectMismatch` is an opaque deterministic `422`; and
+  `DuplicateObjectEffect`/`TooManyObjectEffects`/`UndeclaredObjectEffect`/
+  `ObjectMutationContextMissing`/`SystemModules` join the existing
+  impossible-in-practice `500` "invalid-node-output" bucket. Composition-time-only
+  catalog-construction variants (`PreinstalledModuleWasmTooLarge`/
+  `ManifestIdMismatch`/`CatalogTooLarge`/`DuplicatePreinstalledModule`) are not
+  HTTP-reachable and remain unclassified. Full composition-time
+  registry/catalog reconciliation (iterating and cross-checking every
+  registered module against every catalog entry before serving traffic) is
+  deferred to the devnet composition; a mismatch discovered only at request
+  time remains this fail-closed opaque `500`. Tests build every
+  fixture (module code/manifest/semantics digests, object digests) from
+  `HashSuiteResolver`/canonical encoders rather than pasting digests, cover a
+  signed owned `Write` committing `Accepted` and advancing object
+  version/nonce/receipt, an exact duplicate not re-executing or reapplying, a
+  close/reopen `SqliteDurableStore` replay returning the persisted result
+  (using a real wall-clock `DurableOperationContext`/`SystemClock`, since
+  DR-0079's `SqliteDurableStore` compares its deadline against actual
+  `SystemTime::now()`, unlike `MemoryDurableStateStore`'s settable virtual
+  clock), directly asserting the receipt survives reopen and, separately from
+  exact-replay reconciliation, that a fresh request ID at the already-spent
+  nonce still conflicts after reopen (proving the persisted sender-nonce
+  record itself survived, not only the receipt exact-replay reconciles from
+  first), a deterministic trap committing `Rejected` while consuming the
+  nonce and leaving the object unchanged, a zero-object call rejecting before
+  its first storage dispatch — proven directly by reusing the existing
+  cancel-on-first-receipt-read store/signal wrapper and observing the signal
+  never flips, rather than only by output-side effects — a discriminating
+  `MissingEntrypoint` case proving `422` with no receipt/object mutation, a
+  corrupted-catalog case (WASM bytes no longer rehashing to the registry's
+  committed code hash) proving the opaque `500` catalog-mismatch code end to
+  end, the existing read-only route still rejecting `Write`/`Consume`, both
+  routes sharing identical content-type/content-encoding/body-limit rejection
+  behavior, and cancellation/admission bounds holding on the new route,
+  including a discriminating test that walks the new route's cancellation
+  observation at each of its three pre-storage checkpoints (the axum wrapper's
+  own initial check plus the two checks inside the shared core) exactly like
+  the pre-existing `structured_durable_router` coverage; Shared/System
+  ownership and blob-transfer coverage stays at node-core rather than being
+  duplicated at the HTTP layer, since neither can succeed on this MVP
+  object-access surface — their fail-closed rejections
+  (`ObjectOwnerKindUnsupported`/`ObjectBodyUnavailable`) already originate in
+  shared node-core code, and the native HTTP boundary maps those errors to
+  `501`, so duplicating the same
+  node-core tests at HTTP would add no discrimination. The two axum handlers (`submit_structured_durable_event`
+  and `submit_preinstalled_wasm_structured_durable_event`) no longer duplicate
+  their content-type/body-extraction/admission/cancellation-observation/blocking-dispatch
+  logic: both are now thin wrappers around one private
+  `submit_structured_durable_event_common` async helper parameterized by the
+  caller's own initial cancellation observation, its blocking executor, and a
+  `Send + 'static` blocking-work closure, while the inner shared core
+  (`invoke_structured_durable_event_with_execution`) keeps its own two
+  cancellation re-checks unchanged. `PreinstalledWasmComposition::new` now
+  documents that `created_checkpoint` must be non-decreasing across process
+  restarts for every object the composition may mutate, since a regression
+  fails closed as `NodeCoreError::ObjectCreatedCheckpointRegression`, not
+  silently accepted. Native binary/devnet startup wiring, query
+  APIs, the TypeScript
+  client, the counter UI, arbitrary module upload, and fee/gas metering remain
+  out of scope and deferred, as does provider-hardening work.
+
+  **Repository-boundary decision.** The TypeScript client and the minimal
+  counter demo (Developer MVP Gate steps 5-6) stay inside this monorepo
+  through the Developer MVP Gate, as top-level `clients/typescript` and
+  `demo/counter` directories once those steps are implemented, rather than
+  starting as separate repositories. Extraction into their own repositories is
+  deferred until all of: the canonical wire contracts and shared test vectors
+  they depend on are stable, a real independent consumer or an independent
+  release cadence for the client exists, and an E2E suite can target a
+  released devnet artifact instead of an in-tree build. Until then, splitting
+  them out would only add release/versioning coordination overhead without a
+  concrete consumer to justify it.

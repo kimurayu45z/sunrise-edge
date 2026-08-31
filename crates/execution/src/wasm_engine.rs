@@ -25,8 +25,10 @@
 //! The exported entry-point function **must** have the signature `() -> ()`.
 //! The engine calls it with no arguments and expects no return values.
 //! A contract whose entry point has a different signature (e.g. returns `i32`)
-//! will produce a [`ExecutionError::WasmEngine`] error, not
-//! [`ExecutionError::MissingEntrypoint`].
+//! fails that call with a type-mismatch error from `wasmi`, which this engine
+//! normalizes into a deterministic [`ExecutionStatus::Failure`] (a trap), the
+//! same as any other runtime trap; it does not produce
+//! [`ExecutionError::WasmEngine`] or [`ExecutionError::MissingEntrypoint`].
 //!
 //! # Object ID derivation
 //!
