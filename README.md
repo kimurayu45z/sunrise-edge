@@ -188,7 +188,7 @@ cross-provider ingress milestones implemented through Phase 17:
   PostgreSQL; the live PostgreSQL fixture additionally injects pool/row-lock
   deadline exhaustion, retry exhaustion, and schema skew when its required test
   URL is set. An optional shared commit-loss capability, exercised only by that
-  same live fixture through a bounded `NoTls` TCP proxy, injects a connection
+  same live fixture first through a bounded `NoTls` TCP proxy, injects a connection
   loss immediately before one plain state commit dispatches `COMMIT`, proving
   no state ground truth was published, and separately injects a connection
   loss immediately after the backend returns a successful acknowledgement for
@@ -202,9 +202,15 @@ cross-provider ingress milestones implemented through Phase 17:
   acknowledgement) before checking same-identity reconciliation. Both instants
   classify `Indeterminate(ConnectionLost)`, and the connection pool is proven
   to recover afterward. This shows the backend returned a successful
-  acknowledgement over the plain transport before the driver lost it, not
-  crash durability under abrupt process/power loss, and it says nothing about
-  TLS-path loss or capacity. Broader fault, operations, and production
+  acknowledgement over the plain transport before the driver lost it. The same
+  shared cases also run through a second bounded proxy whose client leg requires
+  PostgreSQL `SSLRequest`, a private ephemeral CA, a `localhost`-only leaf, and
+  rustls CA/hostname verification; an IP-host negative connection is rejected
+  and at least one completed authenticated handshake is asserted. That proxy
+  terminates TLS and speaks plaintext to the test database, so DR-0074 proves
+  only client/driver-to-test-terminator TLS connection-loss behavior, not
+  PostgreSQL-server TLS, provider PKI, mTLS, rotation/revocation, crash durability
+  under abrupt process/power loss, or capacity. Broader fault, operations, and production
   certification remain pending, so this is still As-Is evidence.
 - A separate, serialized live PostgreSQL crash-recovery test (see
   `ARCHITECTURE.md` DR-0069) commits one structured invocation containing
@@ -295,7 +301,8 @@ cross-provider ingress milestones implemented through Phase 17:
   backup/restore evidence criterion. Together, DR-0070/DR-0071/DR-0072/DR-0073
   leave literal-`COMMIT` WAL/data ENOSPC, real storage-device ENOSPC and
   block-device faults, load/soak capacity, connection-pool behavior under a
-  provider-managed pooler, TLS-path connection loss, point-in-time recovery,
+  provider-managed pooler, PostgreSQL-server/provider TLS beyond DR-0074,
+  point-in-time recovery,
   continuous WAL archiving, hot/concurrent backup, checkpoint publication,
   blob-manifest/state-root/encryption-key verification, real writer failover,
   and production certification open.
@@ -423,8 +430,9 @@ node-event dispatch and protocol handlers, in-flight durable-I/O cancellation,
 real provider trigger wiring, abrupt host/power-fault recovery conformance
 (database-process SIGKILL/WAL recovery, bounded pre-commit data-tablespace
 and WAL-filesystem ENOSPC, bounded server connection-slot exhaustion, and a
-bounded `pg_dump`-based database-snapshot restore rehearsal are covered
-As-Is; see DR-0069/DR-0070/DR-0071/DR-0072/DR-0073 — the last of these is a
+bounded `pg_dump`-based database-snapshot restore rehearsal and bounded
+client/driver-to-test-terminator TLS commit-loss behavior are covered As-Is;
+see DR-0069/DR-0070/DR-0071/DR-0072/DR-0073/DR-0074 — DR-0073 is a
 rehearsal for one snapshot cycle, not a production backup/restore
 capability),
 portable system-module execution, cryptographic slashing proof verification,
@@ -445,7 +453,8 @@ database-process SIGKILL/WAL recovery evidence in DR-0069),
 literal-`COMMIT` WAL/data ENOSPC and real storage-device ENOSPC beyond
 DR-0070/DR-0071, connection-pool behavior under a provider-managed pooler and
 load/soak capacity beyond DR-0072's bounded evidence,
-TLS-path connection loss, point-in-time recovery, continuous WAL archiving,
+PostgreSQL-server/provider TLS behavior beyond DR-0074's bounded
+client-to-terminator evidence, point-in-time recovery, continuous WAL archiving,
 hot/concurrent backup, checkpoint publication, blob-manifest/state-root/
 encryption-key verification, real writer failover, and provider conformance
 follow on that foundation. Phase

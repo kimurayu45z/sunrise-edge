@@ -16,14 +16,17 @@ the normalized delivery index and retained lease-attempt history As-Is. An
 optional shared commit-loss capability now proves commit-boundary connection
 loss immediately before `COMMIT` dispatch for one state commit and,
 separately, immediately after backend acceptance for a structured invocation
-commit, outbox claim, and acknowledgement, over a plain `NoTls` transport; see
-section 5. A separate live test now also SIGKILLs the database-process
-container immediately after a committed structured invocation and verifies
-recovery after restart (DR-0069 in `ARCHITECTURE.md`); see section 5. Migration
-operations beyond initial bootstrap, cancellation, TLS-path connection loss,
-abrupt host/power loss, other fault/capacity evidence, and production
-certification are not implemented. A separate disposable-container test now
-proves bounded pre-commit data-tablespace ENOSPC and recovery after freeing
+commit, outbox claim, and acknowledgement, over a plain `NoTls` transport and,
+separately, a strictly authenticated client-to-test-terminator TLS leg
+(DR-0074); see section 5. A separate live test now also SIGKILLs the
+database-process container immediately after a committed structured
+invocation and verifies recovery after restart (DR-0069 in
+`ARCHITECTURE.md`); see section 5. Migration operations beyond initial
+bootstrap, cancellation, PostgreSQL-server/provider TLS, mTLS, PKI lifecycle,
+and production certification beyond the bounded DR-0074 client leg, abrupt
+host/power loss, and other fault/capacity evidence are not implemented. A
+separate disposable-container test now proves bounded pre-commit
+data-tablespace ENOSPC and recovery after freeing
 space (DR-0070); it deliberately leaves WAL and commit-boundary exhaustion
 open. A separate two-container test now rehearses a bounded `pg_dump`-based
 database-snapshot restore, verifying schema identity and restored namespace
@@ -277,11 +280,14 @@ acknowledgement because PostgreSQL does not prove whether dispatch completed.
 
 An optional shared commit-loss capability (`runtime::conformance::
 CommitLossFixture`) now exercises the driver's own commit-boundary connection
-loss, not just deadline SQLSTATEs. Its only current implementation is a
-bounded, test-only `NoTls` TCP proxy in the live test: it binds port 0, relays
-the untyped startup message and every later `1-byte-type + 4-byte-length`
-frame, and detects the exact simple-query `COMMIT` a durable commit, claim, or
-acknowledgement dispatches last. Severing the connection immediately before
+loss, not just deadline SQLSTATEs. Its two current implementations are both
+in the live test: a bounded, test-only `NoTls` TCP proxy, and a separate
+bounded, test-only proxy that terminates a strictly authenticated
+client-to-test-terminator TLS leg (DR-0074) and relays plaintext to the
+dedicated test database. Both bind port 0, relay the untyped startup message
+and every later `1-byte-type + 4-byte-length` frame, and detect the exact
+simple-query `COMMIT` a durable commit, claim, or acknowledgement dispatches
+last. Severing the connection immediately before
 that message reaches the backend, or forwarding it and severing immediately
 after the backend returns a successful `CommandComplete("COMMIT")`/
 `ReadyForQuery`, both surface to the driver with no SQLSTATE at all, a plain
@@ -305,9 +311,11 @@ because a same-lease claim replay or same-identity acknowledgement replay
 alone would succeed identically whether or not the prior transaction actually
 persisted. A final unfaulted commit proves the connection pool recovers a
 healthy connection. This is evidence that the backend returned a successful
-commit acknowledgement over the plain transport before the driver lost it,
-not proof of crash durability under abrupt process/power loss, and it says
-nothing about TLS-path connection loss.
+commit acknowledgement over the plain or bounded client/driver-to-terminator
+TLS transport before the driver lost it, not proof of crash durability under
+abrupt process/power loss. The TLS proxy terminates TLS and relays plaintext
+to PostgreSQL, so it says nothing about PostgreSQL-server/provider TLS,
+mTLS, PKI lifecycle, or production certification beyond that one client leg.
 
 A separate live test, serialized against the other live tests because it
 kills the whole database-service container, commits one structured invocation
@@ -496,8 +504,11 @@ read, commit, claim, and acknowledgement. The same fixture's optional
 commit-loss capability covers commit-boundary connection loss immediately
 before `COMMIT` dispatch for a plain state commit, and immediately after
 backend acceptance for the structured invocation commit, indexed outbox
-claim, and acknowledgement boundaries, over a plain `NoTls` transport only;
-it says nothing about TLS-path connection loss. The separate DR-0070 scenario
+claim, and acknowledgement boundaries, over a plain `NoTls` transport and,
+separately, over a strictly authenticated client-to-test-terminator TLS leg
+(DR-0074); it says nothing about PostgreSQL-server/provider TLS, mTLS, PKI
+lifecycle, or production certification beyond that one client leg. The
+separate DR-0070 scenario
 now covers bounded pre-commit data-tablespace ENOSPC with exact non-publication
 and recovery evidence. A separate two-container DR-0073 scenario now covers a
 bounded `pg_dump`-based database-snapshot restore rehearsal, with exact
@@ -508,7 +519,8 @@ restore-with-blob-manifest-verification criterion above, since point-in-time
 recovery, continuous WAL archiving, hot/concurrent backup, checkpoint
 publication, and blob-manifest/state-root/encryption-key verification remain
 unimplemented. Duplicate request races, abrupt/process faults, WAL or
-commit-boundary/real-device exhaustion, TLS-path connection loss,
-migration compatibility across real old and new binaries,
+commit-boundary/real-device exhaustion, PostgreSQL-server/provider TLS,
+mTLS, PKI lifecycle, and production certification beyond the bounded
+DR-0074 client leg, migration compatibility across real old and new binaries,
 capacity/load/soak, real writer failover, and operational certification
 remain open.

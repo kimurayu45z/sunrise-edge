@@ -4,10 +4,14 @@ use postgres::{
     config::{Host, SslMode},
     error::SqlState,
 };
+use postgres_rustls::MakeTlsConnector;
 use protocol_types::{
     AtomicityDomainId, ChainId, Digest32, HashAlgorithmId, ProtocolVersion, ValidatorId,
 };
-use r2d2_postgres::{PostgresConnectionManager, r2d2::Pool};
+use r2d2_postgres::{
+    PostgresConnectionManager,
+    r2d2::{ManageConnection, Pool},
+};
 use runtime::{
     AtomicStateMutationSet, AtomicStateReadSet, AtomicStateTransaction, DueOutboxClaimRequest,
     DurableCommitOutcome, DurableCommitRejection, DurableDomainStateStore,
@@ -45,10 +49,18 @@ use std::{
 };
 
 mod support;
+#[path = "support/tls_commit_loss.rs"]
+mod tls_commit_loss;
+
+use tls_commit_loss::{
+    TlsCommitLossProxy, proxied_config as tls_commit_loss_proxied_config,
+    wrong_hostname_config as tls_commit_loss_wrong_hostname_config,
+};
 
 const TEST_DATABASE: &str = "sunrise_edge_test";
 
 type TestPostgresManager = PostgresConnectionManager<NoTls>;
+type TlsPostgresManager = PostgresConnectionManager<MakeTlsConnector>;
 
 // --- Bounded, test-only commit-boundary connection-loss proxy -------------
 //
@@ -618,16 +630,57 @@ fn namespace_chain_id(namespace: &PostgresNamespace) -> ConformanceResult<ChainI
         .map_err(|error| ConformanceFailure::new("postgres-fixture", error.to_string()))
 }
 
-struct CommitLossPostgresFixture {
-    store: Arc<PostgresDurableStore<TestPostgresManager>>,
+enum CommitLossController {
+    Plain(CommitLossProxy),
+    Tls(TlsCommitLossProxy),
+}
+
+impl CommitLossController {
+    fn arm(&self, fault_point: CommitFaultPoint) {
+        match self {
+            Self::Plain(proxy) => proxy.arm(fault_point),
+            Self::Tls(proxy) => proxy.arm(fault_point),
+        }
+    }
+
+    fn fault_fired(&self) -> bool {
+        match self {
+            Self::Plain(proxy) => proxy.fault_fired(),
+            Self::Tls(proxy) => proxy.fault_fired(),
+        }
+    }
+
+    fn backend_commit_accepted(&self) -> bool {
+        match self {
+            Self::Plain(proxy) => proxy.backend_commit_accepted(),
+            Self::Tls(proxy) => proxy.backend_commit_accepted(),
+        }
+    }
+
+    fn tls_handshakes(&self) -> Option<usize> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Tls(proxy) => Some(proxy.tls_handshakes()),
+        }
+    }
+}
+
+struct CommitLossPostgresFixture<M>
+where
+    M: ManageConnection<Connection = Client, Error = postgres::Error> + 'static,
+{
+    store: Arc<PostgresDurableStore<M>>,
     namespace: PostgresNamespace,
     operator: Mutex<Client>,
     initial_fence: WriterFenceGeneration,
-    proxy: CommitLossProxy,
+    proxy: CommitLossController,
 }
 
-impl DurableStoreFixture for CommitLossPostgresFixture {
-    type Store = PostgresDurableStore<TestPostgresManager>;
+impl<M> DurableStoreFixture for CommitLossPostgresFixture<M>
+where
+    M: ManageConnection<Connection = Client, Error = postgres::Error> + 'static,
+{
+    type Store = PostgresDurableStore<M>;
 
     fn store(&self) -> Arc<Self::Store> {
         Arc::clone(&self.store)
@@ -696,7 +749,10 @@ impl DurableStoreFixture for CommitLossPostgresFixture {
     }
 }
 
-impl CommitLossFixture for CommitLossPostgresFixture {
+impl<M> CommitLossFixture for CommitLossPostgresFixture<M>
+where
+    M: ManageConnection<Connection = Client, Error = postgres::Error> + 'static,
+{
     fn arm_commit_loss(&self, fault_point: CommitFaultPoint) -> ConformanceResult<()> {
         self.proxy.arm(fault_point);
         Ok(())
@@ -3315,7 +3371,63 @@ fn postgres_schema_and_durable_store_conformance() {
         namespace: commit_loss_namespace,
         operator: Mutex::new(commit_loss_operator),
         initial_fence: commit_loss_fence,
-        proxy: commit_loss_proxy,
+        proxy: CommitLossController::Plain(commit_loss_proxy),
     };
     run_commit_loss_conformance(&commit_loss_fixture).unwrap();
+    drop(commit_loss_fixture);
+
+    let tls_commit_loss_namespace = PostgresNamespace::new(
+        &ChainId::new("postgres-tls-commit-loss-conformance").unwrap(),
+        ValidatorId::new([0xC1; 32]),
+        AtomicityDomainId::new([0xC2; 32]).unwrap(),
+    )
+    .unwrap();
+    let tls_commit_loss_fence = WriterFenceGeneration::new(71).unwrap();
+    let mut tls_commit_loss_operator = Client::connect(&database_url, NoTls).unwrap();
+    bootstrap_namespace(
+        &mut tls_commit_loss_operator,
+        &tls_commit_loss_namespace,
+        POSTGRES_SCHEMA_GENERATION,
+        tls_commit_loss_fence,
+    )
+    .unwrap();
+    let (tls_commit_loss_proxy, tls_connector) =
+        TlsCommitLossProxy::spawn(commit_loss_backend_addr(&database_url));
+    assert!(
+        tls_commit_loss_wrong_hostname_config(&database_url, tls_commit_loss_proxy.local_addr(),)
+            .connect(tls_connector.clone())
+            .is_err(),
+        "TLS commit-loss proxy certificate must reject an IP hostname outside its localhost SAN"
+    );
+    let tls_commit_loss_pool: Pool<TlsPostgresManager> = build_postgres_pool(
+        tls_commit_loss_proxied_config(&database_url, tls_commit_loss_proxy.local_addr()),
+        tls_connector,
+        PostgresPoolConfig::new(
+            NonZeroU32::new(1).unwrap(),
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let tls_commit_loss_fixture = CommitLossPostgresFixture {
+        store: Arc::new(PostgresDurableStore::new(
+            tls_commit_loss_pool,
+            tls_commit_loss_namespace.clone(),
+            PostgresTransactionPolicy::new(NonZeroU32::new(1).unwrap()).unwrap(),
+        )),
+        namespace: tls_commit_loss_namespace,
+        operator: Mutex::new(tls_commit_loss_operator),
+        initial_fence: tls_commit_loss_fence,
+        proxy: CommitLossController::Tls(tls_commit_loss_proxy),
+    };
+    run_commit_loss_conformance(&tls_commit_loss_fixture).unwrap();
+    assert!(
+        tls_commit_loss_fixture
+            .proxy
+            .tls_handshakes()
+            .is_some_and(|count| count > 0),
+        "TLS commit-loss conformance must complete at least one authenticated handshake"
+    );
 }

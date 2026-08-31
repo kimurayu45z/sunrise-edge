@@ -25,7 +25,7 @@ implement cancellation after a started synchronous operation or production
 fault/capacity certification.
 
 The live test additionally implements the optional shared
-`runtime::conformance::CommitLossFixture` capability through a bounded,
+`runtime::conformance::CommitLossFixture` capability first through a bounded,
 test-only `NoTls` TCP proxy that sits between the pool and the real database.
 It can sever the connection either immediately before a dispatched `COMMIT`
 reaches the backend, or immediately after the backend returns a successful
@@ -47,10 +47,18 @@ left due for this one-message batch. These discriminating probes matter
 because a same-lease claim replay or same-identity acknowledgement replay
 alone would succeed identically whether or not the prior transaction actually
 persisted. A final unfaulted commit proves the connection pool recovers a
-healthy connection. This is evidence that the backend returned a successful
-commit acknowledgement over the plain transport before the driver lost it,
-not proof of crash durability under abrupt process/power loss; it says
-nothing about TLS-path connection loss, WAL or commit-boundary exhaustion,
+healthy connection. The exact same shared suite then runs through a second
+bounded proxy whose client leg requires ordinary PostgreSQL `SSLRequest` and
+`SslMode::Require`. It generates an ephemeral private CA and `localhost`-only
+leaf, configures rustls with only that CA, rejects a live IP-host negative
+connection, and asserts that an authenticated handshake completed before the
+fault cases finish. The proxy terminates TLS and relays plaintext PostgreSQL
+frames to the dedicated test database. This is evidence that the backend
+returned a successful commit acknowledgement before the driver lost it and
+that the client/driver-to-test-terminator TLS path preserves the same
+classification and reconciliation. It is not proof of crash durability under
+abrupt process/power loss, PostgreSQL-server TLS, provider trust-store or
+certificate lifecycle behavior, mTLS, WAL or commit-boundary exhaustion,
 backup/restore, capacity/load/soak, or real failover. The separate bounded
 data-tablespace ENOSPC scenario described below does not broaden those claims.
 Request handling must never call `apply_initial_schema` or
@@ -247,8 +255,9 @@ It force-removes only its exact created container on normal return or panic.
 Leaving both variables unset skips the test; setting the required flag
 without a valid digest-pinned image fails instead of skipping. This does not
 cover real-device resource exhaustion, load/soak capacity, connection-pool
-behavior under a provider-managed pooler (e.g. PgBouncer), TLS-path
-connection loss, real writer failover, or production certification.
+behavior under a provider-managed pooler (e.g. PgBouncer), PostgreSQL-server
+or provider TLS beyond the bounded client-to-terminator evidence above, real
+writer failover, or production certification.
 
 ### Live bounded database-snapshot restore rehearsal test
 

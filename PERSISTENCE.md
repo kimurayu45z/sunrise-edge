@@ -411,10 +411,16 @@ not general state reads:
    still active, and a reclaim attempt with the original lease after
    acknowledgement) before checking same-identity reconciliation, with the
    connection pool proven to recover afterward. The only current
-   implementation is a bounded `NoTls` TCP proxy in
-   `runtime-postgres`'s live test; it shows the backend acknowledged commit
-   before the driver lost it, not crash durability under abrupt process/power
-   loss, and it proves nothing about TLS-path connection loss. A separate,
+   implementations are a bounded `NoTls` TCP proxy and a second bounded
+   TLS-terminating proxy in `runtime-postgres`'s live test. The latter requires
+   PostgreSQL `SSLRequest`, trusts only an ephemeral private CA, validates a
+   `localhost` SAN, rejects an IP-host negative connection, and records a
+   completed authenticated handshake before running the exact same shared
+   cases. It proves client/driver-to-test-terminator TLS connection-loss
+   behavior only: the backend leg is plaintext, so PostgreSQL-server/provider
+   TLS, mTLS, certificate rotation/revocation, and production PKI remain open.
+   Both show the backend acknowledged commit before the driver lost it, not
+   crash durability under abrupt process/power loss. A separate,
    serialized live test now `docker kill --signal=KILL`s the database-service
    container immediately after a committed structured invocation (state, an
    exact receipt, and one due outbox message), then restarts the same
@@ -513,10 +519,11 @@ not general state reads:
    recovery evidence above, then extend it with client-disconnect and
    in-flight cancellation semantics, abrupt real host/power fault (storage
    write-cache flush, torn-write, media/filesystem faults included),
-   commit-boundary and real storage-device ENOSPC, TLS-path
-   connection loss, capacity/load/soak
+   commit-boundary and real storage-device ENOSPC, PostgreSQL-server/provider
+   TLS beyond the bounded client-to-terminator evidence, capacity/load/soak
    tests, backup/restore rehearsal, and real writer-fencing failover tests.
-   Every one of these remains open; the database-process SIGKILL/WAL recovery,
+   Every one of these remains open except the bounded client-to-terminator TLS
+   loss slice; the database-process SIGKILL/WAL recovery,
    bounded pre-commit data-tablespace and WAL-filesystem ENOSPC, and bounded
    connection-exhaustion cases above are the only implemented fault slices.
 5. Implement Cloudflare Durable Object and AWS mappings against the same

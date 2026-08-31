@@ -2164,7 +2164,9 @@ Phase 15 As-Is scope:
   absent-key create、tombstone ABA、definite contention outcome、retained outbox lease、writer-fence handoffを
   検証する。PostgreSQL live testはさらにpool acquisition/metadata lock待ちdeadline、retry ceiling到達時の
   serialization rejectionとunsupported schema generationのread/commit/claim/ack fail-closedを検証する
-  （implemented As-Is）。optional shared commit-loss capabilityはbounded test-only `NoTls` TCP proxyを介し、
+  （implemented As-Is）。optional shared commit-loss capabilityはbounded test-only `NoTls` TCP proxyと、
+  PostgreSQL `SSLRequest`を必須化してephemeral private CA・`localhost` SANをrustlsで検証する別の
+  bounded TLS-terminating proxyを介し、
   plain state commitへCOMMIT dispatch直前のconnection lossを1回注入してstate ground truthが存在しないことを
   証明し、別途structured invocation commit・outbox claim・acknowledgementの3箇所へbackend COMMIT acceptance
   直後のconnection lossを注入して、いずれもIndeterminate(ConnectionLost)として分類されつつ、invocation commitでは
@@ -2172,9 +2174,12 @@ Phase 15 As-Is scope:
   same-identity ack replay単独ではpersistedとuncommittedを区別できないため、claimでは別leaseでのclaim probe
   （元leaseがまだactiveであることをNoDueWorkで証明）、ackでは元leaseでのreclaim probe（LeaseIdReuseとして
   rejectされることを証明）を先に行った上でsame-identity reconciliationを証明し、最後にconnection pool
-  recoveryを検証する（implemented As-Is；backendがCOMMITへ成功応答を返したことの証跡であり、abrupt
-  process/power lossに対するcrash durabilityの証明ではなく、TLS-path connection lossは
-  対象外）。別途、serializedなlive testがcommitted structured invocation（state、exact receipt、
+  recoveryを検証する。TLS版はIP-host negative connection rejectionとcompleted authenticated handshakeも
+  証明してexact same shared casesを実行する（implemented As-Is；ARCHITECTURE.md DR-0074）。ただしTLSは
+  test proxyで終端してbackend PostgreSQL legはplaintextであり、client/driver-to-test-terminatorの証跡に
+  限る。backendがCOMMITへ成功応答を返したことの証跡であり、abrupt process/power lossに対するcrash
+  durability、PostgreSQL-server/provider TLS、mTLS、certificate rotation/revocationの証明ではない。
+  別途、serializedなlive testがcommitted structured invocation（state、exact receipt、
   1 due outbox message）の直後にintervening SQLなしでdatabase-service containerへ
   `docker kill --signal=KILL`し、`docker start`と新規connectionでexact state/receipt、
   `RequestAlreadyCommitted` replay、その1 requestへのexact claim/ack 1回に続く`NoDueWork`、
@@ -2370,27 +2375,31 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
    PostgreSQL capability testにimmutable history/current/tombstone/blob mapping、head metadata corruption fail-closed、
    separate version readでのmalformed inline body fail-closed、
    pool/row-lock deadline、serialization failure、
-   schema/version skewを追加する。optional shared commit-loss capabilityはbounded test-only `NoTls` TCP proxyを介し、
+   schema/version skewを追加する。optional shared commit-loss capabilityはbounded test-only `NoTls` TCP proxyと
+   strict CA/hostname verification付きのbounded TLS-terminating proxyを介し、
    plain state commitへのCOMMIT dispatch直前connection lossとinvocation commit・outbox claim・acknowledgementへの
    backend COMMIT acceptance直後connection lossを別々に注入し、いずれもIndeterminate(ConnectionLost)として
    分類されることと、前者はstate ground truth不在、後者はexact state/receipt ground truth・RequestAlreadyCommitted
    （invocation commit）を証明する。claim/ackはsame-lease/same-identity replay単独では非committedと区別できない
    ため、別lease claim probe（NoDueWork）とoriginal lease reclaim probe（LeaseIdReuse）で先にpersistedを証明した上で
    same-identity reconciliationを証明し、pool recoveryを証明する
-   （memory/PostgreSQL/commit-loss capability implemented As-Is；backendの成功応答の証跡でありabrupt
-   process/power lossに対するcrash durabilityの証明ではない; provider adapters、TLS-path connection loss、
-   other fault/capacity certification pending）。別途、serializedなlive testがcommitted structured
+   TLS版ではIP-host negative rejectionとauthenticated handshake countも証明する
+   （memory/PostgreSQL/commit-loss capability implemented As-Is；ARCHITECTURE.md DR-0074；backendの
+   成功応答とclient/driver-to-test-terminator TLS lossの証跡でありabrupt process/power lossに対する
+   crash durability、PostgreSQL-server/provider TLS・mTLS・certificate lifecycleの証明ではない;
+   provider adapters、other fault/capacity certification pending）。別途、serializedなlive testがcommitted structured
    invocationの直後にdatabase-service containerを`docker kill --signal=KILL`し、restart/readiness/
    fresh connection reconciliationを検証する（implemented As-Is; ARCHITECTURE.md DR-0069）。これは
    database-process SIGKILLとWAL recoveryの証明のみであり、abrupt host/power loss、storage write-cache
-   flush/torn-write/media/filesystem fault、TLS-path connection loss、capacity/load/soak、real writer
+   flush/torn-write/media/filesystem fault、PostgreSQL-server/provider TLS、capacity/load/soak、real writer
    failover、backup/restore、provider certificationは未実装である。
 5. real host/power fault（storage write-cache flush、torn-write、media/filesystem fault含む）、
    commit-boundary/real storage-device ENOSPC、
    capacity/load/soak、backup/restore、writer failoverをrehearsalする。database-process
    SIGKILL/WAL recovery、bounded pre-commit data-tablespace ENOSPC（DR-0070）、bounded pre-commit
    WAL-filesystem ENOSPC（DR-0071）、bounded server connection-slot exhaustion（DR-0072）、bounded
-   `pg_dump`ベースのdatabase-snapshot restore rehearsal（DR-0073）以外は
+   `pg_dump`ベースのdatabase-snapshot restore rehearsal（DR-0073）、bounded
+   client/driver-to-test-terminator TLS commit-loss evidence（DR-0074）以外は
    このstep 5の全項目が未実装のまま残っている。connection exhaustionはDR-0072でserverが飽和した
    際にadapter poolがdefinite pre-commit `Rejected(DeadlineExceededBeforeCommit)`を返すことを
    bounded disposable containerで証明したが、real-device resource exhaustion、load/soak capacity、
