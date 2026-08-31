@@ -1770,6 +1770,22 @@ Developer MVP completion criteria:
    `ExecutionEffects`をresponseへ返す。trapはobject mutationなしのRejected receipt/nonceとして
    commitする。zero-object callはこのMVP pathでは明示的に拒否し、native HTTP/devnet wiringは未実装。
 4. local devnet/query API、TypeScript client、counter demo UI、restart/duplicate E2Eを順に追加する。
+   前提として、`runtime-sqlite`へ`StructuredDurableDomainStateStore`/`IndexedOutboxRepository`を
+   実装するadditive、local-only、non-productionな`SqliteDurableStore`を追加済み
+   （implemented As-Is）。既存のopaque `SqliteStateStore`とは別テーブル・別`PRAGMA application_id`で、
+   opaque state-keyのprefixを型付きレコードへ再解釈しない。`application_id`はファイル単位の
+   SQLiteプロパティのため、両ストアは同一ファイルを共有できず、それぞれ別ファイルを必要とする。
+   one trusted bound `(chain, validator, atomicity domain)` namespace、永続化されたfenced writer
+   generation、deadline check、object/receipt/outbox/stateのatomic commit、immutable object
+   version、indexed request/due outbox claim、idempotentなacknowledgementをprocess-local mutex +
+   1つの`BEGIN IMMEDIATE` transactionの上に実装。digest・canonical record type ID・boolean列は
+   すべて厳密にdecodeし、不明なalgorithm、長さ不一致、algorithm/bytesの片方欠落、想定と異なる
+   type ID、0/1以外のcompleted値、current専用列を持つtombstoneはすべてInvalidPersistedStateとして
+   fail closedする。object versionのprovenance chainはbound namespaceのchainとcommit時・read時の
+   両方で照合する。PostgreSQLと共有するconformance suiteおよび、実際のdurable state
+   read/mutation・exact request replayでの`RequestAlreadyCommitted`・reopen後のoutbox
+   acknowledgement冪等性を含むrestart persistence testで検証済み。native devnet/node-coreへの
+   接続は次のPRで行う。
 
 Phase 1:
 - workspace

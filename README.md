@@ -168,6 +168,30 @@ cross-provider ingress milestones implemented through Phase 17:
   identity/version checks. It also implements bounded, cursor-paginated binary
   prefix key discovery for recovery adapters. It is a local reference and
   conformance fixture, not the selected production database.
+- An additive, local-only, non-production `SqliteDurableStore` in the same
+  crate that implements the normalized `StructuredDurableDomainStateStore`
+  and `IndexedOutboxRepository` contracts on their own SQLite tables and its
+  own `PRAGMA application_id`, separate from the opaque legacy store above; it
+  never reinterprets opaque state-key prefixes. Because `application_id` is a
+  whole-file SQLite property, this store and the opaque legacy store each need
+  their own database file. It is bound at construction to one trusted `(chain,
+  validator, atomicity domain)` namespace, persists a fenced writer generation
+  and a documented schema identity, and serializes every operation behind one
+  process-local mutex plus a `BEGIN IMMEDIATE` transaction (no connection
+  pool, no serialization-conflict retries, no live fault-injected evidence).
+  Every digest, canonical-record-type identity, and boolean column is decoded
+  strictly and fails closed on corruption rather than being coerced, and an
+  object version's persisted creating chain is checked against the store's
+  bound chain on both commit and read. The same feature-gated shared
+  conformance suite used by PostgreSQL — complete-read write skew, object
+  head/version lifecycle, lease/writer fencing, and schema skew — passes
+  against it, plus a dedicated restart test that closes and reopens the file
+  to prove durable state, immutable object versions, receipts, and an
+  in-flight outbox lease all survive, that exact request replay after reopen
+  returns `RequestAlreadyCommitted`, and that outbox acknowledgement stays
+  idempotent after reopen. It exists so the preinstalled-WASM native devnet
+  can use one local durable structured store; it is not provider-hardened and
+  is not exposed through native HTTP.
 - An accepted [production persistence architecture](PERSISTENCE.md) that makes
   validator-local atomicity domains, complete read-set validation, normalized
   object/receipt/outbox data, indexed recovery, writer fencing, migration, and
@@ -514,7 +538,7 @@ behavior.
 | State and access | `objects`, `abi` | Versioned objects, ownership, object references, access modes, and transaction access manifests |
 | Execution | `execution`, `contract-sdk`, `chain-ir`, `system-modules` | Transactions/effects, deterministic WASM, proof envelopes/verifier interfaces, contract host APIs, portable IR, and governed modules |
 | Economics and governance | `fees`, `bonds`, `governance`, `protocol-upgrades`, `protocol-config` | Stablecoin fees/bonds, admission, governance actions, upgrades, migrations, and committed configuration |
-| Runtime and consensus | `runtime`, `runtime-sqlite`, `runtime-postgres`, `validator-set`, `consensus`, `node-core` | Persistence/runtime interfaces, local durable SQLite state, normalized PostgreSQL structured commit and indexed outbox adapter, epoch validator snapshots, event-driven shared-object ordering, and one-event conditional transitions |
+| Runtime and consensus | `runtime`, `runtime-sqlite`, `runtime-postgres`, `validator-set`, `consensus`, `node-core` | Persistence/runtime interfaces, local durable SQLite state plus a local-only non-production structured SQLite adapter, normalized PostgreSQL structured commit and indexed outbox adapter, epoch validator snapshots, event-driven shared-object ordering, and one-event conditional transitions |
 | Adapters | `native-http`, `adapters/shared`, `adapters/cloudflare-workers`, `adapters/deno`, `adapters/vercel`, `adapters/supabase-edge`, `adapters/aws-lambda` | Bounded native routing, shared Web ingress, Cloudflare Service-Binding ingress, authenticated Deno/Vercel/Supabase ingress, and AWS HTTP API v2 mapping around the canonical contract |
 
 The repository intentionally keeps vendor-specific dependencies out of the

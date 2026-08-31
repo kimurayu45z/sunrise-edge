@@ -1268,6 +1268,9 @@ dependencies = [
 name = "runtime-sqlite"
 version = "0.1.0"
 dependencies = [
+ "hashing",
+ "objects",
+ "protocol-types",
  "runtime",
  "rusqlite",
 ]

@@ -637,6 +637,20 @@ contract, but it does not provide the normalized object, receipt, outbox,
 checkpoint, migration, retention, or operational indexes required by the
 accepted production persistence architecture.
 
+`runtime-sqlite` additionally exposes `SqliteDurableStore` (DR-0079): an
+additive, local-only, non-production implementation of
+`StructuredDurableDomainStateStore`/`IndexedOutboxRepository` in a separate
+module, its own `PRAGMA application_id`, and separate SQLite tables from the
+opaque `SqliteStateStore` above; because `application_id` is a whole-file
+SQLite property, the two stores require separate database files, not a shared
+one. It normalizes state, immutable object versions, receipts, and outbox
+delivery/lease-attempt state, matching the shared contract that
+`runtime-postgres` implements for production, but with none of that crate's
+connection pooling, multi-writer serialization retries, or live fault
+evidence — every operation is serialized behind one process-local mutex and
+one `BEGIN IMMEDIATE` transaction. It is a Developer MVP prerequisite for the
+preinstalled-WASM native devnet, not a production persistence candidate.
+
 `ComposedRuntime` owns explicitly supplied state, blob, signer, transport,
 clock, and scheduler components and implements the same runtime trait without
 selecting defaults. It allows a native embedding to pair `SqliteStateStore`
@@ -2296,3 +2310,59 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   Shared/System ownership, blob bodies, native HTTP/devnet wiring, arbitrary
   uploads, JIT/AOT, production metering, and versioned module commitment
   provenance remain deferred.
+- DR-0079: Add an additive, local-only, non-production `SqliteDurableStore` in
+  `runtime-sqlite` implementing `StructuredDurableDomainStateStore` and
+  `IndexedOutboxRepository` so the preinstalled-WASM native devnet has a
+  structured durable backend to wire against in a following PR. It lives in a
+  separate module (`structured.rs`) and its own SQLite tables and its own
+  `PRAGMA application_id`, distinct from the existing opaque
+  `SqliteStateStore`; it never reinterprets that store's opaque state-key
+  prefixes as typed rows. Because `application_id`/`user_version` are
+  whole-file SQLite properties, this store and the legacy opaque store cannot
+  share one database file: each requires its own separate file. The store is
+  bound at construction to one trusted `(chain, validator, atomicity domain)`
+  namespace (`SqliteNamespace`), auto-bootstraps a `durable_metadata` row with
+  a documented schema identity and the initial writer fence on first open, and
+  fails closed on schema-identity, schema-version, application-ID, or
+  namespace (chain, validator, or domain) mismatch on every later open and
+  every request-path operation. A later additive schema change bumps the
+  schema identity and version together. `advance_writer_fence` is an explicit
+  operator-only method, not reachable through any runtime trait. Unlike
+  `runtime-postgres`'s pooled, multi-attempt-serializable design, every
+  operation is serialized behind one process-local `Mutex<Connection>` plus a
+  single SQLite `BEGIN IMMEDIATE` transaction, so there are no concurrent
+  writers to retry against within the process; deadline and writer-fence
+  authority are still revalidated immediately before dispatching `COMMIT`, and
+  a local `COMMIT` failure is conservatively classified `Indeterminate`
+  because embedded storage I/O carries the same fsync ambiguity the shared
+  contract documents for a severed remote connection. State, immutable object
+  versions, receipts, and outbox messages/delivery/lease-attempt state each
+  live in their own table; the due-outbox claim uses a partial index on
+  `(available_at_unix_millis, request_id) WHERE completed = 0` so an
+  unattended scheduler claim is a bounded indexed lookup, not a table scan.
+  Every digest, canonical-record-type-ID, and boolean column is decoded
+  strictly: an unknown algorithm ID, a byte length other than 32, exactly one
+  of an algorithm/bytes pair present without the other, a persisted
+  canonical-record-type ID other than the binary's own constant, a completed
+  flag other than exactly 0 or 1, or a tombstoned head carrying any
+  current-only column is always `InvalidPersistedState`, never silently
+  coerced or treated as absent. An object version's own persisted creating
+  chain is also compared against the store's bound chain, both when a new
+  version is inserted at commit and when an existing version is read back, so
+  a version created under a different chain is rejected rather than trusted.
+  The full feature-gated shared conformance suite that PostgreSQL uses
+  (`run_durable_store_conformance`, `run_durable_object_conformance`,
+  `run_schema_skew_conformance`) passes against it unmodified, plus a
+  dedicated restart test that closes and reopens the file to prove committed
+  state (including a real durable state read/mutation), an object's current
+  head/immutable version, and a receipt all survive; that exact request replay
+  after reopen returns `RequestAlreadyCommitted` without reapplying any
+  effect; that acknowledging the same outbox lease twice after reopen remains
+  idempotent; and that the persisted writer fence — not anything held in
+  process memory — is what fences a stale context after an operator advance.
+  Focused corruption tests directly tamper with persisted columns through a
+  second raw connection to prove each strict-decode and cross-check rule
+  above fails closed. This adapter has none of `runtime-postgres`'s connection
+  pooling, disk/WAL/connection-exhaustion fault evidence, PgBouncer/backup-
+  restore rehearsal, or TLS commit-loss evidence, and is not suitable for
+  multi-writer or production deployments.
