@@ -1584,7 +1584,7 @@ returns zero.
 All storage-backed queries allocate a restart-safe correlation identity and a
 bounded deadline from the embedding host, resolve the domain solely from the
 committed manifest, and run through the same bounded blocking executor as
-submission. Capacity exhaustion is `503`; malformed paths are `400`; corrupt,
+submission. Capacity exhaustion is `429`; malformed paths are `400`; corrupt,
 unverifiable, or otherwise invalid durable state is an opaque `500`. Query
 responses are bounded by the existing maximum canonical object/receipt sizes;
 there is no scan, list, prefix, pagination, proof, historical-version selector,
