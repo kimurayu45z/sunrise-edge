@@ -24,8 +24,8 @@ pub const MAX_DEVNET_OWNERS: usize = 64;
 /// caller can read any object, receipt, next-nonce, or context; the address
 /// in `/v1/senders/{sender}/next-nonce` is a public lookup selector, not
 /// authorization), and query and submission share one admission budget
-/// (`compose_devnet_router`'s single `NativeBlockingExecutor`), so a burst of
-/// one can starve the other.
+/// (the single `NativeBlockingExecutor` constructed by the native router), so
+/// a burst of one can starve the other.
 pub const DEVNET_STARTUP_LIMITATIONS_BANNER: &str = "single-validator,owned-objects-only,cross-owner-transfer-fail-closed,fee-free,local-sqlite,unauthenticated-bounded-public-read-query-api,shared-query-submission-admission-budget,non-production";
 
 /// One browser/client-controlled development owner address.

@@ -2729,10 +2729,10 @@ where
 
 /// Failures from one bounded query invocation (DR-0082).
 ///
-/// Every non-cancellation variant maps to one opaque `500`: a syntactically
-/// valid, admitted query can only fail this way through corrupt/unverifiable
-/// durable state or host misconfiguration, never through caller-supplied
-/// input (malformed selectors are rejected before this point).
+/// A syntactically valid, admitted query maps transient host/storage
+/// conditions to an opaque `503` and invalid persisted state or permanent
+/// host failures to an opaque `500`; caller-supplied malformed selectors are
+/// rejected before this point.
 enum QueryInvocationError {
     CancelledBeforeStorage,
     /// The restart-safe identity source could not allocate an identity right
@@ -4862,13 +4862,23 @@ mod tests {
             )],
         )
         .unwrap();
+        let receipt_request_id: RequestId = request_id(receipt_byte);
+        let receipt_event_digest: Digest32 = Digest32::new(
+            HashAlgorithmId::Sha2_256,
+            [receipt_byte.wrapping_add(1); 32],
+        );
+        let receipt_response: NodeResponse =
+            NodeResponse::new(receipt_request_id, NodeResponseStatus::Accepted, None).unwrap();
+        let receipt_record: NodeDedupRecord = NodeDedupRecord::new(
+            receipt_request_id,
+            receipt_event_digest,
+            vec![receipt_response],
+        )
+        .unwrap();
         let receipt = DurableRequestReceipt::new(
-            DurableRequestId::new([receipt_byte; 32]).unwrap(),
-            Digest32::new(
-                HashAlgorithmId::Sha2_256,
-                [receipt_byte.wrapping_add(1); 32],
-            ),
-            vec![receipt_byte.wrapping_add(2)],
+            DurableRequestId::new(*receipt_request_id.as_bytes()).unwrap(),
+            receipt_event_digest,
+            receipt_record.encode().unwrap(),
         )
         .unwrap();
         let invocation =
@@ -10639,12 +10649,14 @@ mod tests {
             9,
         );
 
-        let paths = [
+        let populated_object_path: String = query_object_path(object_ref.id);
+        let populated_receipt_path: String = query_receipt_path(request_id(0x47));
+        let paths: [String; 6] = [
             QUERY_CONTEXT_PATH.to_string(),
             query_object_path(ObjectId::new([0x01; 32])),
-            query_object_path(object_ref.id),
+            populated_object_path.clone(),
             query_receipt_path(request_id(0x02)),
-            query_receipt_path(request_id(0x47)),
+            populated_receipt_path.clone(),
             query_next_nonce_path(&Address::new([0x03; 32])),
         ];
         for path in paths {
@@ -10683,6 +10695,17 @@ mod tests {
                     .await
                     .unwrap();
             assert_eq!(structured_bytes, preinstalled_bytes, "path: {path}");
+            if path == populated_object_path {
+                assert!(matches!(
+                    HttpObjectQueryResult::decode(&structured_bytes).unwrap(),
+                    HttpObjectQueryResult::CurrentInline { .. }
+                ));
+            } else if path == populated_receipt_path {
+                assert!(matches!(
+                    HttpReceiptQueryResult::decode(&structured_bytes).unwrap(),
+                    HttpReceiptQueryResult::Present { .. }
+                ));
+            }
         }
     }
 
