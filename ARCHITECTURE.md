@@ -1182,7 +1182,8 @@ shared namespace-metadata lock so a fence advance cannot race them without
 serializing unrelated delivery rows; `SKIP LOCKED` is confined to due delivery
 selection. Request traffic does not run DDL or bootstrap. An optional shared
 commit-loss capability now covers commit-boundary connection loss over the
-plain `NoTls` transport (see below), and a separate serialized live test now
+plain `NoTls` transport and a separately authenticated TLS client leg that
+terminates at a bounded test proxy (DR-0074; see below), and a separate serialized live test now
 covers database-process SIGKILL and WAL recovery on a live host with a live
 page cache (DR-0069). Separate bounded disposable-container tests cover
 pre-commit data-tablespace ENOSPC (DR-0070) and pre-commit WAL-filesystem
@@ -1203,7 +1204,8 @@ and a valid missing-state gate rejection; this is rehearsal evidence for one
 not close the backup/restore evidence criterion below. In-flight
 cancellation, abrupt host/power loss, storage write-cache
 flush/torn-write/media/filesystem faults, commit-boundary or real-device
-ENOSPC, TLS-path connection loss, point-in-time recovery, continuous WAL
+ENOSPC, PostgreSQL-server/provider TLS beyond the bounded DR-0074 client leg,
+point-in-time recovery, continuous WAL
 archiving, hot/concurrent backup, checkpoint publication, blob-manifest/
 state-root/encryption-key verification, capacity/load/soak, connection-pool
 behavior under a provider-managed pooler, real writer failover, and
@@ -1221,7 +1223,8 @@ writer-fence cases. PostgreSQL additionally injects unsupported schema metadata
 and a real serialization abort at an exhausted retry ceiling when the live-test
 URL is configured; CI supplies it. A separate optional `CommitLossFixture`
 capability, implemented only by that same live PostgreSQL test through a
-bounded `NoTls` TCP proxy, can sever the connection either immediately before
+bounded `NoTls` TCP proxy and a separate required-TLS client-to-terminator
+proxy, can sever the connection either immediately before
 a dispatched `COMMIT` reaches the backend or immediately after the backend
 returns a successful acknowledgement for it; both instants classify as
 `Indeterminate(ConnectionLost)`. The shared case injects the pre-dispatch
@@ -1240,8 +1243,14 @@ a same-lease claim replay or same-identity acknowledgement replay alone would
 succeed identically whether or not the prior transaction actually persisted.
 A final unfaulted commit proves the connection pool recovers afterward. This
 shows the backend returned a successful acknowledgement before the driver
-lost it, not crash durability under abrupt process/power loss, and it says
-nothing about TLS-path connection loss. A separate serialized live test now
+lost it, not crash durability under abrupt process/power loss. The TLS proxy
+requires ordinary PostgreSQL `SSLRequest`, uses an ephemeral private CA and a
+`localhost`-only server certificate, rejects an IP-host negative connection,
+and records completed authenticated handshakes before running the exact same
+shared cases. It terminates TLS and relays plaintext to PostgreSQL, so it proves
+only client/driver-to-test-terminator TLS loss behavior, not server-terminated
+TLS, provider PKI/mTLS/rotation/revocation, or production readiness. A
+separate serialized live test now
 proves database-process SIGKILL and WAL recovery on a live host with a live
 page cache (DR-0069). Separate disposable-container scenarios prove bounded
 data-tablespace ENOSPC before `COMMIT` and exact recovery after space is
@@ -1262,7 +1271,8 @@ missing-state gate rejection
 (DR-0073); none of these
 tests prove abrupt host/power loss, storage write-cache
 flush/torn-write/media/filesystem faults, commit-boundary or
-real-device ENOSPC, TLS-path behavior, point-in-time recovery, continuous WAL
+real-device ENOSPC, PostgreSQL-server/provider TLS beyond DR-0074,
+point-in-time recovery, continuous WAL
 archiving, hot/concurrent backup, checkpoint publication, blob-manifest/
 state-root/encryption-key verification, capacity/load/soak,
 connection-pool behavior under a provider-managed pooler, real writer
@@ -1597,17 +1607,18 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   commit proves the connection pool recovers a healthy connection. This is
   evidence that the backend returned a successful acknowledgement before the
   driver lost it; it is not proof of crash durability under abrupt
-  process/power loss, and it proves nothing about TLS-path connection loss.
-  This evidence is additive to, not a replacement for, DR-0061's existing
-  induced-abort/schema-skew coverage. The only current implementation is a
-  bounded, test-only `NoTls`
-  TCP proxy in `runtime-postgres`'s live PostgreSQL test: it binds port 0,
+  process/power loss. This evidence is additive to, not a replacement for,
+  DR-0061's existing induced-abort/schema-skew coverage. The first
+  implementation is a bounded, test-only `NoTls` TCP proxy in
+  `runtime-postgres`'s live PostgreSQL test: it binds port 0,
   relays the untyped startup message and every later typed frame, detects
   the exact simple-query `COMMIT` a durable commit, claim, or acknowledgement
   dispatches last, and tracks the one active physical connection so `Drop`
   can sever it directly instead of waiting on the pool's own client teardown
-  or the bounded per-socket I/O timeout. Keep abrupt process/power fault,
-  disk-full/WAL exhaustion, TLS-path connection loss, backup/restore,
+  or the bounded per-socket I/O timeout. DR-0074 adds the same shared suite
+  over a strictly authenticated client-to-test-terminator TLS leg. Keep abrupt
+  process/power fault, disk-full/WAL exhaustion, PostgreSQL-server/provider TLS,
+  backup/restore,
   capacity/load/soak, real writer failover, client disconnect, and in-flight
   cancellation deferred.
 - DR-0064: Activate the already-normalized generation-one object tables through
@@ -2044,6 +2055,19 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   read by anything in this crate), blob-manifest verification, state-root
   verification, encryption-key verification, multi-database/whole-cluster
   backup, backup under concurrent adapter write traffic, real storage-device
-  or off-host transfer faults, capacity/load/soak, TLS-path connection loss,
+  or off-host transfer faults, capacity/load/soak, PostgreSQL-server/provider TLS,
   real writer failover beyond the one bounded fence advance proven here, or
   production certification.
+- DR-0074: Run the existing shared commit-loss conformance a second time
+  through a bounded test-only TLS terminator. The client uses ordinary
+  PostgreSQL `SSLRequest` with `SslMode::Require`; rustls trusts only an
+  ephemeral private CA and validates a `localhost` SAN, while a live IP-host
+  negative connection must fail. The proxy counts completed authenticated
+  handshakes, then inspects the decrypted PostgreSQL frames and injects the
+  same before-dispatch and after-backend-acceptance faults, preserving the
+  independent state/receipt/claim/ack ground-truth probes and pool-recovery
+  proof. The proxy's backend leg is plaintext to the dedicated test database.
+  This changes no schema, canonical bytes, or protocol behavior and proves
+  only client/driver-to-test-terminator TLS connection-loss classification;
+  PostgreSQL-server TLS, provider trust stores, mTLS, certificate
+  rotation/revocation, and production certification remain open.

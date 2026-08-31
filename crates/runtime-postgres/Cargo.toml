@@ -12,4 +12,8 @@ runtime.workspace = true
 
 [dev-dependencies]
 objects.workspace = true
+postgres_rustls.workspace = true
+rcgen.workspace = true
 runtime = { workspace = true, features = ["durable-conformance"] }
+rustls.workspace = true
+tokio = { workspace = true, features = ["io-util", "sync", "time"] }
