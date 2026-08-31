@@ -293,7 +293,9 @@ accepts no effect, Write accepts exactly one same-identity `Mutated` effect with
 an exact previous version and checked `+1` version, and Consume accepts exactly
 one exact-version `Deleted` effect. Creation, undeclared or duplicate effects,
 owner/type/schema changes, unsupported owners, overflow, and missing trusted
-creation context fail closed. A Write is encoded canonically, bounded again,
+creation context fail closed. A Write is encoded canonically, and its new body
+shares the same 8 MiB invocation budget already charged by verified input
+bodies rather than receiving a second independent allowance. It is then
 hashed with the active Object suite from trusted chain/protocol/epoch context,
 and translated into a new immutable version plus Update mutation while
 preserving its routing projection; Consume translates to Delete. The live

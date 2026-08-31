@@ -2703,8 +2703,12 @@ where
     // after deterministic execution supplies effects and trusted checkpoint
     // context. Write/Consume are still rejected during dispatch validation.
     let no_object_effects: &[ObjectEffect] = &[];
-    let object_mutations: Vec<DurableObjectMutationEntry> =
-        translate_authenticated_object_effects(loaded_objects.verified(), no_object_effects, None)?;
+    let object_mutations: Vec<DurableObjectMutationEntry> = translate_authenticated_object_effects(
+        loaded_objects.verified(),
+        no_object_effects,
+        None,
+        loaded_objects.total_body_bytes(),
+    )?;
 
     let mut values = BTreeMap::new();
     for access in plan.accesses() {
@@ -2946,6 +2950,7 @@ where
 
         loaded.push(object_id, access.mode, head, object.clone());
     }
+    loaded.set_total_body_bytes(total_body_bytes);
     Ok(loaded)
 }
 

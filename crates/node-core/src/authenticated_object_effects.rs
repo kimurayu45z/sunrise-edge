@@ -28,7 +28,7 @@ pub(super) struct VerifiedAuthenticatedObject {
 }
 
 impl VerifiedAuthenticatedObject {
-    pub(super) const fn new(mode: AccessMode, head: DurableObjectHead, object: Object) -> Self {
+    const fn new(mode: AccessMode, head: DurableObjectHead, object: Object) -> Self {
         Self { mode, head, object }
     }
 }
@@ -37,6 +37,7 @@ impl VerifiedAuthenticatedObject {
 pub(super) struct LoadedAuthenticatedObjects {
     reads: Vec<DurableObjectHeadRead>,
     verified: Vec<VerifiedAuthenticatedObject>,
+    total_body_bytes: usize,
 }
 
 impl LoadedAuthenticatedObjects {
@@ -44,6 +45,7 @@ impl LoadedAuthenticatedObjects {
         Self {
             reads: Vec::with_capacity(capacity),
             verified: Vec::with_capacity(capacity),
+            total_body_bytes: 0,
         }
     }
 
@@ -64,12 +66,32 @@ impl LoadedAuthenticatedObjects {
         &self.verified
     }
 
+    /// Records the already bounds-checked total inline body bytes loaded for
+    /// this invocation's verified objects, so the effect translator can share
+    /// one aggregate budget with the loader instead of starting a second one.
+    pub(super) fn set_total_body_bytes(&mut self, total_body_bytes: usize) {
+        self.total_body_bytes = total_body_bytes;
+    }
+
+    pub(super) fn total_body_bytes(&self) -> usize {
+        self.total_body_bytes
+    }
+
     pub(super) fn into_reads(self) -> Vec<DurableObjectHeadRead> {
         self.reads
     }
 }
 
 /// Trusted context required only when execution creates a new immutable version.
+///
+/// The caller must construct this only from the already-validated event
+/// context (the same `chain_id`, `protocol_version`, and `epoch` the ingress
+/// path verified before dispatch), never from unauthenticated request input.
+/// `created_checkpoint` is trusted verbatim by this module: it is not
+/// re-derived or bounded here, so the future call site that supplies it is
+/// responsible for enforcing that checkpoints are monotonically
+/// non-decreasing across an object's version history before constructing
+/// this context.
 pub(super) struct TrustedObjectMutationContext<'a> {
     pub(super) resolver: &'a HashSuiteResolver,
     pub(super) chain_id: &'a ChainId,
@@ -84,10 +106,18 @@ pub(super) struct TrustedObjectMutationContext<'a> {
 /// read-only inputs. The Write/Consume execution integration will supply a trusted
 /// mutation context in the next Developer MVP slice; until then the ingress path
 /// continues to reject those access modes before storage I/O.
+///
+/// `loaded_body_bytes` is the already bounds-checked total inline body bytes
+/// the loader read for `verified` (see
+/// [`LoadedAuthenticatedObjects::total_body_bytes`]). New update bodies are
+/// added on top of it so old verified bodies and new update bodies share one
+/// `MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES` budget instead of two
+/// independent budgets.
 pub(super) fn translate_authenticated_object_effects(
     verified: &[VerifiedAuthenticatedObject],
     effects: &[ObjectEffect],
     context: Option<&TrustedObjectMutationContext<'_>>,
+    loaded_body_bytes: usize,
 ) -> Result<Vec<DurableObjectMutationEntry>, NodeCoreError> {
     if effects.len() > MAX_AUTHENTICATED_OBJECT_READS {
         return Err(NodeCoreError::TooManyObjectEffects {
@@ -112,7 +142,7 @@ pub(super) fn translate_authenticated_object_effects(
     }
 
     let mut mutations: Vec<DurableObjectMutationEntry> = Vec::new();
-    let mut represented_body_bytes: usize = 0;
+    let mut represented_body_bytes: usize = loaded_body_bytes;
     for input in verified {
         let object_id: ObjectId = input.object.id;
         let effect: Option<&ObjectEffect> = effects_by_id.remove(&object_id);
@@ -355,6 +385,7 @@ mod tests {
                 new_object: next.clone(),
             }],
             Some(&context),
+            0,
         )
         .unwrap();
 
@@ -406,6 +437,7 @@ mod tests {
                 version: current.version,
             }],
             None,
+            0,
         )
         .unwrap();
 
@@ -421,6 +453,7 @@ mod tests {
                 &[verified(AccessMode::Read, current.clone())],
                 &[],
                 None,
+                0,
             ),
             Ok(Vec::new())
         );
@@ -432,6 +465,7 @@ mod tests {
                     version: current.version,
                 }],
                 None,
+                0,
             ),
             Err(NodeCoreError::ObjectEffectMismatch { .. })
         ));
@@ -454,6 +488,7 @@ mod tests {
                     version: undeclared.version,
                 }],
                 None,
+                0,
             ),
             Err(NodeCoreError::UndeclaredObjectEffect { .. })
         ));
@@ -462,6 +497,7 @@ mod tests {
                 &[verified(AccessMode::Consume, first.clone())],
                 &[duplicate_effect.clone(), duplicate_effect],
                 None,
+                0,
             ),
             Err(NodeCoreError::DuplicateObjectEffect { .. })
         ));
@@ -470,6 +506,7 @@ mod tests {
                 &[verified(AccessMode::Read, first)],
                 &[ObjectEffect::Created(undeclared)],
                 None,
+                0,
             ),
             Err(NodeCoreError::ObjectCreationUnsupported { .. })
         ));
@@ -481,7 +518,7 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            translate_authenticated_object_effects(&[], &excessive_effects, None),
+            translate_authenticated_object_effects(&[], &excessive_effects, None, 0),
             Err(NodeCoreError::TooManyObjectEffects {
                 actual: MAX_AUTHENTICATED_OBJECT_READS + 1,
                 maximum: MAX_AUTHENTICATED_OBJECT_READS,
@@ -506,6 +543,7 @@ mod tests {
                     new_object: next,
                 }],
                 None,
+                0,
             ),
             Err(NodeCoreError::ObjectVersionOverflow { .. })
         ));
@@ -519,6 +557,7 @@ mod tests {
                     version: immutable.version,
                 }],
                 None,
+                0,
             ),
             Err(NodeCoreError::ObjectOwnerKindUnsupported { .. })
         ));
@@ -535,6 +574,7 @@ mod tests {
                     new_object: next.clone(),
                 }],
                 None,
+                0,
             ),
             Err(NodeCoreError::ObjectMutationContextMissing { .. })
         ));
@@ -556,6 +596,7 @@ mod tests {
                     new_object: next.clone(),
                 }],
                 Some(&mismatched_context),
+                0,
             ),
             Err(NodeCoreError::ObjectEffectMismatch { .. })
         ));
@@ -577,6 +618,7 @@ mod tests {
                     new_object: next,
                 }],
                 Some(&context),
+                0,
             ),
             Err(NodeCoreError::ObjectEffectMismatch { .. })
         ));
@@ -586,6 +628,299 @@ mod tests {
                 &[verified(AccessMode::Write, current)],
                 &[],
                 Some(&context),
+                0,
+            ),
+            Err(NodeCoreError::ObjectEffectMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn write_effect_must_advance_version_by_exactly_one() {
+        let current = object(5, Owner::Address(Address::new([0x53; 32])), vec![0x0d]);
+        let mut next = current.clone();
+        next.version = 7;
+        next.data = vec![0x0e];
+        assert!(matches!(
+            translate_authenticated_object_effects(
+                &[verified(AccessMode::Write, current.clone())],
+                &[ObjectEffect::Mutated {
+                    previous_version: current.version,
+                    new_object: next,
+                }],
+                None,
+                0,
+            ),
+            Err(NodeCoreError::ObjectEffectMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn write_effect_rejects_wrong_previous_version() {
+        let current = object(5, Owner::Address(Address::new([0x54; 32])), vec![0x0f]);
+        let mut next = current.clone();
+        next.version = 6;
+        next.data = vec![0x10];
+        assert!(matches!(
+            translate_authenticated_object_effects(
+                &[verified(AccessMode::Write, current.clone())],
+                &[ObjectEffect::Mutated {
+                    previous_version: current.version.wrapping_sub(1),
+                    new_object: next,
+                }],
+                None,
+                0,
+            ),
+            Err(NodeCoreError::ObjectEffectMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn write_effect_rejects_new_object_identity_change() {
+        let current = object(5, Owner::Address(Address::new([0x55; 32])), vec![0x11]);
+        let mut next = current.clone();
+        next.version = 6;
+        next.id = ObjectId::new([0x56; 32]);
+        assert!(matches!(
+            translate_authenticated_object_effects(
+                &[verified(AccessMode::Write, current.clone())],
+                &[ObjectEffect::Mutated {
+                    previous_version: current.version,
+                    new_object: next,
+                }],
+                None,
+                0,
+            ),
+            Err(NodeCoreError::ObjectEffectMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn write_effect_rejects_type_hash_change() {
+        let current = object(5, Owner::Address(Address::new([0x57; 32])), vec![0x12]);
+        let mut next = current.clone();
+        next.version = 6;
+        next.type_hash = Digest32::new(HashAlgorithmId::Sha2_256, [0x58; 32]);
+        assert!(matches!(
+            translate_authenticated_object_effects(
+                &[verified(AccessMode::Write, current.clone())],
+                &[ObjectEffect::Mutated {
+                    previous_version: current.version,
+                    new_object: next,
+                }],
+                None,
+                0,
+            ),
+            Err(NodeCoreError::ObjectEffectMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn write_effect_rejects_schema_version_change() {
+        let current = object(5, Owner::Address(Address::new([0x59; 32])), vec![0x13]);
+        let mut next = current.clone();
+        next.version = 6;
+        next.schema_version += 1;
+        assert!(matches!(
+            translate_authenticated_object_effects(
+                &[verified(AccessMode::Write, current.clone())],
+                &[ObjectEffect::Mutated {
+                    previous_version: current.version,
+                    new_object: next,
+                }],
+                None,
+                0,
+            ),
+            Err(NodeCoreError::ObjectEffectMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn write_access_rejects_deleted_effect_variant() {
+        let current = object(5, Owner::Address(Address::new([0x5a; 32])), vec![0x14]);
+        assert!(matches!(
+            translate_authenticated_object_effects(
+                &[verified(AccessMode::Write, current.clone())],
+                &[ObjectEffect::Deleted {
+                    id: current.id,
+                    version: current.version,
+                }],
+                None,
+                0,
+            ),
+            Err(NodeCoreError::ObjectEffectMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn consume_access_rejects_mutated_effect_variant() {
+        let current = object(5, Owner::Address(Address::new([0x5b; 32])), vec![0x15]);
+        let mut next = current.clone();
+        next.version = 6;
+        next.data = vec![0x16];
+        assert!(matches!(
+            translate_authenticated_object_effects(
+                &[verified(AccessMode::Consume, current.clone())],
+                &[ObjectEffect::Mutated {
+                    previous_version: current.version,
+                    new_object: next,
+                }],
+                None,
+                0,
+            ),
+            Err(NodeCoreError::ObjectEffectMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn consume_effect_rejects_version_mismatch() {
+        let current = object(5, Owner::Address(Address::new([0x5c; 32])), vec![0x17]);
+        assert!(matches!(
+            translate_authenticated_object_effects(
+                &[verified(AccessMode::Consume, current.clone())],
+                &[ObjectEffect::Deleted {
+                    id: current.id,
+                    version: current.version.wrapping_sub(1),
+                }],
+                None,
+                0,
+            ),
+            Err(NodeCoreError::ObjectEffectMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn write_effect_rejects_resolver_protocol_version_mismatch() {
+        let current = object(5, Owner::Address(Address::new([0x5d; 32])), vec![0x18]);
+        let mut next = current.clone();
+        next.version = 6;
+        next.data = vec![0x19];
+        let resolver = resolver();
+        let chain_id = ChainId::new("sunrise-mvp").unwrap();
+        let mismatched_context = TrustedObjectMutationContext {
+            resolver: &resolver,
+            chain_id: &chain_id,
+            protocol_version: ProtocolVersion::new(2),
+            epoch: Epoch::new(0),
+            created_checkpoint: 1,
+        };
+        assert!(matches!(
+            translate_authenticated_object_effects(
+                &[verified(AccessMode::Write, current)],
+                &[ObjectEffect::Mutated {
+                    previous_version: 5,
+                    new_object: next,
+                }],
+                Some(&mismatched_context),
+                0,
+            ),
+            Err(NodeCoreError::ObjectEffectMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn write_effect_rejects_per_object_body_over_bound() {
+        let current = object(5, Owner::Address(Address::new([0x5e; 32])), Vec::new());
+        let mut next = current.clone();
+        next.version = 6;
+        let empty_length = encode_object(&next).unwrap().len();
+        next.data = vec![0; MAX_AUTHENTICATED_OBJECT_BODY_BYTES + 1 - empty_length];
+        let body_length = encode_object(&next).unwrap().len();
+        let resolver = resolver();
+        let chain_id = ChainId::new("sunrise-mvp").unwrap();
+        let context = TrustedObjectMutationContext {
+            resolver: &resolver,
+            chain_id: &chain_id,
+            protocol_version: ProtocolVersion::new(1),
+            epoch: Epoch::new(0),
+            created_checkpoint: 1,
+        };
+        assert_eq!(
+            translate_authenticated_object_effects(
+                &[verified(AccessMode::Write, current)],
+                &[ObjectEffect::Mutated {
+                    previous_version: 5,
+                    new_object: next.clone(),
+                }],
+                Some(&context),
+                0,
+            ),
+            Err(NodeCoreError::ObjectBodyTooLarge {
+                object_id: next.id,
+                actual: body_length,
+                maximum: MAX_AUTHENTICATED_OBJECT_BODY_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn write_effect_rejects_aggregate_body_bound_with_already_loaded_bytes() {
+        let current = object(5, Owner::Address(Address::new([0x5f; 32])), Vec::new());
+        let mut next = current.clone();
+        next.version = 6;
+        next.data = vec![0; 32];
+        let body_length = encode_object(&next).unwrap().len();
+        assert!(body_length < MAX_AUTHENTICATED_OBJECT_BODY_BYTES);
+        // The loader already accounted for this many old-body bytes; one more
+        // small new-body byte must be enough to cross the shared aggregate
+        // budget even though the new body alone is far under the per-object
+        // bound.
+        let loaded_body_bytes = MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES - body_length + 1;
+        let resolver = resolver();
+        let chain_id = ChainId::new("sunrise-mvp").unwrap();
+        let context = TrustedObjectMutationContext {
+            resolver: &resolver,
+            chain_id: &chain_id,
+            protocol_version: ProtocolVersion::new(1),
+            epoch: Epoch::new(0),
+            created_checkpoint: 1,
+        };
+        assert_eq!(
+            translate_authenticated_object_effects(
+                &[verified(AccessMode::Write, current)],
+                &[ObjectEffect::Mutated {
+                    previous_version: 5,
+                    new_object: next.clone(),
+                }],
+                Some(&context),
+                loaded_body_bytes,
+            ),
+            Err(NodeCoreError::ObjectBodyTooLarge {
+                object_id: next.id,
+                actual: loaded_body_bytes + body_length,
+                maximum: MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn write_effect_rejects_non_current_head() {
+        let current = object(5, Owner::Address(Address::new([0x60; 32])), vec![0x1a]);
+        let mut next = current.clone();
+        next.version = 6;
+        next.data = vec![0x1b];
+        let non_current = VerifiedAuthenticatedObject::new(
+            AccessMode::Write,
+            DurableObjectHead::Absent,
+            current.clone(),
+        );
+        let resolver = resolver();
+        let chain_id = ChainId::new("sunrise-mvp").unwrap();
+        let context = TrustedObjectMutationContext {
+            resolver: &resolver,
+            chain_id: &chain_id,
+            protocol_version: ProtocolVersion::new(1),
+            epoch: Epoch::new(0),
+            created_checkpoint: 1,
+        };
+        assert!(matches!(
+            translate_authenticated_object_effects(
+                &[non_current],
+                &[ObjectEffect::Mutated {
+                    previous_version: 5,
+                    new_object: next,
+                }],
+                Some(&context),
+                0,
             ),
             Err(NodeCoreError::ObjectEffectMismatch { .. })
         ));
