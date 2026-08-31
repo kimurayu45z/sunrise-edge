@@ -539,16 +539,40 @@ owned-object effects, nonce, receipt, and outbox. Traps are normalized before
 their canonical effects enter a durable receipt. A new additive native-http
 composition, `preinstalled_wasm_structured_durable_router`, now invokes this
 path over HTTP; `structured_durable_router` remains on the read-only
-entrypoint and is unaffected. The immediate sequence is to wire the local
-devnet binary/startup around it, expose bounded query APIs, then build a
-TypeScript client and counter demo with restart and duplicate-request E2E
-coverage. The TypeScript client and counter demo stay in this monorepo (as
-top-level `clients/typescript` and `demo/counter` once implemented) through
-the Developer MVP Gate; extraction into their own repositories is deferred
-until the canonical contracts/vectors are stable, a real independent consumer
-or release cadence exists, and E2E can target a released devnet artifact (see
-`ARCHITECTURE.md` DR-0080). The MVP remains single-validator, owned-object
-only, fee-free, local-SQLite, and explicitly non-production.
+entrypoint and is unaffected.
+
+The planned Developer MVP product surface (see `ARCHITECTURE.md` DR-0081) will
+be implemented in this order: `apps/devnet` (a local devnet binary/startup
+composition around the existing preinstalled-WASM route); a separate bounded
+query-API slice in the protocol/native HTTP surfaces for chain/context info,
+objects, receipts, and nonces; `clients/rust`; `apps/cli` (a
+Rust-only developer CLI depending only on `clients/rust`, never a Node/browser
+runtime), `clients/typescript`, `apps/explorer`, and `apps/wallet`. The
+explorer and wallet are separate static/CSR SvelteKit + shadcn-svelte apps —
+no request-time server-side rendering, server adapter, or server-held
+sessions/keys; build-time prerendering of a fixed static shell is allowed, and
+wallet signing keys stay in the browser only. These surfaces occupy six
+product paths under `apps/` and `clients/`. Restart/duplicate-request E2E
+coverage and explicit documented development-only limitations complete the
+gate. This sequence and layout supersede DR-0080's earlier `clients/typescript`/
+`demo/counter` pairing; no `demo/counter` directory is created. Extraction of
+any `clients/*` directory into its own repository remains deferred until the
+canonical contracts/vectors are stable, a real independent consumer or release
+cadence exists, and E2E can target a released devnet artifact.
+
+The planned devnet demonstration contract will be a preinstalled
+`sunrise.devnet.asset_account.v1` module with one `transfer` entrypoint
+between two ordinary, same-sender-owned asset-account objects, using the same
+single `AssetId`/account/transfer path as every other asset — there is no
+privileged native coin or special-cased balance/transfer/fee path. It will
+enforce conservation and fail closed on zero amount, underflow, overflow, and
+asset-ID mismatch.
+Because cross-owner destination authorization and object owner changes remain
+fail-closed on the existing owned-effects path, this demonstrates only
+same-sender asset movement, not user-to-user transfer; the devnet's fee
+registry stays empty and every transaction commits with `fee_payment: None`.
+The MVP remains single-validator, owned-object only, fee-free, local-SQLite,
+and explicitly non-production.
 
 The Phase 15-17 production exit criteria and accepted persistence designs are
 preserved. Additional capacity/load/soak evidence, PITR, HA/failover,

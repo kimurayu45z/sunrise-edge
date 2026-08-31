@@ -424,7 +424,15 @@ Bond assets and bond lifecycle are deferred.
 Slashing is deferred, but the architecture already separates message families for future equivocation evidence signatures.
 
 ## 18. Stablecoin fee lifecycle
-Stablecoin fee accounting is deferred.
+Stablecoin fee accounting is deferred. DR-0081 ratifies the governing
+constraint ahead of that implementation: a fee asset is an ordinary
+`fees::AssetId`-tagged asset account using the same single account/transfer
+path as every other asset, never a privileged native coin or a second
+balance/transfer implementation. Fee-asset selection (which `AssetId`(s) may
+pay fees, at what rate) is protocol policy layered over ordinary asset
+accounts, and any future fee-debit effect must reuse the same declared object
+access, exact-head assertions, and atomic object-effect commit as every other
+transfer.
 
 ## 19. Governance lifecycle
 Governance is the mechanism by which the active validator set and protocol
@@ -1408,6 +1416,84 @@ manufacture `IndeterminateCommitReason::CancellationRequested`;
 client-disconnect wiring, shutdown budgets, and in-flight cancellation remain
 separate work.
 
+## 42. Local devnet architecture
+
+DR-0081 fixes the local devnet's architecture ahead of its implementation so
+the client/app work that depends on it can target a stable contract. The
+devnet composes the existing `preinstalled_wasm_structured_durable_router`
+around a dedicated startup binary in `apps/devnet` (planned; not yet
+implemented) rather than introducing new protocol behavior:
+
+- **Strict loopback startup.** The devnet binds only a loopback address
+  (`127.0.0.1`/`::1`); it never binds a non-loopback interface, and
+  bundles no TLS termination, authentication, or public-exposure hardening.
+  This is a local developer fixture, not a hosted network.
+- **Persisted fence/boot generation.** After `SqliteDurableStore::open`
+  completes its existing schema/namespace bootstrap and verification, startup
+  reads the persisted writer fence through a new additive operator-only
+  accessor, advances that exact value with checked arithmetic, and uses the
+  result as that process's boot generation and `created_checkpoint`. It never
+  invents an in-memory substitute for missing or invalid durable metadata.
+  The accessor is part of the planned devnet implementation slice; it does not
+  exist yet. This flow makes boot generations non-decreasing across restarts
+  and fences stale request contexts from a prior process.
+- **SQLite structured store.** State, object, receipt, and outbox data use the
+  additive, local-only, non-production `SqliteDurableStore` (DR-0079), never
+  the opaque legacy `SqliteStateStore`; the two require separate files because
+  `PRAGMA application_id` is a whole-file SQLite property.
+- **Registry/catalog reconciliation at startup.** Before serving any request,
+  startup iterates and cross-checks every active `SystemModuleRegistry` entry
+  against every entry in the bounded immutable `PreinstalledModuleCatalog`
+  composed into the process. This closes, for the devnet only, the
+  request-time-only reconciliation gap left open by DR-0078/DR-0080 (on the
+  general preinstalled-WASM route, a mismatch discovered only at request time
+  remains an opaque `500`); a devnet startup mismatch instead fails devnet
+  boot outright with an operator-legible error.
+- **Seeded asset accounts.** Startup seeds exactly two ordinary
+  `sunrise.devnet.asset_account.v1` objects (`Owner::Address`) per configured
+  development owner. Both accounts carry the same fixed, non-placeholder
+  `fees::AssetId`; one starts funded and the other starts empty, so the bundled
+  `transfer` entrypoint has a same-sender source and destination account to
+  exercise immediately after boot. Their object IDs remain distinct and
+  deterministic for that owner and slot.
+- **Bounded asset-account transition.** An asset-account body is exactly 50
+  little-endian bytes: `body_version: u16 = 1`, `asset_id: [u8; 32]`,
+  `balance: u64`, and `sequence: u64`. `transfer` arguments are exactly 10
+  bytes: `args_version: u16 = 1` and a non-zero `amount: u64`. The signed
+  manifest declares exactly two `Write` objects in source/destination order.
+  Execution rejects unknown versions or lengths, unequal asset IDs,
+  insufficient source balance, destination overflow, and sequence overflow;
+  otherwise it writes both objects, increments both sequences, preserves the
+  combined balance, and emits `sunrise.devnet.asset_account.transferred.v1`
+  with the asset ID, amount, and resulting balances. The event and both
+  effects enter the same durable receipt and an exact duplicate replays that
+  receipt without applying either effect again.
+- **Dev-profile identities are not protocol claims.** The seeded `AssetId` and
+  asset-account `type_hash` are fixed, non-zero dev-profile identifiers so
+  clients can render and exercise the local fixture. No mint/metadata object
+  or on-chain asset registry currently vouches for them, and no new
+  `HashPurpose` is introduced by this local composition. Wallet and explorer
+  must therefore render the ID as opaque bytes plus an explicitly local label,
+  never as production asset metadata.
+- **No background sweeper.** The devnet runs no resident outbox-recovery loop,
+  timer, or scheduler; unattended recovery, when needed, is invoked the same
+  way the native binary already exposes it (see "Serverless runtime
+  constraints" and the scheduler-callable recovery API above), consistent with
+  treating process lifetime as a non-requirement.
+
+Current vs. planned: everything above is fixed architecture for `apps/devnet`;
+the binary and its startup wiring are not yet implemented, and neither is any
+`clients/*`/`apps/*` directory from DR-0081. The bounded query API (chain/
+context info, object reads, receipts, and an authenticated sender's next
+nonce) is the next separate implementation slice after the devnet binary
+itself, not part of this architecture entry. Known current limitations that
+must stay visible at devnet startup and in documentation once implemented:
+single validator; owned-object only (Create, Shared/System ownership, and
+blob bodies remain fail-closed); fee-free (`fee_payment: None`, empty fee
+registry); same-sender-only asset movement (no cross-owner transfer
+authorization); local SQLite only; and an overall non-production security/
+operations posture.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -2282,6 +2368,13 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   TypeScript client, a counter UI, and restart/duplicate E2E evidence; retain
   explicit single-validator, owned-only, fee-free, local-SQLite,
   non-production limitations.
+
+  **Amendment: product-surface deliverables superseded by DR-0081.** The
+  Developer MVP priority and production-hardening freeze above remain in
+  force. DR-0081 replaces only this entry's earlier TypeScript-client/counter-
+  UI completion shape with the ordered local-devnet/query/Rust-client/Rust-
+  CLI/TypeScript-client/explorer/wallet surface and its uniform asset-account
+  demonstration; the counter UI is cancelled, not merely deferred.
 - DR-0077: Expose owned Address-object Write/Consume as a separate additive
   authenticated node-core entrypoint rather than weakening the existing
   read-only path. Supply verified objects to the pure transition in signed
@@ -2543,3 +2636,91 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   released devnet artifact instead of an in-tree build. Until then, splitting
   them out would only add release/versioning coordination overhead without a
   concrete consumer to justify it.
+
+  **Amendment: repository-boundary deliverable superseded by DR-0081.** The
+  rest of this entry (the additive `native-http` composition, shared private
+  core, error classification, and test evidence) remains the accepted,
+  implemented history of what DR-0080 shipped and is not rewritten. Only the
+  repository-boundary decision immediately above is superseded: DR-0081
+  replaces the planned `clients/typescript`/`demo/counter` pairing with a
+  six-directory monorepo layout (`clients/rust`, `clients/typescript`,
+  `apps/devnet`, `apps/cli`, `apps/explorer`, `apps/wallet`) and a longer
+  ordered product-surface sequence; no `demo/counter` directory is created.
+  Consequently, the historical deferred-scope reference to "the counter UI"
+  above no longer names planned work; that deliverable is cancelled.
+  The extraction-timing reasoning stated above — wait for stable wire
+  contracts/vectors, a real independent consumer or release cadence, and a
+  released devnet artifact for E2E — is unchanged and still applies to every
+  `clients/*` directory under DR-0081.
+- DR-0081: Define the Developer MVP product-surface monorepo layout and ratify
+  a uniform fungible asset model ahead of implementation.
+
+  **Monorepo layout.** The repository gains six product paths under `apps/`
+  and `clients/` as each is implemented: `clients/rust` and `clients/typescript`
+  (protocol client libraries with no UI of their own), `apps/devnet` (the
+  local devnet binary/startup composition; see "Local devnet architecture"
+  above), `apps/cli` (a Rust-only developer CLI), and `apps/explorer`/
+  `apps/wallet` (browser applications). `apps/cli` depends only on
+  `clients/rust`: it is never a Node/JS/browser runtime and never talks to the
+  protocol through anything but `clients/rust`'s own encode/decode/signing/RPC
+  surface. `apps/explorer` and `apps/wallet` are separate SvelteKit
+  applications using shadcn-svelte (Luma) as their component layer, each built
+  and deployed as a static/CSR app only: no request-time server-side
+  rendering, no SvelteKit server adapter, no `+page.server`/`+layout.server`/
+  `+server` route files, and no server actions, remote functions, or
+  server-held sessions or keys in either app.
+  Build-time prerendering is allowed only for a fixed static shell; no dynamic
+  chain data may be embedded by that build.
+  `apps/wallet` generates, holds,
+  and uses signing keys only in the browser; no wallet key or signature is
+  ever generated on, or transits through, a server this project controls.
+  Both apps fetch dynamic chain data (objects, balances, receipts, chain/
+  context info) directly in the browser runtime through
+  `clients/typescript`, never through a bundler-time or server-side data
+  load. No shared UI package is introduced across `apps/explorer` and
+  `apps/wallet` until real duplication between the two actually exists.
+
+  **Developer MVP order.** Developer MVP completion order (see
+  `TODO.md#developer-mvp-gate`) is: local devnet, bounded query API, Rust
+  client, Rust CLI, TypeScript client, explorer, wallet, restart/duplicate
+  E2E, and explicit documented development-only limitations. This replaces
+  DR-0080's earlier "TypeScript client + counter demo UI" pairing; no
+  `demo/counter` directory is created.
+
+  **Uniform fungible asset model.** Every asset, including any future fee
+  asset, uses exactly one `AssetId`/account/transfer implementation path.
+  There is no privileged native coin, no second balance representation, and
+  no separate transfer or fee-debit code path for a "special" asset. Which
+  asset(s) may pay fees, and at what rate, is protocol policy layered over
+  ordinary asset accounts, not a second implementation of balances or
+  transfer (see "Stablecoin fee lifecycle" above). A future fee-debit effect
+  must reuse the same declared object access, the same exact-head assertions,
+  and the same atomic object-effect commit as every other asset transfer; it
+  may not bypass them with bespoke fee-only state.
+
+  **Local devnet module.** The local devnet's stateful preinstalled module is
+  `sunrise.devnet.asset_account.v1`, exposing one `transfer` entrypoint over
+  two ordinary owned asset-account objects that both belong to the same
+  sender. Both accounts carry the same configured 32-byte `fees::AssetId`
+  (never a placeholder or all-zero value), while their object identities are
+  distinct. The transition enforces
+  balance conservation (the debited and credited amounts are identical and
+  the combined balance across the two accounts is unchanged), and fails
+  closed on zero amount, amount underflow, amount overflow, and any asset-ID
+  mismatch between the two accounts. Because destination-owner
+  authorization for a transfer into an account owned by someone else, and any
+  change of an object's owner, remain fail-closed on the existing owned-
+  effects path (see "Node-core invocation boundary" above and DR-0077), this
+  module demonstrates only same-sender balance movement between two of the
+  sender's own asset accounts. It does not implement, and must not be
+  described as, user-to-user transfer. The devnet's fee registry stays empty
+  and every devnet transaction commits with `fee_payment: None`; this module
+  charges, computes, or debits no fee.
+
+  **Deferred beyond this MVP surface.** Cross-owner transfer authorization and
+  any change of object ownership; `Create` and any notion of "associated" or
+  auto-derived accounts; mint, burn, supply tracking, and asset metadata/
+  registry management; fee charging, gas accounting, and any fee-debit
+  effect; freeze, close, delegate, and allowance/approval semantics; Shared/
+  System object ownership; blob-backed object bodies and arbitrary module
+  upload; and all other production-hardening work already frozen by DR-0076.
