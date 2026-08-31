@@ -353,9 +353,10 @@ container over stdin via `docker exec -i ... dd of=<path> status=none` — one
 direct-argv call per file, no shell, no host bind mount, and (unlike `tee`)
 no echo of the written content into the captured command output: BusyBox
 `dd` writes only to the target file and, with `status=none`, produces no
-stdout/stderr at all, so the generated credential hash is never copied into
-a bounded-output temp file this scenario would otherwise have to create just
-to discard. The pool credential is a freshly generated password; with
+stdout or transfer statistics on stderr when successful, so the generated
+credential hash is never copied into a bounded-output temp file this scenario
+would otherwise have to create just to discard. The pool credential is a
+freshly generated password; with
 `password_encryption=md5` pinned on the PostgreSQL container,
 `pg_authid.rolpassword` is read back after setting it and used directly as
 the userlist's MD5 credential hash, never invented or hashed by the test
