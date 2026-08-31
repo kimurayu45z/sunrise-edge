@@ -1764,8 +1764,11 @@ Developer MVP completion criteria:
 3. committed `ProtocolConfig`から固定したactive system-module registryとbounded immutable
    preinstalled catalogのcode/manifest/semantics commitmentを照合し、object-onlyの
    deterministic WASM executionをowned-effects atomic durable entrypointへ接続する
-   （implemented As-Is in node-core）。canonical `ExecutionEffects`をresponseへ返し、trapは
-   object mutationなしのRejected receipt/nonceとしてcommitする。native HTTP/devnet wiringは未実装。
+   （implemented As-Is in node-core）。code/manifestはcommitted digest自身のalgorithmで再検証し、
+   epoch-only hash-suite rotation後もreadableとする。専用`SystemModuleManifest` hash purpose、
+   pre-activation gas ceiling、engine-independent trap normalizationを適用し、canonical
+   `ExecutionEffects`をresponseへ返す。trapはobject mutationなしのRejected receipt/nonceとして
+   commitする。zero-object callはこのMVP pathでは明示的に拒否し、native HTTP/devnet wiringは未実装。
 4. local devnet/query API、TypeScript client、counter demo UI、restart/duplicate E2Eを順に追加する。
 
 Phase 1:
@@ -2028,7 +2031,9 @@ Phase 15 As-Is scope:
   generic handlerはresolved objectを渡さず、返されたeffectを黙って捨てずにfail closedにする。
   bounded preinstalled module loadとdeterministic WASM executionはadditive node-core entrypointへ
   接続済みで、認証時のcommitted registry、immutable catalogのcode/manifest/semantics commitment、
-  manifest input boundをfail closedに照合し、canonical effectsをowned object atomic commitへ渡す。
+  manifest input boundとpre-activation gas ceilingをfail closedに照合し、code/manifest commitmentは
+  digest自身のalgorithmと専用SystemModule domainで再検証し、canonical effectsをowned object atomic
+  commitへ渡す。trap text/fuel accountingは固定reason/full-gas/empty-effectsへ正規化してから永続化する。
   exact replayはmodule resolve/object read/execution前にreceiptから返る。ただしnative HTTPはread-only
   entrypointを使い続ける。Shared/System owner、blob body、native/devnet module wiring、fee debit、owned fast path
   certificateは未実装である。

@@ -7,7 +7,8 @@
 //! upload — the only constructor is [`PreinstalledModuleCatalogEntry::new`],
 //! called by trusted node composition before serving traffic. Native HTTP
 //! wiring, JIT/AOT execution, and production gas metering remain deferred;
-//! see `ARCHITECTURE.md` and `TODO.md` (Developer MVP Gate, step 3).
+//! see `ARCHITECTURE.md` and `TODO.md` (Developer MVP Gate, step 3). See also
+//! DR-0078 in `ARCHITECTURE.md`.
 //!
 //! # `Transaction.module_ref` mapping (MVP)
 //!
@@ -23,8 +24,26 @@
 //! This reuses the existing `ObjectRef` wire shape without adding a new
 //! transaction field, at the cost of `module_ref` never denoting an actual
 //! stored `Object` on this MVP path.
+//!
+//! # Protocol-version bumps and commitment provenance
+//!
+//! [`hashing::frame_hash_input`] mixes `protocol_version` directly into the
+//! domain-separated hash frame, so a protocol-version bump changes every
+//! digest computed under it — including a registered module's
+//! `canonical_code_hash` and `manifest_hash`. This crate does not persist
+//! which protocol version originally produced a committed
+//! [`SystemModule`] entry, so those commitments are implicitly pinned to the
+//! `ProtocolConfig` version active when governance installed them. Until
+//! module commitment provenance is itself versioned (an explicit, tracked
+//! follow-up; no new persisted schema is added in this MVP slice),
+//! governance MUST re-commit every module's `canonical_code_hash` and
+//! `manifest_hash` in the new `ProtocolConfig` whenever `protocol_version`
+//! changes. An epoch-only
+//! hash-suite rotation, by contrast, does not require recommitment: see
+//! [`resolve_preinstalled_module`]'s use of [`hashing::verify_digest`].
 
-use hashing::HashSuiteResolver;
+use execution::{ExecutionEffects, ExecutionStatus};
+use hashing::{HashSuiteResolver, verify_digest};
 use objects::ObjectRef;
 use protocol_types::{Digest32, Epoch, HashPurpose};
 use system_modules::{
@@ -47,6 +66,18 @@ pub const MAX_PREINSTALLED_MODULE_WASM_BYTES: usize = 4 * 1024 * 1024;
 ///
 /// This is an MVP admission bound, not a measured capacity limit.
 pub const MAX_PREINSTALLED_MODULES: usize = 64;
+
+/// Conservative pre-activation ceiling on a preinstalled-WASM transaction's
+/// `gas_limit`, enforced before the WASM engine ever runs.
+///
+/// `execution::wasm_engine` enables `wasmi` fuel metering for executed WASM
+/// operations, so this bounds worst-case per-call interpreter work
+/// independent of any future fee-weighted gas schedule or production
+/// metering (both remain deferred; see the module-level docs). The value is
+/// deliberately conservative rather than tuned: it exists so one
+/// preinstalled call cannot request unbounded engine work, not to model a
+/// real gas market.
+pub const MAX_PREINSTALLED_MODULE_GAS_LIMIT: u64 = 10_000_000;
 
 /// One immutable, caller-supplied preinstalled module: its exact identity,
 /// canonical WASM bytes, canonical manifest, and committed semantics digest.
@@ -195,27 +226,30 @@ pub(crate) fn preinstalled_module_identity(module_ref: &ObjectRef) -> (ModuleId,
 /// 2. the exact `(module_id, version)` must exist in `catalog`;
 /// 3. the transaction's declared `module_ref.digest` must equal the
 ///    registry's committed `canonical_code_hash`;
-/// 4. the catalog entry's WASM bytes are independently rehashed with
-///    [`HashPurpose::ContractCode`] under `resolver` and must also equal
-///    `canonical_code_hash`;
-/// 5. the catalog entry's manifest is canonically re-encoded and rehashed
-///    with [`HashPurpose::ProtocolConfig`] (see below) and must equal the
-///    registry's committed `manifest_hash`;
+/// 4. the catalog entry's WASM bytes are independently reverified against
+///    `canonical_code_hash` under [`HashPurpose::ContractCode`] (see below);
+/// 5. the catalog entry's manifest is canonically re-encoded and reverified
+///    against the registry's committed `manifest_hash` under
+///    [`HashPurpose::SystemModuleManifest`] (see below);
 /// 6. the catalog entry's `semantics_hash` must equal the registry's
 ///    committed `semantics_hash`.
 ///
-/// # Manifest hash purpose
+/// # Verification uses the committed digest's own algorithm
 ///
-/// [`protocol_types::HashPurpose`] has no dedicated system-module-manifest
-/// purpose today (only [`protocol_types::HashDomain::SystemModule`] exists as
-/// an unused domain identifier). Rather than mint a new discriminant for this
-/// additive MVP slice, this function reuses the existing
-/// [`HashPurpose::ProtocolConfig`] purpose: a [`SystemModuleManifest`] is
-/// itself committed, governance-installed protocol configuration (it lives
-/// inside [`protocol_config::ProtocolConfig::system_modules`]), so its
-/// domain-separation semantics already match. Introducing a dedicated
-/// `HashPurpose::SystemModuleManifest` remains open follow-up work tracked in
-/// `ARCHITECTURE.md`.
+/// Steps 4 and 5 call [`hashing::verify_digest`] rather than
+/// `resolver.hash_for_purpose`. `verify_digest` rehashes using the algorithm
+/// already recorded inside the committed [`Digest32`] itself (`canonical_code_hash`/
+/// `manifest_hash`), together with `resolver`'s trusted `chain_id` and
+/// `protocol_version` — not the hash suite currently active at `epoch`. This
+/// keeps resolution correct across an epoch-only hash-suite rotation: a
+/// module committed under one suite's algorithm stays verifiable at a later
+/// epoch where a different suite is active, because the check only depends
+/// on the algorithm the commitment itself was made with, never on
+/// `resolver.suite_for_epoch(epoch)`. A `chain_id`/`protocol_version`
+/// mismatch between the transaction and `resolver` is still rejected before
+/// this function runs (see [`execution::hash_transaction`]), and a
+/// `protocol_version` bump changes the hash frame itself — see the
+/// module-level docs on why that instead requires governance recommitment.
 pub(crate) fn resolve_preinstalled_module<'a>(
     module_ref: &ObjectRef,
     registered: Option<&SystemModule>,
@@ -252,17 +286,27 @@ pub(crate) fn resolve_preinstalled_module<'a>(
             version,
         });
     }
-    let recomputed_code_hash =
-        resolver.hash_for_purpose(epoch, HashPurpose::ContractCode, entry.wasm_bytes())?;
-    if recomputed_code_hash != registered.canonical_code_hash {
+    let code_hash_verified = verify_digest(
+        &registered.canonical_code_hash,
+        HashPurpose::ContractCode,
+        resolver.protocol_version(),
+        resolver.chain_id(),
+        entry.wasm_bytes(),
+    )?;
+    if !code_hash_verified {
         return Err(NodeCoreError::PreinstalledModuleCodeHashMismatch { module_id, version });
     }
 
     let manifest_bytes =
         encode_system_module_manifest(entry.manifest()).map_err(NodeCoreError::from)?;
-    let recomputed_manifest_hash =
-        resolver.hash_for_purpose(epoch, HashPurpose::ProtocolConfig, &manifest_bytes)?;
-    if recomputed_manifest_hash != registered.manifest_hash {
+    let manifest_hash_verified = verify_digest(
+        &registered.manifest_hash,
+        HashPurpose::SystemModuleManifest,
+        resolver.protocol_version(),
+        resolver.chain_id(),
+        &manifest_bytes,
+    )?;
+    if !manifest_hash_verified {
         return Err(NodeCoreError::PreinstalledModuleManifestHashMismatch { module_id, version });
     }
 
@@ -271,6 +315,59 @@ pub(crate) fn resolve_preinstalled_module<'a>(
     }
 
     Ok(entry)
+}
+
+/// Rejects a preinstalled-WASM `gas_limit` above
+/// [`MAX_PREINSTALLED_MODULE_GAS_LIMIT`] before the engine ever runs.
+pub(crate) fn check_preinstalled_module_gas_limit(gas_limit: u64) -> Result<(), NodeCoreError> {
+    if gas_limit > MAX_PREINSTALLED_MODULE_GAS_LIMIT {
+        return Err(NodeCoreError::PreinstalledModuleGasLimitExceedsCeiling {
+            requested: gas_limit,
+            maximum: MAX_PREINSTALLED_MODULE_GAS_LIMIT,
+        });
+    }
+    Ok(())
+}
+
+/// The canonical, engine-independent failure reason recorded for every
+/// trapped preinstalled-WASM invocation.
+///
+/// A raw `wasmi`/contract trap message (see `execution::wasm_engine`) is
+/// untrusted, `wasmi`-version-dependent free text that can embed
+/// contract-controlled bytes (for example whatever a contract passes to the
+/// `abort` host function). Persisting it verbatim would make the committed
+/// receipt payload depend on engine internals and could leak contract text
+/// into storage. Every trapped call is normalized to this one fixed reason
+/// instead; see [`normalize_trapped_preinstalled_execution`].
+pub(crate) const PREINSTALLED_WASM_TRAP_REASON: &str = "preinstalled module execution trapped";
+
+/// Normalizes a trapped preinstalled-WASM execution result to the canonical,
+/// engine-independent closed failure shape before it is canonically encoded
+/// and persisted.
+///
+/// The normalized value fixes the failure reason to
+/// [`PREINSTALLED_WASM_TRAP_REASON`] (discarding the engine's own,
+/// untrusted trap text), charges the full `gas_limit` deterministically
+/// (discarding the engine's own fuel-remaining accounting, which is not
+/// guaranteed stable across engine versions for a trapped call), and leaves
+/// `object_effects`/`events` empty — matching
+/// `execution::wasm_engine::WasmExecutionEngine`'s own existing behavior of
+/// discarding every candidate effect on trap, asserted here rather than
+/// merely assumed.
+#[must_use]
+pub(crate) fn normalize_trapped_preinstalled_execution(
+    tx_hash: Digest32,
+    gas_limit: u64,
+) -> ExecutionEffects {
+    ExecutionEffects {
+        tx_hash,
+        status: ExecutionStatus::Failure {
+            reason: PREINSTALLED_WASM_TRAP_REASON.to_string(),
+        },
+        object_effects: Vec::new(),
+        events: Vec::new(),
+        gas_used: gas_limit,
+    }
 }
 
 #[cfg(test)]
@@ -316,6 +413,30 @@ mod tests {
         .unwrap()
     }
 
+    /// A resolver with two hash-suite schedule entries: the genesis
+    /// SHA2-256 suite at epoch 0, and a second SHA3-256 suite activating at
+    /// `rotation_epoch`.
+    fn resolver_with_rotation(rotation_epoch: Epoch) -> HashSuiteResolver {
+        HashSuiteResolver::new(
+            ChainId::new("sunrise-mvp").unwrap(),
+            ProtocolVersion::new(1),
+            vec![
+                HashSuiteSchedule {
+                    activation_epoch: Epoch::new(0),
+                    suite: HashSuite::genesis(),
+                },
+                HashSuiteSchedule {
+                    activation_epoch: rotation_epoch,
+                    suite: HashSuite::uniform(
+                        protocol_types::HashSuiteId::new(2),
+                        HashAlgorithmId::Sha3_256,
+                    ),
+                },
+            ],
+        )
+        .unwrap()
+    }
+
     fn sample_manifest(module_id: ModuleId) -> SystemModuleManifest {
         SystemModuleManifest {
             module_id,
@@ -347,8 +468,9 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn committed_module(
+    fn committed_module_at_epoch(
         resolver: &HashSuiteResolver,
+        commit_epoch: Epoch,
         module_id: ModuleId,
         version: u64,
         wasm: &[u8],
@@ -358,11 +480,15 @@ mod tests {
         status: ModuleStatus,
     ) -> SystemModule {
         let code_hash = resolver
-            .hash_for_purpose(Epoch::new(0), HashPurpose::ContractCode, wasm)
+            .hash_for_purpose(commit_epoch, HashPurpose::ContractCode, wasm)
             .unwrap();
         let manifest_bytes = encode_system_module_manifest(manifest).unwrap();
         let manifest_hash = resolver
-            .hash_for_purpose(Epoch::new(0), HashPurpose::ProtocolConfig, &manifest_bytes)
+            .hash_for_purpose(
+                commit_epoch,
+                HashPurpose::SystemModuleManifest,
+                &manifest_bytes,
+            )
             .unwrap();
         SystemModule {
             module_id,
@@ -373,6 +499,30 @@ mod tests {
             activation_epoch,
             status,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn committed_module(
+        resolver: &HashSuiteResolver,
+        module_id: ModuleId,
+        version: u64,
+        wasm: &[u8],
+        manifest: &SystemModuleManifest,
+        semantics_hash: Digest32,
+        activation_epoch: Epoch,
+        status: ModuleStatus,
+    ) -> SystemModule {
+        committed_module_at_epoch(
+            resolver,
+            Epoch::new(0),
+            module_id,
+            version,
+            wasm,
+            manifest,
+            semantics_hash,
+            activation_epoch,
+            status,
+        )
     }
 
     #[test]
@@ -408,6 +558,112 @@ mod tests {
                 .unwrap();
         assert_eq!(resolved.module_id(), id);
         assert_eq!(resolved.version(), 1);
+    }
+
+    #[test]
+    fn resolves_across_an_epoch_only_hash_suite_rotation() {
+        // The module is committed while the SHA2-256 genesis suite is
+        // active, at epoch 0.
+        let commit_resolver = resolver();
+        let id = module_id(0x08);
+        let manifest = sample_manifest(id);
+        let wasm = wasm_bytes();
+        let semantics_hash = digest(0x88);
+        let module = committed_module_at_epoch(
+            &commit_resolver,
+            Epoch::new(0),
+            id,
+            1,
+            &wasm,
+            &manifest,
+            semantics_hash,
+            Epoch::new(0),
+            ModuleStatus::Active,
+        );
+        assert_eq!(
+            module.canonical_code_hash.algorithm(),
+            HashAlgorithmId::Sha2_256
+        );
+        let mut registry = SystemModuleRegistry::new();
+        registry.add_module(module.clone()).unwrap();
+        let entry =
+            PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, semantics_hash).unwrap();
+        let catalog = PreinstalledModuleCatalog::new(vec![entry]).unwrap();
+        let module_ref = ObjectRef {
+            id: objects::ObjectId::new(*id.as_bytes()),
+            version: 1,
+            digest: module.canonical_code_hash,
+        };
+
+        // A resolver whose hash suite rotates to SHA3-256 at epoch 10: the
+        // *same* resolver config governs both the original commitment epoch
+        // and this later resolution epoch, but the transaction is resolved
+        // well after rotation.
+        let rotated_resolver = resolver_with_rotation(Epoch::new(10));
+        assert_eq!(
+            rotated_resolver
+                .suite_for_epoch(Epoch::new(20))
+                .unwrap()
+                .algorithm_for(HashPurpose::ContractCode),
+            HashAlgorithmId::Sha3_256
+        );
+
+        // Resolution at epoch 20 (after rotation) still succeeds: commitment
+        // verification uses the digest's own recorded SHA2-256 algorithm via
+        // `hashing::verify_digest`, not the SHA3-256 suite active at epoch
+        // 20.
+        let resolved = resolve_from_registry(
+            &module_ref,
+            &registry,
+            &catalog,
+            Epoch::new(20),
+            &rotated_resolver,
+        )
+        .unwrap();
+        assert_eq!(resolved.module_id(), id);
+        assert_eq!(resolved.version(), 1);
+
+        // A second module committed *after* rotation, under SHA3-256,
+        // resolves too, proving both schedule halves work through the same
+        // resolver.
+        let id2 = module_id(0x09);
+        let manifest2 = sample_manifest(id2);
+        let wasm2 = wasm_bytes();
+        let semantics_hash2 = digest(0x89);
+        let module2 = committed_module_at_epoch(
+            &rotated_resolver,
+            Epoch::new(20),
+            id2,
+            1,
+            &wasm2,
+            &manifest2,
+            semantics_hash2,
+            Epoch::new(0),
+            ModuleStatus::Active,
+        );
+        assert_eq!(
+            module2.canonical_code_hash.algorithm(),
+            HashAlgorithmId::Sha3_256
+        );
+        let mut registry2 = SystemModuleRegistry::new();
+        registry2.add_module(module2.clone()).unwrap();
+        let entry2 =
+            PreinstalledModuleCatalogEntry::new(id2, 1, wasm2, manifest2, semantics_hash2).unwrap();
+        let catalog2 = PreinstalledModuleCatalog::new(vec![entry2]).unwrap();
+        let module_ref2 = ObjectRef {
+            id: objects::ObjectId::new(*id2.as_bytes()),
+            version: 1,
+            digest: module2.canonical_code_hash,
+        };
+        let resolved2 = resolve_from_registry(
+            &module_ref2,
+            &registry2,
+            &catalog2,
+            Epoch::new(20),
+            &rotated_resolver,
+        )
+        .unwrap();
+        assert_eq!(resolved2.module_id(), id2);
     }
 
     #[test]

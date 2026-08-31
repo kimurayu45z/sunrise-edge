@@ -18,4 +18,4 @@ system-modules.workspace = true
 
 [dev-dependencies]
 ed25519-zebra.workspace = true
-wat = "1"
+wat.workspace = true

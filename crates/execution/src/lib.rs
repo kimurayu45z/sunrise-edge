@@ -244,8 +244,18 @@ impl From<FeeError> for ExecutionError {
 /// 1. `chain_id`, `protocol_version`, and `epoch` match the active context.
 /// 2. The sender `signature` over the canonical transaction encoding is valid.
 /// 3. The `access_manifest` covers every object the contract will touch.
-/// 4. The `module_ref` points to a known WASM module object.
-/// 5. `gas_limit` does not exceed the per-transaction protocol maximum.
+/// 4. `module_ref` identifies the code to execute; this crate does not fix
+///    how. A caller may interpret it as a stored `Object` reference or,
+///    as `node-core`'s current preinstalled-module MVP composition does,
+///    reinterpret its `ObjectId`/version/digest fields as a direct
+///    `(module_id, version, canonical_code_hash)` lookup into a
+///    governance-managed system-module registry with no backing `Object` at
+///    all.
+/// 5. `gas_limit` is bounded by whatever ceiling the calling composition
+///    enforces. This crate does not itself fix or enforce a protocol-wide
+///    maximum; `node-core`'s preinstalled-module MVP composition currently
+///    enforces its own conservative pre-activation ceiling before running the
+///    engine.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transaction {
     /// Chain replay protection identifier.
@@ -260,7 +270,9 @@ pub struct Transaction {
     pub nonce: u64,
     /// All objects the transaction may access, with their access modes.
     pub access_manifest: AccessManifest,
-    /// Reference to the WASM module object that will be executed.
+    /// Reference interpreted by the calling composition to select executable
+    /// code. The preinstalled-module MVP maps its id/version/digest directly
+    /// to a governed module record rather than a stored object.
     pub module_ref: ObjectRef,
     /// Entry-point function to invoke inside the module.
     pub entrypoint: String,

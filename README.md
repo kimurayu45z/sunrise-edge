@@ -489,13 +489,15 @@ before further production hardening. The owned-object Write/Consume durable
 composition and an additive trusted preinstalled-WASM node-core entrypoint are
 now available. The latter resolves the exact active module record captured
 from committed `ProtocolConfig`, checks the preinstalled
-code/manifest/semantics commitments, executes bounded deterministic WASM, and
-atomically commits its owned-object effects, nonce, receipt, and outbox. Native
-HTTP does not invoke this path yet. The immediate sequence is to wire it into
-the local devnet, expose bounded query APIs, then build a TypeScript client and
-counter demo with restart and duplicate-request E2E coverage. The MVP remains
-single-validator, owned-object only, fee-free, local-SQLite, and explicitly
-non-production.
+code/manifest/semantics commitments under dedicated hash domains, remains
+compatible with epoch-only hash-suite rotation, enforces a conservative fuel
+ceiling, executes bounded deterministic WASM, and atomically commits its
+owned-object effects, nonce, receipt, and outbox. Traps are normalized before
+their canonical effects enter a durable receipt. Native HTTP does not invoke
+this path yet. The immediate sequence is to wire it into the local devnet,
+expose bounded query APIs, then build a TypeScript client and counter demo with
+restart and duplicate-request E2E coverage. The MVP remains single-validator,
+owned-object only, fee-free, local-SQLite, and explicitly non-production.
 
 The Phase 15-17 production exit criteria and accepted persistence designs are
 preserved. Additional capacity/load/soak evidence, PITR, HA/failover,

@@ -46,12 +46,15 @@ pub mod transaction_auth;
 use authenticated_object_effects::{
     LoadedAuthenticatedObjects, translate_authenticated_object_effects,
 };
-use preinstalled_wasm::resolve_preinstalled_module;
+use preinstalled_wasm::{
+    check_preinstalled_module_gas_limit, normalize_trapped_preinstalled_execution,
+    resolve_preinstalled_module,
+};
 
 pub use execution::{ObjectEffect, ResolvedObject};
 pub use preinstalled_wasm::{
-    MAX_PREINSTALLED_MODULE_WASM_BYTES, MAX_PREINSTALLED_MODULES, PreinstalledModuleCatalog,
-    PreinstalledModuleCatalogEntry,
+    MAX_PREINSTALLED_MODULE_GAS_LIMIT, MAX_PREINSTALLED_MODULE_WASM_BYTES,
+    MAX_PREINSTALLED_MODULES, PreinstalledModuleCatalog, PreinstalledModuleCatalogEntry,
 };
 pub use transaction_auth::{
     AuthenticatedTransaction, MAX_TRANSACTION_SIGNABLE_BYTES, TransactionAuthError,
@@ -539,6 +542,17 @@ pub enum NodeCoreError {
         /// Maximum accepted argument byte length.
         maximum: u64,
     },
+    /// The transaction's `gas_limit` exceeded the pre-activation preinstalled
+    /// WASM ceiling.
+    PreinstalledModuleGasLimitExceedsCeiling {
+        /// Requested gas limit.
+        requested: u64,
+        /// Maximum accepted gas limit.
+        maximum: u64,
+    },
+    /// A preinstalled-WASM call declared zero authenticated object accesses.
+    /// This MVP path requires at least one.
+    PreinstalledModuleZeroObjectAccess,
 }
 
 impl fmt::Display for NodeCoreError {
@@ -902,6 +916,14 @@ impl fmt::Display for NodeCoreError {
             } => write!(
                 f,
                 "preinstalled module {module_id} version {version} args are {actual} bytes, maximum is {maximum}"
+            ),
+            Self::PreinstalledModuleGasLimitExceedsCeiling { requested, maximum } => write!(
+                f,
+                "preinstalled module gas_limit {requested} exceeds the pre-activation ceiling of {maximum}"
+            ),
+            Self::PreinstalledModuleZeroObjectAccess => write!(
+                f,
+                "preinstalled module call declared zero authenticated object accesses, at least one is required"
             ),
         }
     }
@@ -3000,6 +3022,7 @@ impl TransactionalNodeStateMachine for PreinstalledWasmMachine<'_> {
                 maximum: max_input_size,
             });
         }
+        check_preinstalled_module_gas_limit(self.transaction.gas_limit)?;
 
         let tx_hash = hash_transaction(self.transaction, self.resolver)?;
         let effects = self.engine.execute(
@@ -3011,6 +3034,17 @@ impl TransactionalNodeStateMachine for PreinstalledWasmMachine<'_> {
             &self.transaction.args,
             self.transaction.gas_limit,
         )?;
+
+        // A trap's raw reason/gas accounting is untrusted, engine-dependent
+        // text; normalize before it is ever canonically encoded or
+        // persisted. See `preinstalled_wasm::normalize_trapped_preinstalled_execution`.
+        let effects = match effects.status {
+            ExecutionStatus::Success => effects,
+            ExecutionStatus::Failure { .. } => normalize_trapped_preinstalled_execution(
+                effects.tx_hash,
+                self.transaction.gas_limit,
+            ),
+        };
 
         let status = match &effects.status {
             ExecutionStatus::Success => NodeResponseStatus::Accepted,
@@ -3055,14 +3089,27 @@ impl TransactionalNodeStateMachine for PreinstalledWasmMachine<'_> {
 /// composition, never request input, exactly like the owned-effects
 /// entrypoint. This composition is object-only: it declares no opaque
 /// application state key, and domain placement uses the authenticated
-/// object-access count rather than an opaque state-key count.
+/// object-access count rather than an opaque state-key count. A call that
+/// declares zero authenticated object accesses is rejected with
+/// [`NodeCoreError::PreinstalledModuleZeroObjectAccess`] before domain
+/// resolution; this MVP path requires at least one.
+///
+/// `Transaction.gas_limit` is rejected before the WASM engine ever runs if it
+/// exceeds the conservative pre-activation [`MAX_PREINSTALLED_MODULE_GAS_LIMIT`]
+/// ceiling (see [`NodeCoreError::PreinstalledModuleGasLimitExceedsCeiling`]);
+/// this is not a production fee-weighted gas schedule, which remains
+/// deferred.
 ///
 /// A deterministically trapped/rejected execution still commits: it produces
-/// a `Rejected` [`NodeResponse`] and, because [`ExecutionStatus::Failure`]
-/// discards every object effect before this function ever sees them, no
-/// object mutation. Exact request replay is reconciled from the persisted
-/// receipt before any object load or execution, identical to every other
-/// structured durable entrypoint.
+/// a `Rejected` [`NodeResponse`] whose canonically encoded body is a
+/// normalized, engine-independent closed failure (fixed reason, full
+/// `gas_limit` charge, empty effects/events — see
+/// `preinstalled_wasm::normalize_trapped_preinstalled_execution`), and,
+/// because [`ExecutionStatus::Failure`] discards every object effect before
+/// this function ever sees them, no object mutation. Exact request replay is
+/// reconciled from the persisted receipt before any module resolution,
+/// object load, or execution, identical to every other structured durable
+/// entrypoint.
 ///
 /// Create, Shared/System ownership, blob bodies, native HTTP wiring, and
 /// production gas metering remain unimplemented and fail closed or are
@@ -3085,6 +3132,12 @@ where
         &submission.transaction,
         AuthenticatedObjectPolicy::OwnedMutations { created_checkpoint },
     )?;
+    // This MVP preinstalled-WASM path requires at least one authenticated
+    // object; reject before domain resolution rather than resolving a
+    // domain for a call the machine could never usefully service.
+    if dispatch.accesses.is_empty() {
+        return Err(NodeCoreError::PreinstalledModuleZeroObjectAccess);
+    }
     // Object-only composition: domain placement uses the authenticated
     // object-access count instead of an opaque application state-key count,
     // because this machine declares no state keys (see
@@ -4243,7 +4296,7 @@ mod tests {
     use hashing::{BuiltinHashFunction, HashFunction};
     use objects::{AccessMode, Address, ObjectId, ObjectRef, encode_object};
     use protocol_config::TransactionAuthProfile;
-    use protocol_types::{HashSuite, HashSuiteSchedule, SignatureSchemeId};
+    use protocol_types::{HashSuite, HashSuiteId, HashSuiteSchedule, SignatureSchemeId};
     use runtime::{
         DurableDomainStateStore, DurableObjectProvenance, DurableObjectRoutingProjection,
         MemoryDurableStateStore, MemoryRuntime, StateRevision, StateStore, StorageCorrelationId,
@@ -4335,6 +4388,26 @@ mod tests {
                 activation_epoch: Epoch::new(0),
                 suite: HashSuite::genesis(),
             }],
+        )
+        .unwrap()
+    }
+
+    /// Same as [`resolver`], but with a second SHA3-256 hash-suite schedule
+    /// entry activating at `rotation_epoch`.
+    fn resolver_with_rotation(chain: &str, rotation_epoch: Epoch) -> HashSuiteResolver {
+        HashSuiteResolver::new(
+            ChainId::new(chain).unwrap(),
+            ProtocolVersion::new(3),
+            vec![
+                HashSuiteSchedule {
+                    activation_epoch: Epoch::new(0),
+                    suite: HashSuite::genesis(),
+                },
+                HashSuiteSchedule {
+                    activation_epoch: rotation_epoch,
+                    suite: HashSuite::uniform(HashSuiteId::new(2), HashAlgorithmId::Sha3_256),
+                },
+            ],
         )
         .unwrap()
     }
@@ -8027,9 +8100,68 @@ mod tests {
                 (import "env" "abort"              (func $abort              (param i32 i32)))
                 (memory 1)
                 (export "memory" (memory 0))
-                (data (i32.const 0) "trap")
+                (data (i32.const 0) "contract-secret-abort-marker")
                 (func (export "run")
-                  (call $abort (i32.const 0) (i32.const 4))))"#,
+                  (call $abort (i32.const 0) (i32.const 28))))"#,
+        )
+        .unwrap()
+    }
+
+    /// A contract that succeeds without touching any resolved object, even
+    /// though the transaction may declare `Write`/`Consume` access.
+    fn preinstalled_noop_wasm_bytes() -> Vec<u8> {
+        wat::parse_str(
+            r#"(module
+                (memory 1)
+                (export "memory" (memory 0))
+                (func (export "run")))"#,
+        )
+        .unwrap()
+    }
+
+    /// A contract that consumes `object[0]`.
+    fn preinstalled_consume_wasm_bytes() -> Vec<u8> {
+        wat::parse_str(
+            r#"(module
+                (import "env" "get_object_count"   (func $get_object_count   (result i32)))
+                (import "env" "get_object_data_len"(func $get_object_data_len(param i32)(result i32)))
+                (import "env" "read_object_data"   (func $read_object_data   (param i32 i32 i32 i32)(result i32)))
+                (import "env" "write_object_data"  (func $write_object_data  (param i32 i32 i32)(result i32)))
+                (import "env" "consume_object"     (func $consume_object     (param i32)(result i32)))
+                (import "env" "create_object"      (func $create_object      (param i32 i32 i32 i32 i32 i32)(result i32)))
+                (import "env" "emit_event"         (func $emit_event         (param i32 i32 i32 i32)(result i32)))
+                (import "env" "get_args_len"       (func $get_args_len       (result i32)))
+                (import "env" "read_args"          (func $read_args          (param i32 i32 i32)(result i32)))
+                (import "env" "abort"              (func $abort              (param i32 i32)))
+                (memory 1)
+                (export "memory" (memory 0))
+                (func (export "run")
+                  (drop (call $consume_object (i32.const 0)))))"#,
+        )
+        .unwrap()
+    }
+
+    /// A contract that calls `create_object` once, matching
+    /// `execution::wasm_engine`'s own `create_object` test fixture layout
+    /// (34-byte type hash at offset 0, one data byte at offset 34).
+    fn preinstalled_create_wasm_bytes() -> Vec<u8> {
+        wat::parse_str(
+            r#"(module
+                (import "env" "get_object_count"   (func $get_object_count   (result i32)))
+                (import "env" "get_object_data_len"(func $get_object_data_len(param i32)(result i32)))
+                (import "env" "read_object_data"   (func $read_object_data   (param i32 i32 i32 i32)(result i32)))
+                (import "env" "write_object_data"  (func $write_object_data  (param i32 i32 i32)(result i32)))
+                (import "env" "consume_object"     (func $consume_object     (param i32)(result i32)))
+                (import "env" "create_object"      (func $create_object      (param i32 i32 i32 i32 i32 i32)(result i32)))
+                (import "env" "emit_event"         (func $emit_event         (param i32 i32 i32 i32)(result i32)))
+                (import "env" "get_args_len"       (func $get_args_len       (result i32)))
+                (import "env" "read_args"          (func $read_args          (param i32 i32 i32)(result i32)))
+                (import "env" "abort"              (func $abort              (param i32 i32)))
+                (memory 1)
+                (export "memory" (memory 0))
+                (data (i32.const 0) "\00\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\FF")
+                (func (export "run")
+                  (drop (call $create_object (i32.const 34) (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 0) (i32.const 0)))))"#,
         )
         .unwrap()
     }
@@ -8078,7 +8210,11 @@ mod tests {
             .unwrap();
         let manifest_bytes = system_modules::encode_system_module_manifest(&manifest).unwrap();
         let manifest_hash = resolver
-            .hash_for_purpose(Epoch::new(0), HashPurpose::ProtocolConfig, &manifest_bytes)
+            .hash_for_purpose(
+                Epoch::new(0),
+                HashPurpose::SystemModuleManifest,
+                &manifest_bytes,
+            )
             .unwrap();
         let module = system_modules::SystemModule {
             module_id,
@@ -8357,13 +8493,6 @@ mod tests {
             system_modules::ModuleStatus::Active,
         );
         let empty_registry = SystemModuleRegistry::new();
-        let (object_ref, _) = preload_inline_object(
-            &ScriptedDurableStore::new(DurableCommitOutcome::Committed),
-            "sunrise-test",
-            ObjectId::new([0x97; 32]),
-            Owner::Address(sender),
-            0x97,
-        );
         let run_case = |registry: &SystemModuleRegistry,
                         catalog: &PreinstalledModuleCatalog,
                         module_ref: ObjectRef,
@@ -8415,7 +8544,6 @@ mod tests {
             .unwrap_err();
             (error, store.commits.lock().unwrap().len())
         };
-        let _ = object_ref;
 
         let (error, commits) = run_case(&empty_registry, &catalog, module_ref.clone(), 0xA0);
         assert_eq!(
@@ -8490,8 +8618,7 @@ mod tests {
         let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
         let engine = WasmExecutionEngine;
 
-        let run_case = |module_id: ModuleId,
-                        registry: SystemModuleRegistry,
+        let run_case = |registry: SystemModuleRegistry,
                         catalog: PreinstalledModuleCatalog,
                         module_ref: ObjectRef,
                         request_byte: u8|
@@ -8540,7 +8667,6 @@ mod tests {
                 9,
             )
             .unwrap_err();
-            let _ = module_id;
             (error, store.commits.lock().unwrap().len())
         };
 
@@ -8557,7 +8683,7 @@ mod tests {
         );
         let mut tampered_ref = ref_a.clone();
         tampered_ref.digest = Digest32::new(HashAlgorithmId::Sha2_256, [0xEE; 32]);
-        let (error, commits) = run_case(module_id_a, registry_a, catalog_a, tampered_ref, 0xB0);
+        let (error, commits) = run_case(registry_a, catalog_a, tampered_ref, 0xB0);
         assert_eq!(
             error,
             NodeCoreError::PreinstalledModuleReferenceDigestMismatch {
@@ -8579,7 +8705,7 @@ mod tests {
             system_modules::ModuleStatus::Active,
         );
         let empty_catalog = PreinstalledModuleCatalog::new(vec![]).unwrap();
-        let (error, commits) = run_case(module_id_b, registry_b, empty_catalog, ref_b, 0xB1);
+        let (error, commits) = run_case(registry_b, empty_catalog, ref_b, 0xB1);
         assert_eq!(
             error,
             NodeCoreError::PreinstalledModuleNotCataloged {
@@ -8605,7 +8731,7 @@ mod tests {
         registry_c = SystemModuleRegistry::new();
         registry_c.add_module(tampered_module.clone()).unwrap();
         ref_c.digest = tampered_module.canonical_code_hash;
-        let (error, commits) = run_case(module_id_c, registry_c, catalog_c, ref_c, 0xB2);
+        let (error, commits) = run_case(registry_c, catalog_c, ref_c, 0xB2);
         assert_eq!(
             error,
             NodeCoreError::PreinstalledModuleCodeHashMismatch {
@@ -8631,7 +8757,7 @@ mod tests {
             Digest32::new(HashAlgorithmId::Sha2_256, [0xEE; 32]);
         registry_d = SystemModuleRegistry::new();
         registry_d.add_module(tampered_manifest_module).unwrap();
-        let (error, commits) = run_case(module_id_d, registry_d, catalog_d, ref_d, 0xB3);
+        let (error, commits) = run_case(registry_d, catalog_d, ref_d, 0xB3);
         assert_eq!(
             error,
             NodeCoreError::PreinstalledModuleManifestHashMismatch {
@@ -8657,7 +8783,7 @@ mod tests {
             Digest32::new(HashAlgorithmId::Sha2_256, [0xEE; 32]);
         registry_e = SystemModuleRegistry::new();
         registry_e.add_module(tampered_semantics_module).unwrap();
-        let (error, commits) = run_case(module_id_e, registry_e, catalog_e, ref_e, 0xB4);
+        let (error, commits) = run_case(registry_e, catalog_e, ref_e, 0xB4);
         assert_eq!(
             error,
             NodeCoreError::PreinstalledModuleSemanticsHashMismatch {
@@ -8789,12 +8915,13 @@ mod tests {
             module_ref,
             vec![1, 2],
         );
+        let expected_tx_hash: Digest32 = hash_transaction(&tx, &hash_resolver).unwrap();
         let submission: AuthenticatedSubmitTransaction = authenticated_submission_from_transaction(
             "sunrise-test",
             request(0xB6),
             &signing_key,
             Epoch::new(7),
-            tx,
+            tx.clone(),
             &node_config,
             &protocol_config,
         );
@@ -8816,7 +8943,32 @@ mod tests {
             resolved.output().responses()[0].status(),
             NodeResponseStatus::Rejected
         );
-        assert!(resolved.output().responses()[0].payload().is_some());
+        let payload: &[u8] = resolved.output().responses()[0].payload().unwrap();
+
+        // The contract's own abort message must never reach the persisted
+        // payload, and neither must engine-internal (`wasmi`) text: every
+        // trap is normalized to one fixed, engine-independent reason before
+        // encoding (see `preinstalled_wasm::normalize_trapped_preinstalled_execution`).
+        let payload_text = String::from_utf8_lossy(payload);
+        assert!(!payload_text.contains("contract-secret-abort-marker"));
+        assert!(!payload_text.contains("wasmi"));
+
+        // The encoded payload is stable: it is exactly the canonical
+        // encoding of the normalized closed failure (fixed reason, full
+        // `gas_limit` charge, empty effects/events), independent of exactly
+        // where inside the contract execution trapped.
+        let expected_effects = execution::ExecutionEffects {
+            tx_hash: expected_tx_hash,
+            status: ExecutionStatus::Failure {
+                reason: "preinstalled module execution trapped".to_string(),
+            },
+            object_effects: Vec::new(),
+            events: Vec::new(),
+            gas_used: tx.gas_limit,
+        };
+        let expected_payload = encode_execution_effects(&expected_effects).unwrap();
+        assert_eq!(payload, expected_payload.as_slice());
+
         let write_head: DurableObjectHead = store
             .get_object_head(&context, object_domain, write_id)
             .unwrap();
@@ -8829,6 +8981,590 @@ mod tests {
         let nonce_record: SenderNonceRecord =
             SenderNonceRecord::decode(persisted_nonce.value().unwrap()).unwrap();
         assert_eq!(nonce_record.next_nonce, 1);
+    }
+
+    #[test]
+    fn preinstalled_wasm_zero_object_access_is_rejected_before_domain_resolution() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = active_protocol_config(0xE0);
+        let signing_key: SigningKey = dev_signing_key(0xE0);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0x7A; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_noop_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        // No access-manifest entries at all: this MVP path requires at least
+        // one authenticated object.
+        let manifest = manifest_with(Vec::new());
+        let tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xC0),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::PreinstalledModuleZeroObjectAccess);
+        assert_eq!(store.commits.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn preinstalled_wasm_consume_commits_tombstone_end_to_end() {
+        let store: MemoryDurableStateStore =
+            MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = active_protocol_config(0xE2);
+        let signing_key: SigningKey = dev_signing_key(0xE2);
+        let sender: Address = dev_sender_address(&signing_key);
+        let context: DurableOperationContext = durable_context();
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let object_domain: AtomicityDomainId = domain(0xE2);
+        let module_id = ModuleId::new([0x7C; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_consume_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let consume_id: ObjectId = ObjectId::new([0x9B; 32]);
+        let consume_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            test_object(consume_id, 1, Owner::Address(sender), 0x9B),
+            "sunrise-test",
+            9,
+            0x3E,
+        );
+        let manifest: AccessManifest = manifest_with(vec![AccessEntry {
+            object_ref: consume_ref,
+            mode: AccessMode::Consume,
+        }]);
+        let tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        let submission: AuthenticatedSubmitTransaction = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xC1),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+
+        let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &context,
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.output().responses()[0].status(),
+            NodeResponseStatus::Accepted
+        );
+        let head: DurableObjectHead = store
+            .get_object_head(&context, object_domain, consume_id)
+            .unwrap();
+        assert!(matches!(head, DurableObjectHead::Tombstoned { .. }));
+    }
+
+    #[test]
+    fn preinstalled_wasm_create_effect_is_fail_closed() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = active_protocol_config(0xE3);
+        let signing_key: SigningKey = dev_signing_key(0xE3);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0x7D; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_create_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (object_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0xC2; 32]),
+            Owner::Address(sender),
+            0xC2,
+        );
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref,
+            mode: AccessMode::Read,
+        }]);
+        let tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xC2),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NodeCoreError::ObjectCreationUnsupported { .. }
+        ));
+        assert_eq!(store.commits.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn preinstalled_wasm_missing_entrypoint_is_rejected() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = active_protocol_config(0xE4);
+        let signing_key: SigningKey = dev_signing_key(0xE4);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0x7E; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (object_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0xC3; 32]),
+            Owner::Address(sender),
+            0xC3,
+        );
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref,
+            mode: AccessMode::Read,
+        }]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        tx.entrypoint = "does-not-exist".to_string();
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xC4),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NodeCoreError::Execution(ExecutionError::MissingEntrypoint(_))
+        ));
+        assert_eq!(store.commits.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn preinstalled_wasm_gas_limit_exact_ceiling_succeeds_and_over_ceiling_is_rejected() {
+        // Over the ceiling: rejected before the engine ever runs, no commit.
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut over_protocol_config: ProtocolConfig = active_protocol_config(0xE5);
+        let signing_key: SigningKey = dev_signing_key(0xE5);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let over_module_id = ModuleId::new([0x7F; 32]);
+        let (over_registry, over_catalog, over_module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            over_module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        over_protocol_config.system_modules = over_registry;
+        let over_store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (over_object_ref, _) = preload_inline_object(
+            &over_store,
+            "sunrise-test",
+            ObjectId::new([0xC5; 32]),
+            Owner::Address(sender),
+            0xC5,
+        );
+        let over_manifest = manifest_with(vec![AccessEntry {
+            object_ref: over_object_ref,
+            mode: AccessMode::Read,
+        }]);
+        let mut over_tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            over_manifest,
+            over_module_ref,
+            vec![1, 2],
+        );
+        over_tx.gas_limit = MAX_PREINSTALLED_MODULE_GAS_LIMIT + 1;
+        let over_submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xC6),
+            &signing_key,
+            Epoch::new(7),
+            over_tx,
+            &node_config,
+            &over_protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &over_store,
+            &durable_context(),
+            &hash_resolver,
+            &over_catalog,
+            &engine,
+            over_submission,
+            9,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::PreinstalledModuleGasLimitExceedsCeiling {
+                requested: MAX_PREINSTALLED_MODULE_GAS_LIMIT + 1,
+                maximum: MAX_PREINSTALLED_MODULE_GAS_LIMIT,
+            }
+        );
+        assert_eq!(over_store.commits.lock().unwrap().len(), 0);
+
+        // Exactly at the ceiling: accepted and committed end-to-end.
+        let store: MemoryDurableStateStore =
+            MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let mut protocol_config: ProtocolConfig = active_protocol_config(0xE6);
+        let context: DurableOperationContext = durable_context();
+        let object_domain: AtomicityDomainId = domain(0xE6);
+        let module_id = ModuleId::new([0x80; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let write_id: ObjectId = ObjectId::new([0xC7; 32]);
+        let write_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            test_object(write_id, 1, Owner::Address(sender), 0xC7),
+            "sunrise-test",
+            9,
+            0x3F,
+        );
+        let manifest: AccessManifest = manifest_with(vec![AccessEntry {
+            object_ref: write_ref,
+            mode: AccessMode::Write,
+        }]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        tx.gas_limit = MAX_PREINSTALLED_MODULE_GAS_LIMIT;
+        let submission: AuthenticatedSubmitTransaction = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xC7),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+
+        let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &context,
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.output().responses()[0].status(),
+            NodeResponseStatus::Accepted
+        );
+        let write_head: DurableObjectHead = store
+            .get_object_head(&context, object_domain, write_id)
+            .unwrap();
+        assert_eq!(write_head.object_version(), DurableObjectVersion::new(2));
+    }
+
+    #[test]
+    fn preinstalled_wasm_successful_noop_on_declared_write_is_fail_closed_non_commit() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = active_protocol_config(0xE7);
+        let signing_key: SigningKey = dev_signing_key(0xE7);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0x81; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_noop_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (object_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0xC8; 32]),
+            Owner::Address(sender),
+            0xC8,
+        );
+        let write_object_id = object_ref.id;
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref,
+            mode: AccessMode::Write,
+        }]);
+        let tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xC8),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+
+        // The contract runs to completion without trapping (a genuine
+        // `ExecutionStatus::Success`) but never calls `write_object_data`, so
+        // it produces no effect for the declared `Write` access. This must
+        // still fail closed instead of silently committing as a no-op.
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::ObjectEffectMismatch {
+                object_id: write_object_id,
+                reason: "write access requires exactly one mutated effect",
+            }
+        );
+        assert_eq!(store.commits.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn preinstalled_wasm_resolves_end_to_end_across_hash_suite_rotation() {
+        let store: MemoryDurableStateStore =
+            MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let node_config: NodeConfig = NodeConfig::new(
+            ChainId::new("sunrise-test").unwrap(),
+            ProtocolVersion::new(3),
+            Epoch::new(15),
+            b"node/state".to_vec(),
+        )
+        .unwrap();
+        let mut protocol_config: ProtocolConfig = active_protocol_config(0xE8);
+        let signing_key: SigningKey = dev_signing_key(0xE8);
+        let sender: Address = dev_sender_address(&signing_key);
+        let context: DurableOperationContext = durable_context();
+        let hash_resolver: HashSuiteResolver =
+            resolver_with_rotation("sunrise-test", Epoch::new(10));
+        let object_domain: AtomicityDomainId = domain(0xE8);
+        let module_id = ModuleId::new([0x82; 32]);
+        // Committed while the SHA2-256 genesis suite is active (epoch 0, see
+        // `preinstalled_module_fixture`).
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let write_id: ObjectId = ObjectId::new([0xC9; 32]);
+        let write_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            test_object(write_id, 1, Owner::Address(sender), 0xC9),
+            "sunrise-test",
+            9,
+            0x40,
+        );
+        let manifest: AccessManifest = manifest_with(vec![AccessEntry {
+            object_ref: write_ref,
+            mode: AccessMode::Write,
+        }]);
+        // Epoch 15 is well after the resolver's SHA3-256 rotation at epoch
+        // 10, even though the module was committed under the SHA2-256
+        // genesis suite; resolution must still succeed (see
+        // `hashing::verify_digest`).
+        let tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(15),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        let submission: AuthenticatedSubmitTransaction = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xC9),
+            &signing_key,
+            Epoch::new(15),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+
+        let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &context,
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.output().responses()[0].status(),
+            NodeResponseStatus::Accepted
+        );
+        let write_head: DurableObjectHead = store
+            .get_object_head(&context, object_domain, write_id)
+            .unwrap();
+        assert_eq!(write_head.object_version(), DurableObjectVersion::new(2));
     }
 
     #[test]

@@ -318,20 +318,35 @@ another registry entry without cloning the full registry per request. For this
 MVP path,
 `Transaction.module_ref` maps `ObjectId` bytes to `ModuleId`, object version to
 module version, and object digest to the exact canonical code commitment. The
-selected entry must be active at the transaction epoch and must match a bounded
-immutable node-supplied catalog. Node-core independently hashes its WASM bytes
-under `ContractCode`, canonically encodes and hashes its manifest under the
-existing `ProtocolConfig` purpose, and matches the supplied semantics digest.
-Only then does the bounded deterministic WASM engine run over the already
-verified objects. Canonical `ExecutionEffects` are returned in the response;
-successful owned effects use the existing atomic translator, while a trapped
-execution commits a deterministic rejected receipt and nonce with exact object
-head assertions but no mutation. Exact receipt replay returns before module
-resolution, object reads, or execution. The composition is object-only and
-uses the signed object-access count for logical-domain placement without a
-dummy application key. Native HTTP activation, arbitrary uploads, JIT/AOT,
-production metering, and a dedicated manifest hash-purpose identifier remain
-deferred.
+selected entry must be active at the transaction epoch, must declare at least
+one authenticated object access (a zero-object call is rejected before domain
+resolution), and must match a bounded immutable node-supplied catalog.
+Node-core independently reverifies its WASM bytes against the registry's
+committed `canonical_code_hash` under `ContractCode`, and its canonically
+re-encoded manifest against the committed `manifest_hash` under the dedicated
+`HashPurpose::SystemModuleManifest` purpose (mapped to the already-stable
+`HashDomain::SystemModule` domain and the suite's `config_hash` algorithm),
+and matches the supplied semantics digest. Both commitment checks use
+`hashing::verify_digest` — the algorithm recorded on the committed digest
+itself, plus the resolver's trusted chain/protocol-version context — rather
+than the hash suite active at the transaction's epoch, so an epoch-only
+hash-suite rotation does not require governance to recommit already-installed
+modules; a `protocol_version` bump does, since it changes the hash frame
+itself (see DR-0078). The transaction's `gas_limit` is rejected before the
+engine ever runs if it exceeds a conservative pre-activation ceiling. Only
+then does the bounded deterministic WASM engine run over the already verified
+objects. Canonical `ExecutionEffects` are returned in the response; successful
+owned effects use the existing atomic translator, while a trapped execution is
+first normalized to one fixed, engine-independent failure reason and a
+deterministic full-`gas_limit` charge with empty effects/events (discarding
+the WASM engine's own untrusted trap text and fuel accounting) before that
+normalized value is encoded and committed as a deterministic rejected receipt
+and nonce with exact object head assertions but no mutation. Exact receipt
+replay returns before module resolution, object reads, or execution. The
+composition is object-only and uses the signed object-access count for
+logical-domain placement without a dummy application key. Native HTTP
+activation, arbitrary uploads, JIT/AOT, and production metering remain
+deferred; see DR-0078.
 
 Protocol version 3 MUST NOT be activated on any live chain until fee debit,
 module access, mutating/consuming object effects, shared-object ordering,
@@ -2253,3 +2268,28 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   until the preinstalled module commitment and bounded deterministic WASM
   execution provide the trusted caller; this changes no canonical bytes or
   storage schema.
+- DR-0078: Add a trusted, additive preinstalled-WASM composition without
+  weakening the read-only/native path. Interpret `Transaction.module_ref` on
+  this MVP path as exact `(ModuleId, version, canonical_code_hash)` fields,
+  capture the matching `SystemModule` record or its absence from the same
+  committed `ProtocolConfig` used for authentication, and resolve bytes only
+  from a bounded immutable node-supplied catalog. Verify code under
+  `ContractCode` and manifests under the existing stable `SystemModule` domain
+  through the new `SystemModuleManifest` purpose, always using each committed
+  `Digest32`'s own algorithm so epoch-only hash-suite rotation preserves old
+  modules. Because the hash frame also binds `protocol_version` and registry
+  entries do not yet retain commitment provenance, governance must re-commit
+  code and manifest digests for a protocol-version upgrade in the new
+  `ProtocolConfig`; versioned provenance remains post-MVP work. Require at
+  least one authenticated object, retain the object-count placement projection
+  only for the current single `AllState` rule, and enforce a conservative
+  pre-activation fuel ceiling. Return canonical execution effects, but
+  normalize every engine trap to one fixed reason, a deterministic full-gas
+  charge, and empty effects/events before receipt persistence. A successful
+  execution that omits a declared Write/Consume effect remains a fail-closed
+  non-commit, while an actual trap commits a Rejected receipt and consumes the
+  nonce with exact object-head assertions and no mutation. Keep exact receipt
+  replay ahead of module resolution, object reads, and execution. Create,
+  Shared/System ownership, blob bodies, native HTTP/devnet wiring, arbitrary
+  uploads, JIT/AOT, production metering, and versioned module commitment
+  provenance remain deferred.
