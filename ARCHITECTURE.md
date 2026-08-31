@@ -1664,6 +1664,57 @@ for `/v1/context` and a representative storage-backed object route, and the
 `503`/`500` operational classification — a direct case table plus the
 `SchemaMismatch` decision above — are covered in both crates' test suites.
 
+## 44. Rust client library
+
+The Developer MVP Rust client is a runtime-neutral library at `clients/rust`.
+It exposes seed-based Ed25519 key/address handling, canonical transaction
+construction and signing, submission, bounded receipt waiting, and the four
+query operations from section 43. It stays application-agnostic: asset-account
+transfer arguments, native-coin conventions, fee selection, and other contract
+semantics belong to later consumers such as `apps/cli`, never to the base
+client.
+
+Canonical HTTP result frames and route/media-type constants are shared through
+a dependency-light `node-wire` crate. `native-http` re-exports that contract so
+existing server callers retain the same public names, while `clients/rust`
+depends on `node-core` and `node-wire`, not on Axum or `native-http`. The shared
+crate owns encoding and strict decoding only; routing, admission, clocks,
+storage authority, and HTTP status classification remain server concerns.
+Execution-effect decoders enforce the same collection and byte-size bounds as
+their encoders and reject unknown identifiers, malformed nesting, trailing
+bytes, and non-canonical representations. The transaction signature message
+type is exported from node-core rather than duplicated by a client.
+
+The initial transport is synchronous and deliberately local-development-only.
+A small transport trait permits deterministic tests; the provided HTTP/1.1
+implementation connects only to an explicit loopback address, opens one
+bounded `TcpStream` per request, applies connect/read/write timeouts and header/
+body limits, requires an exact `Content-Length`, and rejects transfer encoding,
+ambiguous lengths, truncated or trailing bodies, unexpected content types, and
+non-loopback targets. It provides no TLS, authentication, proxy, redirect,
+persistent connection, async runtime, or production remote-node claim.
+
+`/v1/context` remains authoritative for chain, epoch, protocol-version, hash-
+suite, authentication-profile, signature-scheme, binding, and atomicity-domain
+identifiers. The canonical `ProtocolConfig` bytes are preserved as opaque bytes
+in this slice rather than partially decoded. A caller supplies the exact trusted
+preinstalled module reference and object references used by its transaction;
+the client does not invent module discovery or object scans. Submission uses an
+explicit non-zero request ID supplied by the caller, checks that the response is
+bound to it, and never derives a protocol identity with an ad hoc hash.
+Receipt absence is normal while waiting; polling always has explicit attempt,
+elapsed-time, and backoff bounds and creates no background worker. Capacity and
+temporary unavailability may be retried only within those caller-visible
+bounds.
+
+Stable literal vectors cover the shared query/response frames and signed
+transaction bytes accepted by node-core. The client does not claim to recompute
+transaction/effect hashes from the context's hash-suite identifier, fetch blob
+bodies, verify certificates, or decode the full protocol configuration. Those
+capabilities, production transports, key generation/keystores, CLI policy, and
+application-specific helpers remain deferred until the MVP consumers require
+them.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -2908,3 +2959,9 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   encode absence and blob-unavailable state explicitly, and exclude scans and
   arbitrary state access. This is a stable client wire contract, not a public
   RPC security or production indexing architecture.
+- DR-0083: Define the Developer MVP Rust client boundary described in "Rust
+  client library". Share canonical result codecs through `node-wire`, keep the
+  client independent of `native-http`/Axum and application semantics, provide
+  only a bounded loopback HTTP transport initially, require caller-supplied
+  request/module/object identities, and defer production networking and full
+  protocol-config/hash verification rather than approximating them.

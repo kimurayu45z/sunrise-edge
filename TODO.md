@@ -1932,6 +1932,15 @@ explicit dev limitations）:
    inactive-placement-before-side-effectsテスト、503/500 operational
    classificationのcase tableテスト、
    admission/cancellationテストを両crateのtest suiteに追加済み。
+7. DR-0083のMVP Rust client境界に従い、次のsliceで`crates/node-wire`へcanonical
+   HTTP result codec・route/media-type contractを抽出し、`native-http`から同じpublic名を
+   re-exportする。`clients/rust`は`node-core`と`node-wire`に依存して、seed-based
+   Ed25519 key/address、canonical transaction build/sign、explicit request IDでのsubmit、
+   bounded receipt wait、context/object/receipt/next-nonce queryを提供する。初期transportは
+   strictなloopback-only synchronous HTTP/1.1とtest用traitだけに限定し、TLS、remote node、
+   async、keystore、full `ProtocolConfig` decode、hash/certificate verification、blob fetch、
+   asset固有helper、CLI policyはこのsliceへ含めない。serverとclientはshared stable vectorsと
+   node-coreが受理するsigned transaction vectorでcanonical contractを固定する（planned）。
 
 **Repository-boundary decision**（ARCHITECTURE.md DR-0081；DR-0080の同名決定のうち
 repository-boundary/counter-demo deliverableのみを置き換える。DR-0080に記録された
