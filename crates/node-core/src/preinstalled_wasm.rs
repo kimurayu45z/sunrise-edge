@@ -246,8 +246,8 @@ pub(crate) fn preinstalled_module_identity(module_ref: &ObjectRef) -> (ModuleId,
 /// epoch where a different suite is active, because the check only depends
 /// on the algorithm the commitment itself was made with, never on
 /// `resolver.suite_for_epoch(epoch)`. A `chain_id`/`protocol_version`
-/// mismatch between the transaction and `resolver` is still rejected before
-/// this function runs (see [`execution::hash_transaction`]), and a
+/// mismatch between the event and `resolver` is still rejected before this
+/// function runs by the durable handler's event digest, and a
 /// `protocol_version` bump changes the hash frame itself — see the
 /// module-level docs on why that instead requires governance recommitment.
 pub(crate) fn resolve_preinstalled_module<'a>(
@@ -352,8 +352,8 @@ pub(crate) const PREINSTALLED_WASM_TRAP_REASON: &str = "preinstalled module exec
 /// guaranteed stable across engine versions for a trapped call), and leaves
 /// `object_effects`/`events` empty — matching
 /// `execution::wasm_engine::WasmExecutionEngine`'s own existing behavior of
-/// discarding every candidate effect on trap, asserted here rather than
-/// merely assumed.
+/// discarding every candidate effect on trap; this function enforces the
+/// empty result directly rather than retaining engine output.
 #[must_use]
 pub(crate) fn normalize_trapped_preinstalled_execution(
     tx_hash: Digest32,

@@ -2285,8 +2285,11 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   only for the current single `AllState` rule, and enforce a conservative
   pre-activation fuel ceiling. Return canonical execution effects, but
   normalize every engine trap to one fixed reason, a deterministic full-gas
-  charge, and empty effects/events before receipt persistence. A successful
-  execution that omits a declared Write/Consume effect remains a fail-closed
+  charge, and empty effects/events before receipt persistence. Successful
+  execution retains deterministic `gas_used`; `wasmi` is therefore exact-pinned,
+  and any engine update requires explicit compatibility review and the full
+  repository gate. A successful execution that omits a declared Write/Consume
+  effect remains a fail-closed
   non-commit, while an actual trap commits a Rejected receipt and consumes the
   nonce with exact object-head assertions and no mutation. Keep exact receipt
   replay ahead of module resolution, object reads, and execution. Create,
