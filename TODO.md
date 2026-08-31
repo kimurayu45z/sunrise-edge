@@ -1770,6 +1770,33 @@ Developer MVP completion criteria:
    `ExecutionEffects`をresponseへ返す。trapはobject mutationなしのRejected receipt/nonceとして
    commitする。zero-object callはこのMVP pathでは明示的に拒否し、native HTTP/devnet wiringは未実装。
 4. local devnet/query API、TypeScript client、counter demo UI、restart/duplicate E2Eを順に追加する。
+   前提として、`runtime-sqlite`へ`StructuredDurableDomainStateStore`/`IndexedOutboxRepository`を
+   実装するadditive、local-only、non-productionな`SqliteDurableStore`を追加済み
+   （implemented As-Is）。既存のopaque `SqliteStateStore`とは別テーブル・別`PRAGMA application_id`で、
+   opaque state-keyのprefixを型付きレコードへ再解釈しない。`application_id`はファイル単位の
+   SQLiteプロパティのため、両ストアは同一ファイルを共有できず、それぞれ別ファイルを必要とする。
+   one trusted bound `(chain, validator, atomicity domain)` namespace、永続化されたfenced writer
+   generation、deadline check、object/receipt/outbox/stateのatomic commit、immutable object
+   version、indexed request/due outbox claim、idempotentなacknowledgementをprocess-local mutex +
+   1つのSQLite transaction（複数statementから成るreadはmetadata/fence checkとpayloadを1つの
+   snapshotで観測する`Deferred` transaction、writeは`BEGIN IMMEDIATE`）の上に実装。`advance_writer_fence`
+   はoperator-only seamとしてBEGIN IMMEDIATE内でschema identityとchain/validator/domain
+   namespaceを再検証してからfenceを読み書きする。各transaction開始前にcaller側の残り
+   deadlineをそのconnectionのSQLite busy_timeoutへ伝播し、`[1ms, 5000ms]`にclampする。writer
+   fenceはBEGIN IMMEDIATE直後に一度だけ検証され、write lockによりCOMMITまで有効性が保たれる
+   （COMMIT直前に再検証されるのはdeadlineのみ）。digest・canonical record type ID・outbox
+   attempt status・boolean列は型付き内部表現ですべて厳密にdecodeし、不明なalgorithm、長さ
+   不一致、algorithm/bytesの片方欠落、想定と異なるtype ID、未知のoutbox attempt status、0/1
+   以外のcompleted値、current専用列を持つtombstoneはすべてInvalidPersistedStateとしてfail
+   closedする。object versionのprovenance chainはbound namespaceのchainとcommit時・read時の
+   両方で照合する。current object headはexact validated immutable version rowと突き合わせ、
+   それがmaximum retained versionであることとdigestの一致を確認してから信頼する
+   （load_object_headはload_object_versionを呼ぶだけで、再帰はしない）。PostgreSQLと共有する
+   conformance suite、実際のdurable state read/mutation・exact request replayでの
+   `RequestAlreadyCommitted`・reopen後のoutbox acknowledgement冪等性を含むrestart persistence
+   test、short deadlineがfixed busy timeoutを待たないことを示すbounded contention testで検証済み。
+   corruption testはrepresentativeなstrict-decode/cross-checkルールを検証するものであり、
+   すべてのルールを網羅しているわけではない。native devnet/node-coreへの接続は次のPRで行う。
 
 Phase 1:
 - workspace
