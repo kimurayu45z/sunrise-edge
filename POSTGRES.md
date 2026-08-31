@@ -419,15 +419,21 @@ A further separate live test starts a digest-pinned disposable PostgreSQL
 1.25.2 proxy container on one isolated, freshly generated Docker bridge
 network; PgBouncer resolves PostgreSQL only by its network alias, never a
 host-published address. The proxy's `pgbouncer.ini`/`userlist.txt` are
-written in over stdin via `docker exec ... tee` (direct argv, no shell, no
-host bind mount), configuring `pool_mode = transaction`, exactly one backend
+written in over stdin via `docker exec ... dd of=<path> status=none` (direct
+argv, no shell, no host bind mount, and no echo of the written
+credential/config into captured output — unlike `tee`, BusyBox `dd` with
+`status=none` writes only to the target file and produces no stdout at all),
+configuring `pool_mode = transaction`, exactly one backend
 connection (`pool_size`/`default_pool_size`/`max_db_connections`/
 `max_user_connections = 1`) for the tested database/user pool, a nonzero
 `max_prepared_statements`, and a bounded `query_wait_timeout`; every one of
 these is asserted directly through PgBouncer's own admin console (`SHOW
-CONFIG`/`SHOW POOLS`/`SHOW SERVERS`/`SHOW CLIENTS`, queried over the simple
-query protocol, the only protocol the admin console answers), never
-inferred from client behavior. The pool's credential is a freshly generated
+CONFIG`/`SHOW POOLS`/`SHOW DATABASES`/`SHOW SERVERS`/`SHOW CLIENTS`, queried
+over the simple query protocol, the only protocol the admin console
+answers), never inferred from client behavior. `SHOW CONFIG`'s
+`default_pool_size`/`max_db_connections`/`max_user_connections` and the
+tested database's own `SHOW DATABASES` `pool_size` are each independently
+read back and asserted exactly one. The pool's credential is a freshly generated
 password; with `password_encryption=md5` pinned on the container, its
 `pg_authid.rolpassword` is read back and used directly as the userlist's MD5
 credential hash. Two distinct client connections, open simultaneously, each
@@ -437,7 +443,9 @@ backend. The real adapter (a genuine `r2d2` pool plus `PostgresDurableStore`,
 distinguished by its own `application_name`) is then pointed at the proxy,
 not PostgreSQL directly. While a separate direct proxied client holds the
 pool's only backend inside an open transaction (left open by withholding
-`COMMIT`/`ROLLBACK`, never a timed sleep), one adapter structured invocation
+`COMMIT`/`ROLLBACK`, never a timed sleep, and proven by the sole `SHOW
+SERVERS` row for that database reporting PgBouncer's own `active` state, not
+merely existing), one adapter structured invocation
 is driven with a context deadline well longer than PgBouncer's own
 `query_wait_timeout`. PgBouncer's queue timeout surfaces as PostgreSQL
 protocol SQLSTATE `08P01` (`query_wait_timeout`) on the adapter's
@@ -460,8 +468,13 @@ socket close, so the very next checkout can be handed that already-dead
 connection and fail near-instantly with a local, unclassified I/O
 error — also `Rejected(UnavailableBeforeCommit)` by the same default
 classification, but resolved in sub-millisecond time rather than tracking
-`query_wait_timeout`); the loop's final outcome must still be `Committed`.
-Recovery proves `Committed`; `SHOW CLIENTS` filtered by the adapter pool's
+`query_wait_timeout`); the loop's final outcome must still be `Committed`,
+and its accumulator is seeded with a rejection, never `Committed`, so a
+future edit that shrank the retry bound to zero attempts fails loudly
+instead of vacuously passing.
+Recovery proves `Committed`; `SHOW SERVERS`' `remote_pid`, read again,
+proves the recovered commit was served by the exact same sole backend the
+two synthetic clients observed; `SHOW CLIENTS` filtered by the adapter pool's
 `application_name` proves specifically that the adapter pool's own proxy
 connection reclaimed the freed backend; a replay of the identical invocation
 returns exact `RequestAlreadyCommitted`; the exact outbox message claims and

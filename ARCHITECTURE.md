@@ -2106,8 +2106,11 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   PostgreSQL's own separately published port, so they stay usable even while
   the proxy's single backend is deliberately held busy. The proxy's
   `pgbouncer.ini`/`userlist.txt` are written into the container over stdin
-  via `docker exec ... tee`, one argv call per file with no shell and no host
-  bind mount; credentials are a freshly generated password whose PostgreSQL
+  via `docker exec ... dd of=<path> status=none`, one argv call per file with
+  no shell, no host bind mount, and no echo of the written credential/config
+  into captured output — unlike `tee`, BusyBox `dd` with `status=none`
+  writes only to the target file and produces no stdout at all; credentials
+  are a freshly generated password whose PostgreSQL
   `pg_authid.rolpassword` (with `password_encryption=md5` pinned on the
   container) is read back and used directly as the userlist's MD5 credential
   hash, never invented or hashed by the test itself. The rendered
@@ -2115,9 +2118,13 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   `default_pool_size`/`max_db_connections`/`max_user_connections = 1` for the
   one tested database/user pool, a nonzero `max_prepared_statements`, and a
   bounded `query_wait_timeout`; every one of these is asserted through
-  PgBouncer's own admin console (`SHOW CONFIG`/`SHOW POOLS`/`SHOW SERVERS`/
-  `SHOW CLIENTS`, queried over the simple query protocol, the only protocol
-  the admin console answers), never inferred from client-side behavior. Two
+  PgBouncer's own admin console (`SHOW CONFIG`/`SHOW POOLS`/`SHOW DATABASES`/
+  `SHOW SERVERS`/`SHOW CLIENTS`, queried over the simple query protocol, the
+  only protocol the admin console answers), never inferred from client-side
+  behavior — `SHOW CONFIG`'s `default_pool_size`/`max_db_connections`/
+  `max_user_connections` and the tested database's own `SHOW DATABASES`
+  `pool_size` are each independently read back and asserted exactly one, not
+  merely inferred from the rendered `pool_size` alone. Two
   distinct client connections, open simultaneously, each run one sequential
   transaction; `SHOW SERVERS`' `remote_pid` is identical after both, proving
   transaction pooling actually reused one physical PostgreSQL backend rather
@@ -2125,7 +2132,9 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   `PostgresDurableStore`, distinguished by its own `application_name`) is
   then pointed at the proxy, not PostgreSQL directly. While a separate direct
   proxied client holds the pool's only backend inside an open transaction
-  (left open by simply not sending `COMMIT`/`ROLLBACK`, not a timed sleep),
+  (left open by simply not sending `COMMIT`/`ROLLBACK`, not a timed sleep,
+  and proven by the sole `SHOW SERVERS` row for that database reporting
+  PgBouncer's own `active` state, not merely existing),
   one adapter structured invocation is driven with a context deadline well
   longer than PgBouncer's own `query_wait_timeout`; live evidence, not an
   assumed classification: PgBouncer's queue timeout surfaces as
@@ -2150,8 +2159,14 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   with a local, unclassified I/O error — also `Rejected(UnavailableBeforeCommit)`
   by the same default classification, but resolved in sub-millisecond time
   rather than tracking `query_wait_timeout`); the retry only tolerates that
-  exact narrow shape, and the loop's final outcome must still be `Committed`.
-  Recovery proves `Committed`, `SHOW CLIENTS` filtered by the adapter pool's
+  exact narrow shape, and the loop's final outcome must still be `Committed`
+  (its accumulator is seeded with a rejection, never `Committed`, so a future
+  edit shrinking the retry bound to zero attempts fails loudly instead of
+  vacuously passing).
+  Recovery proves `Committed`; `SHOW SERVERS`' `remote_pid`, read again,
+  proves the recovered commit was served by the exact same sole backend the
+  two synthetic clients observed above, not a different backend process;
+  `SHOW CLIENTS` filtered by the adapter pool's
   `application_name` proves specifically that the adapter pool's own proxy
   connection reclaimed the freed backend, a replay of the identical
   invocation returns exact `RequestAlreadyCommitted`, the exact outbox

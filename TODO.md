@@ -2277,20 +2277,26 @@ Phase 15 As-Is scope:
   networkへ起動し、PgBouncerはnetwork alias経由でのみPostgreSQLを解決する（host-published
   addressは使わない）。このtest自身のdirect verification connectionはproxyを経由せず
   PostgreSQL自身の別のpublished portへ直接張るため、proxyの単一backendが意図的にblockされて
-  いる間も使い続けられる。`pgbouncer.ini`/`userlist.txt`はcontainerへ`docker exec ... tee`の
-  stdin経由で書き込み、shellもhost bind mountも使わない。credentialはgenerated passwordであり、
+  いる間も使い続けられる。`pgbouncer.ini`/`userlist.txt`はcontainerへ`docker exec ... dd
+  of=<path> status=none`のstdin経由で書き込み、shellもhost bind mountも使わない。`tee`とは
+  異なりBusyBox `dd`は`status=none`指定時にtarget file以外へ何も出力しないため、書き込んだ
+  credential/configがcaptured outputへechoされることもない。credentialはgenerated passwordであり、
   `password_encryption=md5`を設定したPostgreSQL自身の`pg_authid.rolpassword`を読み戻して
   userlistのMD5 credential hashとしてそのまま使う（testが自前で計算しない）。設定は
   `pool_mode = transaction`、対象database/user poolに対して`pool_size`/`default_pool_size`/
   `max_db_connections`/`max_user_connections = 1`、nonzeroな`max_prepared_statements`、
   boundedな`query_wait_timeout`であり、いずれもPgBouncer自身のadmin console
-  （`SHOW CONFIG`/`SHOW POOLS`/`SHOW SERVERS`/`SHOW CLIENTS`、simple query protocol経由）
-  で直接証明し、client側の挙動から推測しない。同時にopenな2つのdistinct client connectionが
+  （`SHOW CONFIG`/`SHOW POOLS`/`SHOW DATABASES`/`SHOW SERVERS`/`SHOW CLIENTS`、
+  simple query protocol経由）で直接証明し、client側の挙動から推測しない。`SHOW CONFIG`の
+  `default_pool_size`/`max_db_connections`/`max_user_connections`と、対象databaseの
+  `SHOW DATABASES`自身の`pool_size`もそれぞれ独立に読み戻してexactly oneであることを証明する
+  （rendered `pool_size`だけから推測しない）。同時にopenな2つのdistinct client connectionが
   それぞれ1回のtransactionを順に実行し、`SHOW SERVERS`の`remote_pid`が両方で同一であることから
   transaction poolingが実際に同一のPostgreSQL backendを再利用したことを証明する。実際のadapter
   （genuineな`r2d2` poolと`PostgresDurableStore`、専用の`application_name`で識別）をproxy経由に
   向け、別のdirect proxied clientがCOMMIT/ROLLBACKを送らずtransactionを開いたままpoolの唯一の
-  backendを保持している間に、PgBouncer自身の`query_wait_timeout`より十分長いcontext deadlineで
+  backendを保持している間（`SHOW SERVERS`の唯一の行がPgBouncer自身の`active` stateであることを
+  証明し、単に存在するだけでないことを示す）に、PgBouncer自身の`query_wait_timeout`より十分長いcontext deadlineで
   1回のadapter structured invocationを実行する。live evidenceとして、PgBouncerのqueue
   timeoutはPostgreSQL protocol SQLSTATE `08P01`（`query_wait_timeout`）としてadapterの最初の
   文（transaction開始の`BEGIN`）に現れ、このcrateの`PreCommitFailure::from_sqlstate`には専用の
@@ -2305,8 +2311,12 @@ Phase 15 As-Is scope:
   `is_closed()`がPgBouncerのasynchronousなsocket closeにまだ追随していない場合）ため、次の
   checkoutがすでに死んでいるそのconnectionを受け取りsub-millisecondでlocalかつunclassifiedな
   I/O errorとして失敗することがある（timingの点でgenuineなproxy rejectionとは明確に区別できる）。
-  このretryはその狭い形状だけを許容し、loopの最終結果は必ず`Committed`でなければならない。
-  recoveryは`Committed`を証明し、`SHOW CLIENTS`をadapter poolの`application_name`で絞り込むことで
+  このretryはその狭い形状だけを許容し、loopの最終結果は必ず`Committed`でなければならない
+  （accumulatorは`Committed`ではなくrejectionで初期化されており、将来retry回数を0へ縮める編集が
+  あってもvacuousにpassせず確実にfailする）。
+  recoveryは`Committed`を証明し、同じ`remote_pid`証跡を再度呼び出して、recovered commitが
+  2つのsynthetic clientで観測したのと同一のsole backendによって処理されたことを証明した上で、
+  `SHOW CLIENTS`をadapter poolの`application_name`で絞り込むことで
   adapter pool自身のproxy connectionが解放されたbackendを奪ったことを証明し、同一invocationの
   replayはexact `RequestAlreadyCommitted`を返し、exact outbox messageはclaim/ackを経て
   `NoDueWork`となり、poolはさらなるreadにも使い続けられる（bounded local PgBouncer
@@ -2449,13 +2459,16 @@ Phase 15 persistence implementation order（To-Beからの逆算）:
    bounded disposable containerで証明したが、real-device resource exhaustion、load/soak capacity、
    production certificationは未実装のままである。DR-0075は digest-pinned PostgreSQL 18.6と
    digest-pinned `ghcr.io/icoretech/pgbouncer-docker` 1.25.2をisolatedなDocker networkへ起動し、
-   PgBouncer admin console evidence（`SHOW CONFIG`/`SHOW POOLS`/`SHOW SERVERS`/`SHOW CLIENTS`）で
-   configured transaction modeと、2つのsimultaneously openなclient connectionが同一backendを
+   PgBouncer admin console evidence（`SHOW CONFIG`/`SHOW POOLS`/`SHOW DATABASES`/`SHOW SERVERS`/
+   `SHOW CLIENTS`）でconfigured transaction modeと、default_pool_size/max_db_connections/
+   max_user_connections/tested databaseのSHOW DATABASES pool_sizeが厳密に1であることと、
+   2つのsimultaneously openなclient connectionが同一backendを
    sequential transactionで再利用することを直接証明し、real adapterをproxy経由に向けた上で、
-   direct proxied clientがproxyの唯一のbackendをtransaction中に保持している間、adapter
+   direct proxied clientがproxyの唯一のbackendを`active` stateのtransaction中に保持している間、adapter
    invocationがPgBouncer自身の`query_wait_timeout`満了によりdefinite pre-commit
    `Rejected(UnavailableBeforeCommit)`となることと非公開を証明し、release後は同一invocationの
-   commit、`RequestAlreadyCommitted` replay、exact outbox claim/ack、pool usabilityを証明した
+   commit（recovered commitが同一sole backend PIDで処理されたことを再度証明）、
+   `RequestAlreadyCommitted` replay、exact outbox claim/ack、pool usabilityを証明した
    （bounded local PgBouncer transaction-pooling rehearsal evidenceのみimplemented As-Is;
    ARCHITECTURE.md DR-0075）。これはprovider-managed pooler service certification、load/soak
    capacity、PgBouncerのhigh availability、TLS、real writer failover、production readinessの

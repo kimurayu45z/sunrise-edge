@@ -306,17 +306,23 @@ cross-provider ingress milestones implemented through Phase 17:
   transaction pooling, exactly one backend connection for the tested
   database/user pool, a nonzero `max_prepared_statements`, and a bounded
   `query_wait_timeout` — every setting asserted directly through PgBouncer's
-  own admin console, never inferred. It proves two simultaneously open,
+  own admin console, never inferred (`default_pool_size`/
+  `max_db_connections`/`max_user_connections` and the tested database's own
+  `SHOW DATABASES` pool size are each independently read back and asserted
+  exactly one). It proves two simultaneously open,
   distinct client connections reuse the exact same PostgreSQL backend across
   sequential transactions, then points the real adapter (a genuine `r2d2`
   pool plus `PostgresDurableStore`) at the proxy. While a direct proxied
-  client holds the pool's only backend inside an open transaction, one
+  client holds the pool's only backend inside an open transaction (proven
+  `active`, not merely present, via `SHOW SERVERS`), one
   adapter invocation gets the definite pre-commit
   `Rejected(UnavailableBeforeCommit)` once PgBouncer's own
   `query_wait_timeout` elapses (PostgreSQL SQLSTATE `08P01`, which this
   adapter's classifier treats as `Unavailable`, never `Indeterminate`), with
   no state/receipt/outbox publication. After release, the identical
-  invocation commits through the same pool/store, `SHOW CLIENTS` proves the
+  invocation commits through the same pool/store; the same backend-PID
+  evidence proves the recovered commit reused the exact backend the two
+  synthetic clients observed, `SHOW CLIENTS` proves the
   adapter pool's own connection reclaimed the freed backend, a replay
   returns exact `RequestAlreadyCommitted`, and the exact outbox message
   claims and acknowledges through `NoDueWork`. This is a bounded local

@@ -42,8 +42,9 @@ pub const CRASH_REQUIRED_ENV: &str = "SUNRISE_EDGE_TEST_POSTGRES_CRASH_REQUIRED"
 /// Hard bound on how long [`LiveTestLock::acquire`] waits for the lock
 /// before giving up. Every live PostgreSQL integration-test binary serializes
 /// on this lock because `cargo test` may run the shared-schema conformance,
-/// SIGKILL, data-full, WAL-full, connection-exhaustion, and backup-restore
-/// scenarios as separate concurrent processes. Each holder completes its own
+/// SIGKILL, data-full, WAL-full, connection-exhaustion, backup-restore, and
+/// PgBouncer transaction-pooling rehearsal scenarios as separate concurrent
+/// processes. Each holder completes its own
 /// bounded database/container work before releasing the next waiter. CI bounds
 /// the whole job at 20 minutes; 600 seconds (10 minutes) keeps an abandoned or
 /// genuinely stuck lock well inside that outer bound while allowing the normal
@@ -805,12 +806,13 @@ fn run_docker_command_bounded_output_capped(
 /// Same as [`run_docker_command_bounded_output_capped`], but first writes
 /// `stdin_bytes` to the child's stdin and closes it before entering the same
 /// bounded poll loop. Used only to hand a small, fully Rust-controlled
-/// in-memory config file to a container-side `tee` via direct argv, with no
-/// shell and no host bind mount involved on either side. The write happens
-/// before the poll loop, not concurrently with it: every caller's
-/// `stdin_bytes` is small enough (a few hundred bytes, well under a pipe
-/// buffer) that the write cannot block on the child draining its own stdout,
-/// so this cannot deadlock the way an unbounded interleaved read/write could.
+/// in-memory config file to a container-side stdin sink (e.g. `dd
+/// of=<path>`) via direct argv, with no shell and no host bind mount
+/// involved on either side. The write happens before the poll loop, not
+/// concurrently with it: every caller's `stdin_bytes` is small enough (a
+/// few hundred bytes, well under a pipe buffer) that the write cannot block
+/// on the child draining its own stdout, so this cannot deadlock the way an
+/// unbounded interleaved read/write could.
 fn run_docker_command_bounded_output_with_stdin(
     command: Command,
     label: &str,
@@ -877,7 +879,8 @@ fn run_docker_command_bounded_output_capped_with_stdin(
             return Err(error);
         }
         // Dropping the handle closes the write end, signaling EOF to the
-        // child (`tee` only exits once it has seen EOF on stdin).
+        // child (a stdin sink like `dd` only exits once it has seen EOF on
+        // stdin).
         drop(stdin);
     }
     let deadline = Instant::now() + DOCKER_COMMAND_TIMEOUT;
@@ -2605,7 +2608,7 @@ pub struct PgBouncerProxyContainer {
 
 impl PgBouncerProxyContainer {
     /// Starts the proxy container idling on a bare `sleep`, writes its config
-    /// files in over stdin via `tee` (direct argv, no shell, no host bind
+    /// files in over stdin via `dd` (direct argv, no shell, no host bind
     /// mount), starts `pgbouncer` itself as a detached in-container exec, and
     /// boundedly waits for its admin console to accept a login. Panics on any
     /// failure.
@@ -2685,7 +2688,7 @@ impl PgBouncerProxyContainer {
 
         let userlist = render_userlist_entry(admin_user, credential_hash);
         container
-            .exec_with_stdin(&["tee", "/etc/pgbouncer/userlist.txt"], userlist.as_bytes())
+            .write_config_file("/etc/pgbouncer/userlist.txt", userlist.as_bytes())
             .unwrap_or_else(|error| panic!("writing pgbouncer userlist.txt failed: {error}"));
 
         let ini = render_pgbouncer_ini(&PgBouncerIniConfig {
@@ -2696,7 +2699,7 @@ impl PgBouncerProxyContainer {
             admin_user,
         });
         container
-            .exec_with_stdin(&["tee", "/etc/pgbouncer/pgbouncer.ini"], ini.as_bytes())
+            .write_config_file("/etc/pgbouncer/pgbouncer.ini", ini.as_bytes())
             .unwrap_or_else(|error| panic!("writing pgbouncer.ini failed: {error}"));
 
         run_docker_command_bounded(
@@ -2718,20 +2721,37 @@ impl PgBouncerProxyContainer {
         container
     }
 
-    fn exec_with_stdin(&self, args: &[&str], stdin_bytes: &[u8]) -> io::Result<String> {
-        let mut full_args: Vec<&str> = vec![
+    /// Writes `contents` (a config file that carries the generated
+    /// credential hash) to `path` inside the container over stdin via
+    /// BusyBox `dd of=<path> status=none`, direct argv with no shell and no
+    /// host bind mount. Deliberately not `tee`: `tee` also copies every byte
+    /// it reads to its own stdout by design, which `run_docker_command_
+    /// bounded_output_with_stdin` captures into a temporary file on the
+    /// host — for `userlist.txt` specifically, that would transiently write
+    /// the credential hash into a bounded-output temp file this scenario
+    /// never otherwise needs to create. `dd of=<path> status=none` writes
+    /// only to `path` and produces no stdout at all (verified against this
+    /// exact pinned image: BusyBox `dd` sends only its own optional
+    /// byte-count summary, never the copied content, to stderr, and
+    /// `status=none` suppresses even that), so the captured output this
+    /// helper returns is always empty on success.
+    fn write_config_file(&self, path: &str, contents: &[u8]) -> io::Result<String> {
+        let destination = format!("of={path}");
+        let full_args: Vec<&str> = vec![
             "exec",
             "-i",
             "--user",
             "postgres",
             "--",
             self.container_id.as_str(),
+            "dd",
+            &destination,
+            "status=none",
         ];
-        full_args.extend_from_slice(args);
         run_docker_command_bounded_output_with_stdin(
             docker_argv_command(&full_args),
             "docker exec (pgbouncer config write)",
-            stdin_bytes,
+            contents,
             DOCKER_COMMAND_OUTPUT_MAX_BYTES,
         )
     }

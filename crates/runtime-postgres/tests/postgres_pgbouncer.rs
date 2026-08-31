@@ -22,29 +22,36 @@
 //! contention this scenario deliberately creates.
 //!
 //! The live evidence proven, in order: (1) PgBouncer's own admin console
-//! (`SHOW CONFIG`/`SHOW POOLS`, asserted directly, never inferred from client
-//! behavior) confirms `pool_mode = transaction`, a nonzero
-//! `max_prepared_statements`, and a bounded `query_wait_timeout`; (2) two
-//! simultaneously open, distinct client connections each complete a
-//! sequential transaction, and `SHOW SERVERS` proves both were served by the
-//! exact same PostgreSQL backend process (`remote_pid`), i.e. transaction
-//! pooling actually reused one backend rather than opening a second; (3) the
-//! real `runtime-postgres` adapter (a genuine `r2d2` pool plus
-//! `PostgresDurableStore`) is pointed at the proxy, not PostgreSQL directly;
-//! (4) while a direct client (bypassing the adapter, but still through the
-//! proxy) holds the pool's only backend inside an open transaction, one
+//! (`SHOW CONFIG`/`SHOW POOLS`/`SHOW DATABASES`, asserted directly, never
+//! inferred from client behavior) confirms `pool_mode = transaction`, a
+//! nonzero `max_prepared_statements`, a bounded `query_wait_timeout`, and
+//! that `default_pool_size`, `max_db_connections`, `max_user_connections`,
+//! and the tested database's own `SHOW DATABASES` `pool_size` are each
+//! exactly one; (2) two simultaneously open, distinct client connections
+//! each complete a sequential transaction, and `SHOW SERVERS` proves both
+//! were served by the exact same PostgreSQL backend process (`remote_pid`),
+//! i.e. transaction pooling actually reused one backend rather than opening
+//! a second; (3) the real `runtime-postgres` adapter (a genuine `r2d2` pool
+//! plus `PostgresDurableStore`) is pointed at the proxy, not PostgreSQL
+//! directly; (4) while a direct client (bypassing the adapter, but still
+//! through the proxy) holds the pool's only backend inside an open
+//! transaction — proven by `SHOW SERVERS`' sole row for that database
+//! reporting PgBouncer's own `active` state, not merely existing — one
 //! adapter structured invocation gets a bounded, definite pre-commit
 //! rejection whose timing tracks PgBouncer's own `query_wait_timeout`, not
 //! this test's own outer deadline, with no state/receipt/outbox row
 //! published (checked through the direct, proxy-bypassing verification
 //! connection, which the proxy's contention cannot affect); (5) after
 //! releasing the blocking transaction, the identical invocation commits
-//! through the same adapter pool/store, a replay returns exact
+//! through the same adapter pool/store — `SHOW SERVERS`' `remote_pid`,
+//! read again, proves the recovered commit was served by the exact same
+//! sole backend the two synthetic clients observed in (2), and `SHOW
+//! CLIENTS`, filtered by the adapter pool's own `application_name`, proves
+//! specifically that the adapter's own proxy connection is the one that
+//! reclaimed the freed backend — a replay returns exact
 //! `RequestAlreadyCommitted`, the exact outbox message is claimed and
 //! acknowledged, a further claim attempt returns `NoDueWork`, and the pool
-//! remains usable — with `SHOW CLIENTS`, filtered by the adapter pool's own
-//! `application_name`, proving specifically that the adapter's own proxy
-//! connection is the one that reclaimed the freed backend.
+//! remains usable.
 //!
 //! This is explicitly a bounded local PgBouncer transaction-pooling
 //! rehearsal, not provider-managed pooler service certification, load/soak
@@ -392,6 +399,35 @@ fn postgres_pgbouncer_transaction_pooling_rehearsal() {
         configured_query_wait_timeout,
         support::PGBOUNCER_QUERY_WAIT_TIMEOUT_SECS
     );
+    // Exactly one backend connection for the tested database/user pool is
+    // not just `pool_size` in the rendered ini: read back every PgBouncer
+    // setting that could independently cap or override it, directly through
+    // the admin console, never inferred from `pool_size` alone.
+    let configured_default_pool_size: u32 = config_value("default_pool_size").parse().unwrap();
+    assert_eq!(configured_default_pool_size, support::PGBOUNCER_POOL_SIZE);
+    let configured_max_db_connections: u32 = config_value("max_db_connections").parse().unwrap();
+    assert_eq!(configured_max_db_connections, support::PGBOUNCER_POOL_SIZE);
+    let configured_max_user_connections: u32 =
+        config_value("max_user_connections").parse().unwrap();
+    assert_eq!(
+        configured_max_user_connections,
+        support::PGBOUNCER_POOL_SIZE
+    );
+
+    // `SHOW DATABASES` carries the per-database `pool_size` PgBouncer
+    // actually loaded from the `[databases]` section for the tested
+    // database specifically (as opposed to `SHOW CONFIG`'s `[pgbouncer]`
+    // section defaults above), so this is independent evidence, not a
+    // restatement of the same setting.
+    let database_rows = admin_show_rows(&mut admin, "SHOW DATABASES");
+    let app_database_row = database_rows
+        .iter()
+        .find(|row| simple_row_get(row, "name") == PGBOUNCER_DATABASE)
+        .unwrap_or_else(|| panic!("SHOW DATABASES did not return a row for {PGBOUNCER_DATABASE}"));
+    let configured_database_pool_size: u32 = simple_row_get(app_database_row, "pool_size")
+        .parse()
+        .unwrap();
+    assert_eq!(configured_database_pool_size, support::PGBOUNCER_POOL_SIZE);
 
     // --- Two simultaneously open, distinct client connections reuse exactly
     //     one PostgreSQL backend across sequential transactions ------------
@@ -435,10 +471,13 @@ fn postgres_pgbouncer_transaction_pooling_rehearsal() {
 
     // --- The real runtime-postgres adapter, pointed at the proxy -----------
 
+    // `connect_timeout`/`tcp_user_timeout` are deliberately not set here:
+    // `build_postgres_pool` always overwrites both from the
+    // `PostgresPoolConfig` below (its own `connection_timeout` argument), so
+    // setting them on this `Config` first would be dead code silently
+    // discarded, not the effective value.
     let mut pool_config: postgres::Config = proxy.url(PGBOUNCER_DATABASE).parse().unwrap();
     pool_config.application_name(ADAPTER_POOL_APPLICATION_NAME);
-    pool_config.connect_timeout(CLIENT_CONNECT_TIMEOUT);
-    pool_config.tcp_user_timeout(CLIENT_TCP_USER_TIMEOUT);
     let pool = build_postgres_pool(
         pool_config,
         NoTls,
@@ -508,13 +547,26 @@ fn postgres_pgbouncer_transaction_pooling_rehearsal() {
     // client's backend assignment for as long as its transaction remains
     // open, which is what makes the adapter's own attempt queue.
 
-    let blocked_row_before = admin_show_rows(&mut admin, "SHOW SERVERS")
-        .into_iter()
-        .filter(|row| simple_row_get(row, "database") == PGBOUNCER_DATABASE)
-        .count();
+    let blocked_server_rows: Vec<postgres::SimpleQueryRow> =
+        admin_show_rows(&mut admin, "SHOW SERVERS")
+            .into_iter()
+            .filter(|row| simple_row_get(row, "database") == PGBOUNCER_DATABASE)
+            .collect();
     assert_eq!(
-        blocked_row_before, 1,
+        blocked_server_rows.len(),
+        1,
         "expected the blocking transaction to hold exactly the one configured backend"
+    );
+    // Not just that the one row exists, but that it is genuinely occupied by
+    // the blocker's open transaction (`state = active`), not merely present
+    // and idle: `active` is PgBouncer's own admin-console evidence that this
+    // backend is currently linked to a client, which is exactly what makes
+    // the adapter's own attempt queue below.
+    assert_eq!(
+        simple_row_get(&blocked_server_rows[0], "state"),
+        "active",
+        "expected the sole backend to be in PgBouncer's `active` state while the blocker's \
+         transaction is open"
     );
 
     let blocked_context = DurableOperationContext::new(
@@ -649,7 +701,13 @@ fn postgres_pgbouncer_transaction_pooling_rehearsal() {
     // outcome fails the test immediately rather than being retried away.
     const RECOVERY_STALE_CONNECTION_RETRY_ATTEMPTS: u32 = 5;
     const RECOVERY_STALE_CONNECTION_ELAPSED_CEILING: Duration = Duration::from_secs(1);
-    let mut recovery_outcome = DurableCommitOutcome::Committed;
+    // Seeded with a rejection, never `Committed`: if a future edit ever
+    // shrinks `RECOVERY_STALE_CONNECTION_RETRY_ATTEMPTS` to `0`, this loop
+    // runs zero iterations and the final `assert_eq!` below must fail loudly
+    // on this seed instead of vacuously passing on an outcome `commit_invocation`
+    // never actually produced.
+    let mut recovery_outcome =
+        DurableCommitOutcome::Rejected(DurableCommitRejection::UnavailableBeforeCommit);
     for attempt in 1..=RECOVERY_STALE_CONNECTION_RETRY_ATTEMPTS {
         let attempt_started = Instant::now();
         recovery_outcome = store.commit_invocation(&recovery_context, invocation.clone());
@@ -669,6 +727,19 @@ fn postgres_pgbouncer_transaction_pooling_rehearsal() {
         }
     }
     assert_eq!(recovery_outcome, DurableCommitOutcome::Committed);
+
+    // Admin evidence, not inferred: the exact same backend-PID probe used
+    // for the two synthetic clients above, called again now, proves the
+    // recovered adapter commit was served by that identical physical
+    // PostgreSQL backend (`remote_pid_after_a == remote_pid_after_b`
+    // already proved above), not a new or different backend process that
+    // PgBouncer happened to open after the blocking transaction released.
+    let remote_pid_after_recovery = sole_backend_remote_pid(&mut admin, PGBOUNCER_DATABASE);
+    assert_eq!(
+        remote_pid_after_recovery, remote_pid_after_b,
+        "expected the adapter's recovered commit to have been served by the exact same sole \
+         PostgreSQL backend the two synthetic clients observed, not a different backend process"
+    );
 
     // Admin evidence, not inferred: PgBouncer's own `SHOW CLIENTS`, filtered
     // by the adapter pool's distinguishing `application_name`, proves

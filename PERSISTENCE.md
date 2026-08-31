@@ -516,17 +516,24 @@ not general state reads:
    live scenario runs a digest-pinned PostgreSQL 18.6 and a digest-pinned
    `ghcr.io/icoretech/pgbouncer-docker` 1.25.2 on one isolated, generated
    Docker network, with PgBouncer configured (via a `docker exec`
-   stdin-piped `tee`, no shell, no host bind mount) for transaction pooling,
-   exactly one backend connection for the tested database/user pool, a
+   stdin-piped `dd of=<path> status=none`, no shell, no host bind mount, and
+   no echo of the written credential/config into captured output) for
+   transaction pooling, exactly one backend connection for the tested
+   database/user pool (`default_pool_size`/`max_db_connections`/
+   `max_user_connections`, and the tested database's own `SHOW DATABASES`
+   `pool_size`, each independently read back and asserted exactly one), a
    nonzero `max_prepared_statements`, and a bounded `query_wait_timeout`;
    every one of these is asserted through PgBouncer's own admin console
-   (`SHOW CONFIG`/`SHOW POOLS`/`SHOW SERVERS`/`SHOW CLIENTS`), never
-   inferred. Two simultaneously open, distinct client connections each
+   (`SHOW CONFIG`/`SHOW POOLS`/`SHOW DATABASES`/`SHOW SERVERS`/`SHOW
+   CLIENTS`), never inferred. Two simultaneously open, distinct client
+   connections each
    complete a sequential transaction, and `SHOW SERVERS`' `remote_pid`
    proves both reused the exact same PostgreSQL backend. The real adapter
    (a genuine `r2d2` pool plus `PostgresDurableStore`) is then pointed at
    the proxy; while a separate direct proxied client holds the pool's only
-   backend in an open transaction, one adapter structured invocation gets
+   backend in an open transaction (proven by the sole `SHOW SERVERS` row for
+   that database reporting PgBouncer's own `active` state, not merely
+   existing), one adapter structured invocation gets
    the definite pre-commit `Rejected(UnavailableBeforeCommit)` once
    PgBouncer's own `query_wait_timeout` elapses (PostgreSQL protocol
    SQLSTATE `08P01`, which this adapter's classifier has no dedicated arm
@@ -534,7 +541,10 @@ not general state reads:
    state/receipt/outbox publication, proven through a direct,
    proxy-bypassing verification connection unaffected by the proxy's
    contention. After the blocking transaction is released, the identical
-   invocation commits through the same pool/store, `SHOW CLIENTS` filtered
+   invocation commits through the same pool/store, `SHOW SERVERS`'
+   `remote_pid` (read again) proves the recovered commit was served by the
+   exact same sole backend the two synthetic clients observed, `SHOW
+   CLIENTS` filtered
    by the adapter pool's own `application_name` proves specifically that
    the adapter pool reclaimed the freed backend, and exact
    replay/claim/acknowledgement/pool-usability are proven as in the other
