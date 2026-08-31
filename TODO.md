@@ -1770,7 +1770,12 @@ explicit dev limitations）:
     二重適用しないことを自動E2Eで証明する。
 11. single validator、owned-object only、fee-free dev profile、local SQLite、
     same-sender-only asset movement（cross-owner transfer authorizationは未実装のためfail
-    closed）、non-production security/operationsという制約をREADMEと起動時表示へ明記する。
+    closed）、4 bounded query routeがunauthenticated public-read API（呼び出し元は誰でも
+    任意のobject/receipt/next-nonce/contextを読める。`/v1/senders/{sender}/next-nonce`の
+    addressはpublic lookup selectorでありauthorizationではない）であること、queryと
+    submissionが単一の共有admission budget（`NativeBlockingExecutor`／
+    `--max-concurrent`）を使う（片方のtrafficがもう片方をstarveしうる）こと、
+    non-production security/operationsという制約をREADMEと起動時表示へ明記する。
 
 現在のMVP実装順序:
 
@@ -1904,19 +1909,28 @@ explicit dev limitations）:
    decodability・outer selector/digestとのidentity一致・（receiptは）exact re-encodingまで
    strictに検証する。contextはzero id（protocol version/hash suite/profile/scheme/binding）・
    長すぎるchain id（`node_core::MAX_CHAIN_ID_BYTES`超過）・空のcanonical `ProtocolConfig` bytes
-   を拒否する。storage-backedな3 routeは`DomainPlacementManifest::resolve_domain`を
-   authenticated write pathと同じactivation-epoch-checkedな経路で呼び出し、
-   `placement.domain()`を無条件には使わない。operational statusは、identity source
-   unavailable・clock/runtime failure・durable readのwriter fenced/deadline/unavailable・
-   committed ProtocolConfigのinactivity/misconfigurationをopaque `503 query-unavailable`、
-   corrupt/invalid persisted content・result encoding failure・identity source exhaustedを
-   opaque `500 query-state-invalid`として区別する（capacity exhaustionは既存の`429`のまま）。
+   を拒否する。4 route全て（`/v1/context`を含む）が共通helper経由で
+   `DomainPlacementManifest::resolve_domain`を authenticated write pathと同じ
+   activation-epoch-checkedな経路で呼び出し、`placement.domain()`を無条件には
+   使わない。operational statusは、identity source unavailable・clock/runtime
+   failure・durable readのwriter fenced/deadline/unavailable・durable schema
+   generationがunsupported（`DurableReadError::SchemaMismatch`。persisted bytes
+   自体のcorruptionではなくoperator/deployment側のschema世代不一致を証明する
+   ものなので、corrupt-state側ではなくavailability側に分類する明示的な決定）・
+   committed ProtocolConfigのinactivity/misconfigurationをopaque
+   `503 query-unavailable`、corrupt/invalid persisted content・result encoding
+   failure・identity source exhaustedをopaque `500 query-state-invalid`として
+   区別する（capacity exhaustionは既存の`429`のまま）。
    `structured_durable_router`と`preinstalled_wasm_structured_durable_router`の両方へ
    GET routeとして配線した。stable literal vectors、round-trip/unknown-tag/selector-mismatch
-   decoderテスト、4 routeすべてのboth-router parity、malformed-path-before-side-effectsテスト、
+   decoderテスト、4 routeすべてのboth-router parity（populatedなcurrent-inline
+   objectとpresent receiptを含む。absenceのみに限定しない）、
+   malformed-path-before-side-effectsテスト、
    object absent/tombstone/current-inline/current-blob/tamper/wrong-chainテスト、receipt
    absent/present/corruptテスト、nonce zero/advanced/deleted-corruptテスト、
-   inactive-placement-before-side-effectsテスト、503/500 operational classificationテスト、
+   `/v1/context`と代表storage-backed object routeの
+   inactive-placement-before-side-effectsテスト、503/500 operational
+   classificationのcase tableテスト、
    admission/cancellationテストを両crateのtest suiteに追加済み。
 
 **Repository-boundary decision**（ARCHITECTURE.md DR-0081；DR-0080の同名決定のうち

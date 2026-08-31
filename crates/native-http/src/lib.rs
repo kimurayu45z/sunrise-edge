@@ -2807,7 +2807,9 @@ fn query_invocation_error_response(error: &QueryInvocationError) -> Response {
 ///
 /// `503 query-unavailable` covers a transient host or storage-availability
 /// condition: clock/runtime failure, a durable read that proves writer
-/// fencing, deadline exhaustion, or backend unavailability, or committed
+/// fencing, deadline exhaustion, or backend unavailability, an unsupported
+/// durable schema identity/generation
+/// (`runtime::DurableReadError::SchemaMismatch`), or committed
 /// `ProtocolConfig` inactivity/misconfiguration (missing domain placement,
 /// an inactive placement at the current epoch, or a missing/invalid
 /// transaction-auth profile). `500 query-state-invalid` covers everything
@@ -2815,6 +2817,12 @@ fn query_invocation_error_response(error: &QueryInvocationError) -> Response {
 /// failure, which by construction can only arise from storage corruption or
 /// a host bug, never from caller-supplied input (malformed selectors are
 /// rejected before any of this runs).
+///
+/// `SchemaMismatch` is deliberately grouped with `503`, not `500`: it proves
+/// the adapter's durable schema generation disagrees with what was persisted
+/// — an operator/deployment condition an operator can resolve by restoring a
+/// compatible adapter or completing a migration — never that the persisted
+/// bytes themselves are corrupt or unverifiable.
 fn query_node_error_response_parts(error: &NodeCoreError) -> (StatusCode, &'static str) {
     let unavailable = matches!(
         error,
@@ -2823,7 +2831,8 @@ fn query_node_error_response_parts(error: &NodeCoreError) -> (StatusCode, &'stat
             | NodeCoreError::DurableRead(
                 runtime::DurableReadError::WriterFenced { .. }
                     | runtime::DurableReadError::DeadlineExceeded
-                    | runtime::DurableReadError::Unavailable,
+                    | runtime::DurableReadError::Unavailable
+                    | runtime::DurableReadError::SchemaMismatch,
             )
     );
     if unavailable {
@@ -2858,6 +2867,23 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
+/// Resolves the logical domain for a query request through
+/// [`DomainPlacementManifest::resolve_domain`] at `config.epoch()` with one
+/// bounded access — the same activation-epoch-checked path the authenticated
+/// write path uses — rather than reading `placement.domain()`
+/// unconditionally, so an inactive placement classifies identically across
+/// every query route, including `/v1/context`, instead of only where storage
+/// I/O happens to run.
+fn resolve_query_domain(
+    placement: &DomainPlacementManifest,
+    config: &NodeConfig,
+) -> Result<AtomicityDomainId, QueryInvocationError> {
+    placement
+        .resolve_domain(config.epoch(), 1)
+        .map_err(NodeCoreError::from)
+        .map_err(QueryInvocationError::Node)
+}
+
 fn invoke_query_context(
     config: &NodeConfig,
     protocol_config: &ProtocolConfig,
@@ -2868,6 +2894,7 @@ fn invoke_query_context(
         .ok_or(ProtocolConfigError::MissingDomainPlacement)
         .map_err(NodeCoreError::from)
         .map_err(QueryInvocationError::Node)?;
+    let domain = resolve_query_domain(placement, config)?;
     let profile = resolve_transaction_auth_profile(protocol_config)
         .map_err(NodeCoreError::from)
         .map_err(QueryInvocationError::Node)?;
@@ -2883,7 +2910,7 @@ fn invoke_query_context(
         profile.profile_id(),
         profile.signature_scheme_id().as_u16(),
         profile.address_binding().as_u16(),
-        placement.domain(),
+        domain,
         protocol_config_bytes,
     )
     .map_err(|_| QueryInvocationError::ResultEncoding)?;
@@ -2897,13 +2924,9 @@ fn invoke_query_context(
 /// identity, and a bounded deadline, all from trusted composition rather
 /// than the HTTP request.
 ///
-/// The domain is resolved through
-/// [`DomainPlacementManifest::resolve_domain`] at `config.epoch()` with one
-/// bounded access — the same activation-epoch-checked path the authenticated
-/// write path uses — rather than reading `placement.domain()`
-/// unconditionally, so an inactive placement rejects before identity
-/// allocation, clock access, or storage I/O exactly like every other
-/// storage-backed query failure.
+/// The domain is resolved through [`resolve_query_domain`], so an inactive
+/// placement rejects before identity allocation, clock access, or storage
+/// I/O exactly like every other storage-backed query failure.
 fn prepare_query_storage_context<S, T, C, I>(
     components: &StructuredDurableNativeComponents<S, T, C, I>,
     protocol_config: &ProtocolConfig,
@@ -2920,10 +2943,7 @@ where
         .ok_or(ProtocolConfigError::MissingDomainPlacement)
         .map_err(NodeCoreError::from)
         .map_err(QueryInvocationError::Node)?;
-    let domain = placement
-        .resolve_domain(config.epoch(), 1)
-        .map_err(NodeCoreError::from)
-        .map_err(QueryInvocationError::Node)?;
+    let domain = resolve_query_domain(placement, config)?;
     let identity = components
         .identities
         .next_attempt_identity()
@@ -9581,6 +9601,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_route_rejects_inactive_domain_placement_before_any_side_effect() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let config = config();
+        // `config()`'s epoch is 7; an activation epoch of 100 makes this
+        // placement inactive at the trusted current epoch, exactly like the
+        // storage-backed routes' inactive-placement rejection.
+        let mut protocol_config =
+            active_protocol_config(AtomicityDomainId::new([0xFC; 32]).unwrap());
+        protocol_config.domain_placement = Some(placement(0xFC, 100));
+        let clock = Arc::new(CountingClock::new(10_000));
+        let identities = Arc::new(CountingIndexedIdentities::default());
+        let machine = Arc::new(IncrementMachine::new(config.state_key()));
+        let app = structured_durable_router(
+            StructuredDurableNativeComponents::new(
+                store,
+                Arc::new(MemoryTransport::default()),
+                Arc::clone(&clock),
+                Arc::clone(&identities),
+            ),
+            protocol_config,
+            structured_request_authority(),
+            config,
+            resolver(),
+            machine,
+            NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+        )
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::get(QUERY_CONTEXT_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "query-unavailable"
+        );
+        assert_eq!(clock.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(identities.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn object_route_returns_true_absence() {
         let fence = WriterFenceGeneration::new(3).unwrap();
         let store = Arc::new(MemoryDurableStateStore::new(fence));
@@ -10107,6 +10176,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn query_node_error_response_parts_classifies_durable_read_variants() {
+        let cases: Vec<(NodeCoreError, StatusCode, &str)> = vec![
+            (
+                NodeCoreError::DurableRead(DurableReadError::WriterFenced {
+                    active_generation: WriterFenceGeneration::new(3).unwrap(),
+                }),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "query-unavailable",
+            ),
+            (
+                NodeCoreError::DurableRead(DurableReadError::DeadlineExceeded),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "query-unavailable",
+            ),
+            (
+                NodeCoreError::DurableRead(DurableReadError::Unavailable),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "query-unavailable",
+            ),
+            // `SchemaMismatch` is an explicit decision (DR-0082): it proves an
+            // adapter/deployment schema disagreement, not corrupted persisted
+            // bytes, so it is grouped with the other availability conditions
+            // rather than with `query-state-invalid`.
+            (
+                NodeCoreError::DurableRead(DurableReadError::SchemaMismatch),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "query-unavailable",
+            ),
+            (
+                NodeCoreError::DurableRead(DurableReadError::InvalidPersistedState),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "query-state-invalid",
+            ),
+            (
+                NodeCoreError::DurableRead(DurableReadError::InvalidRequest(
+                    RuntimeError::UnsupportedObjectStorage,
+                )),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "query-state-invalid",
+            ),
+        ];
+        for (error, expected_status, expected_code) in cases {
+            let (status, code) = query_node_error_response_parts(&error);
+            assert_eq!(status, expected_status, "error: {error:?}");
+            assert_eq!(code, expected_code, "error: {error:?}");
+        }
+    }
+
     #[tokio::test]
     async fn object_route_rejects_inactive_domain_placement_before_any_side_effect() {
         let fence = WriterFenceGeneration::new(3).unwrap();
@@ -10483,6 +10601,27 @@ mod tests {
         let protocol_config = active_protocol_config(domain);
         let catalog = Arc::new(PreinstalledModuleCatalog::new(Vec::new()).unwrap());
 
+        // Populate one verified current-inline object and one present receipt
+        // so parity is checked against real content, not only absence.
+        // Tombstone and blob-reference results are covered by dedicated
+        // structured-router tests and need not be duplicated here.
+        let setup_context = DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(20_000).unwrap(),
+            StorageCorrelationId::new([0xEE; 16]).unwrap(),
+        );
+        let owner = dev_sender_address(&dev_signing_key(0xEE));
+        let object = owned_object(ObjectId::new([0xEF; 32]), owner, 0x46);
+        let object_ref = commit_owned_object(
+            store.as_ref(),
+            &setup_context,
+            domain,
+            object,
+            "sunrise-test",
+            1,
+            0x47,
+        );
+
         let structured = structured_app(
             Arc::clone(&store),
             Arc::new(MemoryTransport::default()),
@@ -10503,7 +10642,9 @@ mod tests {
         let paths = [
             QUERY_CONTEXT_PATH.to_string(),
             query_object_path(ObjectId::new([0x01; 32])),
+            query_object_path(object_ref.id),
             query_receipt_path(request_id(0x02)),
+            query_receipt_path(request_id(0x47)),
             query_next_nonce_path(&Address::new([0x03; 32])),
         ];
         for path in paths {

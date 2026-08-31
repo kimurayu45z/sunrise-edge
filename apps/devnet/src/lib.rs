@@ -27,7 +27,8 @@ pub use boot::{DEVNET_DATABASE_FILE, DevnetBoot, DevnetBootError, boot_local_sto
 pub use catalog::{DevnetAssetModule, DevnetCatalogError, build_asset_module};
 pub use composition::{DevnetCompositionError, compose_devnet_router};
 pub use config::{
-    DevOwner, DevnetConfig, DevnetConfigError, MAX_DEVNET_CONCURRENCY, MAX_DEVNET_OWNERS,
+    DEVNET_STARTUP_LIMITATIONS_BANNER, DevOwner, DevnetConfig, DevnetConfigError,
+    MAX_DEVNET_CONCURRENCY, MAX_DEVNET_OWNERS,
 };
 pub use genesis::{DevnetGenesisError, DevnetProtocolContext, build_devnet_protocol_context};
 pub use identities::DevnetOutboxIdentitySource;

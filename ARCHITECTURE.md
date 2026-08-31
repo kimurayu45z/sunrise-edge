@@ -1535,7 +1535,13 @@ must stay visible at devnet startup and in documentation once implemented:
 single validator; owned-object only (Create, Shared/System ownership, and
 blob bodies remain fail-closed); fee-free (`fee_payment: None`, empty fee
 registry); same-sender-only asset movement (no cross-owner transfer
-authorization); local SQLite only; and an overall non-production security/
+authorization); local SQLite only; the four bounded query routes are an
+unauthenticated public-read API (any caller can read any object/receipt/
+next-nonce/context — the address in `/v1/senders/{sender}/next-nonce` is a
+public lookup selector, not authorization); query and submission share one
+admission budget (`compose_devnet_router`'s single `NativeBlockingExecutor`
+sized from `--max-concurrent`), so a burst of query traffic can starve
+submissions and vice versa; and an overall non-production security/
 operations posture.
 
 ## 43. Bounded Developer MVP query API
@@ -1583,22 +1589,29 @@ canonical re-encoding checks. A deleted nonce record for an epoch that may be
 accepted remains corruption and fails closed; true absence at initial revision
 returns zero.
 
-All storage-backed queries allocate a restart-safe correlation identity and a
-bounded deadline from the embedding host, resolve the domain from the
+Every query route, including `/v1/context`, resolves the domain from the
 committed manifest through the same activation-epoch-checked
 `DomainPlacementManifest::resolve_domain` path the authenticated write path
 uses (at the trusted current epoch, with one bounded access rather than a real
-application plan), and run through the same bounded blocking executor as
-submission. An inactive placement therefore rejects before identity
-allocation, clock access, or storage I/O; it remains an opaque `503`, while a
-malformed selector is a `400` rejected at the HTTP boundary.
+application plan) — never `placement.domain()` read unconditionally — through
+one shared helper both `/v1/context` and the three storage-backed routes
+call. All storage-backed queries additionally allocate a restart-safe
+correlation identity and a bounded deadline from the embedding host, and run
+through the same bounded blocking executor as submission. An inactive
+placement therefore rejects before identity allocation, clock access, or
+storage I/O for the three storage-backed routes, and before any response is
+constructed for `/v1/context`; it remains an opaque `503` for every route,
+while a malformed selector is a `400` rejected at the HTTP boundary.
 Capacity exhaustion is `429`; malformed paths are `400`; a transient host or
 storage-availability condition (identity-source unavailability, clock/runtime
 failure, a durable read that proves writer fencing/deadline exhaustion/
-backend unavailability, or committed `ProtocolConfig`
-inactivity/misconfiguration) is an opaque `503`; corrupt or unverifiable
-persisted content, result-encoding failure, and identity-source exhaustion are
-an opaque `500`. Query responses are bounded by the existing maximum canonical
+backend unavailability/unsupported schema generation
+(`DurableReadError::SchemaMismatch`, treated as an operator/deployment
+condition rather than proof of corrupted persisted bytes), or committed
+`ProtocolConfig` inactivity/misconfiguration) is an opaque `503`; corrupt or
+unverifiable persisted content, result-encoding failure, and identity-source
+exhaustion are an opaque `500`. Query responses are bounded by the existing
+maximum canonical
 object/receipt sizes; there is no scan, list, prefix, pagination, proof,
 historical-version selector, or arbitrary state-key endpoint in this MVP
 slice.
@@ -1642,11 +1655,14 @@ and `/v1/senders/{sender}/next-nonce` into both `structured_durable_router` and
 Every path selector is validated as exactly 64 lowercase ASCII hex characters
 (and, for receipts, non-zero) before any identity allocation, clock access, or
 storage I/O. Stable vectors, round-trip/unknown-tag/mismatched-selector decode
-tests, both-router parity across all four routes, malformed-path-before-side-
-effects, object absent/tombstone/current-inline/current-blob/tamper/wrong-chain,
-receipt absent/present/corrupt, nonce zero/advanced/deleted-corrupt, an
-inactive-placement-before-side-effects case, and the `503`/`500` operational
-classification are covered in both crates' test suites.
+tests, both-router parity across all four routes (including a populated
+current-inline object and a present receipt, not only absence), malformed-
+path-before-side-effects, object absent/tombstone/current-inline/current-blob/
+tamper/wrong-chain, receipt absent/present/corrupt, nonce
+zero/advanced/deleted-corrupt, inactive-placement-before-side-effects cases
+for `/v1/context` and a representative storage-backed object route, and the
+`503`/`500` operational classification — a direct case table plus the
+`SchemaMismatch` decision above — are covered in both crates' test suites.
 
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.

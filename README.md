@@ -590,9 +590,12 @@ node-core, and `native-http` wires the four canonical
 `application/vnd.sunrise-edge.query-result` results (`GET /v1/context`,
 `/v1/objects/{object_id}`, `/v1/receipts/{request_id}`,
 `/v1/senders/{sender}/next-nonce`) into both structured durable routers,
-sharing their blocking admission and cancellation semantics. A signed
-duplicate-transfer HTTP E2E remains the next slice; this is not yet the
-completed devnet criterion.
+sharing their blocking admission and cancellation semantics. These four
+routes are an unauthenticated bounded public-read surface on the configured
+listener, and query requests share the same `--max-concurrent` admission
+budget as submissions; the local devnet startup banner reports both limits.
+A signed duplicate-transfer HTTP E2E remains the next slice; this is not yet
+the completed devnet criterion.
 
 The Phase 15-17 production exit criteria and accepted persistence designs are
 preserved. Additional capacity/load/soak evidence, PITR, HA/failover,
