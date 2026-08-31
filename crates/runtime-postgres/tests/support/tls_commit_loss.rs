@@ -250,6 +250,10 @@ async fn handle_connection(
     state: Arc<ProxyState>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    // Disable Nagle's algorithm on the client leg, matching the plain proxy:
+    // every relayed message is a small write, and leaving Nagle enabled
+    // serializes each one behind the peer's delayed-ACK timer.
+    let _ = client.set_nodelay(true);
     let mut ssl_request = [0_u8; POSTGRES_SSL_REQUEST.len()];
     if bounded_read_exact(&mut client, &mut ssl_request)
         .await
@@ -267,6 +271,9 @@ async fn handle_connection(
     let Ok(Ok(mut backend)) = timeout(IO_TIMEOUT, TcpStream::connect(backend_addr)).await else {
         return;
     };
+    // Same rationale as the client leg: disable Nagle's algorithm so the
+    // relayed messages are not delayed behind the backend's delayed-ACK timer.
+    let _ = backend.set_nodelay(true);
     let (mut client_reader, mut client_writer) = tokio::io::split(tls_client);
     if relay_startup_message(&mut client_reader, &mut backend)
         .await

@@ -146,9 +146,12 @@ pub enum CommitFaultPoint {
 /// fixtures backed by a real, severable network transport.
 ///
 /// Ephemeral in-process stores have no connection to sever and must not
-/// implement this trait or manufacture equivalent evidence. The only current
-/// implementation (`runtime-postgres`'s live PostgreSQL test) severs a plain
-/// `NoTls` connection; it proves nothing about TLS-path connection loss.
+/// implement this trait or manufacture equivalent evidence. The current
+/// implementations, both in `runtime-postgres`'s live PostgreSQL test, sever
+/// either a plain `NoTls` connection or a strictly authenticated
+/// client-to-test-terminator TLS connection (DR-0074); neither proves
+/// anything about PostgreSQL-server/provider TLS, mTLS, PKI lifecycle, or
+/// production certification beyond that TLS leg.
 pub trait CommitLossFixture: DurableStoreFixture {
     /// Arms exactly one future COMMIT dispatched through the fixture's store
     /// to be severed at `fault_point`. The fixture must consume the arming
@@ -2152,9 +2155,10 @@ pub fn run_schema_skew_conformance<F: SchemaSkewFixture>(fixture: &F) -> Conform
 /// survive an abrupt process/power loss. It also covers only the two
 /// connection-loss instants named by [`CommitFaultPoint`] on whatever
 /// transport the fixture severs, is not evidence for disk exhaustion,
-/// TLS-path connection loss, capacity/load/soak, real writer failover, or
-/// client disconnect/in-flight cancellation; those remain open per
-/// `POSTGRES.md`.
+/// PostgreSQL-server/provider TLS, mTLS, PKI lifecycle, or production
+/// certification beyond the fixture's own client/driver-to-terminator leg,
+/// capacity/load/soak, real writer failover, or client disconnect/in-flight
+/// cancellation; those remain open per `POSTGRES.md`.
 pub fn run_commit_loss_conformance<F: CommitLossFixture>(fixture: &F) -> ConformanceResult {
     let store: Arc<F::Store> = fixture.store();
     let domain: AtomicityDomainId = fixture.domain();
