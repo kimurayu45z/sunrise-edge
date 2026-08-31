@@ -17,7 +17,7 @@ use canonical_encoding::{
     CanonicalDecodingError, CanonicalEncodingError, CanonicalStruct, decode_canonical_frame,
 };
 use core::fmt;
-use execution::WasmExecutionEngine;
+use execution::{ExecutionError, WasmExecutionEngine};
 use hashing::HashSuiteResolver;
 use node_core::{
     AuthenticatedSubmitTransaction, MAX_NODE_OUTPUT_ITEMS, MAX_NODE_PAYLOAD_BYTES, NodeConfig,
@@ -231,6 +231,17 @@ pub struct PreinstalledWasmComposition {
 
 impl PreinstalledWasmComposition {
     /// Creates a trusted preinstalled-WASM composition input.
+    ///
+    /// `created_checkpoint` must be non-decreasing across process restarts
+    /// for every object this composition may mutate: node-core rejects a
+    /// Write whose `created_checkpoint` is lower than the previous immutable
+    /// version's own stored checkpoint
+    /// (`NodeCoreError::ObjectCreatedCheckpointRegression`), and that check
+    /// fails closed rather than silently accepting a regressed value. This
+    /// function does not derive or persist `created_checkpoint` itself; the
+    /// caller must source it from its own already-validated, durably
+    /// advancing chain progress (never wall-clock time, never HTTP request
+    /// bytes), exactly like the node-core entrypoint this composition feeds.
     #[must_use]
     pub const fn new(
         catalog: Arc<PreinstalledModuleCatalog>,
@@ -1003,8 +1014,9 @@ fn validate_structured_durable_router_authority(
 
 /// Serves a configured native router until the shutdown future completes.
 ///
-/// Build `app` with [`router`] or [`structured_durable_router`] so the blocking
-/// admission policy is explicit at the composition boundary.
+/// Build `app` with [`router`], [`structured_durable_router`], or
+/// [`preinstalled_wasm_structured_durable_router`] so the blocking admission
+/// policy is explicit at the composition boundary.
 pub async fn serve<F>(
     listener: tokio::net::TcpListener,
     app: Router,
@@ -1583,17 +1595,27 @@ where
         .into_response()
 }
 
-async fn submit_structured_durable_event<S, M, T, C, I>(
-    State(state): State<SharedStructuredDurableNativeHttpState<S, M, T, C, I>>,
+/// Shared request-shape/admission/cancellation plumbing behind both
+/// [`submit_structured_durable_event`] and
+/// [`submit_preinstalled_wasm_structured_durable_event`].
+///
+/// `initial_cancelled` is the caller's own pre-storage cancellation
+/// observation, taken from its typed state before this call; the inner
+/// structured-durable core (`invoke_structured_durable_event_with_execution`)
+/// still re-checks cancellation itself once the durable operation context is
+/// built, so cancellation is checked at both points on every route, not only
+/// here. `work` runs the caller's exact blocking invocation (`invoke_*`)
+/// against the extracted body bytes inside the shared blocking-admission
+/// isolation.
+async fn submit_structured_durable_event_common<F>(
+    initial_cancelled: bool,
+    blocking_executor: NativeBlockingExecutor,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
+    work: F,
 ) -> Response
 where
-    S: IndexedOutboxRepository + Send + Sync + 'static,
-    M: TransactionalNodeStateMachine + Send + Sync + 'static,
-    T: Transport + Send + Sync + 'static,
-    C: Clock + Send + Sync + 'static,
-    I: IndexedOutboxIdentitySource + Send + Sync + 'static,
+    F: FnOnce(Bytes) -> Result<Vec<u8>, InvocationError> + Send + 'static,
 {
     if !has_supported_content_type(&headers) {
         return error_response(
@@ -1611,22 +1633,21 @@ where
         Ok(body) => body,
         Err(error) => return error_response(error.status(), "body-rejected"),
     };
-    if state.components.is_cancelled() {
+    if initial_cancelled {
         return cancelled_before_storage_response();
     }
-    let permit = match state.blocking_executor.try_acquire() {
+    let permit = match blocking_executor.try_acquire() {
         Ok(permit) => permit,
         Err(TryAcquireError::NoPermits) => return overload_response(),
         Err(TryAcquireError::Closed) => {
             return error_response(StatusCode::SERVICE_UNAVAILABLE, "blocking-admission-closed");
         }
     };
-    let blocking_state = Arc::clone(&state);
-    let work = tokio::task::spawn_blocking(move || {
+    let blocking_work = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        invoke_structured_durable_event(blocking_state.as_ref(), &body)
+        work(body)
     });
-    let result = match work.await {
+    let result = match blocking_work.await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => return invocation_error_response(&error),
         Err(_) => {
@@ -1644,6 +1665,30 @@ where
         .into_response()
 }
 
+async fn submit_structured_durable_event<S, M, T, C, I>(
+    State(state): State<SharedStructuredDurableNativeHttpState<S, M, T, C, I>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response
+where
+    S: IndexedOutboxRepository + Send + Sync + 'static,
+    M: TransactionalNodeStateMachine + Send + Sync + 'static,
+    T: Transport + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+    I: IndexedOutboxIdentitySource + Send + Sync + 'static,
+{
+    let initial_cancelled = state.components.is_cancelled();
+    let blocking_executor = state.blocking_executor.clone();
+    submit_structured_durable_event_common(
+        initial_cancelled,
+        blocking_executor,
+        headers,
+        body,
+        move |body| invoke_structured_durable_event(state.as_ref(), &body),
+    )
+    .await
+}
+
 async fn submit_preinstalled_wasm_structured_durable_event<S, M, T, C, I>(
     State(state): State<SharedPreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I>>,
     headers: HeaderMap,
@@ -1656,53 +1701,16 @@ where
     C: Clock + Send + Sync + 'static,
     I: IndexedOutboxIdentitySource + Send + Sync + 'static,
 {
-    if !has_supported_content_type(&headers) {
-        return error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported-content-type",
-        );
-    }
-    if has_unsupported_content_encoding(&headers) {
-        return error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported-content-encoding",
-        );
-    }
-    let body = match body {
-        Ok(body) => body,
-        Err(error) => return error_response(error.status(), "body-rejected"),
-    };
-    if state.components.is_cancelled() {
-        return cancelled_before_storage_response();
-    }
-    let permit = match state.blocking_executor.try_acquire() {
-        Ok(permit) => permit,
-        Err(TryAcquireError::NoPermits) => return overload_response(),
-        Err(TryAcquireError::Closed) => {
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, "blocking-admission-closed");
-        }
-    };
-    let blocking_state = Arc::clone(&state);
-    let work = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        invoke_preinstalled_wasm_structured_durable_event(blocking_state.as_ref(), &body)
-    });
-    let result = match work.await {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => return invocation_error_response(&error),
-        Err(_) => {
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "blocking-task-failed");
-        }
-    };
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, NODE_RESULT_MEDIA_TYPE),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        result,
+    let initial_cancelled = state.components.is_cancelled();
+    let blocking_executor = state.blocking_executor.clone();
+    submit_structured_durable_event_common(
+        initial_cancelled,
+        blocking_executor,
+        headers,
+        body,
+        move |body| invoke_preinstalled_wasm_structured_durable_event(state.as_ref(), &body),
     )
-        .into_response()
+    .await
 }
 
 enum InvocationError {
@@ -2420,10 +2428,35 @@ fn node_error_response(error: &NodeCoreError) -> Response {
             (StatusCode::BAD_REQUEST, "object-version-invalid")
         }
         NodeCoreError::ObjectConflict { .. } => (StatusCode::CONFLICT, "object-head-conflict"),
+        // An object at its maximum immutable version can never be mutated
+        // again: a real conflict, not a malformed request.
+        NodeCoreError::ObjectVersionOverflow { .. } => {
+            (StatusCode::CONFLICT, "object-version-overflow")
+        }
+        // Object-creating effects are outside this MVP slice; consistent
+        // with every other `*Unsupported` object variant below.
+        NodeCoreError::ObjectCreationUnsupported { .. } => {
+            (StatusCode::NOT_IMPLEMENTED, "object-creation-unsupported")
+        }
+        // A declared signed access and its deterministic execution effect
+        // disagreed: deterministic given the same signed transaction and
+        // trusted module, so a client/request fault, not a server fault.
+        NodeCoreError::ObjectEffectMismatch { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "object-effect-mismatch")
+        }
         NodeCoreError::ObjectRecordMissing { .. }
         | NodeCoreError::ObjectRecordMismatch { .. }
         | NodeCoreError::ObjectBodyDigestMismatch { .. }
-        | NodeCoreError::ObjectProvenanceMismatch { .. } => {
+        | NodeCoreError::ObjectProvenanceMismatch { .. }
+        // These can only mean deterministic execution (over a trusted
+        // catalog module) or the owned-effects translator produced output
+        // that disagrees with its own documented invariants: impossible in
+        // practice, never a caller-supplied fault.
+        | NodeCoreError::DuplicateObjectEffect { .. }
+        | NodeCoreError::TooManyObjectEffects { .. }
+        | NodeCoreError::UndeclaredObjectEffect { .. }
+        | NodeCoreError::ObjectMutationContextMissing { .. }
+        | NodeCoreError::SystemModules(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "invalid-node-output")
         }
         NodeCoreError::ObjectDigestUnverifiable { .. } => (
@@ -2433,6 +2466,7 @@ fn node_error_response(error: &NodeCoreError) -> Response {
         NodeCoreError::ObjectBodyTooLarge { .. } => {
             (StatusCode::UNPROCESSABLE_ENTITY, "object-body-too-large")
         }
+        NodeCoreError::Execution(execution_error) => execution_error_response(execution_error),
         // Malformed/inactive/unknown module reference: deterministic,
         // request-dependent client faults.
         NodeCoreError::PreinstalledModuleUnknown { .. } => (
@@ -2499,6 +2533,76 @@ fn node_error_response(error: &NodeCoreError) -> Response {
         _ => (StatusCode::BAD_REQUEST, "invalid-node-event"),
     };
     error_response(status, code)
+}
+
+/// Coarse HTTP classification for every [`ExecutionError`] variant reachable
+/// from the preinstalled-WASM route, matched exhaustively (no wildcard) so a
+/// future variant forces an explicit classification decision here.
+///
+/// By the time [`node_core::handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution`]'s
+/// machine ever runs, [`node_core::authenticate_submit_transaction_event`]
+/// has already decoded and re-encoded the exact same transaction once
+/// (`transaction_auth::authenticate_transaction_bytes` calls
+/// `execution::encode_transaction_signable`), so `EmptyEntrypoint`,
+/// `TransactionFieldTooLarge`, `NonCanonicalTransactionEncoding`, and every
+/// other canonical-encoding-shaped variant can only recur here as a
+/// host/composition invariant violation, never a fresh caller-supplied
+/// fault; the same is true of `HashChainMismatch`/`HashProtocolVersionMismatch`,
+/// since this route's `resolver` is the same trusted value already used to
+/// authenticate the event's chain/protocol version.
+fn execution_error_response(error: &ExecutionError) -> (StatusCode, &'static str) {
+    match error {
+        // The transaction's client-chosen entrypoint name does not exist in
+        // an otherwise trusted, catalog-verified module: deterministic and
+        // request-dependent, so a client fault.
+        ExecutionError::MissingEntrypoint(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "preinstalled-module-entrypoint-unknown",
+        ),
+        // Deterministic execution resource bounds (args/input-object/
+        // input-data size) exceeded; scales with the caller's own manifest
+        // and args, so a client fault. Malformed trusted catalog WASM bytes
+        // cannot reach this arm: `PreinstalledModuleCatalogEntry::new`
+        // already enforces the same module-byte bound at composition time.
+        ExecutionError::ResourceLimitExceeded(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "preinstalled-module-resource-limit-exceeded",
+        ),
+        // The trusted catalog module itself failed to parse, instantiate, or
+        // link, or its resolved entrypoint export has the wrong signature: a
+        // host/catalog defect (malformed trusted catalog WASM), never
+        // something the caller can control. Bounded only by this route's
+        // admission/pre-activation limits, not production fee accounting.
+        ExecutionError::WasmEngine(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "preinstalled-module-engine-failure",
+        ),
+        // Mirrors `NodeCoreError::ObjectVersionOverflow`'s classification:
+        // the object can no longer be mutated, a real conflict rather than a
+        // malformed request.
+        ExecutionError::ObjectVersionOverflow(_) => {
+            (StatusCode::CONFLICT, "object-version-overflow")
+        }
+        // Every remaining variant is internal encoding/hashing/context
+        // machinery over an already-authenticated, already-bounded
+        // transaction; see this function's doc comment for why reaching one
+        // here is a host/composition invariant violation.
+        ExecutionError::CanonicalEncoding(_)
+        | ExecutionError::CanonicalDecoding(_)
+        | ExecutionError::Abi(_)
+        | ExecutionError::Object(_)
+        | ExecutionError::Hashing(_)
+        | ExecutionError::Fee(_)
+        | ExecutionError::ProtocolType(_)
+        | ExecutionError::EmptyEntrypoint
+        | ExecutionError::EmptySignature
+        | ExecutionError::TransactionFieldTooLarge { .. }
+        | ExecutionError::NonCanonicalTransactionEncoding
+        | ExecutionError::HashChainMismatch
+        | ExecutionError::HashProtocolVersionMismatch { .. } => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "invalid-node-output")
+        }
+    }
 }
 
 fn transaction_auth_error_response(error: &TransactionAuthError) -> Response {
@@ -2619,8 +2723,8 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
     use system_modules::{
-        GasModel, ModuleId, ModuleStatus, SystemModule, SystemModuleManifest, SystemModuleRegistry,
-        TypeSchema, encode_system_module_manifest,
+        GasModel, ModuleId, ModuleStatus, SystemModule, SystemModuleError, SystemModuleManifest,
+        SystemModuleRegistry, TypeSchema, encode_system_module_manifest,
     };
     use tokio::sync::Notify;
     use tower::ServiceExt;
@@ -3050,8 +3154,31 @@ mod tests {
         module_ref: ObjectRef,
         args: Vec<u8>,
     ) -> NodeEvent {
+        signed_preinstalled_wasm_submit_transaction_event_with_entrypoint(
+            signing_key,
+            request_id,
+            nonce,
+            access_manifest,
+            module_ref,
+            "run",
+            args,
+        )
+    }
+
+    /// Same as [`signed_preinstalled_wasm_submit_transaction_event`], with a
+    /// caller-chosen entrypoint name instead of the fixed `"run"` export.
+    #[allow(clippy::too_many_arguments)]
+    fn signed_preinstalled_wasm_submit_transaction_event_with_entrypoint(
+        signing_key: &ed25519_zebra::SigningKey,
+        request_id: RequestId,
+        nonce: u64,
+        access_manifest: AccessManifest,
+        module_ref: ObjectRef,
+        entrypoint: &str,
+        args: Vec<u8>,
+    ) -> NodeEvent {
         let sender = dev_sender_address(signing_key);
-        let tx = preinstalled_wasm_transaction(
+        let mut tx = preinstalled_wasm_transaction(
             sender,
             ChainId::new("sunrise-test").unwrap(),
             Epoch::new(7),
@@ -3060,6 +3187,7 @@ mod tests {
             module_ref,
             args,
         );
+        tx.entrypoint = entrypoint.to_string();
         let bytes = signed_transaction_bytes(signing_key, &tx);
         submit_transaction_event(request_id, bytes)
     }
@@ -4459,6 +4587,79 @@ mod tests {
                 },
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "object-created-checkpoint-regression",
+            ),
+            (
+                NodeCoreError::ObjectVersionOverflow { object_id },
+                StatusCode::CONFLICT,
+                "object-version-overflow",
+            ),
+            (
+                NodeCoreError::ObjectCreationUnsupported { object_id },
+                StatusCode::NOT_IMPLEMENTED,
+                "object-creation-unsupported",
+            ),
+            (
+                NodeCoreError::ObjectEffectMismatch {
+                    object_id,
+                    reason: "test reason",
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "object-effect-mismatch",
+            ),
+            (
+                NodeCoreError::DuplicateObjectEffect { object_id },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid-node-output",
+            ),
+            (
+                NodeCoreError::TooManyObjectEffects {
+                    actual: 33,
+                    maximum: 32,
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid-node-output",
+            ),
+            (
+                NodeCoreError::UndeclaredObjectEffect { object_id },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid-node-output",
+            ),
+            (
+                NodeCoreError::ObjectMutationContextMissing { object_id },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid-node-output",
+            ),
+            (
+                NodeCoreError::SystemModules(SystemModuleError::ZeroModuleVersion),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid-node-output",
+            ),
+            (
+                NodeCoreError::Execution(ExecutionError::MissingEntrypoint(
+                    "does-not-exist".to_string(),
+                )),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "preinstalled-module-entrypoint-unknown",
+            ),
+            (
+                NodeCoreError::Execution(ExecutionError::ResourceLimitExceeded("input objects")),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "preinstalled-module-resource-limit-exceeded",
+            ),
+            (
+                NodeCoreError::Execution(ExecutionError::WasmEngine("boom".to_string())),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "preinstalled-module-engine-failure",
+            ),
+            (
+                NodeCoreError::Execution(ExecutionError::ObjectVersionOverflow(object_id)),
+                StatusCode::CONFLICT,
+                "object-version-overflow",
+            ),
+            (
+                NodeCoreError::Execution(ExecutionError::HashChainMismatch),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid-node-output",
             ),
         ];
 
@@ -5877,6 +6078,215 @@ mod tests {
         assert!(transport.drain_outbound().unwrap().is_empty());
     }
 
+    /// A discriminating test proving `MissingEntrypoint` (a client-chosen
+    /// entrypoint name absent from an otherwise valid, catalog-verified
+    /// module) maps to `422` and never reaches object mutation or a
+    /// persisted receipt, exercising `execution_error_response`'s
+    /// classification through the full HTTP path rather than only as a unit
+    /// case on `node_error_response`.
+    #[tokio::test]
+    async fn preinstalled_route_missing_entrypoint_rejects_as_client_fault_without_mutation() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xD2; 32]).unwrap();
+        let module_id = ModuleId::new([0x75; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &resolver(),
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+        );
+        let protocol_config = preinstalled_protocol_config(domain, registry);
+        let signing_key = dev_signing_key(0x57);
+        let sender = dev_sender_address(&signing_key);
+        let setup_context = DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(20_000).unwrap(),
+            StorageCorrelationId::new([0xD2; 16]).unwrap(),
+        );
+        let write_object = owned_object(ObjectId::new([0xD3; 32]), sender, 0x48);
+        let write_ref = commit_owned_object(
+            store.as_ref(),
+            &setup_context,
+            domain,
+            write_object,
+            "sunrise-test",
+            9,
+            0x49,
+        );
+        let write_object_id = write_ref.id;
+        let catalog = Arc::new(catalog);
+        let app = preinstalled_app(
+            Arc::clone(&store),
+            Arc::clone(&transport),
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+            catalog,
+            9,
+        );
+        let mut manifest = AccessManifest::new();
+        manifest.push(AccessEntry {
+            object_ref: write_ref,
+            mode: AccessMode::Write,
+        });
+        let id = request_id(0xD4);
+        // `preinstalled_write_wasm_bytes` only exports `"run"`.
+        let event = signed_preinstalled_wasm_submit_transaction_event_with_entrypoint(
+            &signing_key,
+            id,
+            0,
+            manifest,
+            module_ref,
+            "does-not-exist",
+            vec![1, 2],
+        );
+
+        let response = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event.encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "preinstalled-module-entrypoint-unknown"
+        );
+        assert_eq!(
+            store
+                .get_request_receipt(
+                    &setup_context,
+                    domain,
+                    DurableRequestId::new(*id.as_bytes()).unwrap()
+                )
+                .unwrap(),
+            None
+        );
+        let write_head = store
+            .get_object_head(&setup_context, domain, write_object_id)
+            .unwrap();
+        assert_eq!(write_head.object_version(), DurableObjectVersion::new(1));
+        assert!(transport.drain_outbound().unwrap().is_empty());
+    }
+
+    /// Proves the catalog/commitment-mismatch classification end to end:
+    /// the caller-supplied catalog entry's WASM bytes no longer rehash to
+    /// the governance-committed `canonical_code_hash`, which is a host
+    /// catalog defect, so this must be an opaque `500`, not a client fault,
+    /// and must never leak the internal `Display` text of the mismatch.
+    #[tokio::test]
+    async fn preinstalled_route_catalog_code_hash_mismatch_is_opaque_host_failure() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xD5; 32]).unwrap();
+        let module_id = ModuleId::new([0x76; 32]);
+        let (registry, _genuine_catalog, module_ref) = preinstalled_module_fixture(
+            &resolver(),
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+        );
+        // Corrupt the caller-supplied catalog: same module_id/version/
+        // manifest/semantics as the registry commitment, but different WASM
+        // bytes, so the catalog entry no longer rehashes to the registry's
+        // committed `canonical_code_hash`.
+        let mismatched_entry = PreinstalledModuleCatalogEntry::new(
+            module_id,
+            1,
+            preinstalled_trap_wasm_bytes(),
+            preinstalled_manifest(module_id, 64),
+            Digest32::new(HashAlgorithmId::Sha2_256, [0x33; 32]),
+        )
+        .unwrap();
+        let catalog = Arc::new(PreinstalledModuleCatalog::new(vec![mismatched_entry]).unwrap());
+        let protocol_config = preinstalled_protocol_config(domain, registry);
+        let signing_key = dev_signing_key(0x58);
+        let sender = dev_sender_address(&signing_key);
+        let setup_context = DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(20_000).unwrap(),
+            StorageCorrelationId::new([0xD5; 16]).unwrap(),
+        );
+        let write_object = owned_object(ObjectId::new([0xD6; 32]), sender, 0x4A);
+        let write_ref = commit_owned_object(
+            store.as_ref(),
+            &setup_context,
+            domain,
+            write_object,
+            "sunrise-test",
+            9,
+            0x4B,
+        );
+        let write_object_id = write_ref.id;
+        let app = preinstalled_app(
+            Arc::clone(&store),
+            Arc::clone(&transport),
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+            catalog,
+            9,
+        );
+        let mut manifest = AccessManifest::new();
+        manifest.push(AccessEntry {
+            object_ref: write_ref,
+            mode: AccessMode::Write,
+        });
+        let id = request_id(0xD7);
+        let event = signed_preinstalled_wasm_submit_transaction_event(
+            &signing_key,
+            id,
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+
+        let response = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event.encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "preinstalled-module-catalog-mismatch"
+        );
+        assert_eq!(
+            store
+                .get_request_receipt(
+                    &setup_context,
+                    domain,
+                    DurableRequestId::new(*id.as_bytes()).unwrap()
+                )
+                .unwrap(),
+            None
+        );
+        let write_head = store
+            .get_object_head(&setup_context, domain, write_object_id)
+            .unwrap();
+        assert_eq!(write_head.object_version(), DurableObjectVersion::new(1));
+        assert!(transport.drain_outbound().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn structured_route_still_rejects_write_and_consume_access() {
         let fence = WriterFenceGeneration::new(3).unwrap();
@@ -5934,44 +6344,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preinstalled_route_rejects_cancellation_before_storage_dispatch() {
-        let fence = WriterFenceGeneration::new(3).unwrap();
-        let store = Arc::new(MemoryDurableStateStore::new(fence));
-        store.set_time(10_000);
-        let transport = Arc::new(MemoryTransport::default());
-        let config = config();
-        let domain = AtomicityDomainId::new([0xC5; 32]).unwrap();
-        let protocol_config = active_protocol_config(domain);
-        let cancellation: Arc<ManualCancellation> = Arc::new(ManualCancellation::default());
-        cancellation.cancel();
-        let catalog = Arc::new(PreinstalledModuleCatalog::new(Vec::new()).unwrap());
-        let app = preinstalled_app_with_cancellation(
-            Arc::clone(&store),
-            Arc::clone(&transport),
-            Arc::new(ManualClock::new(10_000)),
-            protocol_config,
-            config,
-            catalog,
-            9,
-            cancellation,
-        );
+    async fn preinstalled_route_rejects_cancellation_at_each_pre_storage_checkpoint() {
+        // Both the shared axum wrapper's own initial observation (call 1) and
+        // the two checkpoints inside the shared
+        // `invoke_structured_durable_event_with_execution` core (calls 2 and
+        // 3, mirroring `structured_route_rejects_cancellation_at_each_pre_storage_checkpoint`)
+        // must reject on this route too, proving the new thin wrapper wires
+        // its own state's cancellation signal through correctly.
+        for cancel_at_call in 1_usize..=3_usize {
+            let fence = WriterFenceGeneration::new(3).unwrap();
+            let store = Arc::new(MemoryDurableStateStore::new(fence));
+            store.set_time(10_000);
+            let transport = Arc::new(MemoryTransport::default());
+            let config = config();
+            let domain = AtomicityDomainId::new([0xC5; 32]).unwrap();
+            let protocol_config = active_protocol_config(domain);
+            let cancellation: Arc<StepCancellation> =
+                Arc::new(StepCancellation::new(cancel_at_call));
+            let catalog = Arc::new(PreinstalledModuleCatalog::new(Vec::new()).unwrap());
+            let app = preinstalled_app_with_cancellation(
+                Arc::clone(&store),
+                Arc::clone(&transport),
+                Arc::new(ManualClock::new(10_000)),
+                protocol_config,
+                config.clone(),
+                catalog,
+                9,
+                cancellation.clone(),
+            );
+            let id = request_id(u8::try_from(0xD0_usize + cancel_at_call).unwrap());
 
-        let response = app
-            .oneshot(
-                Request::post(NODE_EVENT_PATH)
-                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                    .body(Body::from(event(request_id(0xC6)).encode().unwrap()))
+            let response = app
+                .oneshot(
+                    Request::post(NODE_EVENT_PATH)
+                        .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                        .body(Body::from(event(id).encode().unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                to_bytes(response.into_body(), 128).await.unwrap(),
+                "invocation-cancelled-before-storage"
+            );
+            assert_eq!(cancellation.calls(), cancel_at_call);
+            assert!(transport.drain_outbound().unwrap().is_empty());
+            let verification_context = DurableOperationContext::new(
+                fence,
+                StorageDeadline::new(11_000).unwrap(),
+                StorageCorrelationId::new([0xD1; 16]).unwrap(),
+            );
+            assert_eq!(
+                store
+                    .get_request_receipt(
+                        &verification_context,
+                        domain,
+                        DurableRequestId::new(*id.as_bytes()).unwrap(),
+                    )
                     .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            to_bytes(response.into_body(), 128).await.unwrap(),
-            "invocation-cancelled-before-storage"
-        );
-        assert!(transport.drain_outbound().unwrap().is_empty());
+                None
+            );
+        }
     }
 
     #[tokio::test]
@@ -6045,6 +6480,92 @@ mod tests {
             "blocking-capacity-exhausted"
         );
         assert_eq!(first.status(), StatusCode::OK);
+    }
+
+    /// Proves `structured_durable_router` and `preinstalled_wasm_structured_durable_router`
+    /// share identical unsupported-content-type/content-encoding/body rejection
+    /// behavior, since both now dispatch through the one private
+    /// `submit_structured_durable_event_common` helper rather than duplicated
+    /// per-route logic.
+    #[tokio::test]
+    async fn structured_and_preinstalled_routes_share_content_type_and_body_rejection_behavior() {
+        let domain = AtomicityDomainId::new([0xCA; 32]).unwrap();
+        let config = config();
+        let structured_store = Arc::new(MemoryDurableStateStore::new(
+            WriterFenceGeneration::new(3).unwrap(),
+        ));
+        structured_store.set_time(10_000);
+        let structured = structured_app(
+            structured_store,
+            Arc::new(MemoryTransport::default()),
+            Arc::new(ManualClock::new(10_000)),
+            active_protocol_config(domain),
+            config.clone(),
+        );
+        let preinstalled_store = Arc::new(MemoryDurableStateStore::new(
+            WriterFenceGeneration::new(3).unwrap(),
+        ));
+        preinstalled_store.set_time(10_000);
+        let preinstalled = preinstalled_app(
+            preinstalled_store,
+            Arc::new(MemoryTransport::default()),
+            Arc::new(ManualClock::new(10_000)),
+            active_protocol_config(domain),
+            config,
+            Arc::new(PreinstalledModuleCatalog::new(Vec::new()).unwrap()),
+            9,
+        );
+
+        for app in [structured, preinstalled] {
+            let wrong_type = app
+                .clone()
+                .oneshot(
+                    Request::post(NODE_EVENT_PATH)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(event(request_id(0xCB)).encode().unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(wrong_type.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert_eq!(
+                to_bytes(wrong_type.into_body(), 128).await.unwrap(),
+                "unsupported-content-type"
+            );
+
+            let unsupported_encoding = app
+                .clone()
+                .oneshot(
+                    Request::post(NODE_EVENT_PATH)
+                        .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                        .header(header::CONTENT_ENCODING, "gzip")
+                        .body(Body::from(event(request_id(0xCC)).encode().unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                unsupported_encoding.status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE
+            );
+            assert_eq!(
+                to_bytes(unsupported_encoding.into_body(), 128)
+                    .await
+                    .unwrap(),
+                "unsupported-content-encoding"
+            );
+
+            let oversized_body = app
+                .oneshot(
+                    Request::post(NODE_EVENT_PATH)
+                        .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                        .body(Body::from(vec![0_u8; MAX_HTTP_EVENT_BODY_BYTES + 1]))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(oversized_body.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        }
     }
 
     #[tokio::test]

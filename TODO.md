@@ -1761,7 +1761,7 @@ Developer MVP completion criteria:
    exact object head assertionとmutationをnonce/state/receipt/outboxとatomic commitする
    additive node-core entrypoint（implemented As-Is）。generic/read-only経路
    （`structured_durable_router`を含む）は引き続きWrite/Consumeをstorage I/O前に拒否する
-   （step 5の`preinstalled_wasm_structured_durable_router`のみ例外）。
+   （step 4の`preinstalled_wasm_structured_durable_router`のみ例外）。
 3. committed `ProtocolConfig`から固定したactive system-module registryとbounded immutable
    preinstalled catalogのcode/manifest/semantics commitmentを照合し、object-onlyの
    deterministic WASM executionをowned-effects atomic durable entrypointへ接続する
@@ -1769,9 +1769,43 @@ Developer MVP completion criteria:
    epoch-only hash-suite rotation後もreadableとする。専用`SystemModuleManifest` hash purpose、
    pre-activation gas ceiling、engine-independent trap normalizationを適用し、canonical
    `ExecutionEffects`をresponseへ返す。trapはobject mutationなしのRejected receipt/nonceとして
-   commitする。zero-object callはこのMVP pathでは明示的に拒否する。native HTTP wiringはstep 5で
+   commitする。zero-object callはこのMVP pathでは明示的に拒否する。native HTTP wiringはstep 4で
    実装済み（implemented As-Is）、devnet binary/startup wiringは未実装。
-4. local devnet/query API、TypeScript client、counter demo UI、restart/duplicate E2Eを順に追加する。
+4. DR-0078のpreinstalled-WASM entrypointを新しいadditive `native-http`合成
+   （`preinstalled_wasm_structured_durable_router`/`_with_executor`）経由でHTTPへ公開する
+   （implemented As-Is）。既存の`structured_durable_router`はread-only entrypointのまま変更しない。
+   両routerは認証済み準備・storage context構築・exact request-scoped outbox claim/send/ack pathを
+   共有する1つのprivate core（`invoke_structured_durable_event_with_execution`）を、小さなprivate
+   `StructuredDurableAuthenticatedExecution` policy enum（`ReadOnly`/`PreinstalledWasm`）で
+   parameterizeして再利用し、重複させない。両axum handlerも1つのprivate
+   `submit_structured_durable_event_common`ヘルパーへ統合し、content-type/body抽出/admission/
+   cancellation観測/blocking dispatchの重複を排除した。新しいpublic `PreinstalledWasmComposition`は
+   `Arc<PreinstalledModuleCatalog>`・zero-sizedな`execution::WasmExecutionEngine`・
+   `created_checkpoint: u64`のみを保持するcomposition-trusted inputで、HTTP request bytesや
+   wall clockからは決して取得しない（`created_checkpoint`はmutate対象objectについてrestart間で
+   non-decreasingでなければならず、regressionはfail closedになるとdoc化済み）。新routerの
+   `SubmitTransaction`は
+   `handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution`を
+   呼び、他のevent kindは既存のgeneric machine pathのままとする。blocking admissionと
+   pre-storage-dispatch cancellationは両routerで同一のsemanticsを保つ（新routerの3つの
+   pre-storage checkpointすべてで直接cancellation testを追加済み）。coarse HTTP error
+   classificationを拡張し、`execution::ExecutionError`をワイルドカードなしで明示的にmatchする。
+   malformed/inactive/unknown module reference（`MissingEntrypoint`含む）とargs/gas/
+   zero-object/resource-limit requestは引き続きdeterministic client error（422/400）、
+   `WasmEngine`（trusted catalog code）と内部encoding/hash/context failureはopaque 500 host
+   failure、catalog/commitment mismatchと`ObjectCreatedCheckpointRegression`はhost/operator
+   failure、`ObjectCreationUnsupported`は501、`ObjectVersionOverflow`（node-core/execution両方）は
+   409、`ObjectEffectMismatch`はopaque 422、`DuplicateObjectEffect`/`TooManyObjectEffects`/
+   `UndeclaredObjectEffect`/`ObjectMutationContextMissing`/`SystemModules`はopaque 500
+   invalid-outputとして分類する（内部詳細はleakしない）。fixtureはすべて
+   `HashSuiteResolver`/canonical encoderから計算し、pasted digestを使わない。discriminating
+   missing-entrypoint test（422、no receipt/mutation）とcatalog code-hash mismatch test
+   （opaque 500）をHTTPレベルで追加済み。full composition-time registry/catalog reconciliation
+   はdevnet compositionへ延期し、request-time mismatchは引き続きfail-closed 500とする。Create、
+   Shared/System、blob、native binary/devnet startup wiring、query API、TypeScript client、UI、
+   arbitrary upload、fees/meteringは引き続きこのstepの範囲外（Shared/System/blob coverageは
+   node-core側に留め、HTTP層で重複させない）。
+5. local devnet/query API、TypeScript client、counter demo UI、restart/duplicate E2Eを順に追加する。
    前提として、`runtime-sqlite`へ`StructuredDurableDomainStateStore`/`IndexedOutboxRepository`を
    実装するadditive、local-only、non-productionな`SqliteDurableStore`を追加済み
    （implemented As-Is）。既存のopaque `SqliteStateStore`とは別テーブル・別`PRAGMA application_id`で、
@@ -1798,27 +1832,8 @@ Developer MVP completion criteria:
    `RequestAlreadyCommitted`・reopen後のoutbox acknowledgement冪等性を含むrestart persistence
    test、short deadlineがfixed busy timeoutを待たないことを示すbounded contention testで検証済み。
    corruption testはrepresentativeなstrict-decode/cross-checkルールを検証するものであり、
-   すべてのルールを網羅しているわけではない。native-http経路への接続はstep 5で実装済み
+   すべてのルールを網羅しているわけではない。native-http経路への接続はstep 4で実装済み
    （implemented As-Is）、devnet binary/startup wiringは未実装。
-5. DR-0078のpreinstalled-WASM entrypointを新しいadditive `native-http`合成
-   （`preinstalled_wasm_structured_durable_router`/`_with_executor`）経由でHTTPへ公開する
-   （implemented As-Is）。既存の`structured_durable_router`はread-only entrypointのまま変更しない。
-   両routerは認証済み準備・storage context構築・exact request-scoped outbox claim/send/ack pathを
-   共有する1つのprivate core（`invoke_structured_durable_event_with_execution`）を、小さなprivate
-   `StructuredDurableAuthenticatedExecution` policy enum（`ReadOnly`/`PreinstalledWasm`）で
-   parameterizeして再利用し、重複させない。新しいpublic `PreinstalledWasmComposition`は
-   `Arc<PreinstalledModuleCatalog>`・zero-sizedな`execution::WasmExecutionEngine`・
-   `created_checkpoint: u64`のみを保持するcomposition-trusted inputで、HTTP request bytesや
-   wall clockからは決して取得しない。新routerの`SubmitTransaction`は
-   `handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution`を
-   呼び、他のevent kindは既存のgeneric machine pathのままとする。blocking admissionと
-   pre-storage-dispatch cancellationは両routerで同一のsemanticsを保つ。coarse HTTP error
-   classificationを拡張し、malformed/inactive/unknown module referenceとargs/gas/zero-object
-   requestは引き続きdeterministic client error、catalog/commitment mismatchと
-   `ObjectCreatedCheckpointRegression`はhost/operator failureとして分類する（内部詳細は
-   leakしない）。fixtureはすべて`HashSuiteResolver`/canonical encoderから計算し、pasted digestを
-   使わない。Create、Shared/System、blob、native binary/devnet startup wiring、query API、
-   TypeScript client、UI、arbitrary upload、fees/meteringは引き続きこのstepの範囲外。
 
 **Repository-boundary decision**: Developer MVP completion criteria 5/6の TypeScript client library
 とcounter demo UIは、Developer MVP Gateを通過するまでこのmonorepo内に留め、実装時点で
@@ -2090,15 +2105,18 @@ Phase 15 As-Is scope:
   manifest input boundとpre-activation gas ceilingをfail closedに照合し、code/manifest commitmentは
   digest自身のalgorithmと専用SystemModule domainで再検証し、canonical effectsをowned object atomic
   commitへ渡す。trap text/fuel accountingは固定reason/full-gas/empty-effectsへ正規化してから永続化する。
-  exact replayはmodule resolve/object read/execution前にreceiptから返る。ただしnative HTTPはread-only
-  entrypointを使い続ける。Shared/System owner、blob body、native/devnet module wiring、fee debit、owned fast path
-  certificateは未実装である。
+  exact replayはmodule resolve/object read/execution前にreceiptから返る。additive preinstalled-WASM native router
+  （`preinstalled_wasm_structured_durable_router`/`_with_executor`）はこのentrypointへwiring済みである一方、
+  generic structured durable routerはread-only entrypointのままである。Shared/System owner、blob body、
+  devnet/startup composition、arbitrary provider wiring、fee debit、owned fast path certificateは未実装である。
   node-core additive handlerはmanifest domainをI/O前にresolveし、typed receipt replayをstate readより先に行い、
   read-only assertionを含むstate/receipt/outboxをこのenvelopeへ構築する。definite commitまたはexact replay以外では
   outputを返さない。single-lock memoryとnormalized PostgreSQL conformance storeでatomic publication、object lifecycle/ABA、
   conflict rollback、read-only、bound domain、fence、deadline、object read-count bound、blob round-trip、replayを検証する
   （runtime/memory/PostgreSQL、node-core authenticated owned-object atomic effects、bounded preinstalled
-  module execution implemented As-Is; native/devnet wiringとprovider certification pending）。
+  module execution、additive preinstalled-WASM native router wiring implemented As-Is; generic structured
+  durable routerはread-onlyのまま、devnet/startup compositionとarbitrary provider wiring/certification
+  pending）。
 - owned transaction fast pathの認証基盤として、`crypto`にexact-pinned
   `ed25519-zebra` 4.2.0（`[workspace.dependencies]`でdefault features無効を
   一箇所宣言。committed `Cargo.lock`はその依存`curve25519-dalek`を4.1.3で

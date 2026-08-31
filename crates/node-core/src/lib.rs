@@ -3111,9 +3111,12 @@ impl TransactionalNodeStateMachine for PreinstalledWasmMachine<'_> {
 /// object load, or execution, identical to every other structured durable
 /// entrypoint.
 ///
-/// Create, Shared/System ownership, blob bodies, native HTTP wiring, and
-/// production gas metering remain unimplemented and fail closed or are
-/// simply not reachable from this MVP slice.
+/// An additive `native_http::preinstalled_wasm_structured_durable_router`
+/// wires this entrypoint over HTTP (see `ARCHITECTURE.md` DR-0080);
+/// `native_http::structured_durable_router` remains on the read-only
+/// entrypoint. Create, Shared/System ownership, blob bodies, and production
+/// gas metering remain unimplemented and fail closed or are simply not
+/// reachable from this MVP slice.
 pub fn handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution<
     S,
 >(

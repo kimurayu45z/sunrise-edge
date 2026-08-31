@@ -5,10 +5,14 @@
 //! validated construction functions are exported. There is no way to build a
 //! catalog entry from request bytes, a network fetch, or an arbitrary
 //! upload — the only constructor is [`PreinstalledModuleCatalogEntry::new`],
-//! called by trusted node composition before serving traffic. Native HTTP
-//! wiring, JIT/AOT execution, and production gas metering remain deferred;
-//! see `ARCHITECTURE.md` and `TODO.md` (Developer MVP Gate, step 3). See also
-//! DR-0078 in `ARCHITECTURE.md`.
+//! called by trusted node composition before serving traffic. An additive
+//! `native_http::preinstalled_wasm_structured_durable_router` now wires this
+//! module's entrypoint over HTTP; `native_http::structured_durable_router`
+//! remains on the read-only entrypoint and is unaffected. JIT/AOT execution
+//! and production gas metering remain deferred; see `ARCHITECTURE.md` and
+//! `TODO.md` (Developer MVP Gate, step 3). See also DR-0078 (historical:
+//! written before native HTTP wiring existed) and DR-0080 in
+//! `ARCHITECTURE.md`.
 //!
 //! # `Transaction.module_ref` mapping (MVP)
 //!

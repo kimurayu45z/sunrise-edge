@@ -134,8 +134,10 @@ pub(super) struct TrustedObjectMutationContext<'a> {
 ///
 /// The read-only handler calls this with an empty effect list and no mutation
 /// context. The separate owned-effects handler supplies trusted execution
-/// effects and composition-selected checkpoint context. Native HTTP remains on
-/// the read-only handler until bounded module execution is connected.
+/// effects and composition-selected checkpoint context. Generic/read-only
+/// native HTTP routing still uses the empty-effect handler; the additive
+/// preinstalled-WASM native router invokes the separate owned-effects
+/// entrypoint with trusted execution effects and checkpoint context.
 ///
 /// `loaded_body_bytes` is the already bounds-checked total inline body bytes
 /// the loader read for `verified` (see
