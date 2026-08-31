@@ -38,6 +38,17 @@ invalid-dump rollback and a valid missing-state gate rejection (DR-0073 in
 see section 5. This is rehearsal evidence for one `pg_dump`/SQL-execute
 snapshot cycle only — it is not a production backup/restore capability and
 does not close the accepted backup/restore evidence criterion in section 9.
+A separate two-container test now rehearses a bounded local PgBouncer
+1.25.2 transaction-pooling proxy on an isolated Docker network, proving
+configured transaction mode and exact single-backend reuse across two
+simultaneously open client connections through PgBouncer's own admin
+console, the real adapter pool routed through the proxy getting a definite
+pre-commit `Rejected(UnavailableBeforeCommit)` once PgBouncer's own
+`query_wait_timeout` elapses while its one backend is held by a direct
+proxied client, and exact recovery/replay/claim/ack after release (DR-0075
+in `ARCHITECTURE.md`); see section 5. This is a bounded local rehearsal
+only — it is not provider-managed pooler service certification, load/soak
+capacity, PgBouncer high availability, or TLS evidence.
 
 This document refines [`PERSISTENCE.md`](PERSISTENCE.md) for the first
 production-oriented PostgreSQL backend. It deliberately does not map the
@@ -403,6 +414,80 @@ checkpoint-publication path; `sunrise_edge.checkpoints` is not written or
 read by anything in this crate), blob-manifest verification, state-root
 verification, encryption-key verification, or certification.
 
+A further separate live test starts a digest-pinned disposable PostgreSQL
+18.6 container and a digest-pinned `ghcr.io/icoretech/pgbouncer-docker`
+1.25.2 proxy container on one isolated, freshly generated Docker bridge
+network; PgBouncer resolves PostgreSQL only by its network alias, never a
+host-published address. The proxy's `pgbouncer.ini`/`userlist.txt` are
+written in over stdin via `docker exec ... dd of=<path> status=none` (direct
+argv, no shell, no host bind mount, and no echo of the written
+credential/config into captured output — unlike `tee`, BusyBox `dd` with
+`status=none` writes only to the target file and produces no stdout at all),
+configuring `pool_mode = transaction`, exactly one backend
+connection (`pool_size`/`default_pool_size`/`max_db_connections`/
+`max_user_connections = 1`) for the tested database/user pool, a nonzero
+`max_prepared_statements`, and a bounded `query_wait_timeout`; every one of
+these is asserted directly through PgBouncer's own admin console (`SHOW
+CONFIG`/`SHOW POOLS`/`SHOW DATABASES`/`SHOW SERVERS`/`SHOW CLIENTS`, queried
+over the simple query protocol, the only protocol the admin console
+answers), never inferred from client behavior. `SHOW CONFIG`'s
+`default_pool_size`/`max_db_connections`/`max_user_connections` and the
+tested database's own `SHOW DATABASES` `pool_size` are each independently
+read back and asserted exactly one. The pool's credential is a freshly generated
+password; with `password_encryption=md5` pinned on the container, its
+`pg_authid.rolpassword` is read back and used directly as the userlist's MD5
+credential hash. Two distinct client connections, open simultaneously, each
+run one sequential transaction; `SHOW SERVERS`' `remote_pid` is identical
+after both, proving transaction pooling reused one physical PostgreSQL
+backend. The real adapter (a genuine `r2d2` pool plus `PostgresDurableStore`,
+distinguished by its own `application_name`) is then pointed at the proxy,
+not PostgreSQL directly. While a separate direct proxied client holds the
+pool's only backend inside an open transaction (left open by withholding
+`COMMIT`/`ROLLBACK`, never a timed sleep, and proven by the sole `SHOW
+SERVERS` row for that database reporting PgBouncer's own `active` state, not
+merely existing), one adapter structured invocation
+is driven with a context deadline well longer than PgBouncer's own
+`query_wait_timeout`. PgBouncer's queue timeout surfaces as PostgreSQL
+protocol SQLSTATE `08P01` (`query_wait_timeout`) on the adapter's
+transaction-opening `BEGIN`; this crate's `PreCommitFailure::from_sqlstate`
+has no dedicated arm for class `08` and so falls through to its default
+`Unavailable` bucket, producing the definite pre-commit
+`Rejected(UnavailableBeforeCommit)`, never `Indeterminate`. The observed
+elapsed time is bounded from both directions around PgBouncer's own
+`query_wait_timeout` specifically, proving the rejection's timing tracks the
+proxy's queue timeout rather than this probe's own much larger context
+budget. No state/receipt/outbox row is published, checked through a direct,
+proxy-bypassing verification connection unaffected by the proxy's
+contention. After the blocking transaction is released, the identical
+invocation is retried through the same adapter pool/store; a bounded,
+explicitly documented retry tolerates one specific, live-verified transient
+distinct from a genuine proxy rejection by its timing alone (`r2d2` can
+occasionally recycle rather than evict the blocked probe's connection if its
+local closed-state check has not yet caught up with PgBouncer's asynchronous
+socket close, so the very next checkout can be handed that already-dead
+connection and fail near-instantly with a local, unclassified I/O
+error — also `Rejected(UnavailableBeforeCommit)` by the same default
+classification, but resolved in sub-millisecond time rather than tracking
+`query_wait_timeout`); the loop's final outcome must still be `Committed`,
+and its accumulator is seeded with a rejection, never `Committed`, so a
+future edit that shrank the retry bound to zero attempts fails loudly
+instead of vacuously passing.
+Recovery proves `Committed`; `SHOW SERVERS`' `remote_pid`, read again,
+proves the recovered commit was served by the exact same sole backend the
+two synthetic clients observed; `SHOW CLIENTS` filtered by the adapter pool's
+`application_name` proves specifically that the adapter pool's own proxy
+connection reclaimed the freed backend; a replay of the identical invocation
+returns exact `RequestAlreadyCommitted`; the exact outbox message claims and
+acknowledges through `NoDueWork`; and the pool remains usable for a further
+read. CI makes the scenario required with
+`SUNRISE_EDGE_TEST_POSTGRES_PGBOUNCER_REQUIRED=1`; leaving both that flag and
+the two pinned-image variables unset skips it locally, and configuring only
+one of the two pinned images always fails rather than skipping. This is a
+bounded local PgBouncer transaction-pooling rehearsal only: it does not
+prove provider-managed pooler service certification, load/soak capacity,
+PgBouncer high availability or connection draining, TLS on either the
+client or backend leg, real writer failover, or production readiness.
+
 ## 6. Indexed claim and acknowledgement
 
 Claim first checks the lease-attempt identity. A matching active attempt returns
@@ -518,9 +603,20 @@ evidence for one snapshot cycle; this does not close the checkpoint/backup/
 restore-with-blob-manifest-verification criterion above, since point-in-time
 recovery, continuous WAL archiving, hot/concurrent backup, checkpoint
 publication, and blob-manifest/state-root/encryption-key verification remain
-unimplemented. Duplicate request races, abrupt/process faults, WAL or
+unimplemented. A further two-container DR-0075 scenario now covers a bounded
+local PgBouncer 1.25.2 transaction-pooling rehearsal on an isolated Docker
+network, with configured-transaction-mode and single-backend-reuse evidence
+asserted directly through PgBouncer's own admin console, the real adapter
+pool routed through the proxy getting the definite pre-commit
+`Rejected(UnavailableBeforeCommit)` once PgBouncer's own `query_wait_timeout`
+elapses while its one backend is held by a direct proxied client, and exact
+recovery/replay/claim/ack evidence after release; this does not close a
+provider-managed pooler production-certification criterion, since load/soak
+capacity, PgBouncer high availability/connection draining, and TLS on either
+leg remain unimplemented. Duplicate request races, abrupt/process faults, WAL or
 commit-boundary/real-device exhaustion, PostgreSQL-server/provider TLS,
 mTLS, PKI lifecycle, and production certification beyond the bounded
 DR-0074 client leg, migration compatibility across real old and new binaries,
-capacity/load/soak, real writer failover, and operational certification
-remain open.
+capacity/load/soak, real writer failover, provider-managed pooler
+certification beyond the bounded DR-0075 rehearsal, and operational
+certification remain open.
