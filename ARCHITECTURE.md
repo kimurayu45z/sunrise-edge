@@ -1218,7 +1218,9 @@ canonical Object record ID rather than the logical `Object::type_hash` retained
 inside canonical bytes. Memory and PostgreSQL apply object/state/receipt/outbox
 sections atomically, preventing an adapter from hiding object writes in generic
 state. Node-core now uses the object section for authenticated read-only
-manifest authorization and exact head assertions; object mutations/effects
+manifest authorization and exact head assertions, plus an additive
+owned-effects path that commits validated signed Address-object Update/Delete
+mutations; Create, Shared/System ownership, and blob transfer verification
 remain deferred. Indexed outbox
 repositories now refine the structured store trait so one implementation owns
 initial commit and later delivery state. An additive node-core handler now
