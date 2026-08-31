@@ -504,6 +504,78 @@ fn sqlite_structured_restart_persists_state_objects_receipts_and_outbox() {
     assert!(matches!(refreshed_head, DurableObjectHead::Current { .. }));
 }
 
+/// The operator-only [`SqliteDurableStore::writer_fence`] accessor must
+/// return exactly the fence a fresh bootstrap persisted, matching what
+/// `advance_writer_fence`'s own `expected` argument would need to observe.
+#[test]
+fn sqlite_structured_writer_fence_reads_bootstrap_value() {
+    let database = TestDatabase::new();
+    let namespace = namespace("sqlite-writer-fence-bootstrap", 0xD0, 0xD1);
+    let initial_fence = WriterFenceGeneration::new(5).unwrap();
+    let store = SqliteDurableStore::open(&database.path, namespace, initial_fence).unwrap();
+
+    assert_eq!(store.writer_fence().unwrap(), initial_fence);
+}
+
+/// After an operator-only advance, `writer_fence` must observe the new
+/// generation on the same open store, not the value it bootstrapped with.
+#[test]
+fn sqlite_structured_writer_fence_reads_after_advance() {
+    let database = TestDatabase::new();
+    let namespace = namespace("sqlite-writer-fence-advance", 0xD2, 0xD3);
+    let initial_fence = WriterFenceGeneration::new(2).unwrap();
+    let store = SqliteDurableStore::open(&database.path, namespace, initial_fence).unwrap();
+
+    let advanced = WriterFenceGeneration::new(6).unwrap();
+    store.advance_writer_fence(initial_fence, advanced).unwrap();
+
+    assert_eq!(store.writer_fence().unwrap(), advanced);
+}
+
+/// The persisted fence, not anything held in process memory, is what a fresh
+/// `writer_fence` call after a close/reopen observes.
+#[test]
+fn sqlite_structured_writer_fence_survives_reopen() {
+    let database = TestDatabase::new();
+    let namespace = namespace("sqlite-writer-fence-reopen", 0xD4, 0xD5);
+    let initial_fence = WriterFenceGeneration::new(1).unwrap();
+    let advanced = WriterFenceGeneration::new(9).unwrap();
+    {
+        let store =
+            SqliteDurableStore::open(&database.path, namespace.clone(), initial_fence).unwrap();
+        store.advance_writer_fence(initial_fence, advanced).unwrap();
+        assert_eq!(store.writer_fence().unwrap(), advanced);
+    }
+
+    let reopened = SqliteDurableStore::open(&database.path, namespace, initial_fence).unwrap();
+    assert_eq!(reopened.writer_fence().unwrap(), advanced);
+}
+
+/// `writer_fence` must revalidate the persisted schema identity exactly like
+/// every other structured operation and fail closed rather than returning a
+/// value read from a database claimed by an unsupported schema.
+#[test]
+fn sqlite_structured_writer_fence_fails_closed_on_schema_identity_mismatch() {
+    let database = TestDatabase::new();
+    let namespace = namespace("sqlite-writer-fence-schema-skew", 0xD6, 0xD7);
+    let initial_fence = WriterFenceGeneration::new(1).unwrap();
+    let store = SqliteDurableStore::open(&database.path, namespace, initial_fence).unwrap();
+
+    let admin = Connection::open(&database.path).unwrap();
+    let updated = admin
+        .execute(
+            "UPDATE durable_metadata SET schema_identity = ?1 WHERE id = 1",
+            params![b"sunrise-edge/sqlite/structured/schema/unsupported".as_slice()],
+        )
+        .unwrap();
+    assert_eq!(updated, 1);
+
+    assert!(matches!(
+        store.writer_fence(),
+        Err(SqliteDurableStoreError::SchemaIdentityMismatch)
+    ));
+}
+
 #[test]
 fn sqlite_structured_open_rejects_mismatched_namespace() {
     let database = TestDatabase::new();

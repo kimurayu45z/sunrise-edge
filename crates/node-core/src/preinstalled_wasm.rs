@@ -48,11 +48,11 @@
 
 use execution::{ExecutionEffects, ExecutionStatus};
 use hashing::{HashSuiteResolver, verify_digest};
-use objects::ObjectRef;
+use objects::{ObjectId, ObjectRef};
 use protocol_types::{Digest32, Epoch, HashPurpose};
 use system_modules::{
     ModuleId, ModuleStatus, SystemModule, SystemModuleError, SystemModuleManifest,
-    encode_system_module_manifest,
+    SystemModuleRegistry, encode_system_module_manifest,
 };
 
 use super::NodeCoreError;
@@ -206,6 +206,18 @@ impl PreinstalledModuleCatalog {
     ) -> Option<&PreinstalledModuleCatalogEntry> {
         self.entries.get(&(module_id, version))
     }
+
+    /// Returns every cataloged entry in canonical `(module_id, version)`
+    /// order.
+    ///
+    /// This is a bounded, read-only view (the catalog holds at most
+    /// [`MAX_PREINSTALLED_MODULES`] entries and is never mutated after
+    /// construction); it exists so trusted node composition can reconcile the
+    /// whole catalog against a registry, not to let a caller reconstruct or
+    /// grow the catalog.
+    pub fn entries(&self) -> impl Iterator<Item = &PreinstalledModuleCatalogEntry> {
+        self.entries.values()
+    }
 }
 
 /// Maps an authenticated transaction's `module_ref` to the MVP preinstalled
@@ -319,6 +331,89 @@ pub(crate) fn resolve_preinstalled_module<'a>(
     }
 
     Ok(entry)
+}
+
+/// Bounded, fail-closed reconciliation between a governance-committed
+/// [`SystemModuleRegistry`] and a caller-supplied [`PreinstalledModuleCatalog`]
+/// at one `epoch`, intended to run once during trusted node startup (before
+/// any request is served) rather than on every request.
+///
+/// A module is treated as "active" for this reconciliation exactly the way
+/// [`resolve_preinstalled_module`] treats it at request time:
+/// `status == `[`ModuleStatus::Active`]` && activation_epoch <= epoch`. Both
+/// `registry` and `catalog` are already bounded ([`SystemModuleRegistry`] by
+/// its own [`SystemModuleRegistry::validate`] limit, `catalog` by
+/// [`MAX_PREINSTALLED_MODULES`] at construction), so this function runs in
+/// bounded time proportional to their sizes; it revalidates `registry`'s own
+/// bound/order/duplicate invariants before trusting it.
+///
+/// Checks both directions and fails closed on the first violation found, in
+/// this order:
+///
+/// 1. **Every cataloged entry resolves.** For each `(module_id, version)` in
+///    `catalog`, this calls the exact same [`resolve_preinstalled_module`]
+///    used at request time — reusing its existing commitment/resolution
+///    rules and error variants rather than duplicating them — with the
+///    registered module's own `canonical_code_hash` supplied as the
+///    "declared" digest. That specific comparison
+///    ([`NodeCoreError::PreinstalledModuleReferenceDigestMismatch`]) only
+///    ever means a request's own declared reference disagreed with the
+///    registry and is therefore not meaningful outside a real request, so
+///    this call trivially satisfies it; every other step — existence,
+///    active status, activation epoch, code hash, manifest hash, and
+///    semantics hash — runs unchanged and can still fail closed with
+///    [`NodeCoreError::PreinstalledModuleUnknown`],
+///    [`NodeCoreError::PreinstalledModuleInactive`],
+///    [`NodeCoreError::PreinstalledModuleNotYetActive`],
+///    [`NodeCoreError::PreinstalledModuleCodeHashMismatch`],
+///    [`NodeCoreError::PreinstalledModuleManifestHashMismatch`], or
+///    [`NodeCoreError::PreinstalledModuleSemanticsHashMismatch`]. This also
+///    catches an "extra" catalog entry that does not correspond to any
+///    active registry module.
+/// 2. **Every active registry module is cataloged.** For each module in
+///    `registry` that is active at `epoch`, this requires
+///    `catalog.get(module_id, version)` to be `Some`, failing closed with
+///    the existing [`NodeCoreError::PreinstalledModuleNotCataloged`]
+///    otherwise (a module governance has activated but this node cannot
+///    execute).
+///
+/// This performs no request-time behavior change: `resolve_preinstalled_module`
+/// itself is neither modified nor bypassed, only invoked with startup inputs
+/// instead of request inputs.
+pub fn reconcile_preinstalled_registry_and_catalog(
+    registry: &SystemModuleRegistry,
+    catalog: &PreinstalledModuleCatalog,
+    epoch: Epoch,
+    resolver: &HashSuiteResolver,
+) -> Result<(), NodeCoreError> {
+    registry.validate()?;
+
+    for entry in catalog.entries() {
+        let module_id = entry.module_id();
+        let version = entry.version();
+        let registered = registry
+            .get(module_id, version)
+            .ok_or(NodeCoreError::PreinstalledModuleUnknown { module_id, version })?;
+        let module_ref = ObjectRef {
+            id: ObjectId::new(*module_id.as_bytes()),
+            version,
+            digest: registered.canonical_code_hash,
+        };
+        resolve_preinstalled_module(&module_ref, Some(registered), catalog, epoch, resolver)?;
+    }
+
+    for module in registry.modules() {
+        let is_active_now =
+            module.status == ModuleStatus::Active && module.activation_epoch <= epoch;
+        if is_active_now && catalog.get(module.module_id, module.version).is_none() {
+            return Err(NodeCoreError::PreinstalledModuleNotCataloged {
+                module_id: module.module_id,
+                version: module.version,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Rejects a preinstalled-WASM `gas_limit` above
@@ -956,6 +1051,272 @@ mod tests {
         assert_eq!(
             PreinstalledModuleCatalog::new(vec![entry_a, entry_b]),
             Err(NodeCoreError::DuplicatePreinstalledModule {
+                module_id: id,
+                version: 1
+            })
+        );
+    }
+
+    #[test]
+    fn reconcile_accepts_matching_active_registry_and_catalog() {
+        let resolver = resolver();
+        let id = module_id(0x10);
+        let manifest = sample_manifest(id);
+        let wasm = wasm_bytes();
+        let semantics_hash = digest(0x77);
+        let module = committed_module(
+            &resolver,
+            id,
+            1,
+            &wasm,
+            &manifest,
+            semantics_hash,
+            Epoch::new(0),
+            ModuleStatus::Active,
+        );
+        let mut registry = SystemModuleRegistry::new();
+        registry.add_module(module).unwrap();
+        let entry =
+            PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, semantics_hash).unwrap();
+        let catalog = PreinstalledModuleCatalog::new(vec![entry]).unwrap();
+
+        reconcile_preinstalled_registry_and_catalog(&registry, &catalog, Epoch::new(0), &resolver)
+            .unwrap();
+    }
+
+    #[test]
+    fn reconcile_rejects_active_module_missing_from_catalog() {
+        let resolver = resolver();
+        let id = module_id(0x11);
+        let manifest = sample_manifest(id);
+        let wasm = wasm_bytes();
+        let semantics_hash = digest(0x78);
+        let module = committed_module(
+            &resolver,
+            id,
+            1,
+            &wasm,
+            &manifest,
+            semantics_hash,
+            Epoch::new(0),
+            ModuleStatus::Active,
+        );
+        let mut registry = SystemModuleRegistry::new();
+        registry.add_module(module).unwrap();
+        let catalog = PreinstalledModuleCatalog::new(vec![]).unwrap();
+
+        assert_eq!(
+            reconcile_preinstalled_registry_and_catalog(
+                &registry,
+                &catalog,
+                Epoch::new(0),
+                &resolver
+            ),
+            Err(NodeCoreError::PreinstalledModuleNotCataloged {
+                module_id: id,
+                version: 1
+            })
+        );
+    }
+
+    #[test]
+    fn reconcile_rejects_extra_catalog_entry_absent_from_registry() {
+        let resolver = resolver();
+        let id = module_id(0x12);
+        let manifest = sample_manifest(id);
+        let wasm = wasm_bytes();
+        let semantics_hash = digest(0x79);
+        let registry = SystemModuleRegistry::new();
+        let entry =
+            PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, semantics_hash).unwrap();
+        let catalog = PreinstalledModuleCatalog::new(vec![entry]).unwrap();
+
+        assert_eq!(
+            reconcile_preinstalled_registry_and_catalog(
+                &registry,
+                &catalog,
+                Epoch::new(0),
+                &resolver
+            ),
+            Err(NodeCoreError::PreinstalledModuleUnknown {
+                module_id: id,
+                version: 1
+            })
+        );
+    }
+
+    #[test]
+    fn reconcile_rejects_cataloged_module_still_pending() {
+        let resolver = resolver();
+        let id = module_id(0x13);
+        let manifest = sample_manifest(id);
+        let wasm = wasm_bytes();
+        let semantics_hash = digest(0x7A);
+        let module = committed_module(
+            &resolver,
+            id,
+            1,
+            &wasm,
+            &manifest,
+            semantics_hash,
+            Epoch::new(5),
+            ModuleStatus::Pending,
+        );
+        let mut registry = SystemModuleRegistry::new();
+        registry.add_module(module).unwrap();
+        let entry =
+            PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, semantics_hash).unwrap();
+        let catalog = PreinstalledModuleCatalog::new(vec![entry]).unwrap();
+
+        assert_eq!(
+            reconcile_preinstalled_registry_and_catalog(
+                &registry,
+                &catalog,
+                Epoch::new(5),
+                &resolver
+            ),
+            Err(NodeCoreError::PreinstalledModuleInactive {
+                module_id: id,
+                version: 1
+            })
+        );
+    }
+
+    #[test]
+    fn reconcile_rejects_cataloged_active_module_before_activation_epoch() {
+        let resolver = resolver();
+        let id = module_id(0x15);
+        let manifest = sample_manifest(id);
+        let wasm = wasm_bytes();
+        let semantics_hash = digest(0x7C);
+        let activation_epoch = Epoch::new(6);
+        let current_epoch = Epoch::new(5);
+        let module = committed_module(
+            &resolver,
+            id,
+            1,
+            &wasm,
+            &manifest,
+            semantics_hash,
+            activation_epoch,
+            ModuleStatus::Active,
+        );
+        let mut registry = SystemModuleRegistry::new();
+        registry.add_module(module).unwrap();
+        let entry =
+            PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, semantics_hash).unwrap();
+        let catalog = PreinstalledModuleCatalog::new(vec![entry]).unwrap();
+
+        assert_eq!(
+            reconcile_preinstalled_registry_and_catalog(
+                &registry,
+                &catalog,
+                current_epoch,
+                &resolver
+            ),
+            Err(NodeCoreError::PreinstalledModuleNotYetActive {
+                module_id: id,
+                version: 1,
+                activation_epoch,
+                current_epoch,
+            })
+        );
+    }
+
+    #[test]
+    fn reconcile_rejects_code_manifest_and_semantics_hash_mismatch() {
+        let resolver = resolver();
+        let id = module_id(0x14);
+        let manifest = sample_manifest(id);
+        let wasm = wasm_bytes();
+        let semantics_hash = digest(0x7B);
+        let module = committed_module(
+            &resolver,
+            id,
+            1,
+            &wasm,
+            &manifest,
+            semantics_hash,
+            Epoch::new(0),
+            ModuleStatus::Active,
+        );
+
+        // Registry code hash disagrees with the catalog's actual WASM bytes.
+        let mut tampered_code_registry = SystemModuleRegistry::new();
+        let mut tampered_code_module = module.clone();
+        tampered_code_module.canonical_code_hash = digest(0xEE);
+        tampered_code_registry
+            .add_module(tampered_code_module)
+            .unwrap();
+        let code_entry = PreinstalledModuleCatalogEntry::new(
+            id,
+            1,
+            wasm.clone(),
+            manifest.clone(),
+            semantics_hash,
+        )
+        .unwrap();
+        let code_catalog = PreinstalledModuleCatalog::new(vec![code_entry]).unwrap();
+        assert_eq!(
+            reconcile_preinstalled_registry_and_catalog(
+                &tampered_code_registry,
+                &code_catalog,
+                Epoch::new(0),
+                &resolver
+            ),
+            Err(NodeCoreError::PreinstalledModuleCodeHashMismatch {
+                module_id: id,
+                version: 1
+            })
+        );
+
+        // Registry manifest hash disagrees with the catalog's actual manifest.
+        let mut tampered_manifest_registry = SystemModuleRegistry::new();
+        let mut tampered_manifest_module = module.clone();
+        tampered_manifest_module.manifest_hash = digest(0xEE);
+        tampered_manifest_registry
+            .add_module(tampered_manifest_module)
+            .unwrap();
+        let manifest_entry = PreinstalledModuleCatalogEntry::new(
+            id,
+            1,
+            wasm.clone(),
+            manifest.clone(),
+            semantics_hash,
+        )
+        .unwrap();
+        let manifest_catalog = PreinstalledModuleCatalog::new(vec![manifest_entry]).unwrap();
+        assert_eq!(
+            reconcile_preinstalled_registry_and_catalog(
+                &tampered_manifest_registry,
+                &manifest_catalog,
+                Epoch::new(0),
+                &resolver
+            ),
+            Err(NodeCoreError::PreinstalledModuleManifestHashMismatch {
+                module_id: id,
+                version: 1
+            })
+        );
+
+        // Registry semantics hash disagrees with the catalog entry's own value.
+        let mut tampered_semantics_registry = SystemModuleRegistry::new();
+        let mut tampered_semantics_module = module;
+        tampered_semantics_module.semantics_hash = digest(0xEE);
+        tampered_semantics_registry
+            .add_module(tampered_semantics_module)
+            .unwrap();
+        let semantics_entry =
+            PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, semantics_hash).unwrap();
+        let semantics_catalog = PreinstalledModuleCatalog::new(vec![semantics_entry]).unwrap();
+        assert_eq!(
+            reconcile_preinstalled_registry_and_catalog(
+                &tampered_semantics_registry,
+                &semantics_catalog,
+                Epoch::new(0),
+                &resolver
+            ),
+            Err(NodeCoreError::PreinstalledModuleSemanticsHashMismatch {
                 module_id: id,
                 version: 1
             })
