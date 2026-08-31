@@ -12,6 +12,7 @@ use canonical_encoding::{
     CanonicalDecodingError, CanonicalEncodingError, CanonicalStruct, decode_canonical_frame,
 };
 use core::fmt;
+use execution::ObjectEffect;
 use hashing::{HashSuiteResolver, HashingError};
 use objects::{AccessMode, Address, Object, ObjectId, ObjectRef, Owner};
 use protocol_config::{DomainPlacementManifest, ProtocolConfig, ProtocolConfigError};
@@ -22,19 +23,24 @@ use runtime::{
     AtomicStateMutationSet, AtomicStateReadSet, AtomicStateTransaction, AtomicStateWriteResult,
     AtomicStateWriteSet, AtomicityDomainId, DomainTransactionalStateStore, DurableCommitOutcome,
     DurableCommitRejection, DurableInlineObject, DurableInvocationError,
-    DurableInvocationTransaction, DurableObjectChanges, DurableObjectHead, DurableObjectHeadRead,
-    DurableObjectOwnerProjection, DurableObjectPayload, DurableObjectVersion,
-    DurableObjectVersionRecord, DurableOperationContext, DurableOutboxBatch, DurableOutboxMessage,
-    DurableReadError, DurableRequestId, DurableRequestReceipt, DurableStateTransaction,
-    IndeterminateCommitReason, MAX_ATOMIC_STATE_READS, MAX_ATOMIC_STATE_WRITES,
-    MAX_STATE_KEY_BYTES, PersistenceLayout, Runtime, RuntimeError, StateMutation,
-    StateMutationEntry, StateReadAssertion, StateRevision, StateStore, StateWrite,
+    DurableInvocationTransaction, DurableObjectChanges, DurableObjectHead,
+    DurableObjectMutationEntry, DurableObjectOwnerProjection, DurableObjectPayload,
+    DurableObjectVersion, DurableObjectVersionRecord, DurableOperationContext, DurableOutboxBatch,
+    DurableOutboxMessage, DurableReadError, DurableRequestId, DurableRequestReceipt,
+    DurableStateTransaction, IndeterminateCommitReason, MAX_ATOMIC_STATE_READS,
+    MAX_ATOMIC_STATE_WRITES, MAX_STATE_KEY_BYTES, PersistenceLayout, Runtime, RuntimeError,
+    StateMutation, StateMutationEntry, StateReadAssertion, StateRevision, StateStore, StateWrite,
     StructuredDurableDomainStateStore, TransactionalStateStore, VersionedStateValue,
 };
 use std::collections::BTreeMap;
 use std::error::Error;
 
+mod authenticated_object_effects;
 pub mod transaction_auth;
+
+use authenticated_object_effects::{
+    LoadedAuthenticatedObjects, translate_authenticated_object_effects,
+};
 
 pub use transaction_auth::{
     AuthenticatedTransaction, MAX_TRANSACTION_SIGNABLE_BYTES, TransactionAuthError,
@@ -360,6 +366,45 @@ pub enum NodeCoreError {
         /// Maximum accepted inline body length in bytes.
         maximum: usize,
     },
+    /// Deterministic execution returned two effects for the same object.
+    DuplicateObjectEffect {
+        /// Duplicated object identifier.
+        object_id: ObjectId,
+    },
+    /// Deterministic execution returned more effects than one invocation permits.
+    TooManyObjectEffects {
+        /// Number of effects supplied by execution.
+        actual: usize,
+        /// Maximum accepted effects per invocation.
+        maximum: usize,
+    },
+    /// Deterministic execution returned an effect for an undeclared object.
+    UndeclaredObjectEffect {
+        /// Undeclared object identifier.
+        object_id: ObjectId,
+    },
+    /// A declared object access and its deterministic execution effect disagreed.
+    ObjectEffectMismatch {
+        /// Object whose declared access and effect disagreed.
+        object_id: ObjectId,
+        /// Stable, non-secret rejection reason.
+        reason: &'static str,
+    },
+    /// Incrementing an object's immutable version would overflow.
+    ObjectVersionOverflow {
+        /// Object whose version cannot advance.
+        object_id: ObjectId,
+    },
+    /// Object effects that create a new identity are outside this MVP slice.
+    ObjectCreationUnsupported {
+        /// Created object identifier.
+        object_id: ObjectId,
+    },
+    /// A mutation effect was supplied without trusted creation context.
+    ObjectMutationContextMissing {
+        /// Object requiring a new immutable version.
+        object_id: ObjectId,
+    },
 }
 
 impl fmt::Display for NodeCoreError {
@@ -615,6 +660,35 @@ impl fmt::Display for NodeCoreError {
             } => write!(
                 f,
                 "object {object_id} inline body is {actual} bytes, maximum is {maximum}"
+            ),
+            Self::DuplicateObjectEffect { object_id } => {
+                write!(
+                    f,
+                    "execution returned duplicate effects for object {object_id}"
+                )
+            }
+            Self::TooManyObjectEffects { actual, maximum } => write!(
+                f,
+                "execution returned {actual} object effects, maximum is {maximum}"
+            ),
+            Self::UndeclaredObjectEffect { object_id } => {
+                write!(
+                    f,
+                    "execution returned an effect for undeclared object {object_id}"
+                )
+            }
+            Self::ObjectEffectMismatch { object_id, reason } => {
+                write!(f, "object {object_id} effect mismatch: {reason}")
+            }
+            Self::ObjectVersionOverflow { object_id } => {
+                write!(f, "object {object_id} version overflowed")
+            }
+            Self::ObjectCreationUnsupported { object_id } => {
+                write!(f, "creating object {object_id} is outside this MVP slice")
+            }
+            Self::ObjectMutationContextMissing { object_id } => write!(
+                f,
+                "object {object_id} mutation is missing trusted creation context"
             ),
         }
     }
@@ -2617,12 +2691,24 @@ where
     // per-entry head/version storage round-trips. The application-machine
     // interface is unchanged and receives no object data at all, so nothing
     // here can be influenced by `machine.transition` below.
-    let object_reads: Vec<DurableObjectHeadRead> = match &dispatch {
+    let loaded_objects: LoadedAuthenticatedObjects = match &dispatch {
         Some(dispatch) => {
             load_and_authorize_objects(store, context, domain, event.chain_id(), dispatch)?
         }
-        None => Vec::new(),
+        None => LoadedAuthenticatedObjects::default(),
     };
+    // The current live path remains read-only. Calling the authenticated
+    // effect translator here makes that fail-closed contract explicit and
+    // exercises the same production-code surface the next MVP slice will use
+    // after deterministic execution supplies effects and trusted checkpoint
+    // context. Write/Consume are still rejected during dispatch validation.
+    let no_object_effects: &[ObjectEffect] = &[];
+    let object_mutations: Vec<DurableObjectMutationEntry> = translate_authenticated_object_effects(
+        loaded_objects.verified(),
+        no_object_effects,
+        None,
+        loaded_objects.total_body_bytes(),
+    )?;
 
     let mut values = BTreeMap::new();
     for access in plan.accesses() {
@@ -2677,7 +2763,7 @@ where
         )?);
     }
     let state = DurableStateTransaction::new(domain, AtomicStateReadSet::new(reads)?, mutations)?;
-    let objects = DurableObjectChanges::new(object_reads, Vec::new())?;
+    let objects = DurableObjectChanges::new(loaded_objects.into_reads(), object_mutations)?;
     let invocation =
         DurableInvocationTransaction::new(domain, Some(state), objects, receipt, outbox)?;
 
@@ -2699,7 +2785,7 @@ where
 }
 
 /// Loads and authorizes every entry in `dispatch.accesses` against
-/// `dispatch.authority`, returning one exact [`DurableObjectHeadRead`] per
+/// `dispatch.authority`, returning one exact [`runtime::DurableObjectHeadRead`] per
 /// entry in the same canonical order.
 ///
 /// Every check fails closed:
@@ -2726,11 +2812,12 @@ fn load_and_authorize_objects<S>(
     domain: AtomicityDomainId,
     chain_id: &ChainId,
     dispatch: &AuthenticatedObjectDispatch,
-) -> Result<Vec<DurableObjectHeadRead>, NodeCoreError>
+) -> Result<LoadedAuthenticatedObjects, NodeCoreError>
 where
     S: StructuredDurableDomainStateStore,
 {
-    let mut reads: Vec<DurableObjectHeadRead> = Vec::with_capacity(dispatch.accesses.len());
+    let mut loaded: LoadedAuthenticatedObjects =
+        LoadedAuthenticatedObjects::with_capacity(dispatch.accesses.len());
     let mut total_body_bytes: usize = 0;
     for access in &dispatch.accesses {
         let object_id: ObjectId = access.object_ref.id;
@@ -2861,9 +2948,10 @@ where
             }
         }
 
-        reads.push(DurableObjectHeadRead::new(object_id, head));
+        loaded.push(object_id, access.mode, head, object.clone());
     }
-    Ok(reads)
+    loaded.set_total_body_bytes(total_body_bytes);
+    Ok(loaded)
 }
 
 fn handle_domain_idempotent_event_with_plan<R, M>(
@@ -5825,8 +5913,8 @@ mod tests {
         assert_eq!(
             object_changes.reads(),
             &[
-                DurableObjectHeadRead::new(lower_id, lower_head),
-                DurableObjectHeadRead::new(higher_id, higher_head),
+                runtime::DurableObjectHeadRead::new(lower_id, lower_head),
+                runtime::DurableObjectHeadRead::new(higher_id, higher_head),
             ]
         );
     }
@@ -6880,7 +6968,7 @@ mod tests {
             routing_projection: DurableObjectRoutingProjection::default(),
         };
         let create_changes = DurableObjectChanges::new(
-            vec![DurableObjectHeadRead::new(
+            vec![runtime::DurableObjectHeadRead::new(
                 object_id,
                 DurableObjectHead::Absent,
             )],
@@ -7021,7 +7109,7 @@ mod tests {
             routing_projection: DurableObjectRoutingProjection::default(),
         };
         let create_changes = DurableObjectChanges::new(
-            vec![DurableObjectHeadRead::new(
+            vec![runtime::DurableObjectHeadRead::new(
                 object_id,
                 DurableObjectHead::Absent,
             )],
@@ -7061,7 +7149,7 @@ mod tests {
             routing_projection: DurableObjectRoutingProjection::default(),
         };
         let racing_changes = DurableObjectChanges::new(
-            vec![DurableObjectHeadRead::new(object_id, head_v1)],
+            vec![runtime::DurableObjectHeadRead::new(object_id, head_v1)],
             vec![runtime::DurableObjectMutationEntry::new(
                 object_id,
                 racing_mutation,
