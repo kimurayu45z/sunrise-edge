@@ -36,8 +36,10 @@ use std::{
 
 /// Encodes a `u64` as an order-preserving 8-byte big-endian value.
 ///
-/// Shared by the legacy opaque store and the structured store so both use the
-/// same lexicographically ordered on-disk revision/generation encoding.
+/// Used by the structured store for its on-disk revision/generation
+/// encoding. The legacy opaque store inlines the same big-endian encoding
+/// directly rather than calling this helper, but both stay lexicographically
+/// ordered and mutually compatible.
 pub(crate) fn encode_u64(value: u64) -> [u8; 8] {
     value.to_be_bytes()
 }

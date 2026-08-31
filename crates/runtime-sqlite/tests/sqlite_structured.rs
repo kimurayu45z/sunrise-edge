@@ -945,6 +945,19 @@ fn sqlite_structured_object_head_rejects_stale_non_maximum_current_version() {
         &store, &context, &namespace, &chain_id, object_id, request_id,
     );
 
+    // Confirm the head is a genuinely current v1 head before corrupting the
+    // store: this is what makes the final rejection below a discriminating
+    // check on "head names the maximum retained version" rather than a
+    // trivial failure caused by a head that was never valid in the first
+    // place.
+    let head_before_corruption = store
+        .get_object_head(&context, namespace.domain(), object_id)
+        .unwrap();
+    let DurableObjectHead::Current { object_version, .. } = head_before_corruption else {
+        panic!("expected a current object head after commit, got {head_before_corruption:?}");
+    };
+    assert_eq!(object_version, DurableObjectVersion::new(1).unwrap());
+
     // Build a complete, well-formed immutable v2 record with the same
     // helper and conventions every other test uses (correct digest, chain,
     // canonical-record-type ID, and inline payload), then insert its exact
