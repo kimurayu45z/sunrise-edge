@@ -3098,7 +3098,8 @@ mod tests {
         MAX_AUTHENTICATED_OBJECT_BODY_BYTES, MAX_CHAIN_ID_BYTES, NodeDedupRecord,
         NodeOutboxDelivery, NodeOutput, NodeResponse, NodeResponseStatus, NodeStateAccess,
         NodeStateAccessMode, NodeStateAccessPlan, NodeStateSnapshot, NodeStateUpdate,
-        OutboundMessage, PreinstalledModuleCatalogEntry, TransactionalNodeTransition,
+        OutboundMessage, PreinstalledModuleCatalogEntry, PreinstalledModuleSemanticsEnvelope,
+        TransactionalNodeTransition, encode_preinstalled_semantics_envelope,
     };
     use objects::{AccessMode, Address, Object, ObjectId, ObjectRef, Owner, encode_object};
     use protocol_config::TransactionAuthProfile;
@@ -3485,7 +3486,20 @@ mod tests {
         max_input_size: u64,
     ) -> (SystemModuleRegistry, PreinstalledModuleCatalog, ObjectRef) {
         let manifest = preinstalled_manifest(module_id, max_input_size);
-        let semantics_hash = Digest32::new(HashAlgorithmId::Sha2_256, [0x33; 32]);
+        let semantics_envelope: PreinstalledModuleSemanticsEnvelope =
+            PreinstalledModuleSemanticsEnvelope::opaque_only(
+                b"http-preinstalled-semantics-v1".to_vec(),
+            )
+            .unwrap();
+        let semantics_bytes: Vec<u8> =
+            encode_preinstalled_semantics_envelope(&semantics_envelope).unwrap();
+        let semantics_hash: Digest32 = resolver
+            .hash_for_purpose(
+                Epoch::new(0),
+                HashPurpose::SystemModuleManifest,
+                &semantics_bytes,
+            )
+            .unwrap();
         let code_hash = resolver
             .hash_for_purpose(Epoch::new(0), HashPurpose::ContractCode, &wasm_bytes)
             .unwrap();
@@ -3513,7 +3527,7 @@ mod tests {
             version,
             wasm_bytes,
             manifest,
-            semantics_hash,
+            semantics_envelope,
         )
         .unwrap();
         let catalog = PreinstalledModuleCatalog::new(vec![entry]).unwrap();
@@ -7150,12 +7164,12 @@ mod tests {
     }
 
     /// Proves the catalog/commitment-mismatch classification end to end:
-    /// the caller-supplied catalog entry's WASM bytes no longer rehash to
-    /// the governance-committed `canonical_code_hash`, which is a host
-    /// catalog defect, so this must be an opaque `500`, not a client fault,
-    /// and must never leak the internal `Display` text of the mismatch.
+    /// the caller-supplied catalog entry's exact semantics-envelope bytes no
+    /// longer rehash to the governance-committed `semantics_hash`, which is a
+    /// host catalog defect, so this must be an opaque `500`, not a client
+    /// fault, and must never leak the internal `Display` text of the mismatch.
     #[tokio::test]
-    async fn preinstalled_route_catalog_code_hash_mismatch_is_opaque_host_failure() {
+    async fn preinstalled_route_catalog_semantics_hash_mismatch_is_opaque_host_failure() {
         let fence = WriterFenceGeneration::new(3).unwrap();
         let store = Arc::new(MemoryDurableStateStore::new(fence));
         store.set_time(10_000);
@@ -7170,16 +7184,21 @@ mod tests {
             preinstalled_write_wasm_bytes(),
             64,
         );
-        // Corrupt the caller-supplied catalog: same module_id/version/
-        // manifest/semantics as the registry commitment, but different WASM
-        // bytes, so the catalog entry no longer rehashes to the registry's
-        // committed `canonical_code_hash`.
+        // Corrupt the caller-supplied catalog: same module_id/version/WASM/
+        // manifest as the registry commitment, but different exact semantics
+        // envelope bytes, so the catalog entry no longer rehashes to the
+        // registry's committed `semantics_hash`.
+        let mismatched_semantics_envelope: PreinstalledModuleSemanticsEnvelope =
+            PreinstalledModuleSemanticsEnvelope::opaque_only(
+                b"http-preinstalled-semantics-mismatch".to_vec(),
+            )
+            .unwrap();
         let mismatched_entry = PreinstalledModuleCatalogEntry::new(
             module_id,
             1,
-            preinstalled_trap_wasm_bytes(),
+            preinstalled_write_wasm_bytes(),
             preinstalled_manifest(module_id, 64),
-            Digest32::new(HashAlgorithmId::Sha2_256, [0x33; 32]),
+            mismatched_semantics_envelope,
         )
         .unwrap();
         let catalog = Arc::new(PreinstalledModuleCatalog::new(vec![mismatched_entry]).unwrap());

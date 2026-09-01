@@ -5,7 +5,8 @@
 //! production metadata claims. The current WASM host ABI exposes object bodies
 //! but not their type hash, schema version, ID, or owner. Consequently the WASM
 //! module validates the complete self-describing body frame while node-core
-//! separately authenticates same-sender ownership and freezes metadata.
+//! separately authenticates the sender-owned source, enforces the committed
+//! destination policy, and freezes metadata including both owners.
 
 use canonical_encoding::{
     CanonicalDecodingError, CanonicalEncodingError, CanonicalFrame, CanonicalStruct,

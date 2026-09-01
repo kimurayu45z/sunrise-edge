@@ -1,11 +1,13 @@
 //! Bounded, caller-supplied preinstalled WASM module composition.
 //!
 //! This module is intentionally private-by-default: only
-//! [`PreinstalledModuleCatalogEntry`], [`PreinstalledModuleCatalog`], and the
-//! validated construction functions are exported. There is no way to build a
-//! catalog entry from request bytes, a network fetch, or an arbitrary
-//! upload — the only constructor is [`PreinstalledModuleCatalogEntry::new`],
-//! called by trusted node composition before serving traffic. An additive
+//! [`PreinstalledModuleCatalogEntry`], [`PreinstalledModuleCatalog`],
+//! [`PreinstalledModuleSemanticsEnvelope`], [`PreinstalledObjectAccessPolicy`],
+//! and the validated construction/encoding functions are exported. There is
+//! no way to build a catalog entry from request bytes, a network fetch, or an
+//! arbitrary upload — the only constructor is
+//! [`PreinstalledModuleCatalogEntry::new`], called by trusted node
+//! composition before serving traffic. An additive
 //! `native_http::preinstalled_wasm_structured_durable_router` now wires this
 //! module's entrypoint over HTTP; `native_http::structured_durable_router`
 //! remains on the read-only entrypoint and is unaffected. JIT/AOT execution
@@ -29,6 +31,33 @@
 //! transaction field, at the cost of `module_ref` never denoting an actual
 //! stored `Object` on this MVP path.
 //!
+//! # Committed semantics envelope and the cross-owner authorization boundary
+//!
+//! `SystemModule.semantics_hash` commits to one exact generic
+//! [`PreinstalledModuleSemanticsEnvelope`]: opaque, node-core-uninterpreted
+//! application semantics bytes plus a bounded set of
+//! [`PreinstalledObjectAccessPolicy`] values. [`resolve_preinstalled_module`]
+//! independently re-encodes the catalog entry's actual envelope via
+//! [`encode_preinstalled_semantics_envelope`] and reverifies it against the
+//! registry's committed digest exactly like the WASM code and manifest
+//! digests — it never trusts a caller-supplied semantics hash. Node-core's
+//! default object-authorization rule requires every `Owner::Address` object a
+//! transaction accesses to be owned by the authenticated sender (see
+//! `load_and_authorize_objects`). A `PreinstalledObjectAccessPolicy` is the
+//! *only* way to relax that rule, and only narrowly: for one exact declared
+//! object-access index (never index `0`, the transaction's own authorization
+//! source), one exact entrypoint, one exact `Write` access, and only when the
+//! resolved object's current `type_hash`/`schema_version` match the policy
+//! exactly. The policy is resolved once, from the committed registry and
+//! trusted catalog only (no storage I/O), after receipt/nonce reconciliation
+//! and strictly before any object is loaded — see
+//! `handle_durable_idempotent_event_with_plan` in `lib.rs`. It never permits
+//! a literal owner reassignment; that is independently enforced by
+//! `authenticated_object_effects::translate_update`. The generic public
+//! owned-effects entrypoint
+//! (`handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects`)
+//! never supplies a policy and therefore stays strictly sender-only.
+//!
 //! # Protocol-version bumps and commitment provenance
 //!
 //! [`hashing::frame_hash_input`] mixes `protocol_version` directly into the
@@ -46,16 +75,18 @@
 //! hash-suite rotation, by contrast, does not require recommitment: see
 //! [`resolve_preinstalled_module`]'s use of [`hashing::verify_digest`].
 
-use execution::{ExecutionEffects, ExecutionStatus};
+use canonical_encoding::{CanonicalStruct, encode_digest32};
+use execution::{ExecutionEffects, ExecutionStatus, MAX_TRANSACTION_ENTRYPOINT_BYTES};
 use hashing::{HashSuiteResolver, verify_digest};
-use objects::{ObjectId, ObjectRef};
+use objects::{AccessMode, ObjectError, ObjectId, ObjectRef, encode_access_mode};
 use protocol_types::{Digest32, Epoch, HashPurpose};
+use std::collections::BTreeSet;
 use system_modules::{
     ModuleId, ModuleStatus, SystemModule, SystemModuleError, SystemModuleManifest,
     SystemModuleRegistry, encode_system_module_manifest,
 };
 
-use super::NodeCoreError;
+use super::{MAX_AUTHENTICATED_OBJECT_READS, NodeCoreError};
 
 /// Deterministic upper bound on one preinstalled module's canonical WASM
 /// bytes.
@@ -83,15 +114,292 @@ pub const MAX_PREINSTALLED_MODULES: usize = 64;
 /// real gas market.
 pub const MAX_PREINSTALLED_MODULE_GAS_LIMIT: u64 = 10_000_000;
 
+/// Deterministic upper bound on one committed semantics envelope's opaque
+/// application-semantics bytes.
+///
+/// This bounds a description, not executable input: it is sized generously
+/// above any realistic committed declaration text.
+pub const MAX_PREINSTALLED_SEMANTICS_BYTES: usize = 64 * 1024;
+
+/// Deterministic upper bound on the number of object-access authorization
+/// policies one committed semantics envelope may declare.
+pub const MAX_PREINSTALLED_OBJECT_ACCESS_POLICIES: usize = 16;
+
+const PREINSTALLED_OBJECT_ACCESS_POLICY_TYPE_ID: u16 = 0xE007;
+const PREINSTALLED_SEMANTICS_ENVELOPE_TYPE_ID: u16 = 0xE008;
+const PREINSTALLED_ENCODING_VERSION: u16 = 1;
+
+/// One narrow, fail-closed exception to node-core's default same-sender
+/// object-owner rule, committed as part of a preinstalled module's semantics
+/// envelope.
+///
+/// By default `load_and_authorize_objects` requires every `Owner::Address`
+/// object a transaction accesses to be owned by the authenticated sender.
+/// This type lets a trusted, governance-committed preinstalled module
+/// narrowly relax that rule for exactly one declared object-access position,
+/// exactly one entrypoint, and exactly one `Write` access to an object whose
+/// current type/schema match exactly. `access_index` can never be `0`: the
+/// first declared access is always the transaction's own authorization
+/// source and must always remain sender-owned. The exception never allows a
+/// literal owner reassignment; that is independently enforced by
+/// `authenticated_object_effects::translate_update`, which requires the
+/// mutated object's owner to equal the object's owner before mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreinstalledObjectAccessPolicy {
+    access_index: u32,
+    entrypoint: String,
+    mode: AccessMode,
+    expected_type_hash: Digest32,
+    expected_schema_version: u32,
+}
+
+impl PreinstalledObjectAccessPolicy {
+    /// Validates and constructs one object-access authorization policy.
+    ///
+    /// Rejects the reserved source index `0`, an index at or beyond
+    /// node-core's authenticated object-read bound, an empty or oversized
+    /// entrypoint name, and any access mode other than [`AccessMode::Write`]
+    /// (a non-sender `Read` or `Consume` exception is never authorized).
+    pub fn new(
+        access_index: u32,
+        entrypoint: String,
+        mode: AccessMode,
+        expected_type_hash: Digest32,
+        expected_schema_version: u32,
+    ) -> Result<Self, NodeCoreError> {
+        if access_index == 0 {
+            return Err(NodeCoreError::PreinstalledObjectAccessPolicySourceIndexReserved);
+        }
+        let maximum =
+            u32::try_from(MAX_AUTHENTICATED_OBJECT_READS.saturating_sub(1)).unwrap_or(u32::MAX);
+        if access_index > maximum {
+            return Err(
+                NodeCoreError::PreinstalledObjectAccessPolicyIndexOutOfBounds {
+                    access_index,
+                    maximum,
+                },
+            );
+        }
+        if entrypoint.is_empty() || entrypoint.len() > MAX_TRANSACTION_ENTRYPOINT_BYTES {
+            return Err(
+                NodeCoreError::PreinstalledObjectAccessPolicyEntrypointInvalid {
+                    actual: entrypoint.len(),
+                    maximum: MAX_TRANSACTION_ENTRYPOINT_BYTES,
+                },
+            );
+        }
+        if mode != AccessMode::Write {
+            return Err(NodeCoreError::PreinstalledObjectAccessPolicyModeUnsupported { mode });
+        }
+        Ok(Self {
+            access_index,
+            entrypoint,
+            mode,
+            expected_type_hash,
+            expected_schema_version,
+        })
+    }
+
+    /// Returns the exact zero-based signed access index this policy governs.
+    #[must_use]
+    pub const fn access_index(&self) -> u32 {
+        self.access_index
+    }
+
+    /// Returns the exact entrypoint name this policy governs.
+    #[must_use]
+    pub fn entrypoint(&self) -> &str {
+        &self.entrypoint
+    }
+
+    /// Returns the exact access mode this policy authorizes.
+    #[must_use]
+    pub const fn mode(&self) -> AccessMode {
+        self.mode
+    }
+
+    /// Returns the exact committed object type hash this policy requires.
+    #[must_use]
+    pub const fn expected_type_hash(&self) -> Digest32 {
+        self.expected_type_hash
+    }
+
+    /// Returns the exact committed object schema version this policy requires.
+    #[must_use]
+    pub const fn expected_schema_version(&self) -> u32 {
+        self.expected_schema_version
+    }
+}
+
+/// Canonically encodes one [`PreinstalledObjectAccessPolicy`].
+pub fn encode_preinstalled_object_access_policy(
+    policy: &PreinstalledObjectAccessPolicy,
+) -> Result<Vec<u8>, NodeCoreError> {
+    let mut canonical = CanonicalStruct::new(
+        PREINSTALLED_OBJECT_ACCESS_POLICY_TYPE_ID,
+        PREINSTALLED_ENCODING_VERSION,
+    );
+    canonical
+        .field_u32(1, policy.access_index)
+        .map_err(NodeCoreError::CanonicalEncoding)?;
+    canonical
+        .field_str(2, &policy.entrypoint)
+        .map_err(NodeCoreError::CanonicalEncoding)?;
+    let mode_bytes: Vec<u8> =
+        encode_access_mode(policy.mode).map_err(|error: ObjectError| match error {
+            ObjectError::CanonicalEncoding(error) => NodeCoreError::CanonicalEncoding(error),
+            _ => NodeCoreError::PersistenceInvariant(
+                "validated preinstalled access mode failed canonical encoding",
+            ),
+        })?;
+    canonical
+        .field_bytes(3, mode_bytes)
+        .map_err(NodeCoreError::CanonicalEncoding)?;
+    canonical
+        .field_bytes(4, encode_digest32(&policy.expected_type_hash)?)
+        .map_err(NodeCoreError::CanonicalEncoding)?;
+    canonical
+        .field_u32(5, policy.expected_schema_version)
+        .map_err(NodeCoreError::CanonicalEncoding)?;
+    canonical.finish().map_err(NodeCoreError::CanonicalEncoding)
+}
+
+/// A trusted preinstalled module's exact generic committed semantics
+/// envelope: opaque application-semantics bytes plus a bounded set of
+/// [`PreinstalledObjectAccessPolicy`] object-owner exceptions.
+///
+/// This is the exact byte shape `SystemModule.semantics_hash` commits to.
+/// node-core treats `opaque_semantics` as caller-defined, uninterpreted
+/// bytes; only `object_access_policies` is ever read by node-core's
+/// authorization logic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreinstalledModuleSemanticsEnvelope {
+    opaque_semantics: Vec<u8>,
+    object_access_policies: Vec<PreinstalledObjectAccessPolicy>,
+}
+
+impl PreinstalledModuleSemanticsEnvelope {
+    /// Validates and constructs one committed semantics envelope.
+    ///
+    /// Rejects opaque semantics bytes over
+    /// [`MAX_PREINSTALLED_SEMANTICS_BYTES`], more policies than
+    /// [`MAX_PREINSTALLED_OBJECT_ACCESS_POLICIES`], and a duplicate declared
+    /// `access_index`.
+    pub fn new(
+        opaque_semantics: Vec<u8>,
+        mut object_access_policies: Vec<PreinstalledObjectAccessPolicy>,
+    ) -> Result<Self, NodeCoreError> {
+        if opaque_semantics.len() > MAX_PREINSTALLED_SEMANTICS_BYTES {
+            return Err(NodeCoreError::PreinstalledSemanticsBytesTooLarge {
+                actual: opaque_semantics.len(),
+                maximum: MAX_PREINSTALLED_SEMANTICS_BYTES,
+            });
+        }
+        if object_access_policies.len() > MAX_PREINSTALLED_OBJECT_ACCESS_POLICIES {
+            return Err(
+                NodeCoreError::PreinstalledObjectAccessPolicyCollectionTooLarge {
+                    count: object_access_policies.len(),
+                    maximum: MAX_PREINSTALLED_OBJECT_ACCESS_POLICIES,
+                },
+            );
+        }
+        let mut seen_indices: BTreeSet<u32> = BTreeSet::new();
+        for policy in &object_access_policies {
+            if !seen_indices.insert(policy.access_index) {
+                return Err(
+                    NodeCoreError::DuplicatePreinstalledObjectAccessPolicyIndex {
+                        access_index: policy.access_index,
+                    },
+                );
+            }
+        }
+        object_access_policies.sort_by_key(PreinstalledObjectAccessPolicy::access_index);
+        Ok(Self {
+            opaque_semantics,
+            object_access_policies,
+        })
+    }
+
+    /// Constructs an envelope with no object-access policies: every access
+    /// stays sender-only.
+    pub fn opaque_only(opaque_semantics: Vec<u8>) -> Result<Self, NodeCoreError> {
+        Self::new(opaque_semantics, Vec::new())
+    }
+
+    /// Returns the opaque, node-core-uninterpreted application semantics bytes.
+    #[must_use]
+    pub fn opaque_semantics(&self) -> &[u8] {
+        &self.opaque_semantics
+    }
+
+    /// Returns every declared object-access policy.
+    #[must_use]
+    pub fn object_access_policies(&self) -> &[PreinstalledObjectAccessPolicy] {
+        &self.object_access_policies
+    }
+
+    /// Returns the exact policy, if any, authorizing `entrypoint` to relax
+    /// the sender-owner rule at declared access index `access_index`.
+    #[must_use]
+    pub(crate) fn matching_object_access_policy(
+        &self,
+        entrypoint: &str,
+        access_index: u32,
+    ) -> Option<&PreinstalledObjectAccessPolicy> {
+        self.object_access_policies
+            .iter()
+            .find(|policy| policy.access_index == access_index && policy.entrypoint == entrypoint)
+    }
+}
+
+/// Canonically encodes one [`PreinstalledModuleSemanticsEnvelope`].
+///
+/// This is the exact byte shape independently rehashed and compared against
+/// `SystemModule.semantics_hash` by the internal module resolver; no
+/// caller-supplied semantics digest is ever trusted directly.
+pub fn encode_preinstalled_semantics_envelope(
+    envelope: &PreinstalledModuleSemanticsEnvelope,
+) -> Result<Vec<u8>, NodeCoreError> {
+    let mut canonical = CanonicalStruct::new(
+        PREINSTALLED_SEMANTICS_ENVELOPE_TYPE_ID,
+        PREINSTALLED_ENCODING_VERSION,
+    );
+    canonical
+        .field_bytes(1, envelope.opaque_semantics.clone())
+        .map_err(NodeCoreError::CanonicalEncoding)?;
+    let policy_count = u16::try_from(envelope.object_access_policies.len()).map_err(|_| {
+        NodeCoreError::PreinstalledObjectAccessPolicyCollectionTooLarge {
+            count: envelope.object_access_policies.len(),
+            maximum: MAX_PREINSTALLED_OBJECT_ACCESS_POLICIES,
+        }
+    })?;
+    canonical
+        .field_u16(2, policy_count)
+        .map_err(NodeCoreError::CanonicalEncoding)?;
+    for (index, policy) in envelope.object_access_policies.iter().enumerate() {
+        let field_id = u16::try_from(3 + index).map_err(|_| {
+            NodeCoreError::PreinstalledObjectAccessPolicyCollectionTooLarge {
+                count: envelope.object_access_policies.len(),
+                maximum: MAX_PREINSTALLED_OBJECT_ACCESS_POLICIES,
+            }
+        })?;
+        canonical
+            .field_bytes(field_id, encode_preinstalled_object_access_policy(policy)?)
+            .map_err(NodeCoreError::CanonicalEncoding)?;
+    }
+    canonical.finish().map_err(NodeCoreError::CanonicalEncoding)
+}
+
 /// One immutable, caller-supplied preinstalled module: its exact identity,
-/// canonical WASM bytes, canonical manifest, and committed semantics digest.
+/// canonical WASM bytes, canonical manifest, and committed semantics
+/// envelope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreinstalledModuleCatalogEntry {
     module_id: ModuleId,
     version: u64,
     wasm_bytes: Vec<u8>,
     manifest: SystemModuleManifest,
-    semantics_hash: Digest32,
+    semantics_envelope: PreinstalledModuleSemanticsEnvelope,
 }
 
 impl PreinstalledModuleCatalogEntry {
@@ -100,13 +408,16 @@ impl PreinstalledModuleCatalogEntry {
     /// Rejects WASM bytes over [`MAX_PREINSTALLED_MODULE_WASM_BYTES`], an
     /// invalid [`SystemModuleManifest`], and a manifest whose `module_id`
     /// disagrees with this entry's own `module_id`, before the entry can ever
-    /// be resolved against a transaction.
+    /// be resolved against a transaction. `semantics_envelope`'s own
+    /// constructor already bounds its opaque bytes and policy count; this
+    /// entry never recomputes or trusts a caller-supplied semantics digest —
+    /// see the internal preinstalled-module resolver.
     pub fn new(
         module_id: ModuleId,
         version: u64,
         wasm_bytes: Vec<u8>,
         manifest: SystemModuleManifest,
-        semantics_hash: Digest32,
+        semantics_envelope: PreinstalledModuleSemanticsEnvelope,
     ) -> Result<Self, NodeCoreError> {
         if version == 0 {
             return Err(SystemModuleError::ZeroModuleVersion.into());
@@ -128,7 +439,7 @@ impl PreinstalledModuleCatalogEntry {
             version,
             wasm_bytes,
             manifest,
-            semantics_hash,
+            semantics_envelope,
         })
     }
 
@@ -156,10 +467,10 @@ impl PreinstalledModuleCatalogEntry {
         &self.manifest
     }
 
-    /// Returns the committed semantics digest.
+    /// Returns the committed semantics envelope.
     #[must_use]
-    pub const fn semantics_hash(&self) -> Digest32 {
-        self.semantics_hash
+    pub const fn semantics_envelope(&self) -> &PreinstalledModuleSemanticsEnvelope {
+        &self.semantics_envelope
     }
 }
 
@@ -247,8 +558,12 @@ pub(crate) fn preinstalled_module_identity(module_ref: &ObjectRef) -> (ModuleId,
 /// 5. the catalog entry's manifest is canonically re-encoded and reverified
 ///    against the registry's committed `manifest_hash` under
 ///    [`HashPurpose::SystemModuleManifest`] (see below);
-/// 6. the catalog entry's `semantics_hash` must equal the registry's
-///    committed `semantics_hash`.
+/// 6. the catalog entry's [`PreinstalledModuleSemanticsEnvelope`] is
+///    canonically re-encoded via [`encode_preinstalled_semantics_envelope`]
+///    and independently reverified against the registry's committed
+///    `semantics_hash`, exactly like steps 4 and 5 — this function never
+///    trusts a caller-supplied semantics digest, only the registry's own
+///    committed value and the catalog's actual envelope bytes.
 ///
 /// # Verification uses the committed digest's own algorithm
 ///
@@ -326,7 +641,16 @@ pub(crate) fn resolve_preinstalled_module<'a>(
         return Err(NodeCoreError::PreinstalledModuleManifestHashMismatch { module_id, version });
     }
 
-    if entry.semantics_hash() != registered.semantics_hash {
+    let semantics_envelope_bytes =
+        encode_preinstalled_semantics_envelope(entry.semantics_envelope())?;
+    let semantics_hash_verified = verify_digest(
+        &registered.semantics_hash,
+        HashPurpose::SystemModuleManifest,
+        resolver.protocol_version(),
+        resolver.chain_id(),
+        &semantics_envelope_bytes,
+    )?;
+    if !semantics_hash_verified {
         return Err(NodeCoreError::PreinstalledModuleSemanticsHashMismatch { module_id, version });
     }
 
@@ -339,7 +663,7 @@ pub(crate) fn resolve_preinstalled_module<'a>(
 /// any request is served) rather than on every request.
 ///
 /// A module is treated as "active" for this reconciliation exactly the way
-/// [`resolve_preinstalled_module`] treats it at request time:
+/// the internal preinstalled-module resolver treats it at request time:
 /// `status == `[`ModuleStatus::Active`]` && activation_epoch <= epoch`. Both
 /// `registry` and `catalog` are already bounded ([`SystemModuleRegistry`] by
 /// its own [`SystemModuleRegistry::validate`] limit, `catalog` by
@@ -351,7 +675,7 @@ pub(crate) fn resolve_preinstalled_module<'a>(
 /// this order:
 ///
 /// 1. **Every cataloged entry resolves.** For each `(module_id, version)` in
-///    `catalog`, this calls the exact same [`resolve_preinstalled_module`]
+///    `catalog`, this calls the exact same internal module resolver
 ///    used at request time — reusing its existing commitment/resolution
 ///    rules and error variants rather than duplicating them — with the
 ///    registered module's own `canonical_code_hash` supplied as the
@@ -475,6 +799,25 @@ mod tests {
     use protocol_types::{ChainId, HashAlgorithmId, HashSuite, HashSuiteSchedule, ProtocolVersion};
     use system_modules::{GasModel, SystemModuleRegistry, TypeSchema};
 
+    const PREINSTALLED_OBJECT_ACCESS_POLICY_VECTOR: [u8; 129] = [
+        83, 78, 82, 69, 7, 224, 1, 0, 5, 0, 1, 0, 4, 0, 0, 0, 1, 0, 0, 0, 2, 0, 8, 0, 0, 0, 116,
+        114, 97, 110, 115, 102, 101, 114, 3, 0, 17, 0, 0, 0, 83, 78, 82, 69, 6, 64, 1, 0, 1, 0, 1,
+        0, 1, 0, 0, 0, 2, 4, 0, 56, 0, 0, 0, 83, 78, 82, 69, 3, 1, 1, 0, 2, 0, 1, 0, 2, 0, 0, 0, 1,
+        0, 2, 0, 32, 0, 0, 0, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154,
+        154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154,
+        5, 0, 4, 0, 0, 0, 3, 0, 0, 0,
+    ];
+    const PREINSTALLED_SEMANTICS_ENVELOPE_VECTOR: [u8; 179] = [
+        83, 78, 82, 69, 8, 224, 1, 0, 3, 0, 1, 0, 20, 0, 0, 0, 111, 112, 97, 113, 117, 101, 45, 97,
+        112, 112, 45, 115, 101, 109, 97, 110, 116, 105, 99, 115, 2, 0, 2, 0, 0, 0, 1, 0, 3, 0, 129,
+        0, 0, 0, 83, 78, 82, 69, 7, 224, 1, 0, 5, 0, 1, 0, 4, 0, 0, 0, 1, 0, 0, 0, 2, 0, 8, 0, 0,
+        0, 116, 114, 97, 110, 115, 102, 101, 114, 3, 0, 17, 0, 0, 0, 83, 78, 82, 69, 6, 64, 1, 0,
+        1, 0, 1, 0, 1, 0, 0, 0, 2, 4, 0, 56, 0, 0, 0, 83, 78, 82, 69, 3, 1, 1, 0, 2, 0, 1, 0, 2, 0,
+        0, 0, 1, 0, 2, 0, 32, 0, 0, 0, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154,
+        154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154,
+        154, 154, 5, 0, 4, 0, 0, 0, 3, 0, 0, 0,
+    ];
+
     fn resolve_from_registry<'a>(
         module_ref: &ObjectRef,
         registry: &SystemModuleRegistry,
@@ -566,6 +909,12 @@ mod tests {
         .unwrap()
     }
 
+    /// Builds one committed semantics envelope with no object-access
+    /// policies, distinguished only by `byte`.
+    fn semantics_envelope(byte: u8) -> PreinstalledModuleSemanticsEnvelope {
+        PreinstalledModuleSemanticsEnvelope::opaque_only(vec![byte]).unwrap()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn committed_module_at_epoch(
         resolver: &HashSuiteResolver,
@@ -574,7 +923,7 @@ mod tests {
         version: u64,
         wasm: &[u8],
         manifest: &SystemModuleManifest,
-        semantics_hash: Digest32,
+        semantics_envelope: &PreinstalledModuleSemanticsEnvelope,
         activation_epoch: Epoch,
         status: ModuleStatus,
     ) -> SystemModule {
@@ -587,6 +936,15 @@ mod tests {
                 commit_epoch,
                 HashPurpose::SystemModuleManifest,
                 &manifest_bytes,
+            )
+            .unwrap();
+        let semantics_envelope_bytes =
+            encode_preinstalled_semantics_envelope(semantics_envelope).unwrap();
+        let semantics_hash = resolver
+            .hash_for_purpose(
+                commit_epoch,
+                HashPurpose::SystemModuleManifest,
+                &semantics_envelope_bytes,
             )
             .unwrap();
         SystemModule {
@@ -607,7 +965,7 @@ mod tests {
         version: u64,
         wasm: &[u8],
         manifest: &SystemModuleManifest,
-        semantics_hash: Digest32,
+        semantics_envelope: &PreinstalledModuleSemanticsEnvelope,
         activation_epoch: Epoch,
         status: ModuleStatus,
     ) -> SystemModule {
@@ -618,7 +976,7 @@ mod tests {
             version,
             wasm,
             manifest,
-            semantics_hash,
+            semantics_envelope,
             activation_epoch,
             status,
         )
@@ -630,21 +988,20 @@ mod tests {
         let id = module_id(0x01);
         let manifest = sample_manifest(id);
         let wasm = wasm_bytes();
-        let semantics_hash = digest(0x33);
+        let envelope = semantics_envelope(0x33);
         let module = committed_module(
             &resolver,
             id,
             1,
             &wasm,
             &manifest,
-            semantics_hash,
+            &envelope,
             Epoch::new(0),
             ModuleStatus::Active,
         );
         let mut registry = SystemModuleRegistry::new();
         registry.add_module(module.clone()).unwrap();
-        let entry =
-            PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, semantics_hash).unwrap();
+        let entry = PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, envelope).unwrap();
         let catalog = PreinstalledModuleCatalog::new(vec![entry]).unwrap();
         let module_ref = ObjectRef {
             id: objects::ObjectId::new(*id.as_bytes()),
@@ -667,7 +1024,7 @@ mod tests {
         let id = module_id(0x08);
         let manifest = sample_manifest(id);
         let wasm = wasm_bytes();
-        let semantics_hash = digest(0x88);
+        let envelope = semantics_envelope(0x88);
         let module = committed_module_at_epoch(
             &commit_resolver,
             Epoch::new(0),
@@ -675,7 +1032,7 @@ mod tests {
             1,
             &wasm,
             &manifest,
-            semantics_hash,
+            &envelope,
             Epoch::new(0),
             ModuleStatus::Active,
         );
@@ -685,8 +1042,7 @@ mod tests {
         );
         let mut registry = SystemModuleRegistry::new();
         registry.add_module(module.clone()).unwrap();
-        let entry =
-            PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, semantics_hash).unwrap();
+        let entry = PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, envelope).unwrap();
         let catalog = PreinstalledModuleCatalog::new(vec![entry]).unwrap();
         let module_ref = ObjectRef {
             id: objects::ObjectId::new(*id.as_bytes()),
@@ -728,7 +1084,7 @@ mod tests {
         let id2 = module_id(0x09);
         let manifest2 = sample_manifest(id2);
         let wasm2 = wasm_bytes();
-        let semantics_hash2 = digest(0x89);
+        let envelope2 = semantics_envelope(0x89);
         let module2 = committed_module_at_epoch(
             &rotated_resolver,
             Epoch::new(20),
@@ -736,7 +1092,7 @@ mod tests {
             1,
             &wasm2,
             &manifest2,
-            semantics_hash2,
+            &envelope2,
             Epoch::new(0),
             ModuleStatus::Active,
         );
@@ -747,7 +1103,7 @@ mod tests {
         let mut registry2 = SystemModuleRegistry::new();
         registry2.add_module(module2.clone()).unwrap();
         let entry2 =
-            PreinstalledModuleCatalogEntry::new(id2, 1, wasm2, manifest2, semantics_hash2).unwrap();
+            PreinstalledModuleCatalogEntry::new(id2, 1, wasm2, manifest2, envelope2).unwrap();
         let catalog2 = PreinstalledModuleCatalog::new(vec![entry2]).unwrap();
         let module_ref2 = ObjectRef {
             id: objects::ObjectId::new(*id2.as_bytes()),
@@ -771,27 +1127,22 @@ mod tests {
         let id = module_id(0x02);
         let manifest = sample_manifest(id);
         let wasm = wasm_bytes();
-        let semantics_hash = digest(0x44);
+        let envelope = semantics_envelope(0x44);
         let pending = committed_module(
             &resolver,
             id,
             1,
             &wasm,
             &manifest,
-            semantics_hash,
+            &envelope,
             Epoch::new(5),
             ModuleStatus::Pending,
         );
         let mut registry = SystemModuleRegistry::new();
         registry.add_module(pending.clone()).unwrap();
-        let entry = PreinstalledModuleCatalogEntry::new(
-            id,
-            1,
-            wasm.clone(),
-            manifest.clone(),
-            semantics_hash,
-        )
-        .unwrap();
+        let entry =
+            PreinstalledModuleCatalogEntry::new(id, 1, wasm.clone(), manifest.clone(), envelope)
+                .unwrap();
         let catalog = PreinstalledModuleCatalog::new(vec![entry]).unwrap();
 
         let unknown_ref = ObjectRef {
@@ -857,14 +1208,14 @@ mod tests {
         let id = module_id(0x03);
         let manifest = sample_manifest(id);
         let wasm = wasm_bytes();
-        let semantics_hash = digest(0x55);
+        let envelope = semantics_envelope(0x55);
         let module = committed_module(
             &resolver,
             id,
             1,
             &wasm,
             &manifest,
-            semantics_hash,
+            &envelope,
             Epoch::new(0),
             ModuleStatus::Active,
         );
@@ -892,14 +1243,9 @@ mod tests {
             })
         );
 
-        let entry = PreinstalledModuleCatalogEntry::new(
-            id,
-            1,
-            wasm.clone(),
-            manifest.clone(),
-            semantics_hash,
-        )
-        .unwrap();
+        let entry =
+            PreinstalledModuleCatalogEntry::new(id, 1, wasm.clone(), manifest.clone(), envelope)
+                .unwrap();
         let catalog = PreinstalledModuleCatalog::new(vec![entry]).unwrap();
 
         // Declared reference digest disagrees with the registry commitment.
@@ -994,7 +1340,7 @@ mod tests {
             0,
             wasm_bytes(),
             sample_manifest(id),
-            digest(0x66),
+            semantics_envelope(0x66),
         )
         .unwrap_err();
         assert_eq!(
@@ -1003,8 +1349,14 @@ mod tests {
         );
 
         let manifest = sample_manifest(other_id);
-        let err = PreinstalledModuleCatalogEntry::new(id, 1, wasm_bytes(), manifest, digest(0x66))
-            .unwrap_err();
+        let err = PreinstalledModuleCatalogEntry::new(
+            id,
+            1,
+            wasm_bytes(),
+            manifest,
+            semantics_envelope(0x66),
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             NodeCoreError::PreinstalledModuleManifestIdMismatch {
@@ -1019,7 +1371,7 @@ mod tests {
             1,
             oversized,
             sample_manifest(id),
-            digest(0x66),
+            semantics_envelope(0x66),
         )
         .unwrap_err();
         assert_eq!(
@@ -1042,12 +1394,17 @@ mod tests {
             1,
             wasm_bytes(),
             manifest.clone(),
-            digest(0x01),
+            semantics_envelope(0x01),
         )
         .unwrap();
-        let entry_b =
-            PreinstalledModuleCatalogEntry::new(id, 1, wasm_bytes(), manifest, digest(0x02))
-                .unwrap();
+        let entry_b = PreinstalledModuleCatalogEntry::new(
+            id,
+            1,
+            wasm_bytes(),
+            manifest,
+            semantics_envelope(0x02),
+        )
+        .unwrap();
         assert_eq!(
             PreinstalledModuleCatalog::new(vec![entry_a, entry_b]),
             Err(NodeCoreError::DuplicatePreinstalledModule {
@@ -1063,21 +1420,20 @@ mod tests {
         let id = module_id(0x10);
         let manifest = sample_manifest(id);
         let wasm = wasm_bytes();
-        let semantics_hash = digest(0x77);
+        let envelope = semantics_envelope(0x77);
         let module = committed_module(
             &resolver,
             id,
             1,
             &wasm,
             &manifest,
-            semantics_hash,
+            &envelope,
             Epoch::new(0),
             ModuleStatus::Active,
         );
         let mut registry = SystemModuleRegistry::new();
         registry.add_module(module).unwrap();
-        let entry =
-            PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, semantics_hash).unwrap();
+        let entry = PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, envelope).unwrap();
         let catalog = PreinstalledModuleCatalog::new(vec![entry]).unwrap();
 
         reconcile_preinstalled_registry_and_catalog(&registry, &catalog, Epoch::new(0), &resolver)
@@ -1090,14 +1446,14 @@ mod tests {
         let id = module_id(0x11);
         let manifest = sample_manifest(id);
         let wasm = wasm_bytes();
-        let semantics_hash = digest(0x78);
+        let envelope = semantics_envelope(0x78);
         let module = committed_module(
             &resolver,
             id,
             1,
             &wasm,
             &manifest,
-            semantics_hash,
+            &envelope,
             Epoch::new(0),
             ModuleStatus::Active,
         );
@@ -1125,10 +1481,9 @@ mod tests {
         let id = module_id(0x12);
         let manifest = sample_manifest(id);
         let wasm = wasm_bytes();
-        let semantics_hash = digest(0x79);
+        let envelope = semantics_envelope(0x79);
         let registry = SystemModuleRegistry::new();
-        let entry =
-            PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, semantics_hash).unwrap();
+        let entry = PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, envelope).unwrap();
         let catalog = PreinstalledModuleCatalog::new(vec![entry]).unwrap();
 
         assert_eq!(
@@ -1151,21 +1506,20 @@ mod tests {
         let id = module_id(0x13);
         let manifest = sample_manifest(id);
         let wasm = wasm_bytes();
-        let semantics_hash = digest(0x7A);
+        let envelope = semantics_envelope(0x7A);
         let module = committed_module(
             &resolver,
             id,
             1,
             &wasm,
             &manifest,
-            semantics_hash,
+            &envelope,
             Epoch::new(5),
             ModuleStatus::Pending,
         );
         let mut registry = SystemModuleRegistry::new();
         registry.add_module(module).unwrap();
-        let entry =
-            PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, semantics_hash).unwrap();
+        let entry = PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, envelope).unwrap();
         let catalog = PreinstalledModuleCatalog::new(vec![entry]).unwrap();
 
         assert_eq!(
@@ -1188,7 +1542,7 @@ mod tests {
         let id = module_id(0x15);
         let manifest = sample_manifest(id);
         let wasm = wasm_bytes();
-        let semantics_hash = digest(0x7C);
+        let envelope = semantics_envelope(0x7C);
         let activation_epoch = Epoch::new(6);
         let current_epoch = Epoch::new(5);
         let module = committed_module(
@@ -1197,14 +1551,13 @@ mod tests {
             1,
             &wasm,
             &manifest,
-            semantics_hash,
+            &envelope,
             activation_epoch,
             ModuleStatus::Active,
         );
         let mut registry = SystemModuleRegistry::new();
         registry.add_module(module).unwrap();
-        let entry =
-            PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, semantics_hash).unwrap();
+        let entry = PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, envelope).unwrap();
         let catalog = PreinstalledModuleCatalog::new(vec![entry]).unwrap();
 
         assert_eq!(
@@ -1229,14 +1582,14 @@ mod tests {
         let id = module_id(0x14);
         let manifest = sample_manifest(id);
         let wasm = wasm_bytes();
-        let semantics_hash = digest(0x7B);
+        let envelope = semantics_envelope(0x7B);
         let module = committed_module(
             &resolver,
             id,
             1,
             &wasm,
             &manifest,
-            semantics_hash,
+            &envelope,
             Epoch::new(0),
             ModuleStatus::Active,
         );
@@ -1253,7 +1606,7 @@ mod tests {
             1,
             wasm.clone(),
             manifest.clone(),
-            semantics_hash,
+            envelope.clone(),
         )
         .unwrap();
         let code_catalog = PreinstalledModuleCatalog::new(vec![code_entry]).unwrap();
@@ -1282,7 +1635,7 @@ mod tests {
             1,
             wasm.clone(),
             manifest.clone(),
-            semantics_hash,
+            envelope.clone(),
         )
         .unwrap();
         let manifest_catalog = PreinstalledModuleCatalog::new(vec![manifest_entry]).unwrap();
@@ -1307,7 +1660,7 @@ mod tests {
             .add_module(tampered_semantics_module)
             .unwrap();
         let semantics_entry =
-            PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, semantics_hash).unwrap();
+            PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, envelope).unwrap();
         let semantics_catalog = PreinstalledModuleCatalog::new(vec![semantics_entry]).unwrap();
         assert_eq!(
             reconcile_preinstalled_registry_and_catalog(
@@ -1321,5 +1674,225 @@ mod tests {
                 version: 1
             })
         );
+    }
+
+    #[test]
+    fn resolve_rejects_catalog_envelope_bytes_that_disagree_with_committed_semantics_hash() {
+        // The registry commits the hash of `envelope_a`'s canonical bytes,
+        // but the catalog serves a *different* envelope. This proves
+        // `resolve_preinstalled_module` independently rehashes the catalog's
+        // actual bytes rather than trusting any caller-supplied digest: the
+        // old naive "entry.semantics_hash() == registered.semantics_hash"
+        // equality this replaces could not have been fooled this way either,
+        // but this catalog entry type no longer carries a caller-supplied
+        // digest field at all, so this is the only way a bytes mismatch can
+        // now be expressed.
+        let resolver = resolver();
+        let id = module_id(0x16);
+        let manifest = sample_manifest(id);
+        let wasm = wasm_bytes();
+        let envelope_a = semantics_envelope(0xA0);
+        let envelope_b = semantics_envelope(0xB0);
+        assert_ne!(
+            encode_preinstalled_semantics_envelope(&envelope_a).unwrap(),
+            encode_preinstalled_semantics_envelope(&envelope_b).unwrap()
+        );
+        let module = committed_module(
+            &resolver,
+            id,
+            1,
+            &wasm,
+            &manifest,
+            &envelope_a,
+            Epoch::new(0),
+            ModuleStatus::Active,
+        );
+        let mut registry = SystemModuleRegistry::new();
+        registry.add_module(module.clone()).unwrap();
+        let entry = PreinstalledModuleCatalogEntry::new(id, 1, wasm, manifest, envelope_b).unwrap();
+        let catalog = PreinstalledModuleCatalog::new(vec![entry]).unwrap();
+        let module_ref = ObjectRef {
+            id: objects::ObjectId::new(*id.as_bytes()),
+            version: 1,
+            digest: module.canonical_code_hash,
+        };
+
+        assert_eq!(
+            resolve_from_registry(&module_ref, &registry, &catalog, Epoch::new(0), &resolver),
+            Err(NodeCoreError::PreinstalledModuleSemanticsHashMismatch {
+                module_id: id,
+                version: 1
+            })
+        );
+    }
+
+    fn sample_policy(access_index: u32, entrypoint: &str) -> PreinstalledObjectAccessPolicy {
+        PreinstalledObjectAccessPolicy::new(
+            access_index,
+            entrypoint.to_string(),
+            AccessMode::Write,
+            digest(0x9A),
+            3,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn object_access_policy_rejects_reserved_index_out_of_bounds_index_bad_entrypoint_and_mode() {
+        assert_eq!(
+            PreinstalledObjectAccessPolicy::new(
+                0,
+                "transfer".to_string(),
+                AccessMode::Write,
+                digest(0x01),
+                1,
+            ),
+            Err(NodeCoreError::PreinstalledObjectAccessPolicySourceIndexReserved)
+        );
+
+        let maximum = u32::try_from(MAX_AUTHENTICATED_OBJECT_READS - 1).unwrap();
+        assert_eq!(
+            PreinstalledObjectAccessPolicy::new(
+                maximum + 1,
+                "transfer".to_string(),
+                AccessMode::Write,
+                digest(0x01),
+                1,
+            ),
+            Err(
+                NodeCoreError::PreinstalledObjectAccessPolicyIndexOutOfBounds {
+                    access_index: maximum + 1,
+                    maximum,
+                }
+            )
+        );
+        assert!(
+            PreinstalledObjectAccessPolicy::new(
+                maximum,
+                "transfer".to_string(),
+                AccessMode::Write,
+                digest(0x01),
+                1,
+            )
+            .is_ok()
+        );
+
+        assert_eq!(
+            PreinstalledObjectAccessPolicy::new(
+                1,
+                String::new(),
+                AccessMode::Write,
+                digest(0x01),
+                1,
+            ),
+            Err(
+                NodeCoreError::PreinstalledObjectAccessPolicyEntrypointInvalid {
+                    actual: 0,
+                    maximum: MAX_TRANSACTION_ENTRYPOINT_BYTES,
+                }
+            )
+        );
+        let oversized_entrypoint = "x".repeat(MAX_TRANSACTION_ENTRYPOINT_BYTES + 1);
+        assert_eq!(
+            PreinstalledObjectAccessPolicy::new(
+                1,
+                oversized_entrypoint.clone(),
+                AccessMode::Write,
+                digest(0x01),
+                1,
+            ),
+            Err(
+                NodeCoreError::PreinstalledObjectAccessPolicyEntrypointInvalid {
+                    actual: oversized_entrypoint.len(),
+                    maximum: MAX_TRANSACTION_ENTRYPOINT_BYTES,
+                }
+            )
+        );
+
+        for mode in [AccessMode::Read, AccessMode::Consume] {
+            assert_eq!(
+                PreinstalledObjectAccessPolicy::new(
+                    1,
+                    "transfer".to_string(),
+                    mode,
+                    digest(0x01),
+                    1,
+                ),
+                Err(NodeCoreError::PreinstalledObjectAccessPolicyModeUnsupported { mode })
+            );
+        }
+    }
+
+    #[test]
+    fn semantics_envelope_rejects_oversized_bytes_too_many_policies_and_duplicate_index() {
+        let oversized = vec![0u8; MAX_PREINSTALLED_SEMANTICS_BYTES + 1];
+        assert_eq!(
+            PreinstalledModuleSemanticsEnvelope::new(oversized.clone(), Vec::new()),
+            Err(NodeCoreError::PreinstalledSemanticsBytesTooLarge {
+                actual: oversized.len(),
+                maximum: MAX_PREINSTALLED_SEMANTICS_BYTES,
+            })
+        );
+
+        let too_many_policies: Vec<PreinstalledObjectAccessPolicy> = (0
+            ..=MAX_PREINSTALLED_OBJECT_ACCESS_POLICIES)
+            .map(|index| sample_policy(u32::try_from(index).unwrap() + 1, "transfer"))
+            .collect();
+        assert_eq!(
+            PreinstalledModuleSemanticsEnvelope::new(Vec::new(), too_many_policies),
+            Err(
+                NodeCoreError::PreinstalledObjectAccessPolicyCollectionTooLarge {
+                    count: MAX_PREINSTALLED_OBJECT_ACCESS_POLICIES + 1,
+                    maximum: MAX_PREINSTALLED_OBJECT_ACCESS_POLICIES,
+                }
+            )
+        );
+
+        let duplicate_index = vec![sample_policy(1, "transfer"), sample_policy(1, "other")];
+        assert_eq!(
+            PreinstalledModuleSemanticsEnvelope::new(Vec::new(), duplicate_index),
+            Err(NodeCoreError::DuplicatePreinstalledObjectAccessPolicyIndex { access_index: 1 })
+        );
+    }
+
+    #[test]
+    fn semantics_envelope_matches_only_exact_index_and_entrypoint() {
+        let envelope = PreinstalledModuleSemanticsEnvelope::new(
+            b"opaque".to_vec(),
+            vec![sample_policy(1, "transfer")],
+        )
+        .unwrap();
+
+        assert_eq!(
+            envelope.matching_object_access_policy("transfer", 1),
+            envelope.object_access_policies().first()
+        );
+        assert_eq!(envelope.matching_object_access_policy("other", 1), None);
+        assert_eq!(envelope.matching_object_access_policy("transfer", 2), None);
+        assert_eq!(envelope.matching_object_access_policy("transfer", 0), None);
+    }
+
+    #[test]
+    fn preinstalled_object_access_policy_canonical_bytes_are_stable() {
+        let policy = sample_policy(1, "transfer");
+        let encoded = encode_preinstalled_object_access_policy(&policy).unwrap();
+        assert_eq!(encoded, PREINSTALLED_OBJECT_ACCESS_POLICY_VECTOR);
+    }
+
+    #[test]
+    fn preinstalled_semantics_envelope_canonical_bytes_are_stable() {
+        let envelope = PreinstalledModuleSemanticsEnvelope::new(
+            b"opaque-app-semantics".to_vec(),
+            vec![sample_policy(1, "transfer")],
+        )
+        .unwrap();
+        let encoded = encode_preinstalled_semantics_envelope(&envelope).unwrap();
+        assert_eq!(encoded, PREINSTALLED_SEMANTICS_ENVELOPE_VECTOR);
+
+        let empty_policies =
+            PreinstalledModuleSemanticsEnvelope::opaque_only(b"opaque-app-semantics".to_vec())
+                .unwrap();
+        let empty_encoded = encode_preinstalled_semantics_envelope(&empty_policies).unwrap();
+        assert_ne!(encoded, empty_encoded);
     }
 }

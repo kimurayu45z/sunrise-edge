@@ -119,13 +119,15 @@ pub enum CliError {
         /// The decode failure.
         source: ObjectError,
     },
-    /// A referenced object exists and is `CurrentInline`, but its owner is
-    /// not the local signer's `Address`.
+    /// A referenced object exists and is `CurrentInline`, but its owner does
+    /// not equal the locally required address for that access.
     ObjectOwnerMismatch {
         /// Flag naming the object.
         flag: &'static str,
         /// The object identifier, as hex.
         object_id: String,
+        /// The exact locally required Address owner, as hex.
+        expected_owner: String,
         /// A stable label describing the actual owner
         /// (`address:<hex>`, `shared`, `immutable`, or `system`).
         owner: String,
@@ -241,10 +243,11 @@ impl fmt::Display for CliError {
             Self::ObjectOwnerMismatch {
                 flag,
                 object_id,
+                expected_owner,
                 owner,
             } => write!(
                 f,
-                "{flag} {object_id} is not owned by the local signer address (owner={owner})"
+                "{flag} {object_id} owner mismatch (expected=address:{expected_owner}, owner={owner})"
             ),
             Self::EmptySubmitResponse => {
                 f.write_str("submit_transaction returned no responses for the submitted request")

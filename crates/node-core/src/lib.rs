@@ -55,7 +55,10 @@ use preinstalled_wasm::{
 pub use execution::{ObjectEffect, ResolvedObject};
 pub use preinstalled_wasm::{
     MAX_PREINSTALLED_MODULE_GAS_LIMIT, MAX_PREINSTALLED_MODULE_WASM_BYTES,
-    MAX_PREINSTALLED_MODULES, PreinstalledModuleCatalog, PreinstalledModuleCatalogEntry,
+    MAX_PREINSTALLED_MODULES, MAX_PREINSTALLED_OBJECT_ACCESS_POLICIES,
+    MAX_PREINSTALLED_SEMANTICS_BYTES, PreinstalledModuleCatalog, PreinstalledModuleCatalogEntry,
+    PreinstalledModuleSemanticsEnvelope, PreinstalledObjectAccessPolicy,
+    encode_preinstalled_object_access_policy, encode_preinstalled_semantics_envelope,
     reconcile_preinstalled_registry_and_catalog,
 };
 pub use query::{
@@ -559,6 +562,49 @@ pub enum NodeCoreError {
     /// A preinstalled-WASM call declared zero authenticated object accesses.
     /// This MVP path requires at least one.
     PreinstalledModuleZeroObjectAccess,
+    /// A committed semantics envelope's opaque application bytes exceeded the bound.
+    PreinstalledSemanticsBytesTooLarge {
+        /// Actual opaque byte length.
+        actual: usize,
+        /// Maximum accepted opaque byte length.
+        maximum: usize,
+    },
+    /// A committed semantics envelope declared more object-access policies
+    /// than the bound.
+    PreinstalledObjectAccessPolicyCollectionTooLarge {
+        /// Declared policy count.
+        count: usize,
+        /// Maximum accepted policy count.
+        maximum: usize,
+    },
+    /// A committed semantics envelope declared the same access index twice.
+    DuplicatePreinstalledObjectAccessPolicyIndex {
+        /// Duplicated access index.
+        access_index: u32,
+    },
+    /// An object-access policy named the reserved source access index (`0`).
+    PreinstalledObjectAccessPolicySourceIndexReserved,
+    /// An object-access policy's access index exceeded the per-invocation
+    /// authenticated object bound.
+    PreinstalledObjectAccessPolicyIndexOutOfBounds {
+        /// Declared access index.
+        access_index: u32,
+        /// Maximum accepted access index.
+        maximum: u32,
+    },
+    /// An object-access policy declared an empty or oversized entrypoint name.
+    PreinstalledObjectAccessPolicyEntrypointInvalid {
+        /// Actual entrypoint byte length.
+        actual: usize,
+        /// Maximum accepted entrypoint byte length.
+        maximum: usize,
+    },
+    /// An object-access policy declared an access mode other than
+    /// [`AccessMode::Write`], the only mode this exception ever authorizes.
+    PreinstalledObjectAccessPolicyModeUnsupported {
+        /// Declared access mode.
+        mode: AccessMode,
+    },
 }
 
 impl fmt::Display for NodeCoreError {
@@ -930,6 +976,37 @@ impl fmt::Display for NodeCoreError {
             Self::PreinstalledModuleZeroObjectAccess => write!(
                 f,
                 "preinstalled module call declared zero authenticated object accesses, at least one is required"
+            ),
+            Self::PreinstalledSemanticsBytesTooLarge { actual, maximum } => write!(
+                f,
+                "preinstalled semantics envelope opaque bytes are {actual}, maximum is {maximum}"
+            ),
+            Self::PreinstalledObjectAccessPolicyCollectionTooLarge { count, maximum } => write!(
+                f,
+                "preinstalled semantics envelope declares {count} object-access policies, maximum is {maximum}"
+            ),
+            Self::DuplicatePreinstalledObjectAccessPolicyIndex { access_index } => write!(
+                f,
+                "preinstalled semantics envelope declares access index {access_index} twice"
+            ),
+            Self::PreinstalledObjectAccessPolicySourceIndexReserved => write!(
+                f,
+                "preinstalled object-access policy cannot govern the reserved source access index 0"
+            ),
+            Self::PreinstalledObjectAccessPolicyIndexOutOfBounds {
+                access_index,
+                maximum,
+            } => write!(
+                f,
+                "preinstalled object-access policy index {access_index} exceeds the maximum of {maximum}"
+            ),
+            Self::PreinstalledObjectAccessPolicyEntrypointInvalid { actual, maximum } => write!(
+                f,
+                "preinstalled object-access policy entrypoint is {actual} bytes, maximum is {maximum} and it must be non-empty"
+            ),
+            Self::PreinstalledObjectAccessPolicyModeUnsupported { mode } => write!(
+                f,
+                "preinstalled object-access policy declared unsupported access mode {mode:?}, only Write is authorized"
             ),
         }
     }
@@ -2905,7 +2982,7 @@ where
     let plan = machine.access_plan(&event)?;
     let domain = placement.resolve_domain(event.epoch(), plan.accesses().len())?;
     let output = handle_durable_idempotent_event_with_plan(
-        store, context, domain, resolver, event, machine, plan, None, None, None,
+        store, context, domain, resolver, event, machine, plan, None, None, None, None,
     )?;
     Ok(ResolvedNodeOutput::new(domain, output))
 }
@@ -2996,6 +3073,33 @@ struct PreinstalledWasmMachine<'a> {
     registered_module: Option<&'a SystemModule>,
     catalog: &'a PreinstalledModuleCatalog,
     engine: &'a WasmExecutionEngine,
+    resolved_module: std::cell::OnceCell<&'a PreinstalledModuleCatalogEntry>,
+}
+
+impl<'a> PreinstalledWasmMachine<'a> {
+    /// Resolves and verifies the exact committed catalog entry at most once
+    /// for this request. The durable handler invokes this only after receipt
+    /// and nonce reconciliation and before object I/O; `transition` reuses the
+    /// same verified reference without repeating resolution.
+    fn resolve_once(
+        &self,
+        epoch: Epoch,
+    ) -> Result<&'a PreinstalledModuleCatalogEntry, NodeCoreError> {
+        if let Some(module) = self.resolved_module.get() {
+            return Ok(*module);
+        }
+        let module: &'a PreinstalledModuleCatalogEntry = resolve_preinstalled_module(
+            &self.transaction.module_ref,
+            self.registered_module,
+            self.catalog,
+            epoch,
+            self.resolver,
+        )?;
+        self.resolved_module.set(module).map_err(|_| {
+            NodeCoreError::PersistenceInvariant("preinstalled module resolved twice")
+        })?;
+        Ok(module)
+    }
 }
 
 impl TransactionalNodeStateMachine for PreinstalledWasmMachine<'_> {
@@ -3011,13 +3115,7 @@ impl TransactionalNodeStateMachine for PreinstalledWasmMachine<'_> {
         event: &NodeEvent,
     ) -> Result<TransactionalNodeTransition, NodeCoreError> {
         let epoch = event.epoch();
-        let module = resolve_preinstalled_module(
-            &self.transaction.module_ref,
-            self.registered_module,
-            self.catalog,
-            epoch,
-            self.resolver,
-        )?;
+        let module: &PreinstalledModuleCatalogEntry = self.resolve_once(epoch)?;
         let max_input_size = module.manifest().max_input_size;
         let args_len = self.transaction.args.len() as u64;
         if args_len > max_input_size {
@@ -3081,6 +3179,16 @@ impl TransactionalNodeStateMachine for PreinstalledWasmMachine<'_> {
     }
 }
 
+/// The resolved, already-verified authorization context
+/// [`load_and_authorize_objects`] consults for the narrow preinstalled-module
+/// cross-owner exception. Produced by resolving the request-local
+/// [`PreinstalledWasmMachine`] exactly once, after receipt/nonce reconciliation
+/// and before any object load.
+struct ResolvedPreinstalledAuthorization<'a> {
+    entrypoint: &'a str,
+    envelope: &'a PreinstalledModuleSemanticsEnvelope,
+}
+
 /// Commits one preinstalled deterministic WASM contract call through the same
 /// durable invocation as sender nonce, application state, receipt, and
 /// outbox, passing its object effects to the same fail-closed owned-effects
@@ -3089,7 +3197,7 @@ impl TransactionalNodeStateMachine for PreinstalledWasmMachine<'_> {
 ///
 /// `Transaction.module_ref` is resolved against the system-module registry
 /// captured from committed `ProtocolConfig` during authentication and the
-/// trusted `catalog` through [`resolve_preinstalled_module`] (see that
+/// trusted `catalog` through the internal preinstalled-module resolver (see
 /// function's docs for the exact MVP `module_id`/`version`/`digest` mapping
 /// and every commitment check). `created_checkpoint` is trusted node
 /// composition, never request input, exactly like the owned-effects
@@ -3115,7 +3223,17 @@ impl TransactionalNodeStateMachine for PreinstalledWasmMachine<'_> {
 /// this function ever sees them, no object mutation. Exact request replay is
 /// reconciled from the persisted receipt before any module resolution,
 /// object load, or execution, identical to every other structured durable
-/// entrypoint.
+/// entrypoint. The module's committed semantics envelope is independently
+/// re-resolved and reverified (never a caller-supplied digest) exactly once,
+/// immediately after that
+/// receipt/nonce reconciliation and strictly before any object is loaded;
+/// its narrow cross-owner authorization exception (a non-sender
+/// `Owner::Address` destination at exactly the declared access index the
+/// envelope names, for this exact entrypoint, `Write` only, exact
+/// type/schema match) is the only way `load_and_authorize_objects` ever
+/// relaxes the default same-sender rule, and it never permits a literal
+/// owner reassignment (independently enforced by
+/// `authenticated_object_effects::translate_update`).
 ///
 /// An additive `native_http::preinstalled_wasm_structured_durable_router`
 /// wires this entrypoint over HTTP (see `ARCHITECTURE.md` DR-0080);
@@ -3168,6 +3286,7 @@ where
         registered_module: committed_system_module.as_ref(),
         catalog,
         engine,
+        resolved_module: std::cell::OnceCell::new(),
     };
     let plan = machine.access_plan(&event)?;
     let output = handle_durable_idempotent_event_with_plan(
@@ -3181,6 +3300,7 @@ where
         Some(reservation),
         Some(dispatch),
         Some(created_checkpoint),
+        Some(&machine),
     )?;
     Ok(ResolvedNodeOutput::new(domain, output))
 }
@@ -3231,6 +3351,7 @@ where
         Some(reservation),
         Some(dispatch),
         created_checkpoint,
+        None,
     )?;
     Ok(ResolvedNodeOutput::new(domain, output))
 }
@@ -3255,6 +3376,7 @@ fn handle_durable_idempotent_event_with_plan<S, M>(
     reservation: Option<SenderNonceReservation>,
     dispatch: Option<AuthenticatedObjectDispatch>,
     created_checkpoint: Option<u64>,
+    preinstalled_machine: Option<&PreinstalledWasmMachine<'_>>,
 ) -> Result<NodeOutput, NodeCoreError>
 where
     S: StructuredDurableDomainStateStore,
@@ -3341,15 +3463,37 @@ where
         None => None,
     };
 
+    // Resolve the exact committed module and its semantics envelope once,
+    // after receipt and nonce reconciliation but before the first object I/O.
+    // Generic owned-effects callers never provide a preinstalled machine and
+    // therefore remain sender-only.
+    let preinstalled_authorization: Option<ResolvedPreinstalledAuthorization<'_>> =
+        match preinstalled_machine {
+            Some(machine) => {
+                let module: &PreinstalledModuleCatalogEntry =
+                    machine.resolve_once(event.epoch())?;
+                Some(ResolvedPreinstalledAuthorization {
+                    entrypoint: &machine.transaction.entrypoint,
+                    envelope: module.semantics_envelope(),
+                })
+            }
+            None => None,
+        };
+
     // Object reads happen only after the receipt and nonce checks above, so a
     // stale or replayed request never spends the fan-out cost of the
     // per-entry head/version storage round-trips. Only this authenticated
     // path supplies verified typed object inputs to the pure transition;
     // generic handlers always supply an empty object slice.
     let loaded_objects: LoadedAuthenticatedObjects = match &dispatch {
-        Some(dispatch) => {
-            load_and_authorize_objects(store, context, domain, event.chain_id(), dispatch)?
-        }
+        Some(dispatch) => load_and_authorize_objects(
+            store,
+            context,
+            domain,
+            event.chain_id(),
+            dispatch,
+            preinstalled_authorization.as_ref(),
+        )?,
         None => LoadedAuthenticatedObjects::default(),
     };
     let mut values = BTreeMap::new();
@@ -3484,6 +3628,7 @@ fn load_and_authorize_objects<S>(
     domain: AtomicityDomainId,
     chain_id: &ChainId,
     dispatch: &AuthenticatedObjectDispatch,
+    preinstalled_authorization: Option<&ResolvedPreinstalledAuthorization<'_>>,
 ) -> Result<LoadedAuthenticatedObjects, NodeCoreError>
 where
     S: StructuredDurableDomainStateStore,
@@ -3491,7 +3636,7 @@ where
     let mut loaded: LoadedAuthenticatedObjects =
         LoadedAuthenticatedObjects::with_capacity(dispatch.accesses.len());
     let mut total_body_bytes: usize = 0;
-    for access in &dispatch.accesses {
+    for (access_index, access) in dispatch.accesses.iter().enumerate() {
         let object_id: ObjectId = access.object_ref.id;
         let head: DurableObjectHead = store.get_object_head(context, domain, object_id)?;
         let (object_version, digest): (DurableObjectVersion, Digest32) = match &head {
@@ -3611,7 +3756,27 @@ where
         match &object.owner {
             Owner::Address(owner_address) => {
                 if *owner_address != dispatch.authority {
-                    return Err(NodeCoreError::ObjectOwnerMismatch { object_id });
+                    let access_index: u32 = u32::try_from(access_index).map_err(|_| {
+                        NodeCoreError::PersistenceInvariant(
+                            "bounded authenticated object index did not fit u32",
+                        )
+                    })?;
+                    let policy: Option<&PreinstalledObjectAccessPolicy> =
+                        preinstalled_authorization.and_then(|authorization| {
+                            authorization.envelope.matching_object_access_policy(
+                                authorization.entrypoint,
+                                access_index,
+                            )
+                        });
+                    let authorized: bool = policy.is_some_and(|policy| {
+                        access.mode == AccessMode::Write
+                            && access.mode == policy.mode()
+                            && object.type_hash == policy.expected_type_hash()
+                            && object.schema_version == policy.expected_schema_version()
+                    });
+                    if !authorized {
+                        return Err(NodeCoreError::ObjectOwnerMismatch { object_id });
+                    }
                 }
             }
             Owner::Immutable if access.mode == AccessMode::Read => {}
@@ -8082,6 +8247,32 @@ mod tests {
         .unwrap()
     }
 
+    /// A contract that overwrites both declared objects. It is intentionally
+    /// metadata-blind: node-core must authorize the non-sender destination
+    /// from the committed semantics policy before execution.
+    fn preinstalled_write_two_wasm_bytes() -> Vec<u8> {
+        wat::parse_str(
+            r#"(module
+                (import "env" "get_object_count"   (func $get_object_count   (result i32)))
+                (import "env" "get_object_data_len"(func $get_object_data_len(param i32)(result i32)))
+                (import "env" "read_object_data"   (func $read_object_data   (param i32 i32 i32 i32)(result i32)))
+                (import "env" "write_object_data"  (func $write_object_data  (param i32 i32 i32)(result i32)))
+                (import "env" "consume_object"     (func $consume_object     (param i32)(result i32)))
+                (import "env" "create_object"      (func $create_object      (param i32 i32 i32 i32 i32 i32)(result i32)))
+                (import "env" "emit_event"         (func $emit_event         (param i32 i32 i32 i32)(result i32)))
+                (import "env" "get_args_len"       (func $get_args_len       (result i32)))
+                (import "env" "read_args"          (func $read_args          (param i32 i32 i32)(result i32)))
+                (import "env" "abort"              (func $abort              (param i32 i32)))
+                (memory 1)
+                (export "memory" (memory 0))
+                (data (i32.const 0) "\CA\FE")
+                (func (export "run")
+                  (drop (call $write_object_data (i32.const 0) (i32.const 0) (i32.const 2)))
+                  (drop (call $write_object_data (i32.const 1) (i32.const 0) (i32.const 2)))))"#,
+        )
+        .unwrap()
+    }
+
     /// A contract that always traps via `abort`.
     fn preinstalled_trap_wasm_bytes() -> Vec<u8> {
         wat::parse_str(
@@ -8201,8 +8392,33 @@ mod tests {
         activation_epoch: Epoch,
         status: system_modules::ModuleStatus,
     ) -> (SystemModuleRegistry, PreinstalledModuleCatalog, ObjectRef) {
+        let envelope: PreinstalledModuleSemanticsEnvelope =
+            PreinstalledModuleSemanticsEnvelope::opaque_only(b"test-semantics-v1".to_vec())
+                .unwrap();
+        preinstalled_module_fixture_with_envelope(
+            resolver,
+            module_id,
+            version,
+            wasm_bytes,
+            max_input_size,
+            activation_epoch,
+            status,
+            envelope,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn preinstalled_module_fixture_with_envelope(
+        resolver: &HashSuiteResolver,
+        module_id: ModuleId,
+        version: u64,
+        wasm_bytes: Vec<u8>,
+        max_input_size: u64,
+        activation_epoch: Epoch,
+        status: system_modules::ModuleStatus,
+        envelope: PreinstalledModuleSemanticsEnvelope,
+    ) -> (SystemModuleRegistry, PreinstalledModuleCatalog, ObjectRef) {
         let manifest = preinstalled_manifest(module_id, max_input_size);
-        let semantics_hash = Digest32::new(HashAlgorithmId::Sha2_256, [0x33; 32]);
         let code_hash = resolver
             .hash_for_purpose(Epoch::new(0), HashPurpose::ContractCode, &wasm_bytes)
             .unwrap();
@@ -8212,6 +8428,14 @@ mod tests {
                 Epoch::new(0),
                 HashPurpose::SystemModuleManifest,
                 &manifest_bytes,
+            )
+            .unwrap();
+        let semantics_bytes: Vec<u8> = encode_preinstalled_semantics_envelope(&envelope).unwrap();
+        let semantics_hash: Digest32 = resolver
+            .hash_for_purpose(
+                Epoch::new(0),
+                HashPurpose::SystemModuleManifest,
+                &semantics_bytes,
             )
             .unwrap();
         let module = system_modules::SystemModule {
@@ -8225,14 +8449,9 @@ mod tests {
         };
         let mut registry = SystemModuleRegistry::new();
         registry.add_module(module).unwrap();
-        let entry = PreinstalledModuleCatalogEntry::new(
-            module_id,
-            version,
-            wasm_bytes,
-            manifest,
-            semantics_hash,
-        )
-        .unwrap();
+        let entry =
+            PreinstalledModuleCatalogEntry::new(module_id, version, wasm_bytes, manifest, envelope)
+                .unwrap();
         let catalog = PreinstalledModuleCatalog::new(vec![entry]).unwrap();
         let module_ref = ObjectRef {
             id: ObjectId::new(*module_id.as_bytes()),
@@ -8265,6 +8484,64 @@ mod tests {
             fee_payment: None,
             signature: Vec::new(),
         }
+    }
+
+    fn load_cross_owner_destination_with_policy(
+        policy: Option<PreinstalledObjectAccessPolicy>,
+        entrypoint: &str,
+        destination_mode: AccessMode,
+        destination_owner: Owner,
+        source_is_sender: bool,
+    ) -> Result<LoadedAuthenticatedObjects, NodeCoreError> {
+        let store: ScriptedDurableStore =
+            ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let sender: Address = Address::new([0x41; 32]);
+        let (source_ref, _source_head) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0x42; 32]),
+            Owner::Address(if source_is_sender {
+                sender
+            } else {
+                Address::new([0x98; 32])
+            }),
+            0x30,
+        );
+        let (destination_ref, _destination_head) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0x43; 32]),
+            destination_owner,
+            0x31,
+        );
+        let dispatch = AuthenticatedObjectDispatch {
+            authority: sender,
+            accesses: vec![
+                AuthenticatedObjectAccess {
+                    object_ref: source_ref,
+                    mode: AccessMode::Write,
+                },
+                AuthenticatedObjectAccess {
+                    object_ref: destination_ref,
+                    mode: destination_mode,
+                },
+            ],
+        };
+        let policies: Vec<PreinstalledObjectAccessPolicy> = policy.into_iter().collect();
+        let envelope: PreinstalledModuleSemanticsEnvelope =
+            PreinstalledModuleSemanticsEnvelope::new(b"test".to_vec(), policies).unwrap();
+        let authorization = ResolvedPreinstalledAuthorization {
+            entrypoint,
+            envelope: &envelope,
+        };
+        load_and_authorize_objects(
+            &store,
+            &durable_context(),
+            domain(0x44),
+            &ChainId::new("sunrise-test").unwrap(),
+            &dispatch,
+            Some(&authorization),
+        )
     }
 
     #[test]
@@ -8366,6 +8643,241 @@ mod tests {
         let nonce_record: SenderNonceRecord =
             SenderNonceRecord::decode(persisted_nonce.value().unwrap()).unwrap();
         assert_eq!(nonce_record.next_nonce, 1);
+    }
+
+    #[test]
+    fn preinstalled_wasm_committed_policy_allows_exact_cross_owner_destination_write() {
+        let store: MemoryDurableStateStore =
+            MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = active_protocol_config(0xD1);
+        let signing_key: SigningKey = dev_signing_key(0xD1);
+        let sender: Address = dev_sender_address(&signing_key);
+        let recipient: Address = Address::new([0xD2; 32]);
+        let context: DurableOperationContext = durable_context();
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let object_domain: AtomicityDomainId = domain(0xD1);
+        let module_id: ModuleId = ModuleId::new([0xD3; 32]);
+        let destination_byte: u8 = 0x21;
+        let policy: PreinstalledObjectAccessPolicy = PreinstalledObjectAccessPolicy::new(
+            1,
+            "run".to_string(),
+            AccessMode::Write,
+            Digest32::new(
+                HashAlgorithmId::Sha2_256,
+                [destination_byte.wrapping_add(1); 32],
+            ),
+            u32::from(destination_byte),
+        )
+        .unwrap();
+        let envelope: PreinstalledModuleSemanticsEnvelope =
+            PreinstalledModuleSemanticsEnvelope::new(
+                b"two-object-transfer-test".to_vec(),
+                vec![policy],
+            )
+            .unwrap();
+        let (registry, catalog, module_ref) = preinstalled_module_fixture_with_envelope(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_write_two_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+            envelope,
+        );
+        protocol_config.system_modules = registry;
+
+        let source_id: ObjectId = ObjectId::new([0xD4; 32]);
+        let destination_id: ObjectId = ObjectId::new([0xD5; 32]);
+        let source_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            test_object(source_id, 1, Owner::Address(sender), 0x20),
+            "sunrise-test",
+            9,
+            0xD4,
+        );
+        let destination_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            test_object(
+                destination_id,
+                1,
+                Owner::Address(recipient),
+                destination_byte,
+            ),
+            "sunrise-test",
+            9,
+            0xD5,
+        );
+        let manifest: AccessManifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: source_ref,
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: destination_ref,
+                mode: AccessMode::Write,
+            },
+        ]);
+        let transaction: Transaction = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        let submission: AuthenticatedSubmitTransaction = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xD6),
+            &signing_key,
+            Epoch::new(7),
+            transaction,
+            &node_config,
+            &protocol_config,
+        );
+
+        let resolved: ResolvedNodeOutput = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &context,
+            &hash_resolver,
+            &catalog,
+            &WasmExecutionEngine,
+            submission,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.output().responses()[0].status(),
+            NodeResponseStatus::Accepted
+        );
+        for (object_id, expected_owner) in [(source_id, sender), (destination_id, recipient)] {
+            let record: DurableObjectVersionRecord = store
+                .get_object_version(
+                    &context,
+                    object_domain,
+                    object_id,
+                    DurableObjectVersion::new(2).unwrap(),
+                )
+                .unwrap()
+                .unwrap();
+            let object: &Object = record.payload().inline().unwrap().object();
+            assert_eq!(object.owner, Owner::Address(expected_owner));
+            assert_eq!(object.data, vec![0xCA, 0xFE]);
+        }
+    }
+
+    #[test]
+    fn preinstalled_cross_owner_policy_rejects_wrong_position_entrypoint_mode_type_and_schema() {
+        let expected_type: Digest32 = Digest32::new(HashAlgorithmId::Sha2_256, [0x32; 32]);
+        let exact_policy = || {
+            PreinstalledObjectAccessPolicy::new(
+                1,
+                "run".to_string(),
+                AccessMode::Write,
+                expected_type,
+                0x31,
+            )
+            .unwrap()
+        };
+
+        assert!(
+            load_cross_owner_destination_with_policy(
+                Some(exact_policy()),
+                "run",
+                AccessMode::Write,
+                Owner::Address(Address::new([0x99; 32])),
+                true,
+            )
+            .is_ok()
+        );
+
+        let wrong_position: PreinstalledObjectAccessPolicy = PreinstalledObjectAccessPolicy::new(
+            2,
+            "run".to_string(),
+            AccessMode::Write,
+            expected_type,
+            0x31,
+        )
+        .unwrap();
+        let wrong_type: PreinstalledObjectAccessPolicy = PreinstalledObjectAccessPolicy::new(
+            1,
+            "run".to_string(),
+            AccessMode::Write,
+            Digest32::new(HashAlgorithmId::Sha2_256, [0xFF; 32]),
+            0x31,
+        )
+        .unwrap();
+        let wrong_schema: PreinstalledObjectAccessPolicy = PreinstalledObjectAccessPolicy::new(
+            1,
+            "run".to_string(),
+            AccessMode::Write,
+            expected_type,
+            0x32,
+        )
+        .unwrap();
+        let cases: Vec<(Option<PreinstalledObjectAccessPolicy>, &str, AccessMode)> = vec![
+            (None, "run", AccessMode::Write),
+            (Some(wrong_position), "run", AccessMode::Write),
+            (Some(exact_policy()), "other", AccessMode::Write),
+            (Some(exact_policy()), "run", AccessMode::Consume),
+            (Some(wrong_type), "run", AccessMode::Write),
+            (Some(wrong_schema), "run", AccessMode::Write),
+        ];
+        for (policy, entrypoint, mode) in cases {
+            assert!(matches!(
+                load_cross_owner_destination_with_policy(
+                    policy,
+                    entrypoint,
+                    mode,
+                    Owner::Address(Address::new([0x99; 32])),
+                    true,
+                ),
+                Err(NodeCoreError::ObjectOwnerMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn preinstalled_cross_owner_policy_never_authorizes_non_address_owner_kinds() {
+        let policy: PreinstalledObjectAccessPolicy = PreinstalledObjectAccessPolicy::new(
+            1,
+            "run".to_string(),
+            AccessMode::Write,
+            Digest32::new(HashAlgorithmId::Sha2_256, [0x32; 32]),
+            0x31,
+        )
+        .unwrap();
+        for owner in [Owner::Shared, Owner::System, Owner::Immutable] {
+            assert!(matches!(
+                load_cross_owner_destination_with_policy(
+                    Some(policy.clone()),
+                    "run",
+                    AccessMode::Write,
+                    owner,
+                    true,
+                ),
+                Err(NodeCoreError::ObjectOwnerKindUnsupported { .. })
+            ));
+        }
+
+        assert!(matches!(
+            load_cross_owner_destination_with_policy(
+                Some(policy),
+                "run",
+                AccessMode::Write,
+                Owner::Address(Address::new([0x99; 32])),
+                false,
+            ),
+            Err(NodeCoreError::ObjectOwnerMismatch { .. })
+        ));
     }
 
     #[test]
@@ -8569,7 +9081,8 @@ mod tests {
             2,
             preinstalled_write_wasm_bytes(),
             preinstalled_manifest(module_id, 64),
-            Digest32::new(HashAlgorithmId::Sha2_256, [0x33; 32]),
+            PreinstalledModuleSemanticsEnvelope::opaque_only(b"test-semantics-v1".to_vec())
+                .unwrap(),
         )
         .unwrap();
         let pending_catalog = PreinstalledModuleCatalog::new(vec![pending_entry]).unwrap();

@@ -7,8 +7,9 @@
 //! independent verification and for building/replaying one raw
 //! `SubmitTransactionRequest`. It proves exactly:
 //!
-//! 1. A CLI transfer of amount 250 against a freshly seeded devnet, verified
-//!    independently through the client.
+//! 1. A CLI transfer of amount 250 from a sender-owned source into an
+//!    independently seeded recipient-owned destination, verified
+//!    independently through the client with the recipient owner unchanged.
 //! 2. An orderly stop (graceful HTTP shutdown, awaited server task, every
 //!    `Arc<SqliteDurableStore>` reference dropped so the SQLite file is
 //!    genuinely closed) followed by a real reopen through `boot_local_store`
@@ -45,8 +46,8 @@ use runtime::{
 use sunrise_edge_client::{
     AccessEntry, AccessManifest, AccessMode, AtomicityDomainId, Client, ClientError,
     HttpNodeResult, HttpObjectQueryResult, HttpReceiptQueryResult, LocalSigner,
-    LoopbackHttpTransport, NodeResponseStatus, ObjectId, ObjectRef, RequestId, SignatureSchemeId,
-    SubmitTransactionRequest, TransactionRequest, build_signed_transaction,
+    LoopbackHttpTransport, NodeResponseStatus, ObjectId, ObjectRef, Owner, RequestId,
+    SignatureSchemeId, SubmitTransactionRequest, TransactionRequest, build_signed_transaction,
     decode_execution_effects, decode_object,
 };
 use sunrise_edge_devnet::{
@@ -55,7 +56,7 @@ use sunrise_edge_devnet::{
     build_devnet_protocol_context, compose_devnet_router, decode_asset_account,
     encode_transfer_args,
     genesis::{DEVNET_DOMAIN_BYTES, DEVNET_PROTOCOL_VERSION},
-    seed_asset_accounts,
+    seed_asset_accounts, verify_seeded_asset_supply,
 };
 
 const INITIAL_SOURCE_BALANCE: u64 = 1_000_000;
@@ -139,7 +140,7 @@ fn make_client(address: SocketAddr) -> Client<LoopbackHttpTransport> {
 fn query_current_account(
     client: &Client<LoopbackHttpTransport>,
     object_id: ObjectId,
-) -> (ObjectRef, AssetAccount, Vec<u8>) {
+) -> (ObjectRef, AssetAccount, Owner, Vec<u8>) {
     let result = client
         .query_object(object_id)
         .expect("object query should succeed");
@@ -157,12 +158,13 @@ fn query_current_account(
                 decode_object(canonical_object_bytes).expect("canonical object should decode");
             let account = decode_asset_account(&object.data)
                 .expect("object body should decode as an asset account");
+            let owner: Owner = object.owner;
             let object_ref = ObjectRef {
                 id: object_id,
                 version: object_version.get(),
                 digest,
             };
-            (object_ref, account, canonical_result_bytes)
+            (object_ref, account, owner, canonical_result_bytes)
         }
         other => panic!("expected object {object_id} to be CurrentInline, got {other:?}"),
     }
@@ -193,8 +195,11 @@ struct PreRestartState {
 async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_requests() {
     let owner_signer = LocalSigner::from_seed([0x5B; 32]);
     let owner_address = owner_signer.address();
+    let recipient_signer = LocalSigner::from_seed([0x6B; 32]);
+    let recipient_address = recipient_signer.address();
     let seed_file = TempSeedFile::new([0x5B; 32]);
     let dev_owner = DevOwner::new(*owner_address.as_bytes());
+    let recipient_dev_owner = DevOwner::new(*recipient_address.as_bytes());
 
     let directory = TestDirectory::new("restart-duplicate-e2e");
     let config = DevnetConfig::parse_from(vec![
@@ -208,6 +213,8 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         OsString::from("13"),
         OsString::from("--dev-owner"),
         OsString::from(owner_address.to_string()),
+        OsString::from("--dev-owner"),
+        OsString::from(recipient_address.to_string()),
         OsString::from("--max-concurrent"),
         OsString::from("4"),
     ])
@@ -239,8 +246,28 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
     .unwrap();
     assert!(matches!(seed_outcome, SeedAssetAccountsOutcome::Created(_)));
     let first_accounts: SeededAssetAccounts = seed_outcome.accounts().clone();
+    let recipient_seed_context = DurableOperationContext::new(
+        first_generation,
+        seed_deadline,
+        StorageCorrelationId::new([0x64; 16]).unwrap(),
+    );
+    let recipient_seed_outcome = seed_asset_accounts(
+        first_boot.store(),
+        first_module.resolver(),
+        config.epoch(),
+        recipient_dev_owner,
+        first_generation,
+        &recipient_seed_context,
+    )
+    .unwrap();
+    assert!(matches!(
+        recipient_seed_outcome,
+        SeedAssetAccountsOutcome::Created(_)
+    ));
+    verify_seeded_asset_supply(&[seed_outcome.clone(), recipient_seed_outcome.clone()]).unwrap();
+    let recipient_accounts: SeededAssetAccounts = recipient_seed_outcome.accounts().clone();
     let source_id = first_accounts.source().id;
-    let destination_id = first_accounts.destination().id;
+    let destination_id = recipient_accounts.destination().id;
     let module_ref = first_module.module_ref().clone();
 
     // --- Serve on an ephemeral loopback port. ---
@@ -273,10 +300,17 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         let verify_client = make_client(first_address);
 
         // Baseline, independent of the seeding code above.
-        let (_, source_baseline, _) = query_current_account(&verify_client, source_id);
-        let (_, destination_baseline, _) = query_current_account(&verify_client, destination_id);
+        let (_, source_baseline, source_owner_baseline, _) =
+            query_current_account(&verify_client, source_id);
+        let (_, destination_baseline, destination_owner_baseline, _) =
+            query_current_account(&verify_client, destination_id);
         assert_eq!(source_baseline.balance, INITIAL_SOURCE_BALANCE);
         assert_eq!(destination_baseline.balance, 0);
+        assert_eq!(source_owner_baseline, Owner::Address(owner_address));
+        assert_eq!(
+            destination_owner_baseline,
+            Owner::Address(recipient_address)
+        );
 
         // Property 1: user-facing transfer leg through the real CLI binary
         // entrypoint, amount 250, with a bounded wait for the receipt.
@@ -298,6 +332,8 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             OsString::from(source_id.to_string()),
             OsString::from("--destination-object"),
             OsString::from(destination_id.to_string()),
+            OsString::from("--destination-owner"),
+            OsString::from(recipient_address.to_string()),
             OsString::from("--amount"),
             OsString::from(CLI_TRANSFER_AMOUNT.to_string()),
             OsString::from("--gas-limit"),
@@ -328,9 +364,9 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
 
         // Independently capture both decoded account states, the present
         // receipt, and the next nonce after the CLI transfer.
-        let (source_ref_after_cli, source_after_cli, _) =
+        let (source_ref_after_cli, source_after_cli, source_owner_after_cli, _) =
             query_current_account(&verify_client, source_id);
-        let (destination_ref_after_cli, destination_after_cli, _) =
+        let (destination_ref_after_cli, destination_after_cli, destination_owner_after_cli, _) =
             query_current_account(&verify_client, destination_id);
         assert_eq!(
             source_after_cli.balance,
@@ -339,6 +375,11 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         assert_eq!(
             destination_after_cli.balance,
             destination_baseline.balance + CLI_TRANSFER_AMOUNT
+        );
+        assert_eq!(source_owner_after_cli, Owner::Address(owner_address));
+        assert_eq!(
+            destination_owner_after_cli,
+            Owner::Address(recipient_address)
         );
 
         let cli_receipt = verify_client
@@ -417,10 +458,14 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             sunrise_edge_client::ExecutionStatus::Success
         ));
 
-        let (source_ref_after_r2, source_after_r2, source_query_bytes) =
+        let (source_ref_after_r2, source_after_r2, source_owner_after_r2, source_query_bytes) =
             query_current_account(&verify_client, source_id);
-        let (destination_ref_after_r2, destination_after_r2, destination_query_bytes) =
-            query_current_account(&verify_client, destination_id);
+        let (
+            destination_ref_after_r2,
+            destination_after_r2,
+            destination_owner_after_r2,
+            destination_query_bytes,
+        ) = query_current_account(&verify_client, destination_id);
         assert_eq!(
             source_after_r2.balance,
             source_after_cli.balance - SECOND_TRANSFER_AMOUNT
@@ -428,6 +473,11 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         assert_eq!(
             destination_after_r2.balance,
             destination_after_cli.balance + SECOND_TRANSFER_AMOUNT
+        );
+        assert_eq!(source_owner_after_r2, Owner::Address(owner_address));
+        assert_eq!(
+            destination_owner_after_r2,
+            Owner::Address(recipient_address)
         );
 
         let second_transfer_receipt = verify_client
@@ -473,11 +523,13 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         let (
             source_ref_after_same_boot_duplicate,
             source_after_same_boot_duplicate,
+            source_owner_after_same_boot_duplicate,
             source_bytes_after_same_boot_duplicate,
         ) = query_current_account(&verify_client, source_id);
         let (
             destination_ref_after_same_boot_duplicate,
             destination_after_same_boot_duplicate,
+            destination_owner_after_same_boot_duplicate,
             destination_bytes_after_same_boot_duplicate,
         ) = query_current_account(&verify_client, destination_id);
         assert_eq!(source_ref_after_same_boot_duplicate, source_ref_after_r2);
@@ -487,6 +539,14 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         );
         assert_eq!(source_after_same_boot_duplicate, source_after_r2);
         assert_eq!(destination_after_same_boot_duplicate, destination_after_r2);
+        assert_eq!(
+            source_owner_after_same_boot_duplicate,
+            Owner::Address(owner_address)
+        );
+        assert_eq!(
+            destination_owner_after_same_boot_duplicate,
+            Owner::Address(recipient_address)
+        );
         assert_eq!(source_bytes_after_same_boot_duplicate, source_query_bytes);
         assert_eq!(
             destination_bytes_after_same_boot_duplicate,
@@ -572,7 +632,8 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         })
     );
 
-    // Reseed and require Existing with identical account refs.
+    // Reseed both configured owners and require Existing with identical
+    // identities and current references.
     let second_protocol_context =
         build_devnet_protocol_context(config.chain_id().clone(), config.epoch()).unwrap();
     let second_module =
@@ -595,13 +656,34 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         reseed_outcome,
         SeedAssetAccountsOutcome::Existing(_)
     ));
+    let recipient_reseed_context = DurableOperationContext::new(
+        second_generation,
+        StorageDeadline::new(u64::MAX).unwrap(),
+        StorageCorrelationId::new([0x65; 16]).unwrap(),
+    );
+    let recipient_reseed_outcome = seed_asset_accounts(
+        second_boot.store(),
+        second_module.resolver(),
+        config.epoch(),
+        recipient_dev_owner,
+        second_generation,
+        &recipient_reseed_context,
+    )
+    .unwrap();
+    assert!(matches!(
+        recipient_reseed_outcome,
+        SeedAssetAccountsOutcome::Existing(_)
+    ));
+    verify_seeded_asset_supply(&[reseed_outcome.clone(), recipient_reseed_outcome.clone()])
+        .unwrap();
     // `seed_asset_accounts` reports the *current* head reference on the
     // `Existing` path (not the version-one creation snapshot the `Created`
     // path in `first_accounts` captured), so the account identities (owner,
     // object ids) are compared against `first_accounts`, while the exact
-    // current `ObjectRef` (version/digest, advanced by the two real
-    // transfers above) is compared against the state independently observed
-    // immediately before restart.
+    // current `ObjectRef` (version/digest, advanced on the sender source and
+    // recipient destination by the two real cross-owner transfers above) is
+    // compared against state independently observed immediately before
+    // restart. The two unused companion accounts remain at their seeded refs.
     assert_eq!(reseed_outcome.accounts().owner(), first_accounts.owner());
     assert_eq!(
         reseed_outcome.accounts().source().id,
@@ -614,6 +696,18 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
     assert_eq!(reseed_outcome.accounts().source(), &pre_restart.source_ref);
     assert_eq!(
         reseed_outcome.accounts().destination(),
+        first_accounts.destination()
+    );
+    assert_eq!(
+        recipient_reseed_outcome.accounts().owner(),
+        recipient_accounts.owner()
+    );
+    assert_eq!(
+        recipient_reseed_outcome.accounts().source(),
+        recipient_accounts.source()
+    );
+    assert_eq!(
+        recipient_reseed_outcome.accounts().destination(),
         &pre_restart.destination_ref
     );
     assert_eq!(second_module.module_ref(), &module_ref);
@@ -643,12 +737,21 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
 
         // Property 3: balances, sequences, receipts, and next nonce are
         // byte-identical to the values captured immediately before restart.
-        let (_, source_after_restart, source_query_bytes_after_restart) =
+        let (_, source_after_restart, source_owner_after_restart, source_query_bytes_after_restart) =
             query_current_account(&verify_client, source_id);
-        let (_, destination_after_restart, destination_query_bytes_after_restart) =
-            query_current_account(&verify_client, destination_id);
+        let (
+            _,
+            destination_after_restart,
+            destination_owner_after_restart,
+            destination_query_bytes_after_restart,
+        ) = query_current_account(&verify_client, destination_id);
         assert_eq!(source_after_restart, pre_restart.source_account);
         assert_eq!(destination_after_restart, pre_restart.destination_account);
+        assert_eq!(source_owner_after_restart, Owner::Address(owner_address));
+        assert_eq!(
+            destination_owner_after_restart,
+            Owner::Address(recipient_address)
+        );
         assert_eq!(
             source_query_bytes_after_restart,
             pre_restart.source_query_bytes
@@ -718,12 +821,21 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             pre_restart.submit_result_r2_bytes
         );
 
-        let (_, source_after_duplicate, source_query_bytes_after_duplicate) =
+        let (_, source_after_duplicate, source_owner_after_duplicate, source_query_bytes_after_duplicate) =
             query_current_account(&verify_client, source_id);
-        let (_, destination_after_duplicate, destination_query_bytes_after_duplicate) =
-            query_current_account(&verify_client, destination_id);
+        let (
+            _,
+            destination_after_duplicate,
+            destination_owner_after_duplicate,
+            destination_query_bytes_after_duplicate,
+        ) = query_current_account(&verify_client, destination_id);
         assert_eq!(source_after_duplicate, pre_restart.source_account);
         assert_eq!(destination_after_duplicate, pre_restart.destination_account);
+        assert_eq!(source_owner_after_duplicate, Owner::Address(owner_address));
+        assert_eq!(
+            destination_owner_after_duplicate,
+            Owner::Address(recipient_address)
+        );
         assert_eq!(
             source_query_bytes_after_duplicate,
             pre_restart.source_query_bytes
@@ -774,14 +886,26 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             other => panic!("expected a typed fail-closed HTTP conflict, got {other:?}"),
         }
 
-        let (_, source_after_reuse_attempt, source_query_bytes_after_reuse_attempt) =
+        let (_, source_after_reuse_attempt, source_owner_after_reuse_attempt, source_query_bytes_after_reuse_attempt) =
             query_current_account(&verify_client, source_id);
-        let (_, destination_after_reuse_attempt, destination_query_bytes_after_reuse_attempt) =
-            query_current_account(&verify_client, destination_id);
+        let (
+            _,
+            destination_after_reuse_attempt,
+            destination_owner_after_reuse_attempt,
+            destination_query_bytes_after_reuse_attempt,
+        ) = query_current_account(&verify_client, destination_id);
         assert_eq!(source_after_reuse_attempt, pre_restart.source_account);
         assert_eq!(
             destination_after_reuse_attempt,
             pre_restart.destination_account
+        );
+        assert_eq!(
+            source_owner_after_reuse_attempt,
+            Owner::Address(owner_address)
+        );
+        assert_eq!(
+            destination_owner_after_reuse_attempt,
+            Owner::Address(recipient_address)
         );
         assert_eq!(
             source_query_bytes_after_reuse_attempt,

@@ -13,7 +13,8 @@
 //! interaction goes through `sunrise-edge-client`.
 //!
 //! Commands: `address`, `context`, `object`, `receipt`, `next-nonce`, and
-//! `transfer` (the one same-owner devnet asset transfer). Output is
+//! `transfer` (the devnet asset transfer with an explicit destination-owner
+//! expectation). Output is
 //! deterministic, line-oriented `key=value` text; every error is typed and
 //! actionable, and every error exits the process non-zero.
 

@@ -1,4 +1,4 @@
-//! `transfer`: the one same-owner devnet asset transfer command.
+//! `transfer`: the devnet asset-account transfer command.
 //!
 //! This command is the only place in `apps/cli` that knows anything about
 //! the `sunrise.devnet.asset_account.v1` module: its fixed `transfer`
@@ -27,9 +27,11 @@
 //! Once the context is verified, this command queries the signer's next
 //! nonce (checking its epoch agrees with the verified context's before
 //! proceeding) and both current-inline object references, decoding each
-//! object's canonical body and requiring its owner to be the local signer's
-//! own address (defense in depth alongside the server's own fail-closed
-//! owner check — see `ARCHITECTURE.md` §44 / DR-0083). It then builds the
+//! object's canonical body. The source owner must be the local signer's own
+//! address, while the destination owner must exactly match the caller's
+//! required `--destination-owner` address. These are defense-in-depth checks
+//! alongside the server's committed module policy (see `ARCHITECTURE.md`
+//! DR-0086). It then builds the
 //! exact two-`Write` access manifest in source/destination order, builds and
 //! signs the transaction through `clients/rust`, and submits it with an
 //! explicit non-zero request id. Waiting for a receipt is optional and, when
@@ -65,6 +67,7 @@ const MODULE_DIGEST_ALGORITHM: &str = "--module-digest-algorithm";
 const MODULE_DIGEST: &str = "--module-digest";
 const SOURCE_OBJECT: &str = "--source-object";
 const DESTINATION_OBJECT: &str = "--destination-object";
+const DESTINATION_OWNER: &str = "--destination-owner";
 const AMOUNT: &str = "--amount";
 const GAS_LIMIT: &str = "--gas-limit";
 const REQUEST_ID: &str = "--request-id";
@@ -92,6 +95,7 @@ struct TransferInputs {
     module_ref: ObjectRef,
     source_id: ObjectId,
     destination_id: ObjectId,
+    destination_owner: Address,
     amount: u64,
     gas_limit: u64,
     request_id: RequestId,
@@ -129,6 +133,7 @@ fn transfer_flag_specs() -> Vec<crate::args::FlagSpec> {
         scalar(MODULE_DIGEST),
         scalar(SOURCE_OBJECT),
         scalar(DESTINATION_OBJECT),
+        scalar(DESTINATION_OWNER),
         scalar(AMOUNT),
         scalar(GAS_LIMIT),
         scalar(REQUEST_ID),
@@ -158,6 +163,10 @@ fn parse_inputs(parsed: &ParsedArgs) -> Result<TransferInputs, CliError> {
     if source_id == destination_id {
         return Err(CliError::SameSourceAndDestination);
     }
+    let destination_owner = Address::new(decode_hex_32(
+        DESTINATION_OWNER,
+        parsed.require(DESTINATION_OWNER)?,
+    )?);
     let amount = parse_u64(AMOUNT, parsed.require(AMOUNT)?)?;
     if amount == 0 {
         return Err(CliError::ZeroAmount);
@@ -174,6 +183,7 @@ fn parse_inputs(parsed: &ParsedArgs) -> Result<TransferInputs, CliError> {
         module_ref,
         source_id,
         destination_id,
+        destination_owner,
         amount,
         gas_limit,
         request_id,
@@ -237,8 +247,12 @@ where
     }
 
     let source_ref = require_owned_current_inline(client, SOURCE_OBJECT, inputs.source_id, sender)?;
-    let destination_ref =
-        require_owned_current_inline(client, DESTINATION_OBJECT, inputs.destination_id, sender)?;
+    let destination_ref = require_owned_current_inline(
+        client,
+        DESTINATION_OBJECT,
+        inputs.destination_id,
+        inputs.destination_owner,
+    )?;
 
     let mut access_manifest = AccessManifest::new();
     access_manifest.push(AccessEntry {
@@ -383,10 +397,10 @@ fn parse_wait_bounds(parsed: &ParsedArgs) -> Result<Option<ReceiptPollBounds>, C
 ///
 /// This is a client-side, defense-in-depth check: the server's own owned-
 /// effects path independently and authoritatively rejects a transaction
-/// whose declared sender does not own a referenced object (see
-/// `ARCHITECTURE.md` §"Node-core invocation boundary"). Checking here too
-/// only saves a round trip and gives an actionable local error; it never
-/// weakens or substitutes for that server-side check.
+/// whose source owner or committed destination policy is invalid (see
+/// `ARCHITECTURE.md` DR-0086). Checking here too only saves a round trip and
+/// gives an actionable local error; it never weakens or substitutes for that
+/// server-side check.
 fn require_owned_current_inline<T>(
     client: &Client<T>,
     flag: &'static str,
@@ -430,6 +444,7 @@ where
         owner => Err(CliError::ObjectOwnerMismatch {
             flag,
             object_id: object_id.to_string(),
+            expected_owner: expected_owner.to_string(),
             owner: owner_label(owner),
         }),
     }
@@ -609,6 +624,7 @@ mod tests {
             },
             source_id: ObjectId::new([0x10; 32]),
             destination_id: ObjectId::new([0x20; 32]),
+            destination_owner: Address::new([0x88; 32]),
             amount: 250,
             gas_limit: 1_000,
             request_id: RequestId::new([0x30; 32]).unwrap(),
@@ -671,7 +687,8 @@ mod tests {
         let context = sample_context();
         let nonce = HttpNextNonceQueryResult::new(signer.address(), Epoch::new(5), 3);
         let source = current_inline_owned_by(inputs.source_id, 1, signer.address());
-        let destination = current_inline_owned_by(inputs.destination_id, 1, signer.address());
+        let destination =
+            current_inline_owned_by(inputs.destination_id, 1, inputs.destination_owner);
         let accepted =
             NodeResponse::new(inputs.request_id, NodeResponseStatus::Accepted, None).unwrap();
         let submit = HttpNodeResult::new(inputs.request_id, vec![accepted]).unwrap();
@@ -708,7 +725,8 @@ mod tests {
         let context = sample_context();
         let nonce = HttpNextNonceQueryResult::new(signer.address(), Epoch::new(5), 3);
         let source = current_inline_owned_by(inputs.source_id, 1, signer.address());
-        let destination = current_inline_owned_by(inputs.destination_id, 1, signer.address());
+        let destination =
+            current_inline_owned_by(inputs.destination_id, 1, inputs.destination_owner);
         let rejected =
             NodeResponse::new(inputs.request_id, NodeResponseStatus::Rejected, None).unwrap();
         let submit = HttpNodeResult::new(inputs.request_id, vec![rejected]).unwrap();
@@ -742,7 +760,8 @@ mod tests {
         let context = sample_context();
         let nonce = HttpNextNonceQueryResult::new(signer.address(), Epoch::new(5), 3);
         let source = current_inline_owned_by(inputs.source_id, 1, signer.address());
-        let destination = current_inline_owned_by(inputs.destination_id, 1, signer.address());
+        let destination =
+            current_inline_owned_by(inputs.destination_id, 1, inputs.destination_owner);
         let effects = execution::ExecutionEffects {
             tx_hash: Digest32::new(HashAlgorithmId::Sha2_256, [0x0B; 32]),
             status: ExecutionStatus::Failure {
@@ -786,7 +805,8 @@ mod tests {
         let context = sample_context();
         let nonce = HttpNextNonceQueryResult::new(signer.address(), Epoch::new(5), 3);
         let source = current_inline_owned_by(inputs.source_id, 1, signer.address());
-        let destination = current_inline_owned_by(inputs.destination_id, 1, signer.address());
+        let destination =
+            current_inline_owned_by(inputs.destination_id, 1, inputs.destination_owner);
         let submit = HttpNodeResult::new(inputs.request_id, vec![]).unwrap();
 
         let transport = FakeTransport::new(vec![
@@ -1048,6 +1068,39 @@ mod tests {
     }
 
     #[test]
+    fn execute_rejects_a_destination_not_owned_by_the_explicit_expected_address() {
+        let signer = sample_signer();
+        let inputs = sample_inputs();
+        let expected_owner: Address = inputs.destination_owner;
+        let context = sample_context();
+        let nonce = HttpNextNonceQueryResult::new(signer.address(), Epoch::new(5), 3);
+        let source = current_inline_owned_by(inputs.source_id, 1, signer.address());
+        let actual_owner = Address::new([0xB3; 32]);
+        let destination = current_inline_owned_by(inputs.destination_id, 1, actual_owner);
+
+        let transport = FakeTransport::new(vec![
+            query_ok(context.encode().unwrap()),
+            query_ok(nonce.encode().unwrap()),
+            query_ok(source.encode().unwrap()),
+            query_ok(destination.encode().unwrap()),
+        ]);
+        let client = Client::new(transport);
+
+        let error = execute(&client, &signer, inputs).unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::ObjectOwnerMismatch {
+                flag: DESTINATION_OBJECT,
+                expected_owner: expected,
+                owner,
+                ..
+            } if expected == expected_owner.to_string()
+                && owner == format!("address:{actual_owner}")
+        ));
+        assert_eq!(client.transport().requests().len(), 4);
+    }
+
+    #[test]
     fn execute_rejects_shared_system_and_immutable_owned_objects() {
         for (owner, label) in [
             (Owner::Shared, "shared"),
@@ -1117,6 +1170,29 @@ mod tests {
             parse_inputs(&parsed),
             Err(CliError::SameSourceAndDestination)
         ));
+    }
+
+    #[test]
+    fn parse_inputs_requires_an_explicit_destination_owner() {
+        let mut args = base_flag_values();
+        args.remove(DESTINATION_OWNER);
+        let parsed = parse_flags(to_os(&args), &transfer_specs()).unwrap();
+
+        assert!(matches!(
+            parse_inputs(&parsed),
+            Err(CliError::Args(crate::args::ArgsError::MissingFlag(
+                DESTINATION_OWNER
+            )))
+        ));
+    }
+
+    #[test]
+    fn parse_inputs_rejects_a_malformed_destination_owner() {
+        let mut args = base_flag_values();
+        args.insert(DESTINATION_OWNER, "not-hex".to_string());
+        let parsed = parse_flags(to_os(&args), &transfer_specs()).unwrap();
+
+        assert!(matches!(parse_inputs(&parsed), Err(CliError::Hex(_))));
     }
 
     #[test]
@@ -1313,6 +1389,7 @@ mod tests {
         values.insert(MODULE_DIGEST, "02".repeat(32));
         values.insert(SOURCE_OBJECT, "10".repeat(32));
         values.insert(DESTINATION_OBJECT, "20".repeat(32));
+        values.insert(DESTINATION_OWNER, "88".repeat(32));
         values.insert(AMOUNT, "250".to_string());
         values.insert(GAS_LIMIT, "1000".to_string());
         values.insert(REQUEST_ID, "30".repeat(32));

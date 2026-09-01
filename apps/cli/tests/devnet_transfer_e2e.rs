@@ -219,6 +219,8 @@ async fn cli_transfer_command_moves_balance_through_the_real_devnet_router_over_
             OsString::from(source_id.to_string()),
             OsString::from("--destination-object"),
             OsString::from(destination_id.to_string()),
+            OsString::from("--destination-owner"),
+            OsString::from(owner_address.to_string()),
             OsString::from("--amount"),
             OsString::from(TRANSFER_AMOUNT.to_string()),
             OsString::from("--gas-limit"),

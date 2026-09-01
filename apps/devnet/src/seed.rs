@@ -5,7 +5,7 @@ use crate::{
         AssetAccount, AssetAccountCodecError, DEVNET_ASSET_ID, asset_account_type_hash,
         decode_asset_account, encode_asset_account,
     },
-    config::DevOwner,
+    config::{DevOwner, MAX_DEVNET_OWNERS},
     genesis::DEVNET_DOMAIN_BYTES,
 };
 use hashing::{HashSuiteResolver, HashingError, verify_digest};
@@ -22,7 +22,7 @@ use runtime::{
     DurableRequestId, DurableRequestReceipt, IndeterminateCommitReason, IndexedOutboxContractError,
     StructuredDurableDomainStateStore, WriterFenceGeneration,
 };
-use std::{error::Error, fmt};
+use std::{collections::BTreeSet, error::Error, fmt};
 
 const SOURCE_SLOT: u64 = 1;
 const DESTINATION_SLOT: u64 = 2;
@@ -37,6 +37,8 @@ pub struct SeededAssetAccounts {
     owner: DevOwner,
     source: ObjectRef,
     destination: ObjectRef,
+    source_balance: u64,
+    destination_balance: u64,
 }
 
 impl SeededAssetAccounts {
@@ -57,6 +59,10 @@ impl SeededAssetAccounts {
     pub const fn destination(&self) -> &ObjectRef {
         &self.destination
     }
+
+    fn checked_total_balance(&self) -> Option<u64> {
+        self.source_balance.checked_add(self.destination_balance)
+    }
 }
 
 /// Whether this boot created or verified an owner's seeded account pair.
@@ -76,6 +82,47 @@ impl SeedAssetAccountsOutcome {
             Self::Created(accounts) | Self::Existing(accounts) => accounts,
         }
     }
+}
+
+/// Verifies the fixed devnet asset's total seeded supply across all owners.
+///
+/// A cross-owner transfer legitimately changes each owner's local account-pair
+/// total and advances the two touched accounts independently. Startup therefore
+/// verifies every current object and its immutable seed history per owner, then
+/// applies this one bounded global conservation check before serving requests.
+pub fn verify_seeded_asset_supply(
+    outcomes: &[SeedAssetAccountsOutcome],
+) -> Result<(), DevnetSeedError> {
+    if outcomes.is_empty() || outcomes.len() > MAX_DEVNET_OWNERS {
+        return Err(DevnetSeedError::AssetInvariantViolation);
+    }
+    let mut owners: BTreeSet<DevOwner> = BTreeSet::new();
+    let mut object_ids: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut actual_supply: u64 = 0;
+    for outcome in outcomes {
+        let accounts: &SeededAssetAccounts = outcome.accounts();
+        if !owners.insert(accounts.owner)
+            || !object_ids.insert(accounts.source.id)
+            || !object_ids.insert(accounts.destination.id)
+        {
+            return Err(DevnetSeedError::AssetInvariantViolation);
+        }
+        let owner_supply: u64 = accounts
+            .checked_total_balance()
+            .ok_or(DevnetSeedError::AssetInvariantViolation)?;
+        actual_supply = actual_supply
+            .checked_add(owner_supply)
+            .ok_or(DevnetSeedError::AssetInvariantViolation)?;
+    }
+    let owner_count: u64 =
+        u64::try_from(outcomes.len()).map_err(|_| DevnetSeedError::AssetInvariantViolation)?;
+    let expected_supply: u64 = INITIAL_SOURCE_BALANCE
+        .checked_mul(owner_count)
+        .ok_or(DevnetSeedError::AssetInvariantViolation)?;
+    if actual_supply != expected_supply {
+        return Err(DevnetSeedError::AssetInvariantViolation);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -108,7 +155,9 @@ struct ExpectedSeed {
 /// resolver, epoch, owner, and fixed source/destination slots. Creation is one
 /// all-or-none structured durable transaction. A restart never overwrites
 /// existing balances: it verifies both current immutable versions, their
-/// version-one seed history, and the original receipt before returning.
+/// canonical asset bodies and independent sequence counters, their version-one
+/// seed history, and the original receipt before returning. Callers that seed
+/// every configured owner must finish with [`verify_seeded_asset_supply`].
 pub fn seed_asset_accounts<S>(
     store: &S,
     resolver: &HashSuiteResolver,
@@ -429,17 +478,6 @@ where
         owner,
     )?;
 
-    let combined_balance: u64 = source
-        .account
-        .balance
-        .checked_add(destination.account.balance)
-        .ok_or(DevnetSeedError::AssetInvariantViolation)?;
-    if combined_balance != INITIAL_SOURCE_BALANCE
-        || source.account.sequence != destination.account.sequence
-    {
-        return Err(DevnetSeedError::AssetInvariantViolation);
-    }
-
     verify_initial_record(
         store,
         resolver,
@@ -464,6 +502,8 @@ where
         owner,
         source: source.object_ref,
         destination: destination.object_ref,
+        source_balance: source.account.balance,
+        destination_balance: destination.account.balance,
     })
 }
 
@@ -712,6 +752,8 @@ fn initial_accounts(owner: DevOwner, expected: &ExpectedSeed) -> SeededAssetAcco
         owner,
         source: expected.source.object_ref(),
         destination: expected.destination.object_ref(),
+        source_balance: INITIAL_SOURCE_BALANCE,
+        destination_balance: INITIAL_DESTINATION_BALANCE,
     }
 }
 
@@ -772,7 +814,7 @@ pub enum DevnetSeedError {
         /// Stable operator-facing mismatch category.
         detail: &'static str,
     },
-    /// Current balances or sequences violated the bundled transfer invariant.
+    /// The bounded configured-owner set violated the fixed global seeded supply.
     AssetInvariantViolation,
     /// The deterministic original seed receipt was absent.
     MissingSeedReceipt,
@@ -825,7 +867,7 @@ impl fmt::Display for DevnetSeedError {
                 write!(f, "seed object {object_id} failed verification: {detail}")
             }
             Self::AssetInvariantViolation => f.write_str(
-                "seed asset accounts violate conserved balance or paired-sequence invariants",
+                "seed asset accounts violate unique identity or global supply invariants",
             ),
             Self::MissingSeedReceipt => f.write_str("deterministic seed receipt is missing"),
             Self::ReceiptMismatch => f.write_str("deterministic seed receipt differs"),
@@ -885,7 +927,8 @@ impl From<IndexedOutboxContractError> for DevnetSeedError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol_types::{ChainId, HashSuite, HashSuiteSchedule, ProtocolVersion};
+    use fees::AssetId;
+    use protocol_types::{ChainId, HashAlgorithmId, HashSuite, HashSuiteSchedule, ProtocolVersion};
     use runtime::{MemoryDurableStateStore, StorageCorrelationId, StorageDeadline};
 
     fn resolver() -> HashSuiteResolver {
@@ -914,6 +957,92 @@ mod tests {
 
     fn domain() -> AtomicityDomainId {
         AtomicityDomainId::new(DEVNET_DOMAIN_BYTES).unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    enum CurrentAccountTamper {
+        Owner,
+        Type,
+        Schema,
+        Asset,
+        MalformedBody,
+    }
+
+    fn commit_tampered_source(
+        store: &MemoryDurableStateStore,
+        resolver: &HashSuiteResolver,
+        owner: DevOwner,
+        tamper: CurrentAccountTamper,
+        request_tag: u8,
+    ) {
+        let expected: ExpectedSeed = build_expected_seed(resolver, Epoch::new(0), owner).unwrap();
+        let source_id: ObjectId = expected.source.initial_object.id;
+        let head: DurableObjectHead = store
+            .get_object_head(&context(), domain(), source_id)
+            .unwrap();
+        let mut object: Object = expected.source.initial_object;
+        object.version = 2;
+        match tamper {
+            CurrentAccountTamper::Owner => {
+                object.owner = Owner::Address(Address::new([0xA1; 32]));
+            }
+            CurrentAccountTamper::Type => {
+                object.type_hash = Digest32::new(HashAlgorithmId::Sha2_256, [0xA2; 32]);
+            }
+            CurrentAccountTamper::Schema => {
+                object.schema_version = 2;
+            }
+            CurrentAccountTamper::Asset => {
+                object.data = encode_asset_account(&AssetAccount::new(
+                    AssetId::new([0xA3; 32]),
+                    INITIAL_SOURCE_BALANCE,
+                    1,
+                ))
+                .unwrap();
+            }
+            CurrentAccountTamper::MalformedBody => {
+                object.data = vec![0xA4];
+            }
+        }
+        let canonical_object: Vec<u8> = encode_object(&object).unwrap();
+        let digest: Digest32 = resolver
+            .hash_for_purpose(Epoch::new(0), HashPurpose::Object, &canonical_object)
+            .unwrap();
+        let record: DurableObjectVersionRecord = DurableObjectVersionRecord::from_inline_object(
+            object.clone(),
+            digest,
+            DurableObjectProvenance::new(resolver.chain_id().clone(), resolver.protocol_version()),
+            generation().get(),
+        )
+        .unwrap();
+        let owner_projection: DurableObjectOwnerProjection =
+            DurableObjectOwnerProjection::from_owner(object.owner).unwrap();
+        let routing_projection: DurableObjectRoutingProjection =
+            DurableObjectRoutingProjection::new(None).unwrap();
+        let changes: DurableObjectChanges = DurableObjectChanges::new(
+            vec![DurableObjectHeadRead::new(source_id, head)],
+            vec![DurableObjectMutationEntry::new(
+                source_id,
+                DurableObjectMutation::Update {
+                    version: record,
+                    owner_projection,
+                    routing_projection,
+                },
+            )],
+        )
+        .unwrap();
+        let receipt: DurableRequestReceipt = DurableRequestReceipt::new(
+            DurableRequestId::new([request_tag; 32]).unwrap(),
+            Digest32::new(HashAlgorithmId::Sha2_256, [request_tag.wrapping_add(1); 32]),
+            vec![request_tag],
+        )
+        .unwrap();
+        let invocation: DurableInvocationTransaction =
+            DurableInvocationTransaction::new(domain(), None, changes, receipt, None).unwrap();
+        assert_eq!(
+            store.commit_invocation(&context(), invocation),
+            DurableCommitOutcome::Committed
+        );
     }
 
     #[test]
@@ -968,5 +1097,77 @@ mod tests {
             first.source.initial_object.id,
             second.source.initial_object.id
         );
+    }
+
+    #[test]
+    fn global_seeded_supply_accepts_cross_owner_movement() {
+        let resolver: HashSuiteResolver = resolver();
+        let first: ExpectedSeed =
+            build_expected_seed(&resolver, Epoch::new(0), DevOwner::new([0x81; 32])).unwrap();
+        let second: ExpectedSeed =
+            build_expected_seed(&resolver, Epoch::new(0), DevOwner::new([0x82; 32])).unwrap();
+        let mut first_outcome: SeedAssetAccountsOutcome =
+            SeedAssetAccountsOutcome::Existing(initial_accounts(DevOwner::new([0x81; 32]), &first));
+        let mut second_outcome: SeedAssetAccountsOutcome = SeedAssetAccountsOutcome::Existing(
+            initial_accounts(DevOwner::new([0x82; 32]), &second),
+        );
+        let SeedAssetAccountsOutcome::Existing(first_accounts) = &mut first_outcome else {
+            unreachable!();
+        };
+        let SeedAssetAccountsOutcome::Existing(second_accounts) = &mut second_outcome else {
+            unreachable!();
+        };
+        first_accounts.source_balance -= 250;
+        second_accounts.destination_balance += 250;
+
+        verify_seeded_asset_supply(&[first_outcome, second_outcome]).unwrap();
+    }
+
+    #[test]
+    fn restart_verification_rejects_semantically_tampered_current_accounts() {
+        for (index, tamper) in [
+            CurrentAccountTamper::Owner,
+            CurrentAccountTamper::Type,
+            CurrentAccountTamper::Schema,
+            CurrentAccountTamper::Asset,
+            CurrentAccountTamper::MalformedBody,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let store: MemoryDurableStateStore =
+                MemoryDurableStateStore::new_bound(domain(), generation());
+            store.set_time(0);
+            let owner: DevOwner = DevOwner::new([0x91; 32]);
+            let resolver: HashSuiteResolver = resolver();
+            seed_asset_accounts(
+                &store,
+                &resolver,
+                Epoch::new(0),
+                owner,
+                generation(),
+                &context(),
+            )
+            .unwrap();
+            let request_tag: u8 = u8::try_from(index).unwrap() + 0xB0;
+            commit_tampered_source(&store, &resolver, owner, tamper, request_tag);
+
+            let result = seed_asset_accounts(
+                &store,
+                &resolver,
+                Epoch::new(0),
+                owner,
+                generation(),
+                &context(),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(DevnetSeedError::StoredObjectMismatch { .. })
+                        | Err(DevnetSeedError::AssetCodec(_))
+                ),
+                "tamper case {index} unexpectedly verified: {result:?}"
+            );
+        }
     }
 }

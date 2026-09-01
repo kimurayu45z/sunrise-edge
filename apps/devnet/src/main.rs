@@ -7,6 +7,7 @@ use sunrise_edge_devnet::{
     ASSET_ACCOUNT_WASM, DEVNET_ASSET_ID, DEVNET_DATABASE_FILE, DEVNET_STARTUP_LIMITATIONS_BANNER,
     DevnetConfig, SeedAssetAccountsOutcome, asset_account_type_hash, boot_local_store,
     build_asset_module, build_devnet_protocol_context, compose_devnet_router, seed_asset_accounts,
+    verify_seeded_asset_supply,
 };
 
 const SEED_OPERATION_TIMEOUT_MILLIS: u64 = 30_000;
@@ -20,6 +21,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         build_devnet_protocol_context(config.chain_id().clone(), config.epoch())?;
     let asset_module = build_asset_module(protocol_context, ASSET_ACCOUNT_WASM.to_vec())?;
     let module_ref = asset_module.module_ref().clone();
+    let mut seed_outcomes: Vec<SeedAssetAccountsOutcome> =
+        Vec::with_capacity(config.dev_owners().len());
     for (index, owner) in config.dev_owners().iter().copied().enumerate() {
         let now_unix_millis: u64 = SystemClock.now_unix_millis()?;
         let seed_deadline_unix_millis: u64 = now_unix_millis
@@ -56,7 +59,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
             outcome.accounts().source().id,
             outcome.accounts().destination().id
         );
+        seed_outcomes.push(outcome);
     }
+    verify_seeded_asset_supply(&seed_outcomes)?;
 
     let store = Arc::new(boot.into_store());
     let router = compose_devnet_router(
