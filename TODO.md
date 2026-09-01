@@ -1748,7 +1748,11 @@ HA/failover、provider-managed pooler、real-provider certification、provider d
 As-Isであり、CLI Developer MVP Gateは通過済みである。** これはproduction readinessの
 宣言ではない。CLI-First Node Production GateのS0もimplemented As-Isであり、現在の
 implementation priorityはS1（remote TLS transportと、signing前の独立したtrusted
-protocol-context validation）である。S2-S5は順序を飛ばさず後続する。
+protocol-context validation）である。S1のうちsigning前mandatory trusted
+protocol-context検証（S1a）はimplemented As-Is（詳細は
+["CLI-First Node Production Gate"](#cli-first-node-production-gate)のS1参照）だが、
+remote TLS transportは未実装のため、S1全体としてはまだ未完了である。S2-S5は順序を
+飛ばさず後続する。
 
 CLI Developer MVP completion criteria（capability criteria 2-3を満たしながら、product
 surfaceはARCHITECTURE.md DR-0081の順序に従う: local devnet、bounded query API、Rust
@@ -2200,6 +2204,22 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
   期待値と比較して一致を要求する、という別のmandatory trusted protocol-context
   検証を実装する。TLS証明書/公開鍵のpinningだけでcross-chain signingを防げると
   主張しない。
+  **実装状況（2026-09-01）：(b)のsigning前mandatory trusted protocol-context
+  検証（S1a）はimplemented As-Is。** `clients/rust`は公開`ExpectedProtocolContext`
+  （chain_id、protocol_version、この初期sliceのexact-epoch policy、
+  hash_suite_id、transaction_auth_profile_id、signature_scheme_id、
+  address_binding_id、論理`AtomicityDomainId`）と、`/v1/context`を問い合わせて
+  その8フィールド全てを検証してから結果を返す`Client::query_verified_context`、
+  フィールド別の型付き`ProtocolContextMismatch`を持つ。`apps/cli`の`transfer`は
+  `--expected-chain-id`/`--expected-protocol-version`/`--expected-epoch`/
+  `--expected-hash-suite-id`/`--expected-domain`の5フラグを必須とし、
+  missing/zero/malformedな値をnetwork dispatch前にrejectしてから
+  `ExpectedProtocolContext`を構築し、以降のnext-nonce/object query、
+  transaction構築、signing、submissionをすべてこの検証済みcontextに基づいて行う
+  （未検証の`query_context`は使わない）。8フィールドそれぞれのmismatchに対する
+  adversarial testが、`transfer`がcontext requestの1回だけで停止し
+  nonce/object queryやsigningへ進まないことを証明する。**(a)のremote TLS
+  transportは未実装のままであり、S1全体としては未完了。**
 - **S2**: cross-owner transfer（destination-owner authorizationとobject owner
   変更）を既存のowned-effects pathの上へ実装する。
 - **S3**: fees/gas metering。public live ingressの前に実装を完了する（fee-free

@@ -53,7 +53,9 @@ use sunrise_edge_devnet::{
     ASSET_ACCOUNT_WASM, AssetAccount, DevOwner, DevnetConfig, SeedAssetAccountsOutcome,
     SeededAssetAccounts, TransferArgs, boot_local_store, build_asset_module,
     build_devnet_protocol_context, compose_devnet_router, decode_asset_account,
-    encode_transfer_args, seed_asset_accounts,
+    encode_transfer_args,
+    genesis::{DEVNET_DOMAIN_BYTES, DEVNET_PROTOCOL_VERSION},
+    seed_asset_accounts,
 };
 
 const INITIAL_SOURCE_BALANCE: u64 = 1_000_000;
@@ -63,6 +65,9 @@ const TRANSFER_ENTRYPOINT: &str = "transfer";
 const GAS_LIMIT: u64 = 1_000_000;
 const REQUEST_ID_R1_BYTE: u8 = 0x51;
 const REQUEST_ID_R2_BYTE: u8 = 0x52;
+const EXPECTED_CHAIN_ID: &str = "cli-restart-duplicate-e2e-devnet";
+const EXPECTED_EPOCH: &str = "13";
+const EXPECTED_HASH_SUITE_ID: &str = "1";
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -299,6 +304,16 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             OsString::from(GAS_LIMIT.to_string()),
             OsString::from("--request-id"),
             OsString::from(hex32(&[REQUEST_ID_R1_BYTE; 32])),
+            OsString::from("--expected-chain-id"),
+            OsString::from(EXPECTED_CHAIN_ID),
+            OsString::from("--expected-protocol-version"),
+            OsString::from(DEVNET_PROTOCOL_VERSION.get().to_string()),
+            OsString::from("--expected-epoch"),
+            OsString::from(EXPECTED_EPOCH),
+            OsString::from("--expected-hash-suite-id"),
+            OsString::from(EXPECTED_HASH_SUITE_ID),
+            OsString::from("--expected-domain"),
+            OsString::from(hex32(&DEVNET_DOMAIN_BYTES)),
             OsString::from("--wait"),
             OsString::from("--wait-max-attempts"),
             OsString::from("20"),

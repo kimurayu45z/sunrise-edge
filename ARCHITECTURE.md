@@ -3252,6 +3252,82 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   ordered successors, and the TypeScript client/explorer/wallet surface remains
   deferred until the complete CLI-First Node Production Gate passes.
 
+  **S1a implementation status (2026-09-01): expected-protocol-context
+  verification is implemented As-Is; S1 as a whole is not complete.** S1
+  below names two separate concerns. Only the second — mandatory trusted
+  protocol-context verification before signing — is implemented by this
+  update; remote TLS transport is not, so S1 remains incomplete overall and
+  must not be described as done. `clients/rust` adds a public
+  `context::ExpectedProtocolContext`: a caller supplies the exact locally
+  trusted `chain_id`, `protocol_version`, an exact-epoch policy (this initial
+  slice trusts one caller-supplied epoch exactly, not a floor or range —
+  every subsequent epoch rollover requires the caller to update it
+  deliberately, since this type never derives, advances, or widens it
+  automatically), `hash_suite_id`, `transaction_auth_profile_id`,
+  `signature_scheme_id`, `address_binding_id`, and logical
+  `AtomicityDomainId`. `ExpectedProtocolContext::new` rejects a zero
+  `protocol_version`, `hash_suite_id`, `transaction_auth_profile_id`,
+  `signature_scheme_id`, or `address_binding_id` (an empty `chain_id` or an
+  all-zero `domain` is already rejected by `ChainId`/`AtomicityDomainId`
+  themselves before construction); zero `epoch` is deliberately accepted,
+  since epoch zero is the legitimate genesis epoch. It deliberately never
+  pins or decodes `protocol_config_bytes`: approximating full
+  `ProtocolConfig` verification is out of scope for this slice, not silently
+  weakened. `ExpectedProtocolContext::verify` compares every one of those
+  eight fields against an untrusted `/v1/context`
+  `node_wire::HttpContextQueryResult` and returns a typed, field-specific
+  `ProtocolContextMismatch` on the first disagreement, in a fixed
+  deterministic field order; `Client::query_verified_context` is the new
+  client API that queries `/v1/context` and requires an exact match before
+  returning the result at all, so an untrusted mismatched response is never
+  handed to a caller under the pretense of being verified. The logical
+  `AtomicityDomainId` comparison here is a routing/placement expectation —
+  which logical atomicity domain the caller intends to reach — and is
+  deliberately never folded into `crypto::SignatureDomain`; it adds no new
+  signature-domain binding beyond the existing chain id/protocol
+  version/epoch/message type/signature scheme already described in Section 8.
+  No library path panics: every failure is a typed
+  `ExpectedProtocolContextError` (construction) or `ProtocolContextMismatch`
+  (comparison), wrapped by a new `ClientError::ProtocolContextMismatch`
+  variant.
+
+  `apps/cli`'s `transfer` command now requires five `--expected-*` flags —
+  `--expected-chain-id`, `--expected-protocol-version`, `--expected-epoch`,
+  `--expected-hash-suite-id`, `--expected-domain` — and builds an
+  `ExpectedProtocolContext` from them before any network dispatch, rejecting
+  a missing, zero, or malformed value at that point (`ArgsError::MissingFlag`
+  for an absent flag; `ExpectedProtocolContextError`/`TypeError` for a zero or
+  otherwise invalid value; `HexError` for a malformed `--expected-domain`).
+  The transaction-authentication profile id, signature-scheme id, and
+  address-binding id expectations are not separate flags — this workspace
+  implements exactly one combination (the committed
+  `ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`, `Ed25519`, and
+  `AddressIsPublicKey`) — but `transfer` still supplies them explicitly to
+  `ExpectedProtocolContext::new` so the client verifier independently
+  compares them against the remote result rather than trusting them
+  implicitly. `transfer` then calls only
+  `Client::query_verified_context` — never the unverified `query_context` —
+  and uses only that verified `HttpContextQueryResult`, never any value
+  independently derived from the raw remote response, for every subsequent
+  step: the next-nonce query, both object queries, transaction construction
+  (chain id/protocol version/epoch), signing, and submission. Adversarial
+  tests cover every one of `ProtocolContextMismatch`'s eight variants
+  (chain id, protocol version, epoch, hash-suite id, transaction-auth
+  profile id, signature-scheme id, address-binding id, domain) and each
+  proves `transfer` issues exactly one request — the context query — before
+  returning the typed error, never reaching the nonce/object queries or
+  signing/submission that would follow a verified context. Existing stable
+  wire bytes, every previously implemented command, and this command's prior
+  parser/seed-file/two-stage-signer/owner-check behavior are all preserved
+  unchanged; only the pre-signing context check moved from three ad hoc
+  per-field comparisons inside `transfer` into the new typed, reusable
+  `clients/rust` verification boundary, and gained the two additional
+  chain-id/protocol-version/epoch/hash-suite/domain comparisons S1a requires.
+  Remote TLS transport remains entirely unimplemented: `LoopbackHttpTransport`
+  is unchanged and still loopback-only plaintext HTTP/1.1, so a real deployed
+  client still cannot reach a remote validator safely. S1 is not complete
+  until that separate TLS slice lands.
+
   **CLI-First Node Production Gate.** This new gate sits between the CLI
   Developer MVP Gate and the deferred browser surface. It is a real
   node/persistence/operations gate, not client-library work, and it is

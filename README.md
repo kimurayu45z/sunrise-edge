@@ -534,9 +534,23 @@ milestone is S1 of the
 [CLI-First Node Production Gate](TODO.md#cli-first-node-production-gate) — a
 real node/persistence/operations gate defined by reference to the existing,
 unchanged Phase 15 production exit criteria, the Post-MVP persistence
-implementation order, and the cross-phase release gate. S1 adds remote TLS
-transport and a separate locally configured expected protocol-context check
-before signing. The TypeScript-client/explorer/wallet criteria remain
+implementation order, and the cross-phase release gate. S1 has two separate
+concerns: remote TLS transport, and a separate locally configured expected
+protocol-context check before signing. Only the second (S1a) is implemented
+As-Is: `clients/rust` now has a typed, production-oriented
+`ExpectedProtocolContext` verification boundary
+(`clients::context::ExpectedProtocolContext`), and `apps/cli`'s `transfer`
+requires five `--expected-*` flags (chain id, protocol version, exact epoch,
+hash-suite id, and domain) and rejects a missing, zero, or malformed value
+before any network dispatch. `transfer` now uses only
+`Client::query_verified_context` — never the unverified `query_context` — and
+that verified context, for its nonce/object queries, transaction
+construction, signing, and submission, so a mismatch on any field stops the
+command immediately after the one context request, before anything else runs
+against the server. Remote TLS transport itself remains unimplemented:
+`clients/rust`'s provided transport is still the loopback-only, plaintext
+`LoopbackHttpTransport` described below, so S1 as a whole is not yet
+complete. The TypeScript-client/explorer/wallet criteria remain
 unchanged but are deferred until that production gate passes. Passing it is
 explicitly not mainnet readiness; the Phase 16/17 production exit criteria
 and an independent security audit remain required afterward. The owned-object
@@ -644,6 +658,21 @@ device/app/version checks, explicit user confirmation, host-side verification
 (already provided), and hardware-in-the-loop tests — existing Solana or
 Ethereum Ledger apps must never be reused for Sunrise signing (see
 `ARCHITECTURE.md` DR-0084).
+`clients/rust` also now has a typed, production-oriented expected-protocol-
+context verification boundary (`context::ExpectedProtocolContext`, DR-0085's
+S1a slice): a caller supplies the exact locally trusted `chain_id`,
+`protocol_version`, an exact-epoch policy for this slice, `hash_suite_id`,
+`transaction_auth_profile_id`, `signature_scheme_id`, `address_binding_id`,
+and logical `AtomicityDomainId` it expects, and `Client::query_verified_context`
+queries `/v1/context` and rejects with a typed, field-specific
+`ProtocolContextMismatch` before returning it if the untrusted remote result
+disagrees on any of those fields. This exists because a successful transport
+connection — including a future TLS one — only authenticates the transport
+endpoint, never the protocol context itself, so it can never by itself rule
+out cross-chain signing. `protocol_config_bytes` is deliberately not pinned
+or decoded by this check; that remains explicit future work. Remote TLS
+transport itself is not implemented by this boundary or anywhere else in this
+workspace yet: `LoopbackHttpTransport` remains loopback-only and plaintext.
 
 `apps/cli` is now implemented As-Is: a Rust-only Developer MVP CLI with
 exactly one non-development/runtime dependency, `sunrise-edge-client` (a
@@ -656,25 +685,39 @@ and no independent canonical encode/decode, signing, or RPC path. It provides
 non-keystore development seed file — never a home-directory default, never
 accepted on argv, never printed, and checked for symlinks/insecure Unix
 permissions/exact length), `context`, `object`, `receipt`, `next-nonce`, and
-`transfer` — the one same-owner devnet asset transfer command, which queries
-context/next-nonce/both objects, validates the profile and epoch before
-signing, builds the exact two-`Write` access manifest in source/destination
-order, signs and submits through `clients/rust`, and can optionally wait for
-a receipt under caller-supplied, finite poll bounds (`--wait` requires all
-four `--wait-*` bounds together; no hidden default). Output is deterministic
-`key=value` text; every error is typed and exits non-zero. Devnet-specific
-knowledge (the module's entrypoint name and argument frame) lives only in
-`apps/cli`; `clients/rust` gained only a small, generic re-export surface
+`transfer` — the one same-owner devnet asset transfer command. `transfer`
+requires five `--expected-*` flags (`--expected-chain-id`,
+`--expected-protocol-version`, `--expected-epoch`, `--expected-hash-suite-id`,
+`--expected-domain`), rejects a missing, zero, or malformed value before any
+network dispatch, and builds a `clients/rust` `ExpectedProtocolContext` from
+them plus the locally implemented Ed25519/`AddressIsPublicKey` transaction-
+auth-profile/signature-scheme/address-binding constants (still independently
+compared by the client verifier, not merely assumed). It then calls
+`Client::query_verified_context` — never the unverified `query_context` — and
+uses only that verified context, never anything derived from the raw remote
+response, for the next-nonce/both-object queries, transaction construction,
+signing, and submission that follow; a mismatch on any field stops the
+command immediately after that one context request. It then builds the exact
+two-`Write` access manifest in source/destination order, signs and submits
+through `clients/rust`, and can optionally wait for a receipt under
+caller-supplied, finite poll bounds (`--wait` requires all four `--wait-*`
+bounds together; no hidden default). Output is deterministic `key=value`
+text; every error is typed and exits non-zero. Devnet-specific knowledge (the
+module's entrypoint name and argument frame) lives only in `apps/cli`;
+`clients/rust` gained only a small, generic re-export surface
 (access-manifest/canonical-struct/protocol-type re-exports, an
 `AddressIsPublicKey` binding-id constant, and a generic current-inline
 `ObjectRef` extractor) to support it, adding no application semantics of its
 own. Tests cover parser/seed-file adversarial cases, two-stage signer
 adversarial cases (mismatched scheme, malformed/wrong/tampered signatures),
-fake-`Transport` unit tests per command, and two real loopback-TCP tests
-against a composed local devnet router — one exercising the query commands
-and one exercising a complete signed `transfer` against freshly seeded
-accounts through to a waited, present receipt. A signed duplicate-transfer
-restart E2E is now implemented As-Is at
+adversarial `ExpectedProtocolContext` mismatches on every one of its eight
+compared fields (each proven to stop `transfer` after only the context
+request, before any nonce/object query or signing), fake-`Transport` unit
+tests per command, and two real loopback-TCP tests against a composed local
+devnet router — one exercising the query commands and one exercising a
+complete signed `transfer` against freshly seeded accounts through to a
+waited, present receipt. A signed duplicate-transfer restart E2E is now
+implemented As-Is at
 `apps/cli/tests/devnet_restart_duplicate_e2e.rs`: it closes and reopens a
 real file-backed SQLite database (dropping every store/router reference so
 the file is genuinely closed first), verifies the writer generation advances
@@ -689,8 +732,10 @@ concurrency, or SQLite's production suitability.
 
 The Phase 15-17 production exit criteria and accepted persistence designs are
 preserved. The CLI Developer MVP Gate and S0 of the CLI-First Node Production
-Gate are satisfied As-Is. Work now proceeds in order from S1; completing the
-CLI gate does not authorize skipping directly to later production claims.
+Gate are satisfied As-Is. S1's expected-protocol-context verification slice
+(S1a) is now implemented As-Is; S1's remote TLS transport slice remains
+unimplemented, so S1 as a whole is not complete. Completing the CLI gate does
+not authorize skipping directly to later production claims.
 Additional capacity/load/soak evidence, PITR, HA/failover, and provider-managed
 certification remain frozen until S5's certification work or an explicit SLO
 requires them. The
@@ -830,6 +875,20 @@ real assets or exposed beyond your own machine.
    MODULE_DIGEST_HEX="PASTE_HEX_AFTER_THE_MODULE_DIGEST_COLON"
    REQUEST_ID="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
+   # `transfer`'s `--expected-*` flags below are this operator's own locally
+   # trusted expectation, not values copied from an untrusted server
+   # response (see ARCHITECTURE.md DR-0085 / TODO.md CLI-First Node
+   # Production Gate S1a): they must equal exactly the `--chain-id`/`--epoch`
+   # passed to `sunrise-edge-devnet` in step 3, this devnet's fixed protocol
+   # version (3), its fixed genesis hash-suite id (1), and its fixed 32-byte
+   # logical atomicity domain (see "Local devnet architecture" in
+   # ARCHITECTURE.md), not anything printed by `context` below.
+   EXPECTED_CHAIN_ID="sunrise-local-devnet"
+   EXPECTED_PROTOCOL_VERSION=3
+   EXPECTED_EPOCH=0
+   EXPECTED_HASH_SUITE_ID=1
+   EXPECTED_DOMAIN="4444444444444444444444444444444444444444444444444444444444444444"
+
    cargo run -p sunrise-edge-cli -- context --endpoint 127.0.0.1:7400
    cargo run -p sunrise-edge-cli -- next-nonce --endpoint 127.0.0.1:7400 \
      --sender "$DEV_OWNER"
@@ -855,6 +914,11 @@ real assets or exposed beyond your own machine.
      --amount 250 \
      --gas-limit 1000000 \
      --request-id "$REQUEST_ID" \
+     --expected-chain-id "$EXPECTED_CHAIN_ID" \
+     --expected-protocol-version "$EXPECTED_PROTOCOL_VERSION" \
+     --expected-epoch "$EXPECTED_EPOCH" \
+     --expected-hash-suite-id "$EXPECTED_HASH_SUITE_ID" \
+     --expected-domain "$EXPECTED_DOMAIN" \
      --wait \
      --wait-max-attempts 20 \
      --wait-initial-backoff-ms 10 \
@@ -862,7 +926,13 @@ real assets or exposed beyond your own machine.
      --wait-max-elapsed-ms 5000
    ```
 
-   `transfer` treats a rejected or execution-failed submission as a typed,
+   `transfer` requires the five `--expected-*` flags above and rejects a
+   missing, zero, or malformed value before any network dispatch. Before any
+   nonce/object query or signing, it also requires the queried `/v1/context`
+   result to exactly match that locally configured expectation (see "Current
+   status" below and `ARCHITECTURE.md` DR-0085); a mismatch on any field
+   stops the command immediately after that one context request. `transfer`
+   also treats a rejected or execution-failed submission as a typed,
    non-zero-exit error even with `--wait`; it never reports a rejected or
    failed transaction as success.
 

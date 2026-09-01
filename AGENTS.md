@@ -217,10 +217,23 @@ To-Be exit criteria, the Post-MVP persistence implementation order, and the
 cross-phase release gate; passing it is explicitly not mainnet readiness (see
 ARCHITECTURE.md DR-0085 for the full rationale and the S0-S5 ordered slices).
 S1 implements remote TLS transport plus a separate locally configured expected
-protocol-context check before signing. TypeScript-client/explorer/wallet
-criteria 7-9 are kept verbatim, not completed or deleted, and remain deferred
-until the complete production gate passes. Existing production exit criteria
-remain mandatory; capacity/PITR/HA/provider-certification work remains frozen
+protocol-context check before signing; these are two independent slices. As of
+2026-09-01, only the second (S1a, mandatory trusted protocol-context
+verification before signing) is implemented As-Is: `clients/rust` has a public
+`context::ExpectedProtocolContext` and `Client::query_verified_context`
+covering chain id, protocol version, an exact-epoch policy, hash-suite id,
+transaction-auth profile id, signature-scheme id, address-binding id, and the
+logical `AtomicityDomainId` (never `protocol_config_bytes`, and never folded
+into `crypto::SignatureDomain`), and `apps/cli`'s `transfer` requires five
+`--expected-*` flags, rejects a missing/zero/malformed value before any
+network dispatch, and uses only the verified context for every later
+nonce/object query, transaction construction, signing, and submission step.
+Remote TLS transport remains unimplemented (`LoopbackHttpTransport` is still
+loopback-only plaintext), so S1 as a whole is not complete. TypeScript-client/
+explorer/wallet criteria 7-9 are kept verbatim, not completed or deleted, and
+remain deferred until the complete production gate passes. Existing production
+exit criteria remain mandatory; capacity/PITR/HA/provider-certification work
+remains frozen
 until S5 or an explicit SLO triggers it. Node-core now asserts every
 declared read revision in its atomic write set. Runtime has the explicit atomicity
 domain and dedicated read/mutation envelope with memory conformance; additive
