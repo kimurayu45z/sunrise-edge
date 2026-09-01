@@ -20,8 +20,8 @@
 //! A remote result matching a known scheme/binding under an unexpected
 //! profile id is still rejected, since the profile id itself is compared.
 //! This is a mandatory pre-signing check, independent of transport trust: a
-//! successful connection (loopback today; TLS in a later S1 slice) never by
-//! itself proves the remote server speaks this client's intended
+//! successful connection (whether loopback plaintext or authenticated remote
+//! TLS) never by itself proves the remote server speaks this client's intended
 //! chain/protocol.
 //!
 //! Once the context is verified, this command queries the signer's next
@@ -52,7 +52,7 @@ use sunrise_edge_client::{
 use crate::args::{ParsedArgs, parse_flags, scalar, switch};
 use crate::error::CliError;
 use crate::hex::decode_hex_32;
-use crate::net::connect;
+use crate::net::{connect, tls_flag_specs};
 use crate::output::{bounded_hex_field, sanitize_line};
 use crate::parse::{parse_u16, parse_u32, parse_u64};
 use crate::seed::load_dev_seed;
@@ -104,32 +104,9 @@ pub fn run<I>(args: I) -> Result<(), CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let parsed = parse_flags(
-        args,
-        &[
-            scalar(ENDPOINT),
-            scalar(SEED_FILE),
-            scalar(MODULE_ID),
-            scalar(MODULE_VERSION),
-            scalar(MODULE_DIGEST_ALGORITHM),
-            scalar(MODULE_DIGEST),
-            scalar(SOURCE_OBJECT),
-            scalar(DESTINATION_OBJECT),
-            scalar(AMOUNT),
-            scalar(GAS_LIMIT),
-            scalar(REQUEST_ID),
-            scalar(EXPECTED_CHAIN_ID),
-            scalar(EXPECTED_PROTOCOL_VERSION),
-            scalar(EXPECTED_EPOCH),
-            scalar(EXPECTED_HASH_SUITE_ID),
-            scalar(EXPECTED_DOMAIN),
-            switch(WAIT),
-            scalar(WAIT_MAX_ATTEMPTS),
-            scalar(WAIT_INITIAL_BACKOFF_MS),
-            scalar(WAIT_MAX_BACKOFF_MS),
-            scalar(WAIT_MAX_ELAPSED_MS),
-        ],
-    )?;
+    let mut specs = transfer_flag_specs();
+    specs.extend(tls_flag_specs());
+    let parsed = parse_flags(args, &specs)?;
 
     let endpoint = parsed.require(ENDPOINT)?;
     let seed_file = parsed.require(SEED_FILE)?;
@@ -138,8 +115,34 @@ where
     let seed = load_dev_seed(std::path::Path::new(seed_file))?;
     let signer = LocalSigner::from_seed(seed);
 
-    let client = connect(endpoint)?;
+    let client = connect(endpoint, &parsed)?;
     execute(&client, &signer, inputs)
+}
+
+fn transfer_flag_specs() -> Vec<crate::args::FlagSpec> {
+    vec![
+        scalar(ENDPOINT),
+        scalar(SEED_FILE),
+        scalar(MODULE_ID),
+        scalar(MODULE_VERSION),
+        scalar(MODULE_DIGEST_ALGORITHM),
+        scalar(MODULE_DIGEST),
+        scalar(SOURCE_OBJECT),
+        scalar(DESTINATION_OBJECT),
+        scalar(AMOUNT),
+        scalar(GAS_LIMIT),
+        scalar(REQUEST_ID),
+        scalar(EXPECTED_CHAIN_ID),
+        scalar(EXPECTED_PROTOCOL_VERSION),
+        scalar(EXPECTED_EPOCH),
+        scalar(EXPECTED_HASH_SUITE_ID),
+        scalar(EXPECTED_DOMAIN),
+        switch(WAIT),
+        scalar(WAIT_MAX_ATTEMPTS),
+        scalar(WAIT_INITIAL_BACKOFF_MS),
+        scalar(WAIT_MAX_BACKOFF_MS),
+        scalar(WAIT_MAX_ELAPSED_MS),
+    ]
 }
 
 fn parse_inputs(parsed: &ParsedArgs) -> Result<TransferInputs, CliError> {
@@ -1321,28 +1324,13 @@ mod tests {
         values
     }
 
+    /// The subset of [`transfer_flag_specs`] the parsing-only unit tests
+    /// below exercise (they never supply `--endpoint`/`--seed-file`).
     fn transfer_specs() -> Vec<crate::args::FlagSpec> {
-        vec![
-            scalar(MODULE_ID),
-            scalar(MODULE_VERSION),
-            scalar(MODULE_DIGEST_ALGORITHM),
-            scalar(MODULE_DIGEST),
-            scalar(SOURCE_OBJECT),
-            scalar(DESTINATION_OBJECT),
-            scalar(AMOUNT),
-            scalar(GAS_LIMIT),
-            scalar(REQUEST_ID),
-            scalar(EXPECTED_CHAIN_ID),
-            scalar(EXPECTED_PROTOCOL_VERSION),
-            scalar(EXPECTED_EPOCH),
-            scalar(EXPECTED_HASH_SUITE_ID),
-            scalar(EXPECTED_DOMAIN),
-            switch(WAIT),
-            scalar(WAIT_MAX_ATTEMPTS),
-            scalar(WAIT_INITIAL_BACKOFF_MS),
-            scalar(WAIT_MAX_BACKOFF_MS),
-            scalar(WAIT_MAX_ELAPSED_MS),
-        ]
+        transfer_flag_specs()
+            .into_iter()
+            .filter(|spec| spec.name != ENDPOINT && spec.name != SEED_FILE)
+            .collect()
     }
 
     fn to_os(values: &std::collections::BTreeMap<&'static str, String>) -> Vec<OsString> {

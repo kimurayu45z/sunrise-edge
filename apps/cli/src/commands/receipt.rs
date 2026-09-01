@@ -7,23 +7,26 @@ use sunrise_edge_client::{Client, HttpReceiptQueryResult, RequestId, Transport};
 use crate::args::{parse_flags, scalar};
 use crate::error::CliError;
 use crate::hex::decode_hex_32;
-use crate::net::connect;
+use crate::net::{connect, tls_flag_specs};
 use crate::output::bounded_hex_field;
 
 const ENDPOINT: &str = "--endpoint";
 const REQUEST_ID: &str = "--request-id";
 
-/// Runs `receipt --endpoint <host:port> --request-id <hex>`.
+/// Runs `receipt --endpoint <host:port> --request-id <hex> [--tls-server-name
+/// <dns-name> --tls-ca-cert-der-file <path>]`.
 pub fn run<I>(args: I) -> Result<(), CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let parsed = parse_flags(args, &[scalar(ENDPOINT), scalar(REQUEST_ID)])?;
+    let mut specs = vec![scalar(ENDPOINT), scalar(REQUEST_ID)];
+    specs.extend(tls_flag_specs());
+    let parsed = parse_flags(args, &specs)?;
     let endpoint = parsed.require(ENDPOINT)?;
     let request_id_bytes = decode_hex_32(REQUEST_ID, parsed.require(REQUEST_ID)?)?;
     let request_id = RequestId::new(request_id_bytes)?;
 
-    let client = connect(endpoint)?;
+    let client = connect(endpoint, &parsed)?;
     execute(&client, request_id)
 }
 

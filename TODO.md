@@ -1746,13 +1746,11 @@ HA/failover、provider-managed pooler、real-provider certification、provider d
 
 **Current status (2026-09-01): criteria 1-6・10・11はimplemented and validated
 As-Isであり、CLI Developer MVP Gateは通過済みである。** これはproduction readinessの
-宣言ではない。CLI-First Node Production GateのS0もimplemented As-Isであり、現在の
-implementation priorityはS1（remote TLS transportと、signing前の独立したtrusted
-protocol-context validation）である。S1のうちsigning前mandatory trusted
-protocol-context検証（S1a）はimplemented As-Is（詳細は
-["CLI-First Node Production Gate"](#cli-first-node-production-gate)のS1参照）だが、
-remote TLS transportは未実装のため、S1全体としてはまだ未完了である。S2-S5は順序を
-飛ばさず後続する。
+宣言ではない。CLI-First Node Production GateのS0・S1もimplemented and validated
+As-Isであり（S1のremote TLS transportとsigning前の独立したtrusted
+protocol-context validationの両方。詳細は
+["CLI-First Node Production Gate"](#cli-first-node-production-gate)のS1参照）、
+現在のimplementation priorityはS2である。S3-S5は順序を飛ばさず後続する。
 
 CLI Developer MVP completion criteria（capability criteria 2-3を満たしながら、product
 surfaceはARCHITECTURE.md DR-0081の順序に従う: local devnet、bounded query API、Rust
@@ -1995,16 +1993,22 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    restart E2Eはstep 9（S0）で実装した。
 8. criterion 6の`apps/cli`を、実行時（non-dev）の直接依存が`clients/rust`のみのRust-only
    binaryとして実装した（`Cargo.toml`の`[dev-dependencies]`にはtest専用でreal devnetの
-   composeとfixture構築、および decoded execution-effects fixtureの構築のためだけの
-   `execution`/`objects`/`runtime`/`native-http`/`sunrise-edge-devnet`/`tokio`が
-   あるが、いずれもnon-test buildからは到達できない。implemented As-Is;
+   composeとfixture構築、decoded execution-effects fixtureの構築、およびreal TLS E2E
+   fixture構築のためだけの`execution`/`objects`/`runtime`/`native-http`/
+   `sunrise-edge-devnet`/`tokio`/`rcgen`/`rustls`があるが、いずれもnon-test buildからは
+   到達できない。implemented As-Is;
    ARCHITECTURE.md DR-0084）。Node/browser runtime、独自canonical codec、
    独自signing/RPC pathは導入していない。引数parsingはclap等を使わない小さな手書きの
    strict `--flag value` parserで、duplicate flag・unknown flag・flag値なし・宣言外の
    positional argumentをすべて拒否する。`address`（明示的に指定したdevelopment seed
    fileからAddressIsPublicKeyのaddressを導出）、`context`/`object`/`receipt`/`next-nonce`
    （`clients/rust`の対応するquery methodへの薄いwrapper）、`transfer`（single same-owner
-   devnet asset transfer）の6コマンドを提供する。`--endpoint`はすべてloopbackのみを受理し、
+   devnet asset transfer）の6コマンドを提供する。`--tls-server-name`/
+   `--tls-ca-cert-der-file`をいずれも指定しない場合、`--endpoint`はplaintext
+   `LoopbackHttpTransport`の下でloopbackのみを受理する。S1実装後は、両方の
+   TLSフラグを指定した場合のみ`--endpoint`を既に解決済みの`SocketAddr`として
+   扱う`RemoteTlsHttpTransport`を使い、loopback制限は課さない。片方だけの指定は
+   networkへ出る前にfail closedする（詳細はS1参照）。
    出力はdeterministicなline-oriented `key=value`テキスト、すべてのエラーはtypedな
    `CliError`でexit non-zeroとなる。development seed fileは明示的なpathのみを受理し
    （home directoryのdefault path無し）、symlinkと非regular fileを拒否し、Unix上では
@@ -2204,13 +2208,14 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
   期待値と比較して一致を要求する、という別のmandatory trusted protocol-context
   検証を実装する。TLS証明書/公開鍵のpinningだけでcross-chain signingを防げると
   主張しない。
-  **実装状況（2026-09-01）：(b)のsigning前mandatory trusted protocol-context
-  検証（S1a）はimplemented As-Is。** `clients/rust`は公開`ExpectedProtocolContext`
-  （chain_id、protocol_version、この初期sliceのexact-epoch policy、
-  hash_suite_id、transaction_auth_profile_id、signature_scheme_id、
-  address_binding_id、論理`AtomicityDomainId`）と、`/v1/context`を問い合わせて
-  その8フィールド全てを検証してから結果を返す`Client::query_verified_context`、
-  フィールド別の型付き`ProtocolContextMismatch`を持つ。`apps/cli`の`transfer`は
+  **実装状況（2026-09-01）：(a)(b)ともimplemented As-Is。S1全体として完了。**
+  (b)のsigning前mandatory trusted protocol-context検証：`clients/rust`は公開
+  `ExpectedProtocolContext`（chain_id、protocol_version、この初期sliceの
+  exact-epoch policy、hash_suite_id、transaction_auth_profile_id、
+  signature_scheme_id、address_binding_id、論理`AtomicityDomainId`）と、
+  `/v1/context`を問い合わせてその8フィールド全てを検証してから結果を返す
+  `Client::query_verified_context`、フィールド別の型付き
+  `ProtocolContextMismatch`を持つ。`apps/cli`の`transfer`は
   `--expected-chain-id`/`--expected-protocol-version`/`--expected-epoch`/
   `--expected-hash-suite-id`/`--expected-domain`の5フラグを必須とし、
   missing/zero/malformedな値をnetwork dispatch前にrejectしてから
@@ -2218,8 +2223,62 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
   transaction構築、signing、submissionをすべてこの検証済みcontextに基づいて行う
   （未検証の`query_context`は使わない）。8フィールドそれぞれのmismatchに対する
   adversarial testが、`transfer`がcontext requestの1回だけで停止し
-  nonce/object queryやsigningへ進まないことを証明する。**(a)のremote TLS
-  transportは未実装のままであり、S1全体としては未完了。**
+  nonce/object queryやsigningへ進まないことを証明する。
+
+  (a)のremote TLS transport：`clients/rust`は`transport::RemoteTlsHttpTransport`
+  を追加した。`LoopbackHttpTransport`と同一のbounded HTTP/1.1
+  request/response framing・header/body上限・per-stage monotonic deadlineを
+  共有しつつ、caller供給の`SocketAddr`（DNS解決は一切行わない）、caller供給の
+  DNS server name（TLS SNIとpost-handshake hostname検証の両方に使う。空文字列
+  やIPアドレスliteralは拒否し、接続先IPへのfallback検証も行わない）、caller供給の
+  CA trust-anchor DER（新設の公開定数`transport::MAX_CA_CERTIFICATE_DER_BYTES`
+  （16 KiB）で上限し、空・oversized・不正なX.509はrejectする。systemのtrust
+  storeは一切参照せず、mTLS client証明書も提示しない）を要求する。
+  `clients/rust/tests/remote_tls_transport.rs`はephemeralな`rcgen`発行の
+  CA/leaf対と実際の`rustls` `ServerConnection`serverに対してreal client codeを
+  駆動し（fake `Transport`は使わない）、正しいhostname/CAでの成功と正確な
+  `Host`ヘッダ、誤ったhostname/CAでのTLS protocol error、stalled handshakeと
+  handshake完了前のpeer closeがdeadline内に速やかに失敗すること、caller
+  deadlineがtransport budgetを短縮すること、malformedなconstructor入力が
+  network I/O前にrejectされることを証明する。同ファイルの回帰testは、
+  shared bounded-stream refactorが`LoopbackHttpTransport`のplaintext framingを
+  一切変えていないことも証明する。
+
+  `apps/cli`の`context`/`object`/`receipt`/`next-nonce`/`transfer`各コマンドは
+  対になったoptional flag `--tls-server-name`/`--tls-ca-cert-der-file`を
+  受け付ける（`address`は networkへ出ないため対象外）。両方とも未指定なら
+  従来どおりloopback-onlyのplaintext `LoopbackHttpTransport`を使い（非loopbackな
+  `--endpoint`は引き続きreject）、両方とも指定した場合のみ`--endpoint`を
+  既に解決済みの`SocketAddr`として扱い`RemoteTlsHttpTransport`を使う。どちらか
+  一方だけの指定はnetwork dispatch前に型付きerror
+  `CliError::PartialTlsConfiguration`でfail closedする。CA fileはstdのみで
+  読み込み、transportと同じ`MAX_CA_CERTIFICATE_DER_BYTES`に1 byteを加えた位置で
+  `Read::take`により読み取りを打ち切ってoversizeを検出することで無制限のbufferingを防ぎ、
+  空/oversized/読み込み失敗をそれぞれ型付きCliErrorで報告する（証明書の中身は
+  一切出力しない）。`apps/cli/tests/tls_cli_e2e.rs`は実際の`rcgen`/`rustls`
+  loopback TLS serverに対して`sunrise_edge_cli::run`を直接駆動する2つの
+  deterministic integration testを追加した：1つは`context`が正しいTLS
+  authenticationの下で成功し、`Host`ヘッダが正確なDNS名+portであることを
+  証明する。もう1つは、TLS自体は正しく認証できたserverが`--expected-chain-id`
+  と食い違う`/v1/context`を返した場合、`transfer`がserver側の接続カウンタで
+  確認できる形で正確に1回だけ`/v1/context`を要求し、nonce/object/sign/submitに
+  進む前に型付き`ProtocolContextMismatch`を返すことを証明する——TLS
+  endpoint認証とexpected-protocol-context検証が独立した別のboundaryであり、
+  一方が他方を代替しないことを示す評価である。
+
+  **明示する限界（silentに前提としない）：** DNS解決は一切行わない（callerが
+  常に解決済み`SocketAddr`を渡す）。信頼するCAはcaller供給のDER 1個のみ
+  （systemのtrust store、PEM/bundle形式、複数anchorの合成はいずれも未対応）。
+  mTLSは未対応（client証明書を提示しない）。証明書のrevocation（CRL/OCSP）・
+  rotation・lifecycle管理は未実装であり、CA証明書をoperatorのfilesystemへ
+  どう配布・rotateするかのdeployment/operations evidenceも本sliceの範囲外
+  （S5またはPost-MVP Production Hardeningのpersistence/operations workへ
+  明示的に先送り）。TLS endpoint認証とmandatory trusted protocol-context検証は
+  意図的に統合しない：TLS handshakeの成功がprotocol-context検証を代替すること
+  はなく、検証済みcontextがTLS層の信頼範囲を広げることもない。これは
+  mainnet readinessやproduction certificationの主張ではない：Phase 16/17の
+  production exit criteriaと独立したsecurity auditは引き続き必須であり、次の
+  優先slice はS2（cross-owner transfer）である。
 - **S2**: cross-owner transfer（destination-owner authorizationとobject owner
   変更）を既存のowned-effects pathの上へ実装する。
 - **S3**: fees/gas metering。public live ingressの前に実装を完了する（fee-free
@@ -2947,7 +3006,7 @@ Post-MVP Production Hardening: Phase 15 persistence implementation order（To-Be
 restart safety、fail-closed behaviorを直接満たすために必要な既存contract修正は先行して
 よいものとしていた。CLI Developer MVP Gateは現在通過済みであり、以下の項目は
 ["CLI-First Node Production Gate"](#cli-first-node-production-gate)のS5が参照する
-production persistence作業そのものである。現在はS1がpriorityであり、capacity/PITR/HA等の
+production persistence作業そのものである。現在はS2がpriorityであり、capacity/PITR/HA等の
 S5 certification項目はS5または明示的なSLOがtriggerするまで引き続き凍結する。
 
 1. SQLite既存dataを暗黙migrationせず、writer fence、deadline、typed conflict/indeterminate failureを持つ
