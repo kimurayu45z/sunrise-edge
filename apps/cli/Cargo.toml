@@ -1,0 +1,23 @@
+[package]
+name = "sunrise-edge-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "sunrise_edge_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sunrise-edge-cli"
+path = "src/main.rs"
+
+[dependencies]
+sunrise-edge-client.workspace = true
+
+[dev-dependencies]
+native-http.workspace = true
+objects.workspace = true
+runtime.workspace = true
+sunrise-edge-devnet.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }

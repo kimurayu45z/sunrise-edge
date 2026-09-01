@@ -1,9 +1,24 @@
 //! Canonical Transaction v1 construction and signing.
+//!
+//! Construction is a safe two-stage external-signer API
+//! ([`PreparedTransaction::prepare`] /
+//! [`PreparedTransaction::finalize`]/[`PreparedTransaction::sign_and_finalize_with`]):
+//! a caller first prepares an immutable transaction from an explicit
+//! sender, the active signature scheme, and a [`TransactionRequest`], then
+//! either signs it in-process with a [`SignatureSigner`] (for example
+//! [`LocalSigner`]) or exports the exact bytes an out-of-process signer
+//! (see `ARCHITECTURE.md` DR-0084's Ledger-ready external signing boundary)
+//! must sign. [`build_signed_transaction`] is the original
+//! single-call convenience entrypoint and is now implemented through this
+//! same path, so its stable output is unchanged.
 
-use crypto::{SignatureDomain, SignatureMessageType, SignatureSigner};
+use crypto::{
+    Ed25519Verifier, SignatureDomain, SignatureMessageType, SignatureSigner, SignatureVerifier,
+    frame_signature_message,
+};
 use execution::{Transaction, encode_transaction, encode_transaction_signable};
 use node_core::TRANSACTION_V1_MESSAGE_TYPE;
-use objects::ObjectRef;
+use objects::{Address, ObjectRef};
 use protocol_types::{ChainId, Epoch, ProtocolVersion, SignatureSchemeId};
 
 use crate::error::ClientError;
@@ -44,68 +59,188 @@ pub struct TransactionRequest {
     pub fee_payment: Option<fees::FeePayment>,
 }
 
+/// An immutable, fully framed Transaction v1 awaiting a signature.
+///
+/// Built by [`PreparedTransaction::prepare`] from an explicit sender, the
+/// active signature scheme, and a [`TransactionRequest`]. Every field the
+/// signature covers is fixed the moment this value exists; nothing about it
+/// can be mutated before signing, so a signer (in-process or external) is
+/// always shown the exact bytes it is about to authenticate.
+///
+/// Only `Ed25519` with the `AddressIsPublicKey` address binding is
+/// implemented anywhere in this workspace today (see `ARCHITECTURE.md`
+/// DR-0084): [`PreparedTransaction::prepare`] rejects every other signature
+/// scheme before any framing happens, and
+/// [`PreparedTransaction::finalize`] verifies a returned signature directly
+/// against the sender's 32 bytes as an Ed25519 verification key. A future
+/// scheme requires an explicit new arm in both places, not a silent
+/// fallback.
+pub struct PreparedTransaction {
+    unsigned: Transaction,
+    domain: SignatureDomain,
+    signable: Vec<u8>,
+}
+
+impl PreparedTransaction {
+    /// Prepares an immutable transaction, rejecting an unsupported signature
+    /// scheme before any framing or allocation beyond the signable payload
+    /// itself.
+    pub fn prepare(
+        sender: Address,
+        signature_scheme_id: SignatureSchemeId,
+        request: TransactionRequest,
+    ) -> Result<Self, ClientError> {
+        reject_unsupported_scheme(signature_scheme_id)?;
+
+        let TransactionRequest {
+            chain_id,
+            protocol_version,
+            epoch,
+            nonce,
+            access_manifest,
+            module_ref,
+            entrypoint,
+            args,
+            gas_limit,
+            fee_payment,
+        } = request;
+
+        let unsigned = Transaction {
+            chain_id: chain_id.clone(),
+            protocol_version,
+            epoch,
+            sender,
+            nonce,
+            access_manifest,
+            module_ref,
+            entrypoint,
+            args,
+            gas_limit,
+            fee_payment,
+            signature: Vec::new(),
+        };
+
+        let signable = encode_transaction_signable(&unsigned)?;
+        let domain = SignatureDomain {
+            chain_id,
+            protocol_version,
+            epoch,
+            message_type: SignatureMessageType::new(TRANSACTION_V1_MESSAGE_TYPE)?,
+            signature_scheme_id,
+        };
+
+        Ok(Self {
+            unsigned,
+            domain,
+            signable,
+        })
+    }
+
+    /// Returns the sender this transaction will be authenticated as.
+    #[must_use]
+    pub const fn sender(&self) -> Address {
+        self.unsigned.sender
+    }
+
+    /// Returns the declared signature scheme.
+    #[must_use]
+    pub const fn signature_scheme_id(&self) -> SignatureSchemeId {
+        self.domain.signature_scheme_id
+    }
+
+    /// Returns the exact framed bytes an external signer must produce a raw
+    /// signature over.
+    ///
+    /// This is the same centralized domain frame every in-process signer and
+    /// verifier in this workspace uses
+    /// ([`crypto::frame_signature_message`]); it exists so an out-of-process
+    /// signer — for example a future dedicated hardware-wallet application
+    /// (see `ARCHITECTURE.md` DR-0084) — can be shown the exact bytes it is
+    /// asked to sign without this client duplicating or re-deriving that
+    /// framing.
+    pub fn signable_frame(&self) -> Result<Vec<u8>, ClientError> {
+        Ok(frame_signature_message(&self.domain, &self.signable)?)
+    }
+
+    /// Finalizes this transaction with a signature produced by an external
+    /// signer, returning the exact canonical signed wire bytes.
+    ///
+    /// Fails closed, in order: an unsupported declared scheme (defense in
+    /// depth; [`PreparedTransaction::prepare`] already rejects this), a
+    /// signature whose length is not exactly the scheme's supported length,
+    /// and a well-formed signature that does not cryptographically verify
+    /// against this transaction's sender treated as an `AddressIsPublicKey`
+    /// Ed25519 verification key under the declared scheme. Only a `true`
+    /// verification result produces output.
+    pub fn finalize(mut self, signature: Vec<u8>) -> Result<Vec<u8>, ClientError> {
+        match self.domain.signature_scheme_id {
+            SignatureSchemeId::Ed25519 => {
+                let verifier =
+                    Ed25519Verifier::from_verifying_key_bytes(self.unsigned.sender.as_bytes())?;
+                let framed = self.signable_frame()?;
+                if !verifier.verify_framed(&framed, &signature)? {
+                    return Err(ClientError::ExternalSignatureInvalid {
+                        sender: self.unsigned.sender,
+                    });
+                }
+                self.unsigned.signature = signature;
+                Ok(encode_transaction(&self.unsigned)?)
+            }
+            SignatureSchemeId::Secp256k1 => Err(ClientError::UnsupportedSignatureScheme(
+                self.domain.signature_scheme_id,
+            )),
+        }
+    }
+
+    /// Signs this transaction in-process with `signer` and finalizes it in
+    /// one call.
+    ///
+    /// Uses [`SignatureSigner::sign_canonical`], so a `signer` whose own
+    /// scheme disagrees with this transaction's declared scheme is rejected
+    /// before any framing or signing happens, exactly as
+    /// [`crypto::SignatureSigner::sign_canonical`] documents.
+    pub fn sign_and_finalize_with<S>(self, signer: &S) -> Result<Vec<u8>, ClientError>
+    where
+        S: SignatureSigner,
+    {
+        let signature = signer.sign_canonical(&self.domain, &self.signable)?;
+        self.finalize(signature)
+    }
+}
+
+fn reject_unsupported_scheme(scheme: SignatureSchemeId) -> Result<(), ClientError> {
+    match scheme {
+        SignatureSchemeId::Ed25519 => Ok(()),
+        SignatureSchemeId::Secp256k1 => Err(ClientError::UnsupportedSignatureScheme(scheme)),
+    }
+}
+
 /// Builds and signs one canonical Transaction v1 under the exact stable
 /// `"transaction-v1"` message family
 /// ([`node_core::TRANSACTION_V1_MESSAGE_TYPE`]) and returns its exact
 /// canonical wire bytes, ready to submit as a `SubmitTransaction` event.
 ///
 /// `signature_scheme_id` must come from a trusted `/v1/context` query
-/// result; this function never guesses or defaults the active scheme, and
-/// [`crypto::SignatureSigner::sign_canonical`] rejects a scheme mismatch
-/// between `signer` and `signature_scheme_id` before any framing or signing
-/// work runs.
+/// result; this function never guesses or defaults the active scheme. It is
+/// a thin convenience wrapper over [`PreparedTransaction::prepare`] and
+/// [`PreparedTransaction::sign_and_finalize_with`]: its stable output bytes
+/// are unchanged from before this module's two-stage external-signer API
+/// existed.
 pub fn build_signed_transaction(
     signer: &LocalSigner,
     signature_scheme_id: SignatureSchemeId,
     request: TransactionRequest,
 ) -> Result<Vec<u8>, ClientError> {
-    let TransactionRequest {
-        chain_id,
-        protocol_version,
-        epoch,
-        nonce,
-        access_manifest,
-        module_ref,
-        entrypoint,
-        args,
-        gas_limit,
-        fee_payment,
-    } = request;
-
-    let unsigned = Transaction {
-        chain_id: chain_id.clone(),
-        protocol_version,
-        epoch,
-        sender: signer.address(),
-        nonce,
-        access_manifest,
-        module_ref,
-        entrypoint,
-        args,
-        gas_limit,
-        fee_payment,
-        signature: Vec::new(),
-    };
-
-    let signable = encode_transaction_signable(&unsigned)?;
-    let domain = SignatureDomain {
-        chain_id,
-        protocol_version,
-        epoch,
-        message_type: SignatureMessageType::new(TRANSACTION_V1_MESSAGE_TYPE)?,
-        signature_scheme_id,
-    };
-    let signature = signer.sign_canonical(&domain, &signable)?;
-
-    let mut signed = unsigned;
-    signed.signature = signature;
-    Ok(encode_transaction(&signed)?)
+    let sender = signer.address();
+    let prepared = PreparedTransaction::prepare(sender, signature_scheme_id, request)?;
+    prepared.sign_and_finalize_with(signer)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use abi::AccessManifest;
+    use crypto::CryptoError;
     use execution::decode_transaction;
     use objects::ObjectId;
     use protocol_types::{Digest32, HashAlgorithmId};
@@ -171,15 +306,129 @@ mod tests {
     }
 
     #[test]
-    fn scheme_mismatch_is_rejected_before_signing() {
+    fn unsupported_scheme_is_rejected_before_any_framing() {
         let signer = LocalSigner::from_seed([0xAE; 32]);
         let result =
             build_signed_transaction(&signer, SignatureSchemeId::Secp256k1, base_request());
         assert!(matches!(
             result,
-            Err(ClientError::Crypto(
-                crypto::CryptoError::SignatureSchemeMismatch { .. }
+            Err(ClientError::UnsupportedSignatureScheme(
+                SignatureSchemeId::Secp256k1
             ))
+        ));
+    }
+
+    #[test]
+    fn prepare_exposes_the_exact_bytes_an_external_signer_must_sign() {
+        let signer = LocalSigner::from_seed([0xAF; 32]);
+        let sender = signer.address();
+        let prepared =
+            PreparedTransaction::prepare(sender, SignatureSchemeId::Ed25519, base_request())
+                .unwrap();
+        let framed = prepared.signable_frame().unwrap();
+
+        let raw_signature = signer.sign_framed(&framed).unwrap();
+        let signed_bytes = prepared.finalize(raw_signature).unwrap();
+
+        let decoded = decode_transaction(&signed_bytes).unwrap();
+        assert_eq!(decoded.sender, sender);
+    }
+
+    #[test]
+    fn finalize_rejects_a_wrong_length_signature() {
+        let signer = LocalSigner::from_seed([0xB0; 32]);
+        let prepared = PreparedTransaction::prepare(
+            signer.address(),
+            SignatureSchemeId::Ed25519,
+            base_request(),
+        )
+        .unwrap();
+
+        let error = prepared.finalize(vec![0u8; 63]).unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::Crypto(CryptoError::InvalidSignatureLength(63))
+        ));
+    }
+
+    #[test]
+    fn finalize_rejects_a_well_formed_but_invalid_signature() {
+        let signer = LocalSigner::from_seed([0xB1; 32]);
+        let prepared = PreparedTransaction::prepare(
+            signer.address(),
+            SignatureSchemeId::Ed25519,
+            base_request(),
+        )
+        .unwrap();
+
+        let error = prepared.finalize(vec![0u8; 64]).unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::ExternalSignatureInvalid { sender } if sender == signer.address()
+        ));
+    }
+
+    #[test]
+    fn finalize_rejects_a_signature_from_the_wrong_signer() {
+        let sender_signer = LocalSigner::from_seed([0xB2; 32]);
+        let other_signer = LocalSigner::from_seed([0xB3; 32]);
+        let prepared = PreparedTransaction::prepare(
+            sender_signer.address(),
+            SignatureSchemeId::Ed25519,
+            base_request(),
+        )
+        .unwrap();
+        let framed = prepared.signable_frame().unwrap();
+        let wrong_signature = other_signer.sign_framed(&framed).unwrap();
+
+        let error = prepared.finalize(wrong_signature).unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::ExternalSignatureInvalid { sender } if sender == sender_signer.address()
+        ));
+    }
+
+    #[test]
+    fn finalize_rejects_a_tampered_signature() {
+        let signer = LocalSigner::from_seed([0xB4; 32]);
+        let prepared = PreparedTransaction::prepare(
+            signer.address(),
+            SignatureSchemeId::Ed25519,
+            base_request(),
+        )
+        .unwrap();
+        let framed = prepared.signable_frame().unwrap();
+        let mut signature = signer.sign_framed(&framed).unwrap();
+        signature[0] ^= 0xFF;
+
+        let error = prepared.finalize(signature).unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::ExternalSignatureInvalid { .. }
+        ));
+    }
+
+    #[test]
+    fn finalize_rejects_a_signature_over_tampered_transaction_fields() {
+        let signer = LocalSigner::from_seed([0xB5; 32]);
+        let sender = signer.address();
+        let honest =
+            PreparedTransaction::prepare(sender, SignatureSchemeId::Ed25519, base_request())
+                .unwrap();
+        let honest_signature = signer
+            .sign_framed(&honest.signable_frame().unwrap())
+            .unwrap();
+
+        let mut tampered_request = base_request();
+        tampered_request.gas_limit = base_request().gas_limit + 1;
+        let tampered =
+            PreparedTransaction::prepare(sender, SignatureSchemeId::Ed25519, tampered_request)
+                .unwrap();
+
+        let error = tampered.finalize(honest_signature).unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::ExternalSignatureInvalid { .. }
         ));
     }
 }

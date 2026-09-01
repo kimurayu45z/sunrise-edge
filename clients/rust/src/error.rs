@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use node_core::RequestId;
 use objects::{Address, ObjectId};
+use protocol_types::SignatureSchemeId;
 
 use crate::transport::TransportError;
 
@@ -88,6 +89,21 @@ pub enum ClientError {
     /// The caller supplied an elapsed-time bound that could not be added to
     /// the current monotonic clock instant.
     ReceiptPollDeadlineOverflow,
+    /// [`crate::transaction::PreparedTransaction::prepare`] or
+    /// [`crate::transaction::PreparedTransaction::finalize`] was asked to
+    /// use a signature scheme this client does not implement. Only
+    /// `Ed25519` is implemented anywhere in this workspace today (see
+    /// `ARCHITECTURE.md` DR-0084).
+    UnsupportedSignatureScheme(SignatureSchemeId),
+    /// A signature presented to
+    /// [`crate::transaction::PreparedTransaction::finalize`] had the exact
+    /// expected length but did not cryptographically verify against the
+    /// transaction's sender treated as an `AddressIsPublicKey` Ed25519
+    /// verification key.
+    ExternalSignatureInvalid {
+        /// The transaction's sender address.
+        sender: Address,
+    },
 }
 
 impl fmt::Display for ClientError {
@@ -129,6 +145,13 @@ impl fmt::Display for ClientError {
             Self::ReceiptPollDeadlineOverflow => {
                 f.write_str("receipt poll elapsed-time bound overflows the monotonic clock")
             }
+            Self::UnsupportedSignatureScheme(scheme) => {
+                write!(f, "signature scheme {} is not implemented", scheme.as_u16())
+            }
+            Self::ExternalSignatureInvalid { sender } => write!(
+                f,
+                "signature does not verify against sender {sender} under the declared scheme"
+            ),
         }
     }
 }
@@ -149,7 +172,9 @@ impl Error for ClientError {
             | Self::ReceiptQuerySelectorMismatch { .. }
             | Self::NextNonceQuerySelectorMismatch { .. }
             | Self::ReceiptPollExhausted { .. }
-            | Self::ReceiptPollDeadlineOverflow => None,
+            | Self::ReceiptPollDeadlineOverflow
+            | Self::UnsupportedSignatureScheme(_)
+            | Self::ExternalSignatureInvalid { .. } => None,
         }
     }
 }

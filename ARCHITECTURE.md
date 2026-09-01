@@ -1736,6 +1736,148 @@ query all four routes through a real composed devnet router over TCP. A live
 signed asset transfer, duplicate replay, and restart sequence remains Developer
 MVP criterion 10 work; this client slice does not claim that later E2E.
 
+## 45. Rust client external-signer boundary and Developer MVP CLI
+
+`clients/rust` gains a safe, additive two-stage transaction-construction API
+(`transaction::PreparedTransaction`) alongside the existing single-call
+`build_signed_transaction`, which is now implemented through the same path so
+its stable output bytes are unchanged. `PreparedTransaction::prepare` takes an
+explicit sender `Address`, the active `SignatureSchemeId` from a trusted
+`/v1/context` result, and a `TransactionRequest`, and returns an immutable
+value with the canonical Transaction v1 fields already fixed; it rejects any
+scheme other than `Ed25519` before any framing happens. `signable_frame`
+exposes the exact centralized-domain-framed bytes
+([`crypto::frame_signature_message`]) an external signer must produce a raw
+signature over — the same bytes any in-process `SignatureSigner` ultimately
+signs. `finalize` accepts that raw signature and only produces output after
+independently constructing an `Ed25519Verifier` from the sender's 32 bytes
+(the only implemented `AddressIsPublicKey` binding), re-deriving the same
+framed bytes, and confirming the signature both has the scheme's exact
+supported length and cryptographically verifies; a well-formed but invalid,
+wrong-signer, or tampered (signature or transaction field) signature is
+rejected with a typed `ClientError` and produces no output.
+`sign_and_finalize_with` is a convenience composition of `finalize` for any
+in-process `SignatureSigner` (for example `LocalSigner`), reusing
+`sign_canonical`'s own scheme-match guard. This boundary exists so a future
+external signer — including but not limited to a dedicated hardware wallet —
+can be integrated without changing `PreparedTransaction`'s public shape or
+this crate's stable transaction bytes: only a new caller supplying bytes to
+`finalize` would be added.
+
+**Ledger boundary is not implemented in this slice.** No USB/HID/Ledger
+dependency exists anywhere in this workspace, and none belongs in a protocol
+or client crate. `PreparedTransaction` is Ledger-*ready* only in the narrow
+sense that it already exposes the exact bytes an external signer would need
+and already independently verifies whatever signature comes back; it is not
+a Ledger integration. A real integration additionally requires, at minimum: a
+dedicated Sunrise Edge Ledger device application (existing Solana or Ethereum
+Ledger apps must not be reused for Sunrise transaction signing — they know
+nothing about this protocol's canonical framing and would either reject the
+payload or, worse, sign it under the wrong domain); an APDU protocol and host
+transport to that device application; on-device parsing and clear signing of
+the exact Sunrise signature frame (chain/protocol-version/epoch/message-type/
+scheme plus the canonical transaction payload) so a user approves what they
+are actually signing, not opaque bytes; public-key/address verification
+against the device; an explicit derivation-path policy; device/application/
+firmware-version checks; explicit on-device user confirmation before signing;
+host-side signature verification (which `PreparedTransaction::finalize`
+already provides); and hardware-in-the-loop tests. None of this is
+implemented or claimed here.
+
+`apps/cli` is a new, additive, Rust-only Developer MVP CLI with exactly one
+non-development/runtime dependency: `sunrise-edge-client`. (`Cargo.toml` also
+declares a handful of `[dev-dependencies]` — `objects`, `runtime`,
+`native-http`, `sunrise-edge-devnet`, `tokio` — used only to compose a real
+local devnet and build canonical test fixtures directly in this crate's own
+test suite; none of them are reachable from `main`, `lib`, or any non-test
+build.) It has no Node/browser runtime, no argument-parsing crate (flags are
+parsed by a small hand-written, strict `--flag value` parser that rejects
+duplicates, unknown flags, and any non-flag/extra positional token), no
+`unsafe` (`#![forbid(unsafe_code)]`), and no independent canonical
+encode/decode, signing, or RPC path — every protocol interaction goes
+through `sunrise-edge-client`. It provides six
+commands: `address` (derives and prints the `AddressIsPublicKey` address
+bound to an explicitly named development seed file — never a keystore, never
+a home-directory default, and the seed is never accepted on argv or printed);
+`context`, `object`, `receipt`, and `next-nonce` (thin wrappers over the
+matching `sunrise-edge-client` query methods); and `transfer`, the one
+same-owner devnet asset transfer command. All network commands target an
+explicit, strictly loopback-only `--endpoint`; a non-loopback address is
+rejected before any connection is attempted. Output is deterministic,
+line-oriented `key=value` text; every error is a typed, actionable
+`CliError`, and every error exits the process non-zero. A successful node
+response payload is decoded through `sunrise-edge-client`'s already-generic
+`execution::ExecutionEffects` decoder when possible; receipts, object bodies,
+and any payload that does not decode as effects are printed as bounded
+lowercase hex instead of inventing a claim about their meaning.
+
+`transfer` is the only place in this repository outside `apps/devnet` that
+knows the `sunrise.devnet.asset_account.v1` module's fixed `transfer`
+entrypoint name and its exact `CanonicalStruct(0xF002, v1){1: u64 amount}`
+argument frame — `clients/rust` stays application-agnostic. To build that
+frame and the transaction's access manifest without a second direct
+dependency, `clients/rust` additively re-exports a small, generic surface
+that adds no devnet-specific semantics of its own: `abi::{AccessEntry,
+AccessManifest}`, `objects::AccessMode`/`Object`, `canonical_encoding::{
+CanonicalStruct, CanonicalEncodingError}`, `protocol_types::{AtomicityDomainId,
+ChainId, Digest32, Epoch, HashAlgorithmId, HashSuiteId, ProtocolVersion,
+SignatureSchemeId, TypeError}`, `NODE_RESULT_MEDIA_TYPE`, and two small
+helpers: `current_inline_object_ref` (extracts the exact `ObjectRef` from a
+`CurrentInline` object-query result, `None` for every other status — generic
+over any object, not asset-specific) and the
+`ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID` constant (the `AddressBinding::
+AddressIsPublicKey` wire value, duplicated as a plain `u16` so a caller can
+compare it against `HttpContextQueryResult::address_binding_id()` without a
+direct `protocol-config` dependency; `protocol-config` remains a `clients/rust`
+dev-dependency only, and a dedicated test pins the two values together so
+they cannot silently drift).
+
+`transfer` queries `/v1/context`, the sender's `/v1/senders/{sender}/next-nonce`,
+and both `/v1/objects/{object_id}` results for the caller's exact
+`--source-object`/`--destination-object` identifiers; validates the
+committed profile is `Ed25519` + `AddressIsPublicKey` and that the context
+and next-nonce queries agree on epoch, all before signing; requires both
+objects to be `CurrentInline` (any other status is a typed, actionable
+rejection); constructs the exact two-entry `AccessManifest` with `Write`
+access to source then destination, in that order; builds and signs the
+transaction through `PreparedTransaction`/`build_signed_transaction`; and
+submits it with an explicit, caller-supplied non-zero request id. Every
+asset, including this one, uses the same uniform `AssetId`/account/transfer
+path — there is no native-coin or fee special case, and cross-owner transfer
+remains fail-closed on the existing owned-effects path (see DR-0081).
+Waiting for the resulting receipt is optional (`--wait`) and, when
+requested, every one of `--wait-max-attempts`, `--wait-initial-backoff-ms`,
+`--wait-max-backoff-ms`, and `--wait-max-elapsed-ms` must also be supplied —
+there is no hidden default poll bound, and supplying a wait-bound flag
+without `--wait` is itself rejected.
+
+The development seed file loaded by `address` and `transfer` must be an
+explicit path (there is no default or home-directory location), must not be
+a symlink, must be a regular file, must on Unix grant no permission bit to
+group or other, and must contain exactly 64 hexadecimal digits plus at most
+one trailing `\n` — anything else is a typed, actionable rejection before any
+key material is derived. This is a development convenience, explicitly not a
+keystore.
+
+Current vs. planned: this slice is implemented As-Is except where marked.
+`clients/rust`'s two-stage signer API, its small generic re-export surface,
+and `apps/cli`'s six commands are implemented and tested, including
+adversarial coverage of a mismatched, malformed-length, wrong-signer, and
+tampered signature; parser rejection of duplicate/unknown/malformed/
+extra-positional arguments; development seed file symlink/permission/length
+rejection (Unix); a fake-`Transport` unit test per query command plus
+`transfer`'s full success and epoch-mismatch/unsupported-scheme/
+non-current-inline-object adversarial paths; and two real loopback-TCP tests
+against a composed local devnet router — one exercising `context`/
+`next-nonce`/`object`, and one exercising a complete signed `transfer`
+against freshly seeded accounts through to a waited, present receipt. The
+Ledger device application, APDU/host transport, on-device clear signing, and
+hardware-in-the-loop tests described above remain entirely unimplemented and
+are not claimed by `PreparedTransaction`'s readiness for that boundary.
+`clients/typescript`, `apps/explorer`, `apps/wallet`, the restart/duplicate
+E2E, and explicit documented development-only limitations remain the
+Developer MVP Gate's next slices (see `TODO.md#developer-mvp-gate`).
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.
@@ -2986,3 +3128,31 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   only a bounded loopback HTTP transport initially, require caller-supplied
   request/module/object identities, and defer production networking and full
   protocol-config/hash verification rather than approximating them.
+- DR-0084: Define the Rust-only `apps/cli` Developer MVP boundary and the
+  Ledger-ready external signing boundary described in "Rust client
+  external-signer boundary and Developer MVP CLI". `apps/cli` has exactly one
+  non-development/runtime dependency, `sunrise-edge-client` (test-only
+  `[dev-dependencies]` exist to compose a real devnet and build fixtures for
+  this crate's own tests, and are unreachable from any non-test build),
+  parses arguments with a strict hand-written parser
+  (no clap, no other argument crate), never accepts a seed directly on argv,
+  and treats every development seed file as explicitly named, non-default,
+  non-keystore input with symlink/permission/length checks. `clients/rust`'s
+  new two-stage `PreparedTransaction` external-signer API is additive and
+  keeps `build_signed_transaction`'s stable output bytes unchanged; it fails
+  closed on any signature scheme other than the one implemented `Ed25519`/
+  `AddressIsPublicKey` binding and independently verifies a returned
+  signature's exact length and cryptographic validity before producing
+  output. Real Ledger (or other external/hardware) signing is explicitly not
+  implemented by this decision: it requires a dedicated Sunrise Edge Ledger
+  device application, an APDU/host transport, on-device parsing and clear
+  signing of the exact canonical signature frame, public-key/address
+  verification, an explicit derivation-path policy, device/application/
+  version checks, explicit user confirmation, host-side signature
+  verification, and hardware-in-the-loop tests — none of which exist yet, and
+  existing Solana/Ethereum Ledger apps must never be reused for Sunrise
+  transaction signing. No USB/HID/Ledger dependency exists in any protocol or
+  client crate. Devnet asset-transfer semantics (the module's entrypoint name
+  and argument frame) live only in `apps/cli`'s `transfer` command; the small
+  generic re-exports `clients/rust` adds to support it add no application
+  semantics of their own.

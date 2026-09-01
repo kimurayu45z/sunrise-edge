@@ -1949,9 +1949,66 @@ explicit dev limitations）:
    fake transportでsubmit/request bindingとbounded receipt wait、raw loopback TCPでadversarial response、
    実際にcomposeしたdevnet routerへの4 query全てのTCP E2Eを検証済み。live signed transfer/duplicate/
    restart E2Eはcriterion 10へ残る。
-8. 次のproduct-surface sliceとして、criterion 6の`apps/cli`を`clients/rust`のみに依存する
-   Rust-only binaryとして実装する（planned）。Node/browser runtime、独自canonical codec、
-   独自signing/RPC pathは導入しない。
+8. criterion 6の`apps/cli`を、実行時（non-dev）の直接依存が`clients/rust`のみのRust-only
+   binaryとして実装した（`Cargo.toml`の`[dev-dependencies]`にはtest専用でreal devnetの
+   composeとfixture構築のためだけの`objects`/`runtime`/`native-http`/`sunrise-edge-devnet`/
+   `tokio`があるが、いずれもnon-test buildからは到達できない。implemented As-Is;
+   ARCHITECTURE.md DR-0084）。Node/browser runtime、独自canonical codec、
+   独自signing/RPC pathは導入していない。引数parsingはclap等を使わない小さな手書きの
+   strict `--flag value` parserで、duplicate flag・unknown flag・flag値なし・宣言外の
+   positional argumentをすべて拒否する。`address`（明示的に指定したdevelopment seed
+   fileからAddressIsPublicKeyのaddressを導出）、`context`/`object`/`receipt`/`next-nonce`
+   （`clients/rust`の対応するquery methodへの薄いwrapper）、`transfer`（single same-owner
+   devnet asset transfer）の6コマンドを提供する。`--endpoint`はすべてloopbackのみを受理し、
+   出力はdeterministicなline-oriented `key=value`テキスト、すべてのエラーはtypedな
+   `CliError`でexit non-zeroとなる。development seed fileは明示的なpathのみを受理し
+   （home directoryのdefault path無し）、symlinkと非regular fileを拒否し、Unix上では
+   group/other permission bitを一切許可せず、内容は正確に64桁の16進数字＋任意の1個の
+   trailing `\n`のみを受理する。seedはargvへ直接渡さず、標準出力へも一切printしない。
+   `transfer`は`/v1/context`・sender自身の`/v1/senders/{sender}/next-nonce`・
+   `--source-object`/`--destination-object`の`/v1/objects/{object_id}`結果を照会し、
+   committed profileがEd25519 + AddressIsPublicKeyであること、contextとnext-nonceの
+   epochが一致することを署名前に検証し、両objectがCurrentInlineであることを要求し、
+   source→destinationの順でexactly two `Write` access manifestを構築し、
+   `clients/rust`経由でtransactionをbuild・signし、caller指定のnon-zero request idで
+   submitする。あらゆるassetは同一の`AssetId`/account/transfer pathを使い、native coinや
+   feeの特別扱いは無く、cross-owner transferは既存のowned-effects pathの上で引き続き
+   fail closedのままである（DR-0081参照）。receiptのwaitは`--wait`で明示的に有効化した
+   場合のみ行い、その際は`--wait-max-attempts`/`--wait-initial-backoff-ms`/
+   `--wait-max-backoff-ms`/`--wait-max-elapsed-ms`をすべて明示的に指定する必要があり、
+   隠れたdefault poll boundは無い（`--wait`無しでwait-bound flagだけを渡すのも拒否する）。
+   `sunrise.devnet.asset_account.v1`のentrypoint名と`CanonicalStruct(0xF002,v1)`引数
+   frameは`apps/cli`の`transfer`コマンドだけが知っており、`clients/rust`へdevnet固有の
+   意味論は置いていない。そのために`clients/rust`へ追加した最小限のgeneric re-export
+   （`abi::{AccessEntry,AccessManifest}`、`objects::AccessMode`/`Object`、
+   `canonical_encoding::{CanonicalStruct,CanonicalEncodingError}`、`protocol_types`の
+   基本型群、`current_inline_object_ref`ヘルパー、`ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID`
+   定数）はいずれもapplication固有の意味論を持たない。
+   同時に`clients/rust`のtransaction構築をadditiveなsafe two-stage external-signer API
+   （`transaction::PreparedTransaction::prepare`/`finalize`/`sign_and_finalize_with`）へ
+   refactorし、`build_signed_transaction`は同じpathで実装することで既存のstable出力
+   bytesを変更していない。`prepare`はexplicitなsender/active signature scheme/
+   `TransactionRequest`からimmutableな値を構築し、実装済みでない
+   signature schemeをframing前にfail closedで拒否する。`signable_frame`はexternal
+   signerが署名すべき正確なframed bytesを公開し、`finalize`は返された署名の長さが
+   exact scheme長であることとAddressIsPublicKeyのsender公開鍵に対して暗号学的に
+   verifyされることの両方を確認してからのみ出力を生成する（scheme不一致・不正な
+   署名長・well-formedだが無効な署名・wrong signerの署名・transaction改ざんは
+   すべてadversarial testでカバー済み）。ARCHITECTURE.md DR-0084が明記する通り、
+   real Ledger（またはその他のexternal/hardware）署名はこのsliceでは実装しておらず、
+   専用のSunrise Edge Ledger device app・APDU/host transport・on-deviceでの正確な
+   signature frameのparsingとclear signing・public key/address照合・derivation path
+   policy・device/app/version check・explicit user confirmation・host側signature
+   verification・hardware-in-the-loop testが別途必要である。既存のSolanaやEthereum
+   向けLedger appをSunriseのtransaction署名に転用することはできず、USB/HID/Ledgerへの
+   依存はどのprotocol/client crateにも存在しない。
+   parser/development seed file（symlink・permission・length。Unix）のadversarial
+   test、`clients/rust`側の two-stage signing adversarial test（scheme不一致・不正な
+   署名長・wrong signer・改ざん）、各query commandのfake `Transport` unit test、
+   `transfer`のsuccess pathおよびepoch不一致・unsupported scheme・non-current-inline
+   objectのadversarial test、実際にcomposeしたdevnet routerへのreal loopback TCP E2E
+   （`context`/`next-nonce`/`object`の一括実行と、freshly seedしたaccount間での完全な
+   signed `transfer`から`--wait`によるpresent receiptまでの2本）で検証済み。
 
 **Repository-boundary decision**（ARCHITECTURE.md DR-0081；DR-0080の同名決定のうち
 repository-boundary/counter-demo deliverableのみを置き換える。DR-0080に記録された
