@@ -685,12 +685,13 @@ and logical `AtomicityDomainId` it expects, and `Client::query_verified_context`
 queries `/v1/context` and rejects with a typed, field-specific
 `ProtocolContextMismatch` before returning it if the untrusted remote result
 disagrees on any of those fields. This exists because a successful transport
-connection — including a future TLS one — only authenticates the transport
+connection — including the implemented remote TLS one — only authenticates the transport
 endpoint, never the protocol context itself, so it can never by itself rule
 out cross-chain signing. `protocol_config_bytes` is deliberately not pinned
-or decoded by this check; that remains explicit future work. Remote TLS
-transport itself is not implemented by this boundary or anywhere else in this
-workspace yet: `LoopbackHttpTransport` remains loopback-only and plaintext.
+or decoded by this check; that remains explicit future work. Remote TLS is
+implemented by the separate `RemoteTlsHttpTransport` described above;
+`LoopbackHttpTransport` deliberately remains loopback-only and plaintext, and
+neither transport choice replaces this expected-context boundary.
 
 `apps/cli` is now implemented As-Is: a Rust-only Developer MVP CLI with
 exactly one non-development/runtime dependency, `sunrise-edge-client` (a

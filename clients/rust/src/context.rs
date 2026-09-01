@@ -2,8 +2,8 @@
 //! boundary (`ARCHITECTURE.md` DR-0085; `TODO.md` CLI-First Node Production
 //! Gate S1a).
 //!
-//! A successful transport connection — including a future TLS connection
-//! with a valid, hostname-verified certificate — proves only that the
+//! A successful transport connection — including the implemented remote TLS
+//! transport with a valid, hostname-verified certificate — proves only that the
 //! client reached *some* server holding a trusted key for that hostname. It
 //! does not prove that server actually serves the client's intended
 //! chain/protocol: TLS authenticates the transport endpoint, not the
@@ -17,10 +17,10 @@
 //!
 //! This slice deliberately does not pin or decode
 //! [`node_wire::HttpContextQueryResult::protocol_config_bytes`]: that
-//! remains explicit future work, not silently approximated here. Remote TLS
-//! transport is also a separate, not-yet-implemented S1 concern (see
-//! `README.md` current status); this module only implements the
-//! expected-context verification half of S1.
+//! remains explicit future work, not silently approximated here. Remote TLS is
+//! implemented separately in [`crate::transport::RemoteTlsHttpTransport`];
+//! this module implements only S1's independent expected-context verification
+//! boundary, and neither boundary substitutes for the other.
 
 use core::fmt;
 use std::error::Error;

@@ -28,7 +28,7 @@
 //! other, separate concern: a mandatory, locally trusted expected-
 //! protocol-context check ([`Client::query_verified_context`]) that a
 //! caller must perform before any nonce/object query or signing, since a
-//! successful transport connection — including a future TLS one — proves
+//! successful transport connection — including the implemented remote TLS one — proves
 //! only that the client reached some server holding a trusted key for that
 //! hostname, never that it is the caller's intended chain/protocol.
 //!
@@ -36,8 +36,9 @@
 //! supply module/object references and the active signature scheme, never
 //! derives a request id, never recomputes a hash-suite or execution-effects
 //! digest, and adds no asset-specific helpers or CLI policy. Those
-//! capabilities, production remote transport, and blob fetch remain
-//! deferred (see `ARCHITECTURE.md` §44 / DR-0083). [`key::LocalSigner`] is
+//! capabilities, general-purpose DNS/root-store/mTLS transport expansion, and
+//! blob fetch remain deferred (see `ARCHITECTURE.md` §44 / DR-0083).
+//! [`key::LocalSigner`] is
 //! an explicit development-only, in-memory key, never a keystore; real
 //! external/hardware signing — including any future dedicated Ledger
 //! device application — is a deferred, not-yet-implemented boundary (see
