@@ -604,7 +604,9 @@ methods. Its provided HTTP/1.1 transport is synchronous and loopback-only,
 with strict timeouts, header/body bounds, selector binding, and ambiguous-
 framing rejection; it is not a production remote transport. Stable signed
 transaction bytes are accepted directly by node-core, parser adversarial tests
-use real TCP, and an E2E query reaches the composed devnet router over TCP.
+use real TCP, and all four query methods reach the composed devnet router over
+TCP. A caller deadline bounds the complete exchange, including slow-drip
+responses, rather than resetting on each received byte.
 `apps/cli` is the next product-surface slice. A signed duplicate-transfer HTTP
 E2E remains required later by the Developer MVP Gate and is not claimed here.
 

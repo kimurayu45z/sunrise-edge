@@ -85,6 +85,9 @@ pub enum ClientError {
         /// Total elapsed wall-clock time across all attempts.
         elapsed: Duration,
     },
+    /// The caller supplied an elapsed-time bound that could not be added to
+    /// the current monotonic clock instant.
+    ReceiptPollDeadlineOverflow,
 }
 
 impl fmt::Display for ClientError {
@@ -123,6 +126,9 @@ impl fmt::Display for ClientError {
                 f,
                 "receipt poll exhausted after {attempts} attempts and {elapsed:?}"
             ),
+            Self::ReceiptPollDeadlineOverflow => {
+                f.write_str("receipt poll elapsed-time bound overflows the monotonic clock")
+            }
         }
     }
 }
@@ -142,7 +148,8 @@ impl Error for ClientError {
             | Self::ObjectQuerySelectorMismatch { .. }
             | Self::ReceiptQuerySelectorMismatch { .. }
             | Self::NextNonceQuerySelectorMismatch { .. }
-            | Self::ReceiptPollExhausted { .. } => None,
+            | Self::ReceiptPollExhausted { .. }
+            | Self::ReceiptPollDeadlineOverflow => None,
         }
     }
 }

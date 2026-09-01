@@ -105,12 +105,20 @@ where
         &self,
         request_id: RequestId,
     ) -> Result<HttpReceiptQueryResult, ClientError> {
+        self.query_receipt_with_deadline(request_id, None)
+    }
+
+    fn query_receipt_with_deadline(
+        &self,
+        request_id: RequestId,
+        deadline: Option<Instant>,
+    ) -> Result<HttpReceiptQueryResult, ClientError> {
         let path = substitute_selector(
             QUERY_RECEIPT_PATH,
             "{request_id}",
             &hex64_lower(request_id.as_bytes()),
         );
-        let body = self.get(&path)?;
+        let body = self.get_with_deadline(&path, deadline)?;
         let result = HttpReceiptQueryResult::decode(&body)?;
         if result.request_id() != request_id {
             return Err(ClientError::ReceiptQuerySelectorMismatch {
@@ -164,6 +172,7 @@ where
             path: NODE_EVENT_PATH.to_string(),
             content_type: Some(NODE_EVENT_MEDIA_TYPE),
             body,
+            deadline: None,
         };
         let response = self.transport.send(&wire_request)?;
         let body = expect_success(response, NODE_RESULT_MEDIA_TYPE)?;
@@ -191,27 +200,41 @@ where
         bounds: &ReceiptPollBounds,
     ) -> Result<HttpReceiptQueryResult, ClientError> {
         let start = Instant::now();
+        let deadline = start
+            .checked_add(bounds.max_elapsed)
+            .ok_or(ClientError::ReceiptPollDeadlineOverflow)?;
         let mut backoff = bounds.initial_backoff;
         let mut attempt: u32 = 0;
         loop {
-            if start.elapsed() >= bounds.max_elapsed {
+            if Instant::now() >= deadline {
                 return Err(ClientError::ReceiptPollExhausted {
                     attempts: attempt,
                     elapsed: start.elapsed(),
                 });
             }
             attempt += 1;
-            let result = self.query_receipt(request_id)?;
+            let result = match self.query_receipt_with_deadline(request_id, Some(deadline)) {
+                Ok(result) => result,
+                Err(ClientError::Transport(
+                    crate::transport::TransportError::RequestDeadlineExceeded,
+                )) if Instant::now() >= deadline => {
+                    return Err(ClientError::ReceiptPollExhausted {
+                        attempts: attempt,
+                        elapsed: start.elapsed(),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
             if matches!(result, HttpReceiptQueryResult::Present { .. }) {
                 return Ok(result);
             }
-            if attempt >= bounds.max_attempts.get() || start.elapsed() >= bounds.max_elapsed {
+            if attempt >= bounds.max_attempts.get() || Instant::now() >= deadline {
                 return Err(ClientError::ReceiptPollExhausted {
                     attempts: attempt,
                     elapsed: start.elapsed(),
                 });
             }
-            let remaining = bounds.max_elapsed.saturating_sub(start.elapsed());
+            let remaining = deadline.saturating_duration_since(Instant::now());
             std::thread::sleep(backoff.min(bounds.max_backoff).min(remaining));
             backoff = backoff
                 .checked_mul(2)
@@ -221,11 +244,20 @@ where
     }
 
     fn get(&self, path: &str) -> Result<Vec<u8>, ClientError> {
+        self.get_with_deadline(path, None)
+    }
+
+    fn get_with_deadline(
+        &self,
+        path: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<u8>, ClientError> {
         let request = WireRequest {
             method: Method::Get,
             path: path.to_string(),
             content_type: None,
             body: Vec::new(),
+            deadline,
         };
         let response = self.transport.send(&request)?;
         expect_success(response, QUERY_RESULT_MEDIA_TYPE)
@@ -295,6 +327,16 @@ mod tests {
                 .borrow_mut()
                 .pop()
                 .expect("fake transport ran out of scripted responses")
+        }
+    }
+
+    struct DeadlineTransport;
+
+    impl Transport for DeadlineTransport {
+        fn send(&self, request: &WireRequest) -> Result<WireResponse, TransportError> {
+            assert!(request.deadline.is_some());
+            std::thread::sleep(Duration::from_millis(10));
+            Err(TransportError::RequestDeadlineExceeded)
         }
     }
 
@@ -531,7 +573,9 @@ mod tests {
         };
         let result = client.wait_for_receipt(request_id, &bounds).unwrap();
         assert_eq!(result, present);
-        assert_eq!(client.transport().requests.borrow().len(), 2);
+        let requests = client.transport().requests.borrow();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.deadline.is_some()));
     }
 
     #[test]
@@ -574,6 +618,24 @@ mod tests {
             ClientError::ReceiptPollExhausted { attempts: 0, .. }
         ));
         assert!(client.transport().requests.borrow().is_empty());
+    }
+
+    #[test]
+    fn wait_for_receipt_maps_its_expired_request_deadline_to_poll_exhaustion() {
+        let request_id = RequestId::new([0x0A; 32]).unwrap();
+        let client = Client::new(DeadlineTransport);
+        let bounds = ReceiptPollBounds {
+            max_attempts: NonZeroU32::new(2).unwrap(),
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+            max_elapsed: Duration::from_millis(1),
+        };
+
+        let error = client.wait_for_receipt(request_id, &bounds).unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::ReceiptPollExhausted { attempts: 1, .. }
+        ));
     }
 
     fn sample_dedup_record_bytes(request_id: RequestId) -> Vec<u8> {

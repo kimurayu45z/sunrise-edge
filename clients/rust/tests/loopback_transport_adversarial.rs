@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::num::NonZeroUsize;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sunrise_edge_client::{LoopbackHttpTransport, Method, Transport, TransportError, WireRequest};
 
@@ -49,6 +49,7 @@ fn get_request() -> WireRequest {
         path: "/v1/context".to_string(),
         content_type: None,
         body: Vec::new(),
+        deadline: None,
     }
 }
 
@@ -201,4 +202,75 @@ fn rejects_a_non_three_digit_status_code() {
     let addr = serve_once(b"HTTP/1.1 20 OK\r\nContent-Length: 0\r\n\r\n".to_vec());
     let error = transport(addr).send(&get_request()).unwrap_err();
     assert!(matches!(error, TransportError::InvalidStatusCode));
+}
+
+#[test]
+fn rejects_duplicate_content_type_and_non_utf8_headers() {
+    let duplicate = serve_once(
+        b"HTTP/1.1 200 OK\r\nContent-Type: a/b\r\nContent-Type: a/b\r\nContent-Length: 0\r\n\r\n"
+            .to_vec(),
+    );
+    let duplicate_error = transport(duplicate).send(&get_request()).unwrap_err();
+    assert!(matches!(
+        duplicate_error,
+        TransportError::DuplicateContentType
+    ));
+
+    let invalid_utf8 =
+        serve_once(b"HTTP/1.1 200 OK\r\nX-Invalid: \xff\r\nContent-Length: 0\r\n\r\n".to_vec());
+    let utf8_error = transport(invalid_utf8).send(&get_request()).unwrap_err();
+    assert!(matches!(utf8_error, TransportError::MalformedHeaders));
+}
+
+#[test]
+fn rejects_a_connection_close_response_that_does_not_close() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            let _ = stream.flush();
+            thread::sleep(Duration::from_millis(200));
+        }
+    });
+    let bounded = LoopbackHttpTransport::new(
+        addr,
+        Duration::from_secs(1),
+        Duration::from_millis(40),
+        Duration::from_secs(1),
+        NonZeroUsize::new(1024).unwrap(),
+        NonZeroUsize::new(1024).unwrap(),
+    )
+    .unwrap();
+    let error = bounded.send(&get_request()).unwrap_err();
+    assert!(matches!(error, TransportError::ResponseDidNotClose));
+}
+
+#[test]
+fn caller_deadline_stops_a_slow_drip_response() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+            for byte in response {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                let _ = stream.flush();
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    });
+    let bounded = transport(addr);
+    let mut request = get_request();
+    request.deadline = Some(Instant::now() + Duration::from_millis(100));
+    let started = Instant::now();
+    let error = bounded.send(&request).unwrap_err();
+    assert!(matches!(error, TransportError::RequestDeadlineExceeded));
+    assert!(started.elapsed() < Duration::from_secs(1));
 }

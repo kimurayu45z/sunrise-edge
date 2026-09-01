@@ -1227,3 +1227,38 @@ fn take_list_bytes<'a>(
     *offset = end;
     Ok(value)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONTEXT_STABLE_VECTOR_HEX: &str = concat!(
+        "534e524502e10100090001000c00000073756e726973652d746573740200040000000300000003000800",
+        "00000700000000000000040002000000010005000200000001000600020000000100070002000000010008",
+        "0020000000111111111111111111111111111111111111111111111111111111111111111109000300000",
+        "0aabbcc",
+    );
+
+    fn decode_hex(input: &str) -> Vec<u8> {
+        input
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let text = std::str::from_utf8(pair).unwrap();
+                u8::from_str_radix(text, 16).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn context_codec_owns_and_round_trips_the_existing_server_vector() {
+        let bytes = decode_hex(CONTEXT_STABLE_VECTOR_HEX);
+        let result = HttpContextQueryResult::decode(&bytes).unwrap();
+
+        assert_eq!(result.chain_id().as_str(), "sunrise-test");
+        assert_eq!(result.protocol_version().get(), 3);
+        assert_eq!(result.epoch().get(), 7);
+        assert_eq!(result.protocol_config_bytes(), [0xAA, 0xBB, 0xCC]);
+        assert_eq!(result.encode().unwrap(), bytes);
+    }
+}

@@ -6,7 +6,7 @@ use std::error::Error;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::num::NonZeroUsize;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// HTTP method used by one bounded request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +37,10 @@ pub struct WireRequest {
     pub content_type: Option<&'static str>,
     /// Request body. Empty for every `GET` call this client makes.
     pub body: Vec<u8>,
+    /// Optional caller deadline for the complete exchange. The loopback
+    /// transport combines it with its own configured total bound and uses
+    /// whichever expires first.
+    pub deadline: Option<Instant>,
 }
 
 /// One bounded HTTP response.
@@ -53,9 +57,10 @@ pub struct WireResponse {
 /// A deterministic transport for one bounded request/response exchange.
 ///
 /// Implementations must not retry, cache, follow redirects, or perform any
-/// work after returning. [`LoopbackHttpTransport`] is the only production
-/// implementation this crate ships; tests supply a fake implementing this
-/// same trait.
+/// work after returning. When [`WireRequest::deadline`] is present, an
+/// implementation must stop the complete exchange by that monotonic deadline.
+/// [`LoopbackHttpTransport`] is the only production implementation this crate
+/// ships; tests supply a fake implementing this same trait.
 pub trait Transport {
     /// Sends one request and returns its complete, bounded response.
     fn send(&self, request: &WireRequest) -> Result<WireResponse, TransportError>;
@@ -74,6 +79,11 @@ pub enum TransportError {
     /// The request content type contained bytes unsafe for one HTTP header
     /// value.
     InvalidRequestContentType,
+    /// The configured per-stage timeouts could not form one total request
+    /// budget on the monotonic clock.
+    RequestDeadlineOverflow,
+    /// The complete request exceeded its transport or caller deadline.
+    RequestDeadlineExceeded,
     /// Opening the bounded `TcpStream` failed.
     Connect(std::io::Error),
     /// Configuring a socket timeout failed.
@@ -144,6 +154,10 @@ impl fmt::Display for TransportError {
             Self::InvalidRequestContentType => {
                 f.write_str("request content type is not a safe HTTP header value")
             }
+            Self::RequestDeadlineOverflow => {
+                f.write_str("configured request timeouts overflow the monotonic clock")
+            }
+            Self::RequestDeadlineExceeded => f.write_str("request deadline exceeded"),
             Self::Connect(error) => write!(f, "failed to connect: {error}"),
             Self::SetTimeout(error) => write!(f, "failed to configure socket timeout: {error}"),
             Self::Write(error) => write!(f, "failed to write request: {error}"),
@@ -274,14 +288,26 @@ impl Transport for LoopbackHttpTransport {
         {
             return Err(TransportError::InvalidRequestContentType);
         }
-        let mut stream = TcpStream::connect_timeout(&self.addr, self.connect_timeout)
-            .map_err(TransportError::Connect)?;
-        stream
-            .set_read_timeout(Some(self.read_timeout))
-            .map_err(TransportError::SetTimeout)?;
-        stream
-            .set_write_timeout(Some(self.write_timeout))
-            .map_err(TransportError::SetTimeout)?;
+        let transport_budget = self
+            .connect_timeout
+            .checked_add(self.write_timeout)
+            .and_then(|value| value.checked_add(self.read_timeout))
+            .ok_or(TransportError::RequestDeadlineOverflow)?;
+        let transport_deadline = Instant::now()
+            .checked_add(transport_budget)
+            .ok_or(TransportError::RequestDeadlineOverflow)?;
+        let deadline = request
+            .deadline
+            .map_or(transport_deadline, |value| value.min(transport_deadline));
+        let connect_timeout = remaining_timeout(deadline, self.connect_timeout)?;
+        let mut stream =
+            TcpStream::connect_timeout(&self.addr, connect_timeout).map_err(|error| {
+                if is_timeout(&error) && Instant::now() >= deadline {
+                    TransportError::RequestDeadlineExceeded
+                } else {
+                    TransportError::Connect(error)
+                }
+            })?;
 
         let mut head = format!(
             "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
@@ -296,20 +322,18 @@ impl Transport for LoopbackHttpTransport {
         }
         head.push_str(&format!("Content-Length: {}\r\n\r\n", request.body.len()));
 
-        stream
-            .write_all(head.as_bytes())
-            .map_err(TransportError::Write)?;
+        write_all_until(&mut stream, head.as_bytes(), deadline, self.write_timeout)?;
         if !request.body.is_empty() {
-            stream
-                .write_all(&request.body)
-                .map_err(TransportError::Write)?;
+            write_all_until(&mut stream, &request.body, deadline, self.write_timeout)?;
         }
-        stream.flush().map_err(TransportError::Write)?;
+        flush_until(&mut stream, deadline, self.write_timeout)?;
 
         read_response(
             &mut stream,
             self.max_response_header_bytes,
             self.max_response_body_bytes,
+            deadline,
+            self.read_timeout,
         )
     }
 }
@@ -318,6 +342,8 @@ fn read_response(
     stream: &mut TcpStream,
     max_header_bytes: usize,
     max_body_bytes: usize,
+    deadline: Instant,
+    read_timeout: Duration,
 ) -> Result<WireResponse, TransportError> {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 4096];
@@ -335,7 +361,7 @@ fn read_response(
                 maximum: max_header_bytes,
             });
         }
-        let read = stream.read(&mut chunk).map_err(TransportError::Read)?;
+        let read = read_until(stream, &mut chunk, deadline, read_timeout)?;
         if read == 0 {
             return Err(TransportError::TruncatedResponseHeaders);
         }
@@ -400,7 +426,7 @@ fn read_response(
         return Err(TransportError::TrailingResponseBytes);
     }
     while already_read_body.len() < content_length {
-        let read = stream.read(&mut chunk).map_err(TransportError::Read)?;
+        let read = read_until(stream, &mut chunk, deadline, read_timeout)?;
         if read == 0 {
             return Err(TransportError::TruncatedResponseBody {
                 expected: content_length,
@@ -419,9 +445,15 @@ fn read_response(
     // size, so any further byte before the peer closes is a protocol
     // violation. A timeout here (the peer simply has not closed yet) is not
     // itself evidence of trailing bytes.
+    stream
+        .set_read_timeout(Some(remaining_timeout(deadline, read_timeout)?))
+        .map_err(TransportError::SetTimeout)?;
     match stream.read(&mut chunk) {
         Ok(0) => {}
         Ok(_) => return Err(TransportError::TrailingResponseBytes),
+        Err(error) if is_timeout(&error) && Instant::now() >= deadline => {
+            return Err(TransportError::RequestDeadlineExceeded);
+        }
         Err(error) if is_timeout(&error) => return Err(TransportError::ResponseDidNotClose),
         Err(error) => return Err(TransportError::Read(error)),
     }
@@ -430,6 +462,81 @@ fn read_response(
         status,
         content_type,
         body: already_read_body,
+    })
+}
+
+fn remaining_timeout(
+    deadline: Instant,
+    per_operation: Duration,
+) -> Result<Duration, TransportError> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(TransportError::RequestDeadlineExceeded)?;
+    if remaining.is_zero() {
+        return Err(TransportError::RequestDeadlineExceeded);
+    }
+    Ok(remaining.min(per_operation))
+}
+
+fn write_all_until(
+    stream: &mut TcpStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+    write_timeout: Duration,
+) -> Result<(), TransportError> {
+    while !bytes.is_empty() {
+        stream
+            .set_write_timeout(Some(remaining_timeout(deadline, write_timeout)?))
+            .map_err(TransportError::SetTimeout)?;
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(TransportError::Write(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "failed to write the complete request",
+                )));
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if is_timeout(&error) && Instant::now() >= deadline => {
+                return Err(TransportError::RequestDeadlineExceeded);
+            }
+            Err(error) => return Err(TransportError::Write(error)),
+        }
+    }
+    Ok(())
+}
+
+fn flush_until(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    write_timeout: Duration,
+) -> Result<(), TransportError> {
+    stream
+        .set_write_timeout(Some(remaining_timeout(deadline, write_timeout)?))
+        .map_err(TransportError::SetTimeout)?;
+    stream.flush().map_err(|error| {
+        if is_timeout(&error) && Instant::now() >= deadline {
+            TransportError::RequestDeadlineExceeded
+        } else {
+            TransportError::Write(error)
+        }
+    })
+}
+
+fn read_until(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+    read_timeout: Duration,
+) -> Result<usize, TransportError> {
+    stream
+        .set_read_timeout(Some(remaining_timeout(deadline, read_timeout)?))
+        .map_err(TransportError::SetTimeout)?;
+    stream.read(buffer).map_err(|error| {
+        if is_timeout(&error) && Instant::now() >= deadline {
+            TransportError::RequestDeadlineExceeded
+        } else {
+            TransportError::Read(error)
+        }
     })
 }
 
@@ -567,6 +674,7 @@ mod tests {
             path: "/v1/context\r\nX-Injected: yes".to_string(),
             content_type: None,
             body: Vec::new(),
+            deadline: None,
         };
         assert!(matches!(
             transport.send(&invalid_path),
@@ -578,6 +686,7 @@ mod tests {
             path: "/v1/events".to_string(),
             content_type: Some("application/test\r\nX-Injected: yes"),
             body: Vec::new(),
+            deadline: None,
         };
         assert!(matches!(
             transport.send(&invalid_content_type),

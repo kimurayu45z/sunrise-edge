@@ -150,6 +150,16 @@ pub enum ExecutionError {
     /// A decoded event-records list declared more entries than the encoder
     /// permits.
     TooManyEvents(usize),
+    /// A nested execution-effects list declared a count different from the
+    /// exact number of entry fields present in its canonical frame.
+    ExecutionEffectsListCountMismatch {
+        /// Stable name of the nested list being decoded.
+        list: &'static str,
+        /// Entry count declared in field 1.
+        declared_count: usize,
+        /// Total fields actually present, including the count field.
+        field_count: usize,
+    },
     /// Re-encoding a decoded `ExecutionEffects` did not reproduce its input
     /// bytes, meaning the input was not the unique canonical encoding of its
     /// value.
@@ -214,6 +224,14 @@ impl fmt::Display for ExecutionError {
             Self::TooManyEvents(count) => {
                 write!(f, "execution effects declare {count} events")
             }
+            Self::ExecutionEffectsListCountMismatch {
+                list,
+                declared_count,
+                field_count,
+            } => write!(
+                f,
+                "{list} declares {declared_count} entries but contains {field_count} total fields"
+            ),
             Self::NonCanonicalExecutionEffectsEncoding => write!(
                 f,
                 "decoded execution effects do not re-encode to their input bytes"
@@ -765,16 +783,23 @@ fn decode_object_effects_list(bytes: &[u8]) -> Result<Vec<ObjectEffect>, Executi
         return Err(ExecutionError::TooManyObjectEffects(count));
     }
 
-    let mut allowed_fields: Vec<u16> = Vec::with_capacity(count + 1);
-    allowed_fields.push(1);
+    let expected_field_count = count
+        .checked_add(1)
+        .ok_or(ExecutionError::TooManyObjectEffects(usize::MAX))?;
+    if frame.field_count() != expected_field_count {
+        return Err(ExecutionError::ExecutionEffectsListCountMismatch {
+            list: "object-effects list",
+            declared_count: count,
+            field_count: frame.field_count(),
+        });
+    }
+
     let mut effects = Vec::with_capacity(count);
     for index in 0..count {
         let field_id =
             u16::try_from(2 + index).map_err(|_| ExecutionError::TooManyObjectEffects(count))?;
-        allowed_fields.push(field_id);
         effects.push(decode_object_effect(frame.required_field(field_id)?)?);
     }
-    frame.require_only_fields(&allowed_fields)?;
     Ok(effects)
 }
 
@@ -789,16 +814,23 @@ fn decode_event_records_list(bytes: &[u8]) -> Result<Vec<EventRecord>, Execution
         return Err(ExecutionError::TooManyEvents(count));
     }
 
-    let mut allowed_fields: Vec<u16> = Vec::with_capacity(count + 1);
-    allowed_fields.push(1);
+    let expected_field_count = count
+        .checked_add(1)
+        .ok_or(ExecutionError::TooManyEvents(usize::MAX))?;
+    if frame.field_count() != expected_field_count {
+        return Err(ExecutionError::ExecutionEffectsListCountMismatch {
+            list: "event-records list",
+            declared_count: count,
+            field_count: frame.field_count(),
+        });
+    }
+
     let mut events = Vec::with_capacity(count);
     for index in 0..count {
         let field_id =
             u16::try_from(2 + index).map_err(|_| ExecutionError::TooManyEvents(count))?;
-        allowed_fields.push(field_id);
         events.push(decode_event_record(frame.required_field(field_id)?)?);
     }
-    frame.require_only_fields(&allowed_fields)?;
     Ok(events)
 }
 
@@ -2045,9 +2077,11 @@ mod tests {
 
         assert_eq!(
             decode_object_effects_list(&bytes),
-            Err(ExecutionError::CanonicalDecoding(
-                CanonicalDecodingError::MissingField(2)
-            ))
+            Err(ExecutionError::ExecutionEffectsListCountMismatch {
+                list: "object-effects list",
+                declared_count: 1,
+                field_count: 1,
+            })
         );
     }
 

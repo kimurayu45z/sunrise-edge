@@ -3018,6 +3018,7 @@ fn execution_error_response(error: &ExecutionError) -> (StatusCode, &'static str
         | ExecutionError::UnknownObjectEffectTag(_)
         | ExecutionError::TooManyObjectEffects(_)
         | ExecutionError::TooManyEvents(_)
+        | ExecutionError::ExecutionEffectsListCountMismatch { .. }
         | ExecutionError::NonCanonicalExecutionEffectsEncoding
         | ExecutionError::HashChainMismatch
         | ExecutionError::HashProtocolVersionMismatch { .. } => {

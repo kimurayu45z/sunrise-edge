@@ -1724,12 +1724,17 @@ checks every returned object/request/sender selector against the exact query,
 and the loopback transport rejects request framing injection, over-bound
 headers/bodies, transfer encoding, ambiguous lengths, malformed status/header
 syntax, truncation, trailing bytes, and failure to close a `Connection: close`
-response within its timeout. Tests pin the existing signed transaction vector,
-authenticate freshly client-signed bytes through node-core, exercise fake
-submission/receipt behavior, exercise adversarial raw TCP responses, and query
-`/v1/context` through a real composed devnet router over TCP. A live signed
-asset transfer, duplicate replay, and restart sequence remains Developer MVP
-criterion 10 work; this client slice does not claim that later E2E.
+response within its timeout. Per-stage socket timeouts are also capped by one
+monotonic complete-request deadline, and receipt polling passes its overall
+elapsed deadline into every transport call, so a slow-drip peer cannot reset
+the bound byte by byte. Nested effect-list decoders compare the declared count
+with the frame's exact field count before allocating or iterating. Tests pin
+the existing signed transaction vector, authenticate freshly client-signed
+bytes through node-core, exercise fake submission/receipt behavior, exercise
+adversarial raw TCP responses (including slow-drip and close timeout), and
+query all four routes through a real composed devnet router over TCP. A live
+signed asset transfer, duplicate replay, and restart sequence remains Developer
+MVP criterion 10 work; this client slice does not claim that later E2E.
 
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.

@@ -10,7 +10,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use sunrise_edge_client::{Client, LoopbackHttpTransport};
+use sunrise_edge_client::{
+    Address, Client, HttpObjectQueryResult, HttpReceiptQueryResult, LoopbackHttpTransport,
+    ObjectId, RequestId,
+};
 use sunrise_edge_devnet::{
     ASSET_ACCOUNT_WASM, DevnetConfig, boot_local_store, build_asset_module,
     build_devnet_protocol_context, compose_devnet_router,
@@ -37,7 +40,7 @@ impl Drop for TestDirectory {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn client_queries_context_from_the_real_devnet_router_over_tcp() {
+async fn client_queries_all_four_routes_from_the_real_devnet_router_over_tcp() {
     let directory = TestDirectory::new();
     let config = DevnetConfig::parse_from(vec![
         OsString::from("--data-dir"),
@@ -89,7 +92,27 @@ async fn client_queries_context_from_the_real_devnet_router_over_tcp() {
             NonZeroUsize::new(1024 * 1024).unwrap(),
         )
         .unwrap();
-        Client::new(transport).query_context().unwrap()
+        let client = Client::new(transport);
+        let context = client.query_context().unwrap();
+
+        let object_id = ObjectId::new([0x41; 32]);
+        assert_eq!(
+            client.query_object(object_id).unwrap(),
+            HttpObjectQueryResult::Absent { object_id }
+        );
+
+        let request_id = RequestId::new([0x42; 32]).unwrap();
+        assert_eq!(
+            client.query_receipt(request_id).unwrap(),
+            HttpReceiptQueryResult::Absent { request_id }
+        );
+
+        let sender = Address::new([0x43; 32]);
+        let nonce = client.query_next_nonce(sender).unwrap();
+        assert_eq!(nonce.sender(), sender);
+        assert_eq!(nonce.epoch().get(), 7);
+        assert_eq!(nonce.next_nonce(), 0);
+        context
     })
     .await
     .unwrap();

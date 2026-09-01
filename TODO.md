@@ -1943,9 +1943,12 @@ explicit dev limitations）:
    node-coreが受理するsigned transaction vectorでcanonical contractを固定した
    （implemented As-Is）。clientは全query selectorを応答内selectorと再照合し、transportは
    request framing injection、header/body超過、ambiguous length、transfer encoding、truncation、
-   trailing bytes、close timeoutをfail closedにする。fake transportでsubmit/request bindingと
-   bounded receipt wait、raw loopback TCPでadversarial response、実際にcomposeしたdevnet routerへの
-   `/v1/context` TCP E2Eを検証済み。live signed transfer/duplicate/restart E2Eはcriterion 10へ残る。
+   trailing bytes、close timeoutをfail closedにし、per-stage socket timeoutに加えて完全な1 requestの
+   monotonic deadlineを適用する。receipt waitは同じoverall deadlineをtransportへ渡すためslow-dripで
+   elapsed boundを更新できない。effects listはdeclared countとexact field countをallocation前に照合する。
+   fake transportでsubmit/request bindingとbounded receipt wait、raw loopback TCPでadversarial response、
+   実際にcomposeしたdevnet routerへの4 query全てのTCP E2Eを検証済み。live signed transfer/duplicate/
+   restart E2Eはcriterion 10へ残る。
 8. 次のproduct-surface sliceとして、criterion 6の`apps/cli`を`clients/rust`のみに依存する
    Rust-only binaryとして実装する（planned）。Node/browser runtime、独自canonical codec、
    独自signing/RPC pathは導入しない。
