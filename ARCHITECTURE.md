@@ -1523,13 +1523,18 @@ restart-idempotent account seeding. Its binary composes those pieces into the
 bounded preinstalled-WASM native router and serves HTTP on the configured
 loopback address. Live smoke validation observed a `204` liveness response and
 verified the same seeded object IDs after reopening under the next writer
-generation. A signed duplicate-transfer HTTP E2E is still planned; direct WASM
-tests already prove successful same-asset movement and effect-free rejection
-of mixed asset IDs. No other `clients/*`/`apps/*` path from DR-0081 exists.
-The bounded query API (chain/context info, object reads, receipts, and an
-authenticated sender's next nonce) is implemented As-Is per the design defined
-below; a Rust/TypeScript client, CLI, explorer, wallet, and restart/duplicate
-E2E coverage remain the next separate implementation slices. Known current
+generation. Direct WASM tests prove successful same-asset movement and
+effect-free rejection of mixed asset IDs. The bounded query API (chain/context
+info, object reads, receipts, and an authenticated sender's next nonce), the
+Rust client (`clients/rust`), the Rust-only CLI (`apps/cli`), and a signed
+duplicate-transfer restart/duplicate HTTP E2E
+(`apps/cli/tests/devnet_restart_duplicate_e2e.rs`) are implemented As-Is per
+the designs defined below and in "Rust client library" / "Rust client
+external-signer boundary and Developer MVP CLI". Under the CLI-first
+production-strategy pivot (see "Local devnet architecture" above and
+DR-0085), the TypeScript client, explorer, and wallet remain deferred until
+the CLI-First Node Production Gate passes (`TODO.md#cli-first-node-production-gate`);
+no other `clients/*`/`apps/*` path from DR-0081 exists yet. Known current
 limitations that
 must stay visible at devnet startup and in documentation once implemented:
 single validator; owned-object only (Create, Shared/System ownership, and
@@ -1914,9 +1919,12 @@ allocator has not yet overwritten, remain resident. This is consistent with
 `load_dev_seed`'s and `LocalSigner`'s existing documented status as
 explicit, non-keystore, development-only conveniences — not production key
 handling — and is called out here rather than silently assumed.
-`clients/typescript`, `apps/explorer`, `apps/wallet`, the restart/duplicate
-E2E, and any further explicit documented development-only limitations remain
-the Developer MVP Gate's next slices (see `TODO.md#developer-mvp-gate`).
+The restart/duplicate E2E is implemented As-Is (see
+`apps/cli/tests/devnet_restart_duplicate_e2e.rs` and "Local devnet
+architecture" above). Under the CLI-first production-strategy pivot (DR-0085),
+`clients/typescript`, `apps/explorer`, and `apps/wallet` remain deferred until
+the CLI-First Node Production Gate passes (see
+`TODO.md#cli-developer-mvp-gate` and `TODO.md#cli-first-node-production-gate`).
 
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
@@ -3105,11 +3113,21 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   `apps/wallet` until real duplication between the two actually exists.
 
   **Developer MVP order.** Developer MVP completion order (see
-  `TODO.md#developer-mvp-gate`) is: local devnet, bounded query API, Rust
+  `TODO.md#cli-developer-mvp-gate`) is: local devnet, bounded query API, Rust
   client, Rust CLI, TypeScript client, explorer, wallet, restart/duplicate
   E2E, and explicit documented development-only limitations. This replaces
   DR-0080's earlier "TypeScript client + counter demo UI" pairing; no
   `demo/counter` directory is created.
+
+  **Amendment: gate renamed and resequenced by DR-0085.** The monorepo
+  layout, uniform fungible asset model, local devnet module, and deferred
+  scope stated in this entry are unchanged. Only the ordering statement
+  immediately above is resequenced: DR-0085 renames the gate this order
+  belongs to `CLI Developer MVP Gate`, keeps this entry's `clients/typescript`/
+  `apps/explorer`/`apps/wallet` steps verbatim as still-required future work,
+  and defers starting them until a new `CLI-First Node Production Gate`
+  passes. The `local devnet, bounded query API, Rust client, Rust CLI,
+  restart/duplicate E2E` prefix of this order is implemented As-Is.
 
   **Uniform fungible asset model.** Every asset, including any future fee
   asset, uses exactly one `AssetId`/account/transfer implementation path.
@@ -3196,3 +3214,114 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   and argument frame) live only in `apps/cli`'s `transfer` command; the small
   generic re-exports `clients/rust` adds to support it add no application
   semantics of their own.
+- DR-0085: Adopt a CLI-first production strategy and add the CLI-First Node
+  Production Gate. This is a sequencing decision, not a scope change: it
+  reorders when work starts, and it does not complete, delete, weaken, or
+  reinterpret any existing production criterion anywhere in `TODO.md`,
+  `PERSISTENCE.md`, or `POSTGRES.md`.
+
+  **Rationale.** The Developer MVP Gate (DR-0076, resequenced by DR-0081) put
+  a browser-facing product surface (TypeScript client, explorer, wallet) in
+  the same near-term gate as the node's own core capabilities (local devnet,
+  owned-object execution, bounded query API, Rust client, Rust CLI,
+  restart/duplicate E2E). That framing under-weighted the fact that the node
+  itself — persistence, operations, and release evidence — is far short of
+  the production posture `TODO.md`'s Phase 15 To-Be exit criteria already
+  require, while a browser UI cannot usefully exercise a node that is not
+  itself production-oriented. This decision narrows the near-term gate to the
+  node/client/CLI capabilities that are implementable and independently
+  verifiable today, renames it to make that narrowing explicit, and inserts
+  an explicit node-production gate between it and the deferred browser
+  surface.
+
+  **Gate rename and resequencing.** The gate defined in `TODO.md` is renamed
+  `CLI Developer MVP Gate`. Its criteria 1-6, 10, and 11 (local devnet,
+  authenticated owned-object Read/Write/Consume, preinstalled deterministic
+  WASM execution, bounded query API, Rust client library, Rust-only CLI,
+  restart/duplicate E2E, and explicit non-production limitations) remain the
+  near-term gate. Its criteria 7-9 (TypeScript client, explorer, wallet) are
+  kept verbatim — not completed, not deleted, not weakened — and are
+  explicitly deferred/resequenced to start only after the new CLI-First Node
+  Production Gate below passes (see the "Amendment: gate renamed and
+  resequenced by DR-0085" note on DR-0081's "Developer MVP order" above).
+
+  **Current implementation status (2026-09-01).** The CLI Developer MVP Gate's
+  criteria 1-6, 10, and 11 are implemented and validated As-Is, so that gate
+  has passed without making a production-readiness claim. S0 below is also
+  implemented As-Is. The current implementation priority is S1; S2-S5 remain
+  ordered successors, and the TypeScript client/explorer/wallet surface remains
+  deferred until the complete CLI-First Node Production Gate passes.
+
+  **CLI-First Node Production Gate.** This new gate sits between the CLI
+  Developer MVP Gate and the deferred browser surface. It is a real
+  node/persistence/operations gate, not client-library work, and it is
+  defined entirely by reference to existing, unchanged criteria:
+  `TODO.md`'s Phase 15 To-Be production exit criteria (1-10); the Post-MVP
+  Production Hardening Phase 15 persistence implementation order (steps
+  1-6, covering the durable domain adapter boundary, the indexed due-outbox
+  repository, the normalized PostgreSQL structured-durable schema and its
+  shared conformance suite, real host/power-fault and capacity/backup
+  rehearsal evidence, and real Cloudflare Durable Object/AWS provider
+  certification); the cross-phase production release gate; the existing hard
+  activation constraint that protocol version 3's live activation stays
+  prohibited until fee, module/object-effect, and `FastCertificate` atomic
+  composition is complete; and the existing hard activation constraint that
+  every externally accepted node-event family other than `SubmitTransaction`
+  (especially certificate, protocol-upgrade, and validator-set-change events)
+  needs its own authenticated/authorized ingress boundary before live
+  activation. Passing this gate is explicitly **not** mainnet readiness:
+  Phase 16 (Cloudflare) and Phase 17 (Deno/Vercel/Supabase/AWS) To-Be
+  production exit criteria and an independent security audit remain required
+  afterward, unchanged.
+
+  **Ordered slices.** The CLI-First Node Production Gate's work is sequenced
+  as S0-S5 (see `TODO.md#cli-first-node-production-gate`):
+
+  - S0: an automated restart/duplicate E2E, plus a separate documented
+    command sequence that reproduces the local devnet/CLI experience (start,
+    transfer, receipt, orderly restart, persisted state) by hand — not the
+    raw byte-identical duplicate replay itself, which only the automated E2E
+    proves (implemented As-Is by this decision; see criterion 10,
+    `apps/cli/tests/devnet_restart_duplicate_e2e.rs`, and README "Run the
+    local devnet and CLI").
+  - S1: remote TLS transport and mandatory trusted protocol-context
+    validation before signing, as two separate concerns. The transport
+    performs normal TLS server-identity and hostname validation under an
+    explicit trust policy (for example, system CA plus hostname validation,
+    or an explicitly configured CA/anchor); this does not require brittle
+    leaf-certificate pinning as the only valid TLS trust design. Separately,
+    because a successful TLS handshake authenticates the transport endpoint,
+    not the protocol context, a valid TLS connection alone does not prove
+    the remote server speaks the client's intended chain/protocol and does
+    not by itself prevent cross-chain signing. The client/CLI must therefore
+    require a locally configured expected chain identity and protocol
+    policy, and compare the remote `/v1/context` result's chain id, protocol
+    version, epoch policy, signature scheme, address binding, and
+    transaction auth profile against that expectation before any signing
+    occurs.
+  - S2: cross-owner transfer (destination-owner authorization and object
+    owner changes) on the existing owned-effects path.
+  - S3: fees and gas metering, completed before the devnet's fee-free posture
+    is exposed to public live ingress.
+  - S4: a secure signer replacing today's development-only `LocalSigner`, and
+    a real dedicated Sunrise Edge Ledger integration (see "Rust client
+    external-signer boundary and Developer MVP CLI" and DR-0084; existing
+    Solana/Ethereum Ledger apps are never reused).
+  - S5: production persistence, outbox operation, provider deployment
+    (Cloudflare Durable Object/AWS), operations (observability, runbooks),
+    security (independent audit), and release evidence (migration/backup/
+    disaster-recovery rehearsal, reproducible build) — i.e., the Post-MVP
+    Production Hardening persistence implementation order above.
+
+  Capacity/load/soak, PITR, and HA/failover evidence stay frozen exactly as
+  the existing freeze already states, until S5's own certification or an SLO
+  actually requires one of them; this decision does not add or relax that
+  freeze.
+
+  **Production target.** The conservative production target this gate and
+  the existing validator-set/consensus criteria are sequenced toward is a
+  multi-validator L1, not a permanently single-operator service. Nothing in
+  this decision narrows validator-set, bond, or consensus criteria to a
+  single-validator design; the devnet's current single-validator posture
+  remains an explicit MVP-only limitation (see "Local devnet architecture"
+  above), not the production target.
