@@ -136,11 +136,12 @@ fn is_unicode_format_character(character: char) -> bool {
             // (Kaithi, supplementary plane).
             | '\u{110BD}'
             | '\u{110CD}'
-            // U+13430..U+1343F the Egyptian Hieroglyph format controls —
-            // the full Unicode 16.0 block, including the U+13439..U+1343F
-            // enclosure/insertion/mirroring controls added after Unicode
-            // 15.0's initial U+13430..U+13438 (Egyptian Hieroglyph Format
-            // Controls, supplementary plane).
+            // U+13430..U+1343F the Egyptian Hieroglyph format controls
+            // (Egyptian Hieroglyph Format Controls, supplementary plane),
+            // assigned across three Unicode versions: U+13430..U+13438 in
+            // Unicode 12.0, U+13439..U+1343B in Unicode 15.0, and
+            // U+1343C..U+1343F in Unicode 16.0 — the full block is `Cf` as
+            // of Unicode 16.0.
             | '\u{13430}'..='\u{1343F}'
             // U+1BCA0..U+1BCA3 the Duployan shorthand format controls
             // (Shorthand Format Controls, supplementary plane).

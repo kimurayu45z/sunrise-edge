@@ -1796,11 +1796,12 @@ implemented or claimed here.
 
 `apps/cli` is a new, additive, Rust-only Developer MVP CLI with exactly one
 non-development/runtime dependency: `sunrise-edge-client`. (`Cargo.toml` also
-declares a handful of `[dev-dependencies]` — `objects`, `runtime`,
-`native-http`, `sunrise-edge-devnet`, `tokio` — used only to compose a real
-local devnet and build canonical test fixtures directly in this crate's own
-test suite; none of them are reachable from `main`, `lib`, or any non-test
-build.) It has no Node/browser runtime, no argument-parsing crate (flags are
+declares a handful of `[dev-dependencies]` — `execution`, `native-http`,
+`objects`, `runtime`, `sunrise-edge-devnet`, `tokio` — used only to compose a
+real local devnet, build canonical test fixtures, and build a decoded
+execution-effects fixture directly in this crate's own test suite; none of
+them are reachable from `main`, `lib`, or any non-test build.) It has no
+Node/browser runtime, no argument-parsing crate (flags are
 parsed by a small hand-written, strict `--flag value` parser that rejects
 duplicates, unknown flags, and any non-flag/extra positional token), no
 `unsafe` (`#![forbid(unsafe_code)]`), and no independent canonical
@@ -1863,6 +1864,17 @@ submits it with an explicit, caller-supplied non-zero request id. Every
 asset, including this one, uses the same uniform `AssetId`/account/transfer
 path — there is no native-coin or fee special case, and cross-owner transfer
 remains fail-closed on the existing owned-effects path (see DR-0081).
+`transfer` treats the submission itself as fail-closed, not merely the
+queries that precede it: an empty submit-result `responses()` list, any
+response declaring `NodeResponseStatus::Rejected`, and any response whose
+payload decodes to `ExecutionStatus::Failure` (even one the node accepted at
+the node-core level) are each a typed, non-zero-exit `CliError` — this
+command never reports a rejected or failed transaction as success. Every
+response's diagnostics are printed before the command exits — the failure
+is detected while iterating, not by inspecting `responses()` up front — and
+`--wait` is never entered once any response has failed this way, so a
+rejected or failed submission can never be turned into an apparent success
+by also requesting `--wait`.
 Waiting for the resulting receipt is optional (`--wait`) and, when
 requested, every one of `--wait-max-attempts`, `--wait-initial-backoff-ms`,
 `--wait-max-backoff-ms`, and `--wait-max-elapsed-ms` must also be supplied —

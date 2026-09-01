@@ -1951,8 +1951,9 @@ explicit dev limitations）:
    restart E2Eはcriterion 10へ残る。
 8. criterion 6の`apps/cli`を、実行時（non-dev）の直接依存が`clients/rust`のみのRust-only
    binaryとして実装した（`Cargo.toml`の`[dev-dependencies]`にはtest専用でreal devnetの
-   composeとfixture構築のためだけの`objects`/`runtime`/`native-http`/`sunrise-edge-devnet`/
-   `tokio`があるが、いずれもnon-test buildからは到達できない。implemented As-Is;
+   composeとfixture構築、および decoded execution-effects fixtureの構築のためだけの
+   `execution`/`objects`/`runtime`/`native-http`/`sunrise-edge-devnet`/`tokio`が
+   あるが、いずれもnon-test buildからは到達できない。implemented As-Is;
    ARCHITECTURE.md DR-0084）。Node/browser runtime、独自canonical codec、
    独自signing/RPC pathは導入していない。引数parsingはclap等を使わない小さな手書きの
    strict `--flag value` parserで、duplicate flag・unknown flag・flag値なし・宣言外の
@@ -1973,7 +1974,18 @@ explicit dev limitations）:
    `clients/rust`経由でtransactionをbuild・signし、caller指定のnon-zero request idで
    submitする。あらゆるassetは同一の`AssetId`/account/transfer pathを使い、native coinや
    feeの特別扱いは無く、cross-owner transferは既存のowned-effects pathの上で引き続き
-   fail closedのままである（DR-0081参照）。receiptのwaitは`--wait`で明示的に有効化した
+   fail closedのままである（DR-0081参照）。`transfer`はsubmission自体もfail closedとして
+   扱い、それはsubmissionに先立つqueryだけではない：submit resultの`responses()`が
+   空である場合、いずれかのresponseが`NodeResponseStatus::Rejected`を宣言している場合、
+   およびいずれかのresponseのpayloadがdecodeした結果`ExecutionStatus::Failure`である場合
+   （node-coreレベルでacceptされたresponseであっても）は、それぞれtypedでnon-zero exitの
+   `CliError`となる——このコマンドはrejectされたtransactionやfailしたtransactionを
+   successとして報告することは無い。すべてのresponseのdiagnosticsはコマンドが終了する前に
+   printされる（`responses()`を事前に検査するのではなく、iteration中に検出する）。
+   そして、いずれかのresponseがこの意味でfailした場合、`--wait`には決して入らないため、
+   `--wait`を同時に指定してもrejectされた・failしたsubmissionをapparent successへ
+   変えることはできない。
+   receiptのwaitは`--wait`で明示的に有効化した
    場合のみ行い、その際は`--wait-max-attempts`/`--wait-initial-backoff-ms`/
    `--wait-max-backoff-ms`/`--wait-max-elapsed-ms`をすべて明示的に指定する必要があり、
    隠れたdefault poll boundは無い（`--wait`無しでwait-bound flagだけを渡すのも拒否する）。

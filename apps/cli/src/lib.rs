@@ -37,12 +37,12 @@ pub use error::CliError;
 ///
 /// The message is sanitized (control characters, including newlines,
 /// Unicode bidirectional/format characters, and Unicode line/paragraph
-/// separators, collapsed to spaces — see [`output::sanitize_line`]) so
+/// separators, collapsed to spaces — see `output::sanitize_line`) so
 /// untrusted, server-derived text embedded in an error — for example an
 /// HTTP error response body echoed back verbatim in
 /// [`sunrise_edge_client::ClientError::UnexpectedStatus`] — cannot inject
 /// additional terminal lines or visually reorder/hide output. The sanitized
-/// message is also bounded to [`output::MAX_ERROR_MESSAGE_CHARS`]; a
+/// message is also bounded to `output::MAX_ERROR_MESSAGE_CHARS`; a
 /// truncated message is explicitly marked so it is never mistaken for the
 /// complete message.
 #[must_use]
