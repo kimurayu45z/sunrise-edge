@@ -16,7 +16,18 @@
 //! [`transport::LoopbackHttpTransport`] is a strict, synchronous,
 //! loopback-only HTTP/1.1 implementation for local development; the
 //! [`transport::Transport`] trait exists so tests and other embedders can
-//! supply a deterministic fake instead.
+//! supply a deterministic fake instead. `LoopbackHttpTransport` speaks
+//! plaintext HTTP/1.1 only; remote TLS transport is a separate, not-yet-
+//! implemented `CLI-First Node Production Gate` S1 slice (see
+//! `ARCHITECTURE.md` DR-0085).
+//!
+//! [`context::ExpectedProtocolContext`] implements that same S1 slice's
+//! other, separate concern: a mandatory, locally trusted expected-
+//! protocol-context check ([`Client::query_verified_context`]) that a
+//! caller must perform before any nonce/object query or signing, since a
+//! successful transport connection — including a future TLS one — proves
+//! only that the client reached some server holding a trusted key for that
+//! hostname, never that it is the caller's intended chain/protocol.
 //!
 //! This client keeps `ProtocolConfig` bytes opaque, requires the caller to
 //! supply module/object references and the active signature scheme, never
@@ -33,6 +44,7 @@
 //! crate is ready for that boundary without weakening today's signing path.
 
 pub mod client;
+pub mod context;
 pub mod error;
 pub mod key;
 pub mod support;
@@ -40,6 +52,7 @@ pub mod transaction;
 pub mod transport;
 
 pub use client::{Client, ReceiptPollBounds, SubmitTransactionRequest};
+pub use context::{ExpectedProtocolContext, ExpectedProtocolContextError, ProtocolContextMismatch};
 pub use error::ClientError;
 pub use key::LocalSigner;
 pub use support::{

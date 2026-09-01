@@ -14,6 +14,7 @@ use node_wire::{
 use objects::{Address, ObjectId};
 use protocol_types::{ChainId, Epoch, ProtocolVersion};
 
+use crate::context::ExpectedProtocolContext;
 use crate::error::ClientError;
 use crate::transport::{Method, Transport, WireRequest};
 
@@ -80,6 +81,22 @@ where
     pub fn query_context(&self) -> Result<HttpContextQueryResult, ClientError> {
         let body = self.get(QUERY_CONTEXT_PATH)?;
         Ok(HttpContextQueryResult::decode(&body)?)
+    }
+
+    /// Queries `GET /v1/context` and requires every field
+    /// [`ExpectedProtocolContext`] covers to match before returning it (see
+    /// `ARCHITECTURE.md` DR-0085 / `TODO.md` CLI-First Node Production Gate
+    /// S1). This is the mandatory trusted-context check callers must perform
+    /// before any nonce/object query or signing: a successful transport
+    /// connection alone — TLS or otherwise — never establishes that the
+    /// remote server actually speaks the caller's intended chain/protocol.
+    pub fn query_verified_context(
+        &self,
+        expected: &ExpectedProtocolContext,
+    ) -> Result<HttpContextQueryResult, ClientError> {
+        let context = self.query_context()?;
+        expected.verify(&context)?;
+        Ok(context)
     }
 
     /// Queries `GET /v1/objects/{object_id}`.
@@ -489,6 +506,80 @@ mod tests {
 
         let error = client.query_context().unwrap_err();
         assert!(matches!(error, ClientError::UnexpectedContentType { .. }));
+    }
+
+    fn sample_expected_context() -> crate::context::ExpectedProtocolContext {
+        crate::context::ExpectedProtocolContext::new(
+            ChainId::new("sunrise-devnet").unwrap(),
+            ProtocolVersion::new(3),
+            Epoch::new(5),
+            protocol_types::HashSuiteId::new(1),
+            1,
+            1,
+            1,
+            protocol_types::AtomicityDomainId::new([0x44; 32]).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn sample_matching_context_result() -> HttpContextQueryResult {
+        HttpContextQueryResult::new(
+            ChainId::new("sunrise-devnet").unwrap(),
+            ProtocolVersion::new(3),
+            Epoch::new(5),
+            protocol_types::HashSuiteId::new(1),
+            1,
+            1,
+            1,
+            protocol_types::AtomicityDomainId::new([0x44; 32]).unwrap(),
+            vec![0xAA],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn query_verified_context_returns_the_context_on_an_exact_match() {
+        let transport = FakeTransport::new(vec![ok_response(
+            QUERY_RESULT_MEDIA_TYPE,
+            sample_matching_context_result().encode().unwrap(),
+        )]);
+        let client = Client::new(transport);
+
+        let result = client
+            .query_verified_context(&sample_expected_context())
+            .unwrap();
+        assert_eq!(result, sample_matching_context_result());
+    }
+
+    #[test]
+    fn query_verified_context_rejects_a_mismatched_chain_id() {
+        let mismatched = HttpContextQueryResult::new(
+            ChainId::new("some-other-chain").unwrap(),
+            ProtocolVersion::new(3),
+            Epoch::new(5),
+            protocol_types::HashSuiteId::new(1),
+            1,
+            1,
+            1,
+            protocol_types::AtomicityDomainId::new([0x44; 32]).unwrap(),
+            vec![0xAA],
+        )
+        .unwrap();
+        let transport = FakeTransport::new(vec![ok_response(
+            QUERY_RESULT_MEDIA_TYPE,
+            mismatched.encode().unwrap(),
+        )]);
+        let client = Client::new(transport);
+
+        let error = client
+            .query_verified_context(&sample_expected_context())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::ProtocolContextMismatch(
+                crate::context::ProtocolContextMismatch::ChainId { .. }
+            )
+        ));
     }
 
     #[test]

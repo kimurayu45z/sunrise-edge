@@ -22,11 +22,15 @@ use sunrise_edge_client::{Client, LoopbackHttpTransport, ObjectId, decode_object
 use sunrise_edge_devnet::{
     ASSET_ACCOUNT_WASM, AssetAccount, DevOwner, DevnetConfig, boot_local_store, build_asset_module,
     build_devnet_protocol_context, compose_devnet_router, decode_asset_account,
+    genesis::{DEVNET_DOMAIN_BYTES, DEVNET_PROTOCOL_VERSION},
     seed_asset_accounts,
 };
 
 const INITIAL_SOURCE_BALANCE: u64 = 1_000_000;
 const TRANSFER_AMOUNT: u64 = 250;
+const EXPECTED_CHAIN_ID: &str = "cli-transfer-e2e-devnet";
+const EXPECTED_EPOCH: &str = "11";
+const EXPECTED_HASH_SUITE_ID: &str = "1";
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -221,6 +225,16 @@ async fn cli_transfer_command_moves_balance_through_the_real_devnet_router_over_
             OsString::from("1000000"),
             OsString::from("--request-id"),
             OsString::from("50".repeat(32)),
+            OsString::from("--expected-chain-id"),
+            OsString::from(EXPECTED_CHAIN_ID),
+            OsString::from("--expected-protocol-version"),
+            OsString::from(DEVNET_PROTOCOL_VERSION.get().to_string()),
+            OsString::from("--expected-epoch"),
+            OsString::from(EXPECTED_EPOCH),
+            OsString::from("--expected-hash-suite-id"),
+            OsString::from(EXPECTED_HASH_SUITE_ID),
+            OsString::from("--expected-domain"),
+            OsString::from(hex32(&DEVNET_DOMAIN_BYTES)),
             OsString::from("--wait"),
             OsString::from("--wait-max-attempts"),
             OsString::from("20"),

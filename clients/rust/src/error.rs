@@ -8,6 +8,7 @@ use node_core::RequestId;
 use objects::{Address, ObjectId};
 use protocol_types::SignatureSchemeId;
 
+use crate::context::ProtocolContextMismatch;
 use crate::transport::TransportError;
 
 /// Errors returned by the Sunrise Edge Rust client.
@@ -38,6 +39,12 @@ pub enum ClientError {
     },
     /// Canonical query-result encoding or decoding failed.
     Wire(node_wire::QueryResultError),
+    /// A remote `/v1/context` result did not match the caller's locally
+    /// configured [`crate::context::ExpectedProtocolContext`] (see
+    /// `ARCHITECTURE.md` DR-0085 / `TODO.md` CLI-First Node Production Gate
+    /// S1). This is the mandatory pre-signing trusted-context check: a
+    /// successful transport connection alone never establishes this.
+    ProtocolContextMismatch(ProtocolContextMismatch),
     /// Canonical event/result envelope encoding or decoding failed.
     Contract(node_wire::HttpContractError),
     /// A node-core canonical type failed to encode, decode, or validate.
@@ -118,6 +125,7 @@ impl fmt::Display for ClientError {
                 "unexpected content type: expected {expected}, got {actual:?}"
             ),
             Self::Wire(error) => write!(f, "query result codec error: {error}"),
+            Self::ProtocolContextMismatch(error) => write!(f, "{error}"),
             Self::Contract(error) => write!(f, "event result codec error: {error}"),
             Self::NodeCore(error) => write!(f, "node-core validation error: {error}"),
             Self::Execution(error) => write!(f, "transaction codec error: {error}"),
@@ -161,6 +169,7 @@ impl Error for ClientError {
         match self {
             Self::Transport(error) => Some(error),
             Self::Wire(error) => Some(error),
+            Self::ProtocolContextMismatch(error) => Some(error),
             Self::Contract(error) => Some(error),
             Self::NodeCore(error) => Some(error),
             Self::Execution(error) => Some(error),
@@ -188,6 +197,12 @@ impl From<TransportError> for ClientError {
 impl From<node_wire::QueryResultError> for ClientError {
     fn from(value: node_wire::QueryResultError) -> Self {
         Self::Wire(value)
+    }
+}
+
+impl From<ProtocolContextMismatch> for ClientError {
+    fn from(value: ProtocolContextMismatch) -> Self {
+        Self::ProtocolContextMismatch(value)
     }
 }
 

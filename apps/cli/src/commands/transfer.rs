@@ -8,13 +8,24 @@
 //! canonical-struct and access-manifest surface `clients/rust` re-exports
 //! (DR-0084).
 //!
-//! It queries authoritative context first and validates, before any
-//! nonce/object query or signing, that the committed transaction-auth
-//! profile id, signature scheme, and address binding are all the ones this
-//! client implements (the single committed profile id, `Ed25519`, and
-//! `AddressIsPublicKey`); an unknown profile id is rejected there even
-//! though it happens to pair a known scheme/binding. It then queries the
-//! signer's next nonce (checking its epoch agrees with the context's before
+//! It queries authoritative context first and, before any nonce/object
+//! query or signing, requires the trusted `/v1/context` result to exactly
+//! match a locally configured [`sunrise_edge_client::ExpectedProtocolContext`]
+//! (see `ARCHITECTURE.md` DR-0085 / `TODO.md` CLI-First Node Production Gate
+//! S1a): the caller-supplied `--expected-chain-id`, `--expected-protocol-
+//! version`, `--expected-epoch`, `--expected-hash-suite-id`, and
+//! `--expected-domain` flags, plus the transaction-auth profile id,
+//! signature scheme, and address binding this client actually implements
+//! (the single committed profile id, `Ed25519`, and `AddressIsPublicKey`).
+//! A remote result matching a known scheme/binding under an unexpected
+//! profile id is still rejected, since the profile id itself is compared.
+//! This is a mandatory pre-signing check, independent of transport trust: a
+//! successful connection (loopback today; TLS in a later S1 slice) never by
+//! itself proves the remote server speaks this client's intended
+//! chain/protocol.
+//!
+//! Once the context is verified, this command queries the signer's next
+//! nonce (checking its epoch agrees with the verified context's before
 //! proceeding) and both current-inline object references, decoding each
 //! object's canonical body and requiring its owner to be the local signer's
 //! own address (defense in depth alongside the server's own fail-closed
@@ -29,12 +40,13 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use sunrise_edge_client::{
-    AccessEntry, AccessManifest, AccessMode, Address, CanonicalStruct, Client, Digest32,
-    ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID, ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
-    ExecutionEffects, ExecutionStatus, HashAlgorithmId, LocalSigner, NodeResponseStatus,
-    ObjectEffect, ObjectId, ObjectRef, Owner, ReceiptPollBounds, RequestId, SignatureSchemeId,
-    SubmitTransactionRequest, TransactionRequest, Transport, build_signed_transaction,
-    decode_object,
+    AccessEntry, AccessManifest, AccessMode, Address, AtomicityDomainId, CanonicalStruct, ChainId,
+    Client, Digest32, ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+    ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID, Epoch, ExecutionEffects, ExecutionStatus,
+    ExpectedProtocolContext, HashAlgorithmId, HashSuiteId, LocalSigner, NodeResponseStatus,
+    ObjectEffect, ObjectId, ObjectRef, Owner, ProtocolVersion, ReceiptPollBounds, RequestId,
+    SignatureSchemeId, SubmitTransactionRequest, TransactionRequest, Transport,
+    build_signed_transaction, decode_object,
 };
 
 use crate::args::{ParsedArgs, parse_flags, scalar, switch};
@@ -56,6 +68,11 @@ const DESTINATION_OBJECT: &str = "--destination-object";
 const AMOUNT: &str = "--amount";
 const GAS_LIMIT: &str = "--gas-limit";
 const REQUEST_ID: &str = "--request-id";
+const EXPECTED_CHAIN_ID: &str = "--expected-chain-id";
+const EXPECTED_PROTOCOL_VERSION: &str = "--expected-protocol-version";
+const EXPECTED_EPOCH: &str = "--expected-epoch";
+const EXPECTED_HASH_SUITE_ID: &str = "--expected-hash-suite-id";
+const EXPECTED_DOMAIN: &str = "--expected-domain";
 const WAIT: &str = "--wait";
 const WAIT_MAX_ATTEMPTS: &str = "--wait-max-attempts";
 const WAIT_INITIAL_BACKOFF_MS: &str = "--wait-initial-backoff-ms";
@@ -78,6 +95,7 @@ struct TransferInputs {
     amount: u64,
     gas_limit: u64,
     request_id: RequestId,
+    expected_context: ExpectedProtocolContext,
     wait_bounds: Option<ReceiptPollBounds>,
 }
 
@@ -100,6 +118,11 @@ where
             scalar(AMOUNT),
             scalar(GAS_LIMIT),
             scalar(REQUEST_ID),
+            scalar(EXPECTED_CHAIN_ID),
+            scalar(EXPECTED_PROTOCOL_VERSION),
+            scalar(EXPECTED_EPOCH),
+            scalar(EXPECTED_HASH_SUITE_ID),
+            scalar(EXPECTED_DOMAIN),
             switch(WAIT),
             scalar(WAIT_MAX_ATTEMPTS),
             scalar(WAIT_INITIAL_BACKOFF_MS),
@@ -141,6 +164,7 @@ fn parse_inputs(parsed: &ParsedArgs) -> Result<TransferInputs, CliError> {
         return Err(CliError::ZeroGasLimit);
     }
     let request_id = RequestId::new(decode_hex_32(REQUEST_ID, parsed.require(REQUEST_ID)?)?)?;
+    let expected_context = parse_expected_context(parsed)?;
     let wait_bounds = parse_wait_bounds(parsed)?;
 
     Ok(TransferInputs {
@@ -150,8 +174,43 @@ fn parse_inputs(parsed: &ParsedArgs) -> Result<TransferInputs, CliError> {
         amount,
         gas_limit,
         request_id,
+        expected_context,
         wait_bounds,
     })
+}
+
+/// Parses the required `--expected-*` flags into a locally trusted
+/// [`ExpectedProtocolContext`] (see `ARCHITECTURE.md` DR-0085), rejecting a
+/// missing, zero, or malformed value before any network dispatch. The
+/// transaction-auth profile id, signature scheme, and address binding
+/// expectations come from this client's own implemented constants, not from
+/// a flag — there is only one implemented combination — but they are still
+/// compared against the remote result by
+/// [`ExpectedProtocolContext::verify`].
+fn parse_expected_context(parsed: &ParsedArgs) -> Result<ExpectedProtocolContext, CliError> {
+    let chain_id = ChainId::new(parsed.require(EXPECTED_CHAIN_ID)?)?;
+    let protocol_version = ProtocolVersion::new(parse_u32(
+        EXPECTED_PROTOCOL_VERSION,
+        parsed.require(EXPECTED_PROTOCOL_VERSION)?,
+    )?);
+    let epoch = Epoch::new(parse_u64(EXPECTED_EPOCH, parsed.require(EXPECTED_EPOCH)?)?);
+    let hash_suite_id = HashSuiteId::new(parse_u16(
+        EXPECTED_HASH_SUITE_ID,
+        parsed.require(EXPECTED_HASH_SUITE_ID)?,
+    )?);
+    let domain_bytes = decode_hex_32(EXPECTED_DOMAIN, parsed.require(EXPECTED_DOMAIN)?)?;
+    let domain = AtomicityDomainId::new(domain_bytes)?;
+
+    Ok(ExpectedProtocolContext::new(
+        chain_id,
+        protocol_version,
+        epoch,
+        hash_suite_id,
+        ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
+        SignatureSchemeId::Ed25519.as_u16(),
+        ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+        domain,
+    )?)
 }
 
 fn execute<T>(
@@ -164,22 +223,7 @@ where
 {
     let sender = signer.address();
 
-    let context = client.query_context()?;
-    if context.signature_scheme_id() != SignatureSchemeId::Ed25519.as_u16() {
-        return Err(CliError::UnsupportedSignatureScheme(
-            context.signature_scheme_id(),
-        ));
-    }
-    if context.address_binding_id() != ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID {
-        return Err(CliError::UnsupportedAddressBinding(
-            context.address_binding_id(),
-        ));
-    }
-    if context.transaction_auth_profile_id() != ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID {
-        return Err(CliError::UnsupportedAuthProfile(
-            context.transaction_auth_profile_id(),
-        ));
-    }
+    let context = client.query_verified_context(&inputs.expected_context)?;
 
     let nonce_result = client.query_next_nonce(sender)?;
     if nonce_result.epoch() != context.epoch() {
@@ -530,13 +574,27 @@ mod tests {
     use super::*;
     use crate::test_support::{FakeTransport, node_result_ok, query_ok};
     use sunrise_edge_client::{
-        AtomicityDomainId, ChainId, Epoch, HashSuiteId, HttpContextQueryResult,
+        AtomicityDomainId, ChainId, ClientError, Epoch, HashSuiteId, HttpContextQueryResult,
         HttpNextNonceQueryResult, HttpNodeResult, HttpObjectQueryResult, NodeResponse,
-        ProtocolVersion,
+        ProtocolContextMismatch, ProtocolVersion,
     };
 
     fn sample_signer() -> LocalSigner {
         LocalSigner::from_seed([0x77; 32])
+    }
+
+    fn sample_expected_context() -> ExpectedProtocolContext {
+        ExpectedProtocolContext::new(
+            ChainId::new("transfer-test-chain").unwrap(),
+            ProtocolVersion::new(3),
+            Epoch::new(5),
+            HashSuiteId::new(1),
+            ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
+            SignatureSchemeId::Ed25519.as_u16(),
+            ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+            AtomicityDomainId::new([0x44; 32]).unwrap(),
+        )
+        .unwrap()
     }
 
     fn sample_inputs() -> TransferInputs {
@@ -551,6 +609,7 @@ mod tests {
             amount: 250,
             gas_limit: 1_000,
             request_id: RequestId::new([0x30; 32]).unwrap(),
+            expected_context: sample_expected_context(),
             wait_bounds: None,
         }
     }
@@ -763,10 +822,146 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn execute_rejects_an_unsupported_signature_scheme() {
+    /// Runs `execute` against a `/v1/context` response that mismatches
+    /// `sample_expected_context()` in exactly one field, and proves it stops
+    /// after only that one context request — never issuing a second
+    /// (nonce/object/submit) request — before returning the expected
+    /// [`ProtocolContextMismatch`] variant.
+    ///
+    /// Only the context response is scripted: if `execute` dispatched a
+    /// second request, the fake transport would return
+    /// `RequestDeadlineExceeded` for it instead, and either the error match
+    /// or the request-count assertion below would fail.
+    fn assert_context_mismatch_stops_before_further_dispatch(
+        mismatched_context: HttpContextQueryResult,
+        matches_expected_variant: impl Fn(&ProtocolContextMismatch) -> bool,
+    ) {
         let signer = sample_signer();
         let inputs = sample_inputs();
+
+        let transport = FakeTransport::new(vec![query_ok(mismatched_context.encode().unwrap())]);
+        let client = Client::new(transport);
+
+        let error = execute(&client, &signer, inputs).unwrap_err();
+        match error {
+            CliError::Client(boxed) => match *boxed {
+                ClientError::ProtocolContextMismatch(mismatch) => {
+                    assert!(
+                        matches_expected_variant(&mismatch),
+                        "unexpected mismatch variant: {mismatch:?}"
+                    );
+                }
+                other => panic!("expected ProtocolContextMismatch, got {other:?}"),
+            },
+            other => panic!("expected CliError::Client(ProtocolContextMismatch), got {other:?}"),
+        }
+        assert_eq!(client.transport().requests().len(), 1);
+    }
+
+    #[test]
+    fn execute_rejects_a_mismatched_chain_id_before_any_later_dispatch() {
+        let context = HttpContextQueryResult::new(
+            ChainId::new("some-other-chain").unwrap(),
+            ProtocolVersion::new(3),
+            Epoch::new(5),
+            HashSuiteId::new(1),
+            1,
+            SignatureSchemeId::Ed25519.as_u16(),
+            ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+            AtomicityDomainId::new([0x44; 32]).unwrap(),
+            vec![0xAA],
+        )
+        .unwrap();
+        assert_context_mismatch_stops_before_further_dispatch(context, |mismatch| {
+            matches!(mismatch, ProtocolContextMismatch::ChainId { .. })
+        });
+    }
+
+    #[test]
+    fn execute_rejects_a_mismatched_protocol_version_before_any_later_dispatch() {
+        let context = HttpContextQueryResult::new(
+            ChainId::new("transfer-test-chain").unwrap(),
+            ProtocolVersion::new(4),
+            Epoch::new(5),
+            HashSuiteId::new(1),
+            1,
+            SignatureSchemeId::Ed25519.as_u16(),
+            ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+            AtomicityDomainId::new([0x44; 32]).unwrap(),
+            vec![0xAA],
+        )
+        .unwrap();
+        assert_context_mismatch_stops_before_further_dispatch(context, |mismatch| {
+            matches!(mismatch, ProtocolContextMismatch::ProtocolVersion { .. })
+        });
+    }
+
+    #[test]
+    fn execute_rejects_a_mismatched_epoch_before_any_later_dispatch() {
+        let context = HttpContextQueryResult::new(
+            ChainId::new("transfer-test-chain").unwrap(),
+            ProtocolVersion::new(3),
+            Epoch::new(6),
+            HashSuiteId::new(1),
+            1,
+            SignatureSchemeId::Ed25519.as_u16(),
+            ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+            AtomicityDomainId::new([0x44; 32]).unwrap(),
+            vec![0xAA],
+        )
+        .unwrap();
+        assert_context_mismatch_stops_before_further_dispatch(context, |mismatch| {
+            matches!(mismatch, ProtocolContextMismatch::Epoch { .. })
+        });
+    }
+
+    #[test]
+    fn execute_rejects_a_mismatched_hash_suite_id_before_any_later_dispatch() {
+        let context = HttpContextQueryResult::new(
+            ChainId::new("transfer-test-chain").unwrap(),
+            ProtocolVersion::new(3),
+            Epoch::new(5),
+            HashSuiteId::new(2),
+            1,
+            SignatureSchemeId::Ed25519.as_u16(),
+            ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+            AtomicityDomainId::new([0x44; 32]).unwrap(),
+            vec![0xAA],
+        )
+        .unwrap();
+        assert_context_mismatch_stops_before_further_dispatch(context, |mismatch| {
+            matches!(mismatch, ProtocolContextMismatch::HashSuiteId { .. })
+        });
+    }
+
+    #[test]
+    fn execute_rejects_a_mismatched_transaction_auth_profile_id_before_any_later_dispatch() {
+        // A profile id other than the one implemented
+        // `ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`, even though the
+        // scheme/binding below are otherwise the implemented pair — the
+        // profile id itself must still be checked.
+        let context = HttpContextQueryResult::new(
+            ChainId::new("transfer-test-chain").unwrap(),
+            ProtocolVersion::new(3),
+            Epoch::new(5),
+            HashSuiteId::new(1),
+            2,
+            SignatureSchemeId::Ed25519.as_u16(),
+            ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+            AtomicityDomainId::new([0x44; 32]).unwrap(),
+            vec![0xAA],
+        )
+        .unwrap();
+        assert_context_mismatch_stops_before_further_dispatch(context, |mismatch| {
+            matches!(
+                mismatch,
+                ProtocolContextMismatch::TransactionAuthProfileId { .. }
+            )
+        });
+    }
+
+    #[test]
+    fn execute_rejects_a_mismatched_signature_scheme_id_before_any_later_dispatch() {
         let context = HttpContextQueryResult::new(
             ChainId::new("transfer-test-chain").unwrap(),
             ProtocolVersion::new(3),
@@ -779,49 +974,47 @@ mod tests {
             vec![0xAA],
         )
         .unwrap();
-
-        let transport = FakeTransport::new(vec![query_ok(context.encode().unwrap())]);
-        let client = Client::new(transport);
-
-        let error = execute(&client, &signer, inputs).unwrap_err();
-        assert!(matches!(
-            error,
-            CliError::UnsupportedSignatureScheme(id) if id == SignatureSchemeId::Secp256k1.as_u16()
-        ));
+        assert_context_mismatch_stops_before_further_dispatch(context, |mismatch| {
+            matches!(mismatch, ProtocolContextMismatch::SignatureSchemeId { .. })
+        });
     }
 
     #[test]
-    fn execute_rejects_an_unsupported_auth_profile_before_any_later_dispatch() {
-        let signer = sample_signer();
-        let inputs = sample_inputs();
+    fn execute_rejects_a_mismatched_address_binding_id_before_any_later_dispatch() {
         let context = HttpContextQueryResult::new(
             ChainId::new("transfer-test-chain").unwrap(),
             ProtocolVersion::new(3),
             Epoch::new(5),
             HashSuiteId::new(1),
-            // A profile id other than the one implemented
-            // `ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`, even though the
-            // scheme/binding below are otherwise the implemented pair — the
-            // profile id itself must still be checked.
-            2,
+            1,
             SignatureSchemeId::Ed25519.as_u16(),
-            ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+            2,
             AtomicityDomainId::new([0x44; 32]).unwrap(),
             vec![0xAA],
         )
         .unwrap();
+        assert_context_mismatch_stops_before_further_dispatch(context, |mismatch| {
+            matches!(mismatch, ProtocolContextMismatch::AddressBindingId { .. })
+        });
+    }
 
-        // Only the context response is scripted: if `execute` dispatched a
-        // second request (nonce, object, or submit), the fake transport
-        // would return `RequestDeadlineExceeded` for it and the test would
-        // observe that error instead of `UnsupportedAuthProfile`, or the
-        // request-count assertion below would fail.
-        let transport = FakeTransport::new(vec![query_ok(context.encode().unwrap())]);
-        let client = Client::new(transport);
-
-        let error = execute(&client, &signer, inputs).unwrap_err();
-        assert!(matches!(error, CliError::UnsupportedAuthProfile(2)));
-        assert_eq!(client.transport().requests().len(), 1);
+    #[test]
+    fn execute_rejects_a_mismatched_domain_before_any_later_dispatch() {
+        let context = HttpContextQueryResult::new(
+            ChainId::new("transfer-test-chain").unwrap(),
+            ProtocolVersion::new(3),
+            Epoch::new(5),
+            HashSuiteId::new(1),
+            1,
+            SignatureSchemeId::Ed25519.as_u16(),
+            ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+            AtomicityDomainId::new([0x55; 32]).unwrap(),
+            vec![0xAA],
+        )
+        .unwrap();
+        assert_context_mismatch_stops_before_further_dispatch(context, |mismatch| {
+            matches!(mismatch, ProtocolContextMismatch::Domain { .. })
+        });
     }
 
     #[test]
@@ -951,6 +1144,110 @@ mod tests {
     }
 
     #[test]
+    fn parse_inputs_rejects_a_missing_expected_flag() {
+        let mut args = base_flag_values();
+        args.remove(EXPECTED_CHAIN_ID);
+        let parsed = parse_flags(to_os(&args), &transfer_specs()).unwrap();
+
+        assert!(matches!(
+            parse_inputs(&parsed),
+            Err(CliError::Args(crate::args::ArgsError::MissingFlag(
+                EXPECTED_CHAIN_ID
+            )))
+        ));
+    }
+
+    #[test]
+    fn parse_expected_context_rejects_an_empty_expected_chain_id() {
+        let mut args = base_flag_values();
+        args.insert(EXPECTED_CHAIN_ID, String::new());
+        let parsed = parse_flags(to_os(&args), &transfer_specs()).unwrap();
+
+        assert!(matches!(
+            parse_expected_context(&parsed),
+            Err(CliError::InvalidExpectedProtocolType(_))
+        ));
+    }
+
+    #[test]
+    fn parse_expected_context_rejects_a_zero_expected_protocol_version() {
+        let mut args = base_flag_values();
+        args.insert(EXPECTED_PROTOCOL_VERSION, "0".to_string());
+        let parsed = parse_flags(to_os(&args), &transfer_specs()).unwrap();
+
+        assert!(matches!(
+            parse_expected_context(&parsed),
+            Err(CliError::InvalidExpectedContext(
+                sunrise_edge_client::ExpectedProtocolContextError::ZeroProtocolVersion
+            ))
+        ));
+    }
+
+    #[test]
+    fn parse_expected_context_accepts_a_zero_expected_epoch() {
+        // Epoch zero is the legitimate genesis epoch and must not be
+        // rejected merely for being zero.
+        let mut args = base_flag_values();
+        args.insert(EXPECTED_EPOCH, "0".to_string());
+        let parsed = parse_flags(to_os(&args), &transfer_specs()).unwrap();
+
+        assert!(parse_expected_context(&parsed).is_ok());
+    }
+
+    #[test]
+    fn parse_expected_context_rejects_a_zero_expected_hash_suite_id() {
+        let mut args = base_flag_values();
+        args.insert(EXPECTED_HASH_SUITE_ID, "0".to_string());
+        let parsed = parse_flags(to_os(&args), &transfer_specs()).unwrap();
+
+        assert!(matches!(
+            parse_expected_context(&parsed),
+            Err(CliError::InvalidExpectedContext(
+                sunrise_edge_client::ExpectedProtocolContextError::ZeroHashSuiteId
+            ))
+        ));
+    }
+
+    #[test]
+    fn parse_expected_context_rejects_a_zero_expected_domain() {
+        let mut args = base_flag_values();
+        args.insert(EXPECTED_DOMAIN, "00".repeat(32));
+        let parsed = parse_flags(to_os(&args), &transfer_specs()).unwrap();
+
+        assert!(matches!(
+            parse_expected_context(&parsed),
+            Err(CliError::InvalidExpectedProtocolType(_))
+        ));
+    }
+
+    #[test]
+    fn parse_expected_context_rejects_a_malformed_expected_domain() {
+        let mut args = base_flag_values();
+        args.insert(EXPECTED_DOMAIN, "not-hex".to_string());
+        let parsed = parse_flags(to_os(&args), &transfer_specs()).unwrap();
+
+        assert!(matches!(
+            parse_expected_context(&parsed),
+            Err(CliError::Hex(_))
+        ));
+    }
+
+    #[test]
+    fn parse_expected_context_rejects_a_malformed_expected_protocol_version() {
+        let mut args = base_flag_values();
+        args.insert(EXPECTED_PROTOCOL_VERSION, "not-a-number".to_string());
+        let parsed = parse_flags(to_os(&args), &transfer_specs()).unwrap();
+
+        assert!(matches!(
+            parse_expected_context(&parsed),
+            Err(CliError::InvalidInteger {
+                flag: EXPECTED_PROTOCOL_VERSION,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn wait_bound_flag_without_wait_is_rejected() {
         let mut args = base_flag_values();
         args.insert(WAIT_MAX_ATTEMPTS, "3".to_string());
@@ -1016,6 +1313,11 @@ mod tests {
         values.insert(AMOUNT, "250".to_string());
         values.insert(GAS_LIMIT, "1000".to_string());
         values.insert(REQUEST_ID, "30".repeat(32));
+        values.insert(EXPECTED_CHAIN_ID, "transfer-test-chain".to_string());
+        values.insert(EXPECTED_PROTOCOL_VERSION, "3".to_string());
+        values.insert(EXPECTED_EPOCH, "5".to_string());
+        values.insert(EXPECTED_HASH_SUITE_ID, "1".to_string());
+        values.insert(EXPECTED_DOMAIN, "44".repeat(32));
         values
     }
 
@@ -1030,6 +1332,11 @@ mod tests {
             scalar(AMOUNT),
             scalar(GAS_LIMIT),
             scalar(REQUEST_ID),
+            scalar(EXPECTED_CHAIN_ID),
+            scalar(EXPECTED_PROTOCOL_VERSION),
+            scalar(EXPECTED_EPOCH),
+            scalar(EXPECTED_HASH_SUITE_ID),
+            scalar(EXPECTED_DOMAIN),
             switch(WAIT),
             scalar(WAIT_MAX_ATTEMPTS),
             scalar(WAIT_INITIAL_BACKOFF_MS),

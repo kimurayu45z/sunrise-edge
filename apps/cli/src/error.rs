@@ -5,7 +5,8 @@ use std::net::{AddrParseError, SocketAddr};
 use std::num::ParseIntError;
 
 use sunrise_edge_client::{
-    CanonicalEncodingError, ClientError, NodeCoreError, ObjectError, TransportError,
+    CanonicalEncodingError, ClientError, ExpectedProtocolContextError, NodeCoreError, ObjectError,
+    TransportError, TypeError,
 };
 
 use crate::args::ArgsError;
@@ -56,15 +57,13 @@ pub enum CliError {
     WaitBoundWithoutWait(&'static str),
     /// `--wait` was supplied without one of its required bound flags.
     WaitBoundRequired(&'static str),
-    /// The trusted `/v1/context` result declared a signature scheme this
-    /// client does not implement.
-    UnsupportedSignatureScheme(u16),
-    /// The trusted `/v1/context` result declared an address binding this
-    /// client does not implement.
-    UnsupportedAddressBinding(u16),
-    /// The trusted `/v1/context` result declared a transaction-authentication
-    /// profile id other than the one this client implements.
-    UnsupportedAuthProfile(u16),
+    /// An `--expected-chain-id` or `--expected-domain` flag failed to
+    /// construct a valid protocol type (an empty chain id, or an all-zero
+    /// domain).
+    InvalidExpectedProtocolType(TypeError),
+    /// The locally constructed S1 expected protocol context (see
+    /// `ARCHITECTURE.md` DR-0085) had a missing/zero/malformed field.
+    InvalidExpectedContext(ExpectedProtocolContextError),
     /// The next-nonce query result's epoch disagreed with the context
     /// query's epoch.
     EpochMismatch {
@@ -169,18 +168,12 @@ impl fmt::Display for CliError {
             Self::WaitBoundRequired(flag) => {
                 write!(f, "--wait requires {flag} to also be supplied")
             }
-            Self::UnsupportedSignatureScheme(id) => write!(
-                f,
-                "server context declared signature scheme {id}, which this client does not implement"
-            ),
-            Self::UnsupportedAddressBinding(id) => write!(
-                f,
-                "server context declared address binding {id}, which this client does not implement"
-            ),
-            Self::UnsupportedAuthProfile(id) => write!(
-                f,
-                "server context declared transaction-authentication profile {id}, which this client does not implement"
-            ),
+            Self::InvalidExpectedProtocolType(error) => {
+                write!(f, "invalid --expected-* value: {error}")
+            }
+            Self::InvalidExpectedContext(error) => {
+                write!(f, "invalid --expected-* protocol context: {error}")
+            }
             Self::EpochMismatch {
                 context_epoch,
                 nonce_epoch,
@@ -242,6 +235,8 @@ impl std::error::Error for CliError {
             Self::NodeCore(error) => Some(error),
             Self::Transport(error) => Some(error),
             Self::Client(error) => Some(error),
+            Self::InvalidExpectedProtocolType(error) => Some(error),
+            Self::InvalidExpectedContext(error) => Some(error),
             _ => None,
         }
     }
@@ -280,6 +275,18 @@ impl From<TransportError> for CliError {
 impl From<NodeCoreError> for CliError {
     fn from(value: NodeCoreError) -> Self {
         Self::NodeCore(value)
+    }
+}
+
+impl From<TypeError> for CliError {
+    fn from(value: TypeError) -> Self {
+        Self::InvalidExpectedProtocolType(value)
+    }
+}
+
+impl From<ExpectedProtocolContextError> for CliError {
+    fn from(value: ExpectedProtocolContextError) -> Self {
+        Self::InvalidExpectedContext(value)
     }
 }
 
