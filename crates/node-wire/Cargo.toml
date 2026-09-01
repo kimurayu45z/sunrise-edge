@@ -1,0 +1,12 @@
+[package]
+name = "node-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+canonical-encoding.workspace = true
+node-core.workspace = true
+objects.workspace = true
+protocol-types.workspace = true
+runtime.workspace = true

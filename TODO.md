@@ -1932,6 +1932,26 @@ explicit dev limitations）:
    inactive-placement-before-side-effectsテスト、503/500 operational
    classificationのcase tableテスト、
    admission/cancellationテストを両crateのtest suiteに追加済み。
+7. DR-0083のMVP Rust client境界に従い、`crates/node-wire`へcanonical
+   HTTP result codec・route/media-type contractを抽出し、`native-http`から同じpublic名を
+   re-exportする。`clients/rust`は`node-core`と`node-wire`に依存して、seed-based
+   Ed25519 key/address、canonical transaction build/sign、explicit request IDでのsubmit、
+   bounded receipt wait、context/object/receipt/next-nonce queryを提供する。初期transportは
+   strictなloopback-only synchronous HTTP/1.1とtest用traitだけに限定し、TLS、remote node、
+   async、keystore、full `ProtocolConfig` decode、hash/certificate verification、blob fetch、
+   asset固有helper、CLI policyはこのsliceへ含めない。serverとclientはshared stable vectorsと
+   node-coreが受理するsigned transaction vectorでcanonical contractを固定した
+   （implemented As-Is）。clientは全query selectorを応答内selectorと再照合し、transportは
+   request framing injection、header/body超過、ambiguous length、transfer encoding、truncation、
+   trailing bytes、close timeoutをfail closedにし、per-stage socket timeoutに加えて完全な1 requestの
+   monotonic deadlineを適用する。receipt waitは同じoverall deadlineをtransportへ渡すためslow-dripで
+   elapsed boundを更新できない。effects listはdeclared countとexact field countをallocation前に照合する。
+   fake transportでsubmit/request bindingとbounded receipt wait、raw loopback TCPでadversarial response、
+   実際にcomposeしたdevnet routerへの4 query全てのTCP E2Eを検証済み。live signed transfer/duplicate/
+   restart E2Eはcriterion 10へ残る。
+8. 次のproduct-surface sliceとして、criterion 6の`apps/cli`を`clients/rust`のみに依存する
+   Rust-only binaryとして実装する（planned）。Node/browser runtime、独自canonical codec、
+   独自signing/RPC pathは導入しない。
 
 **Repository-boundary decision**（ARCHITECTURE.md DR-0081；DR-0080の同名決定のうち
 repository-boundary/counter-demo deliverableのみを置き換える。DR-0080に記録された

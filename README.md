@@ -541,8 +541,8 @@ composition, `preinstalled_wasm_structured_durable_router`, now invokes this
 path over HTTP; `structured_durable_router` remains on the read-only
 entrypoint and is unaffected.
 
-The planned Developer MVP product surface (see `ARCHITECTURE.md` DR-0081) will
-be implemented in this order: `apps/devnet` (a local devnet binary/startup
+The Developer MVP product surface (see `ARCHITECTURE.md` DR-0081) is being
+implemented in this order: `apps/devnet` (a local devnet binary/startup
 composition around the existing preinstalled-WASM route); a separate bounded
 query-API slice in the protocol/native HTTP surfaces for chain/context info,
 objects, receipts, and nonces; `clients/rust`; `apps/cli` (a
@@ -594,8 +594,21 @@ sharing their blocking admission and cancellation semantics. These four
 routes are an unauthenticated bounded public-read surface on the configured
 listener, and query requests share the same `--max-concurrent` admission
 budget as submissions; the local devnet startup banner reports both limits.
-A signed duplicate-transfer HTTP E2E remains the next slice; this is not yet
-the completed devnet criterion.
+
+The Rust client is now implemented As-Is at `clients/rust`. Canonical HTTP
+result codecs and route/media constants live in the shared, transport-neutral
+`node-wire` crate and remain re-exported by `native-http`. The client provides
+seed-based Ed25519 key/address handling, Transaction v1 construction/signing,
+explicit-request-ID submission, bounded receipt polling, and all four query
+methods. Its provided HTTP/1.1 transport is synchronous and loopback-only,
+with strict timeouts, header/body bounds, selector binding, and ambiguous-
+framing rejection; it is not a production remote transport. Stable signed
+transaction bytes are accepted directly by node-core, parser adversarial tests
+use real TCP, and all four query methods reach the composed devnet router over
+TCP. A caller deadline bounds the complete exchange, including slow-drip
+responses, rather than resetting on each received byte.
+`apps/cli` is the next product-surface slice. A signed duplicate-transfer HTTP
+E2E remains required later by the Developer MVP Gate and is not claimed here.
 
 The Phase 15-17 production exit criteria and accepted persistence designs are
 preserved. Additional capacity/load/soak evidence, PITR, HA/failover,
@@ -613,6 +626,7 @@ behavior.
 | Execution | `execution`, `contract-sdk`, `chain-ir`, `system-modules` | Transactions/effects, deterministic WASM, proof envelopes/verifier interfaces, contract host APIs, portable IR, and governed modules |
 | Economics and governance | `fees`, `bonds`, `governance`, `protocol-upgrades`, `protocol-config` | Stablecoin fees/bonds, admission, governance actions, upgrades, migrations, and committed configuration |
 | Runtime and consensus | `runtime`, `runtime-sqlite`, `runtime-postgres`, `validator-set`, `consensus`, `node-core` | Persistence/runtime interfaces, local durable SQLite state plus a local-only non-production structured SQLite adapter, normalized PostgreSQL structured commit and indexed outbox adapter, epoch validator snapshots, event-driven shared-object ordering, and one-event conditional transitions |
+| Client wire and SDK | `node-wire`, `clients/rust` | Shared canonical HTTP/query frames plus the bounded loopback-only Rust Developer MVP client |
 | Adapters | `native-http`, `adapters/shared`, `adapters/cloudflare-workers`, `adapters/deno`, `adapters/vercel`, `adapters/supabase-edge`, `adapters/aws-lambda` | Bounded native routing, shared Web ingress, Cloudflare Service-Binding ingress, authenticated Deno/Vercel/Supabase ingress, and AWS HTTP API v2 mapping around the canonical contract |
 
 The repository intentionally keeps vendor-specific dependencies out of the

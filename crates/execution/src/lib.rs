@@ -27,14 +27,14 @@
 use abi::{AbiError, AccessManifest, decode_access_manifest, encode_access_manifest};
 use canonical_encoding::{
     CanonicalDecodingError, CanonicalEncodingError, CanonicalFrame, CanonicalStruct,
-    decode_canonical_frame, encode_digest32,
+    decode_canonical_frame, decode_digest32, encode_digest32,
 };
 use core::fmt;
 use fees::{FeeError, FeePayment, decode_fee_payment, encode_fee_payment};
 use hashing::{HashSuiteResolver, HashingError};
 use objects::{
-    AccessMode, Address, Object, ObjectId, ObjectRef, decode_object_ref, encode_object,
-    encode_object_id, encode_object_ref,
+    AccessMode, Address, Object, ObjectId, ObjectRef, decode_object, decode_object_id,
+    decode_object_ref, encode_object, encode_object_id, encode_object_ref,
 };
 use protocol_types::{ChainId, Digest32, Epoch, HashPurpose, ProtocolVersion, TypeError};
 use std::error::Error;
@@ -139,6 +139,31 @@ pub enum ExecutionError {
     },
     /// A deterministic execution resource limit was exceeded.
     ResourceLimitExceeded(&'static str),
+    /// A decoded `ExecutionStatus` tag was not `1` (success) or `2` (failure).
+    UnknownExecutionStatusTag(u8),
+    /// A decoded `ObjectEffect` tag was not `1` (created), `2` (mutated), or
+    /// `3` (deleted).
+    UnknownObjectEffectTag(u8),
+    /// A decoded object-effects list declared more entries than the encoder
+    /// permits.
+    TooManyObjectEffects(usize),
+    /// A decoded event-records list declared more entries than the encoder
+    /// permits.
+    TooManyEvents(usize),
+    /// A nested execution-effects list declared a count different from the
+    /// exact number of entry fields present in its canonical frame.
+    ExecutionEffectsListCountMismatch {
+        /// Stable name of the nested list being decoded.
+        list: &'static str,
+        /// Entry count declared in field 1.
+        declared_count: usize,
+        /// Total fields actually present, including the count field.
+        field_count: usize,
+    },
+    /// Re-encoding a decoded `ExecutionEffects` did not reproduce its input
+    /// bytes, meaning the input was not the unique canonical encoding of its
+    /// value.
+    NonCanonicalExecutionEffectsEncoding,
 }
 
 impl fmt::Display for ExecutionError {
@@ -187,6 +212,30 @@ impl fmt::Display for ExecutionError {
             Self::ResourceLimitExceeded(resource) => {
                 write!(f, "execution resource limit exceeded: {resource}")
             }
+            Self::UnknownExecutionStatusTag(tag) => {
+                write!(f, "unknown execution status tag: {tag}")
+            }
+            Self::UnknownObjectEffectTag(tag) => {
+                write!(f, "unknown object effect tag: {tag}")
+            }
+            Self::TooManyObjectEffects(count) => {
+                write!(f, "execution effects declare {count} object effects")
+            }
+            Self::TooManyEvents(count) => {
+                write!(f, "execution effects declare {count} events")
+            }
+            Self::ExecutionEffectsListCountMismatch {
+                list,
+                declared_count,
+                field_count,
+            } => write!(
+                f,
+                "{list} declares {declared_count} entries but contains {field_count} total fields"
+            ),
+            Self::NonCanonicalExecutionEffectsEncoding => write!(
+                f,
+                "decoded execution effects do not re-encode to their input bytes"
+            ),
         }
     }
 }
@@ -513,6 +562,19 @@ pub fn encode_event_record(event: &EventRecord) -> Result<Vec<u8>, ExecutionErro
     Ok(canonical.finish()?)
 }
 
+/// Decodes one canonical [`EventRecord`], rejecting any field other than the
+/// exact `type_tag`/`data` pair produced by [`encode_event_record`].
+pub fn decode_event_record(input: &[u8]) -> Result<EventRecord, ExecutionError> {
+    let frame: CanonicalFrame<'_> = decode_canonical_frame(input)?;
+    frame.require_type(EVENT_RECORD_TYPE_ID)?;
+    frame.require_version(ENCODING_VERSION)?;
+    frame.require_only_fields(&[1, 2])?;
+    Ok(EventRecord {
+        type_tag: frame.required_field(1)?.to_vec(),
+        data: frame.required_field(2)?.to_vec(),
+    })
+}
+
 // ── ObjectEffect ──────────────────────────────────────────────────────────
 
 /// A single object-level change produced by execution.
@@ -567,6 +629,47 @@ pub fn encode_object_effect(effect: &ObjectEffect) -> Result<Vec<u8>, ExecutionE
         }
     }
     Ok(canonical.finish()?)
+}
+
+/// Decodes one canonical [`ObjectEffect`], rejecting an unknown tag or any
+/// field the encoded variant does not itself carry.
+pub fn decode_object_effect(input: &[u8]) -> Result<ObjectEffect, ExecutionError> {
+    let frame: CanonicalFrame<'_> = decode_canonical_frame(input)?;
+    frame.require_type(OBJECT_EFFECT_TYPE_ID)?;
+    frame.require_version(ENCODING_VERSION)?;
+
+    let tag_bytes = frame.required_field(1)?;
+    let tag: [u8; 1] =
+        tag_bytes
+            .try_into()
+            .map_err(|_| CanonicalDecodingError::InvalidFieldLength {
+                field_id: 1,
+                expected: 1,
+                actual: tag_bytes.len(),
+            })?;
+    match tag[0] {
+        1 => {
+            frame.require_only_fields(&[1, 2])?;
+            Ok(ObjectEffect::Created(decode_object(
+                frame.required_field(2)?,
+            )?))
+        }
+        2 => {
+            frame.require_only_fields(&[1, 2, 3])?;
+            Ok(ObjectEffect::Mutated {
+                previous_version: frame.required_u64(2)?,
+                new_object: decode_object(frame.required_field(3)?)?,
+            })
+        }
+        3 => {
+            frame.require_only_fields(&[1, 2, 3])?;
+            Ok(ObjectEffect::Deleted {
+                id: decode_object_id(frame.required_field(2)?)?,
+                version: frame.required_u64(3)?,
+            })
+        }
+        other => Err(ExecutionError::UnknownObjectEffectTag(other)),
+    }
 }
 
 // ── ExecutionStatus ───────────────────────────────────────────────────────
@@ -659,6 +762,139 @@ pub fn encode_execution_effects(effects: &ExecutionEffects) -> Result<Vec<u8>, E
     canonical.field_bytes(5, effects_list_bytes)?;
     canonical.field_bytes(6, events_list_bytes)?;
     Ok(canonical.finish()?)
+}
+
+/// Maximum object effects or events one nested list frame may carry.
+///
+/// Matches the field-id ceiling [`encode_execution_effects`] itself relies
+/// on: each entry after the leading count field claims one `u16` field id
+/// starting at `2`, so `u16::MAX - 1` entries is the most the wire format can
+/// address.
+const MAX_EXECUTION_EFFECTS_LIST_ITEMS: usize = u16::MAX as usize - 1;
+
+fn decode_object_effects_list(bytes: &[u8]) -> Result<Vec<ObjectEffect>, ExecutionError> {
+    let frame: CanonicalFrame<'_> = decode_canonical_frame(bytes)?;
+    frame.require_type(OBJECT_EFFECTS_LIST_TYPE_ID)?;
+    frame.require_version(ENCODING_VERSION)?;
+
+    let count = usize::try_from(frame.required_u32(1)?)
+        .map_err(|_| ExecutionError::TooManyObjectEffects(usize::MAX))?;
+    if count > MAX_EXECUTION_EFFECTS_LIST_ITEMS {
+        return Err(ExecutionError::TooManyObjectEffects(count));
+    }
+
+    let expected_field_count = count
+        .checked_add(1)
+        .ok_or(ExecutionError::TooManyObjectEffects(usize::MAX))?;
+    if frame.field_count() != expected_field_count {
+        return Err(ExecutionError::ExecutionEffectsListCountMismatch {
+            list: "object-effects list",
+            declared_count: count,
+            field_count: frame.field_count(),
+        });
+    }
+
+    let mut effects = Vec::with_capacity(count);
+    for index in 0..count {
+        let field_id =
+            u16::try_from(2 + index).map_err(|_| ExecutionError::TooManyObjectEffects(count))?;
+        effects.push(decode_object_effect(frame.required_field(field_id)?)?);
+    }
+    Ok(effects)
+}
+
+fn decode_event_records_list(bytes: &[u8]) -> Result<Vec<EventRecord>, ExecutionError> {
+    let frame: CanonicalFrame<'_> = decode_canonical_frame(bytes)?;
+    frame.require_type(EVENT_RECORDS_LIST_TYPE_ID)?;
+    frame.require_version(ENCODING_VERSION)?;
+
+    let count = usize::try_from(frame.required_u32(1)?)
+        .map_err(|_| ExecutionError::TooManyEvents(usize::MAX))?;
+    if count > MAX_EXECUTION_EFFECTS_LIST_ITEMS {
+        return Err(ExecutionError::TooManyEvents(count));
+    }
+
+    let expected_field_count = count
+        .checked_add(1)
+        .ok_or(ExecutionError::TooManyEvents(usize::MAX))?;
+    if frame.field_count() != expected_field_count {
+        return Err(ExecutionError::ExecutionEffectsListCountMismatch {
+            list: "event-records list",
+            declared_count: count,
+            field_count: frame.field_count(),
+        });
+    }
+
+    let mut events = Vec::with_capacity(count);
+    for index in 0..count {
+        let field_id =
+            u16::try_from(2 + index).map_err(|_| ExecutionError::TooManyEvents(count))?;
+        events.push(decode_event_record(frame.required_field(field_id)?)?);
+    }
+    Ok(events)
+}
+
+/// Decodes [`ExecutionEffects`] from its strict canonical wire format.
+///
+/// Beyond the shared [`decode_canonical_frame`] guarantees, this additionally:
+///
+/// * requires the execution-effects type id (`0x6004`) and encoding version 1;
+/// * requires exactly fields 1, 2, 4, 5, 6, with field 3 (`reason`) present if
+///   and only if the decoded status tag is `2` (failure), and rejects any
+///   other field id or an unknown status tag;
+/// * recursively decodes the nested object-effects (`0x6005`) and
+///   event-records (`0x6006`) list frames, each bounded to the same
+///   `u16::MAX - 1` item ceiling [`encode_execution_effects`] enforces, and
+///   each nested [`ObjectEffect`]/[`EventRecord`] frame with
+///   [`decode_object_effect`]/[`decode_event_record`];
+/// * finally re-encodes the decoded value with [`encode_execution_effects`]
+///   and requires the result to be byte-for-byte identical to `input`, so no
+///   alternate representation of the same logical effects is accepted.
+pub fn decode_execution_effects(input: &[u8]) -> Result<ExecutionEffects, ExecutionError> {
+    let frame: CanonicalFrame<'_> = decode_canonical_frame(input)?;
+    frame.require_type(EXECUTION_EFFECTS_TYPE_ID)?;
+    frame.require_version(ENCODING_VERSION)?;
+
+    let tx_hash = decode_digest32(frame.required_field(1)?)?;
+
+    let status_tag_bytes = frame.required_field(2)?;
+    let status_tag: [u8; 1] =
+        status_tag_bytes
+            .try_into()
+            .map_err(|_| CanonicalDecodingError::InvalidFieldLength {
+                field_id: 2,
+                expected: 1,
+                actual: status_tag_bytes.len(),
+            })?;
+    let status = match status_tag[0] {
+        1 => {
+            frame.require_only_fields(&[1, 2, 4, 5, 6])?;
+            ExecutionStatus::Success
+        }
+        2 => {
+            frame.require_only_fields(&[1, 2, 3, 4, 5, 6])?;
+            ExecutionStatus::Failure {
+                reason: frame.required_str(3)?.to_string(),
+            }
+        }
+        other => return Err(ExecutionError::UnknownExecutionStatusTag(other)),
+    };
+
+    let gas_used = frame.required_u64(4)?;
+    let object_effects = decode_object_effects_list(frame.required_field(5)?)?;
+    let events = decode_event_records_list(frame.required_field(6)?)?;
+
+    let effects = ExecutionEffects {
+        tx_hash,
+        status,
+        object_effects,
+        events,
+        gas_used,
+    };
+    if encode_execution_effects(&effects)?.as_slice() != input {
+        return Err(ExecutionError::NonCanonicalExecutionEffectsEncoding);
+    }
+    Ok(effects)
 }
 
 /// Hashes the canonical encoding of [`ExecutionEffects`] for the
@@ -1629,6 +1865,240 @@ mod tests {
         let h2 = hash_execution_effects(&effects, Epoch::new(5), &sample_resolver()).unwrap();
         assert_eq!(h1, h2);
         assert_eq!(h1.algorithm(), HashAlgorithmId::Sha2_256);
+    }
+
+    // ── decode_event_record / decode_object_effect / decode_execution_effects ──
+
+    #[test]
+    fn event_record_round_trips() {
+        let event = EventRecord {
+            type_tag: b"transfer".to_vec(),
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let encoded = encode_event_record(&event).unwrap();
+        assert_eq!(decode_event_record(&encoded).unwrap(), event);
+    }
+
+    #[test]
+    fn event_record_rejects_wrong_type_id() {
+        let object_effect =
+            encode_object_effect(&ObjectEffect::Created(sample_object(0x01, 1))).unwrap();
+        assert!(matches!(
+            decode_event_record(&object_effect),
+            Err(ExecutionError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedTypeId { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn event_record_rejects_trailing_bytes() {
+        let event = EventRecord {
+            type_tag: b"tag".to_vec(),
+            data: vec![0x01],
+        };
+        let mut encoded = encode_event_record(&event).unwrap();
+        encoded.push(0x00);
+        assert!(matches!(
+            decode_event_record(&encoded),
+            Err(ExecutionError::CanonicalDecoding(
+                CanonicalDecodingError::TrailingBytes(1)
+            ))
+        ));
+    }
+
+    #[test]
+    fn object_effect_round_trips_every_variant() {
+        let created = ObjectEffect::Created(sample_object(0x21, 1));
+        let mutated = ObjectEffect::Mutated {
+            previous_version: 3,
+            new_object: sample_object(0x22, 4),
+        };
+        let deleted = ObjectEffect::Deleted {
+            id: ObjectId::new([0x23; 32]),
+            version: 7,
+        };
+        for effect in [created, mutated, deleted] {
+            let encoded = encode_object_effect(&effect).unwrap();
+            assert_eq!(decode_object_effect(&encoded).unwrap(), effect);
+        }
+    }
+
+    #[test]
+    fn object_effect_rejects_unknown_tag() {
+        let mut frame = CanonicalStruct::new(OBJECT_EFFECT_TYPE_ID, ENCODING_VERSION);
+        frame.field_bytes(1, [9u8]).unwrap();
+        let bytes = frame.finish().unwrap();
+
+        assert_eq!(
+            decode_object_effect(&bytes),
+            Err(ExecutionError::UnknownObjectEffectTag(9))
+        );
+    }
+
+    #[test]
+    fn object_effect_created_rejects_a_trailing_field() {
+        let object_bytes = encode_object(&sample_object(0x24, 1)).unwrap();
+        let mut frame = CanonicalStruct::new(OBJECT_EFFECT_TYPE_ID, ENCODING_VERSION);
+        frame.field_bytes(1, [1u8]).unwrap();
+        frame.field_bytes(2, object_bytes).unwrap();
+        frame.field_u64(3, 99).unwrap();
+        let bytes = frame.finish().unwrap();
+
+        assert!(matches!(
+            decode_object_effect(&bytes),
+            Err(ExecutionError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedField(3)
+            ))
+        ));
+    }
+
+    #[test]
+    fn execution_effects_round_trip_success_and_failure() {
+        let tx_hash = sample_digest(0x40);
+        let success = sample_effects(tx_hash);
+        let encoded_success = encode_execution_effects(&success).unwrap();
+        assert_eq!(decode_execution_effects(&encoded_success).unwrap(), success);
+
+        let failure = ExecutionEffects {
+            tx_hash,
+            status: ExecutionStatus::Failure {
+                reason: "trap".to_string(),
+            },
+            object_effects: vec![],
+            events: vec![],
+            gas_used: 42,
+        };
+        let encoded_failure = encode_execution_effects(&failure).unwrap();
+        assert_eq!(decode_execution_effects(&encoded_failure).unwrap(), failure);
+    }
+
+    #[test]
+    fn execution_effects_decode_rejects_unknown_status_tag() {
+        let mut frame = CanonicalStruct::new(EXECUTION_EFFECTS_TYPE_ID, ENCODING_VERSION);
+        frame
+            .field_bytes(1, encode_digest32(&sample_digest(0x41)).unwrap())
+            .unwrap();
+        frame.field_bytes(2, [9u8]).unwrap();
+        frame.field_u64(4, 0).unwrap();
+        let empty_effects_list = {
+            let mut list = CanonicalStruct::new(OBJECT_EFFECTS_LIST_TYPE_ID, ENCODING_VERSION);
+            list.field_u32(1, 0).unwrap();
+            list.finish().unwrap()
+        };
+        let empty_events_list = {
+            let mut list = CanonicalStruct::new(EVENT_RECORDS_LIST_TYPE_ID, ENCODING_VERSION);
+            list.field_u32(1, 0).unwrap();
+            list.finish().unwrap()
+        };
+        frame.field_bytes(5, empty_effects_list).unwrap();
+        frame.field_bytes(6, empty_events_list).unwrap();
+        let bytes = frame.finish().unwrap();
+
+        assert_eq!(
+            decode_execution_effects(&bytes),
+            Err(ExecutionError::UnknownExecutionStatusTag(9))
+        );
+    }
+
+    #[test]
+    fn execution_effects_success_rejects_a_present_reason_field() {
+        let tx_hash = sample_digest(0x42);
+        let mut success = sample_effects(tx_hash);
+        success.object_effects.clear();
+        success.events.clear();
+        let encoded = encode_execution_effects(&success).unwrap();
+
+        // Re-encode by hand with an extra field-3 `reason` string even though
+        // the status tag stays `1` (success), simulating a tampered/malformed
+        // peer rather than anything `encode_execution_effects` itself emits.
+        let mut frame = CanonicalStruct::new(EXECUTION_EFFECTS_TYPE_ID, ENCODING_VERSION);
+        frame
+            .field_bytes(1, encode_digest32(&tx_hash).unwrap())
+            .unwrap();
+        frame.field_bytes(2, [1u8]).unwrap();
+        frame.field_str(3, "unexpected").unwrap();
+        frame.field_u64(4, success.gas_used).unwrap();
+        let empty_effects_list = {
+            let mut list = CanonicalStruct::new(OBJECT_EFFECTS_LIST_TYPE_ID, ENCODING_VERSION);
+            list.field_u32(1, 0).unwrap();
+            list.finish().unwrap()
+        };
+        let empty_events_list = {
+            let mut list = CanonicalStruct::new(EVENT_RECORDS_LIST_TYPE_ID, ENCODING_VERSION);
+            list.field_u32(1, 0).unwrap();
+            list.finish().unwrap()
+        };
+        frame.field_bytes(5, empty_effects_list).unwrap();
+        frame.field_bytes(6, empty_events_list).unwrap();
+        let tampered = frame.finish().unwrap();
+        assert_ne!(tampered, encoded);
+
+        assert!(matches!(
+            decode_execution_effects(&tampered),
+            Err(ExecutionError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedField(3)
+            ))
+        ));
+    }
+
+    #[test]
+    fn execution_effects_decode_rejects_trailing_bytes() {
+        let tx_hash = sample_digest(0x43);
+        let effects = sample_effects(tx_hash);
+        let mut encoded = encode_execution_effects(&effects).unwrap();
+        encoded.push(0xAB);
+
+        assert!(matches!(
+            decode_execution_effects(&encoded),
+            Err(ExecutionError::CanonicalDecoding(
+                CanonicalDecodingError::TrailingBytes(1)
+            ))
+        ));
+    }
+
+    #[test]
+    fn object_effects_list_decode_rejects_a_count_exceeding_the_item_ceiling() {
+        let mut list = CanonicalStruct::new(OBJECT_EFFECTS_LIST_TYPE_ID, ENCODING_VERSION);
+        list.field_u32(1, u32::from(u16::MAX)).unwrap();
+        let bytes = list.finish().unwrap();
+
+        assert_eq!(
+            decode_object_effects_list(&bytes),
+            Err(ExecutionError::TooManyObjectEffects(usize::from(u16::MAX)))
+        );
+    }
+
+    #[test]
+    fn object_effects_list_decode_rejects_a_missing_declared_entry() {
+        let mut list = CanonicalStruct::new(OBJECT_EFFECTS_LIST_TYPE_ID, ENCODING_VERSION);
+        list.field_u32(1, 1).unwrap();
+        let bytes = list.finish().unwrap();
+
+        assert_eq!(
+            decode_object_effects_list(&bytes),
+            Err(ExecutionError::ExecutionEffectsListCountMismatch {
+                list: "object-effects list",
+                declared_count: 1,
+                field_count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn event_records_list_decode_rejects_a_missing_declared_entry() {
+        let mut list = CanonicalStruct::new(EVENT_RECORDS_LIST_TYPE_ID, ENCODING_VERSION);
+        list.field_u32(1, 1).unwrap();
+        let bytes = list.finish().unwrap();
+
+        assert_eq!(
+            decode_event_records_list(&bytes),
+            Err(ExecutionError::ExecutionEffectsListCountMismatch {
+                list: "event-records list",
+                declared_count: 1,
+                field_count: 1,
+            })
+        );
     }
 
     // ── NullExecutionEngine ───────────────────────────────────────────────
