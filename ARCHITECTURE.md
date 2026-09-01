@@ -1453,10 +1453,15 @@ protocol behavior:
 - **Seeded asset accounts.** Startup seeds exactly two ordinary
   `sunrise.devnet.asset_account.v1` objects (`Owner::Address`) per configured
   development owner. Both accounts carry the same fixed, non-placeholder
-  `fees::AssetId`; one starts funded and the other starts empty, so the bundled
-  `transfer` entrypoint has a same-sender source and destination account to
-  exercise immediately after boot. Their object IDs remain distinct and
-  deterministic for that owner and slot.
+  `fees::AssetId`; one starts funded and the other starts empty. A transfer may
+  pair one configured owner's source with another configured owner's existing
+  destination under the exact committed S2 policy. Their object IDs remain
+  distinct and deterministic for that owner and slot. Restart verifies every
+  current object's exact identity/owner/type/schema/canonical body/digest/
+  provenance, its immutable version-one seed history and receipt, then checks
+  the fixed total seeded supply across the bounded configured-owner set;
+  per-owner pair totals and sequences are intentionally not assumed equal
+  after legitimate cross-owner movement.
 - **Bounded asset-account transition.** The dev profile reserves the otherwise
   unused local type-ID block `0xF001`-`0xF003`, all at encoding version 1. An
   asset-account body is one 76-byte `CanonicalStruct` (`0xF001`) with fields
@@ -1480,24 +1485,26 @@ protocol behavior:
   without applying either effect again.
 - **Canonical catalog declarations.** The dev profile also reserves local
   declaration type IDs `0xF010` for the asset-account schema declaration and
-  `0xF011` for its execution-semantics declaration, both at encoding version
-  1. These declarations are complete `CanonicalStruct` frames and are hashed
+  `0xF011` for its execution-semantics declaration. The schema declaration
+  remains encoding version 1. The historical same-sender semantics declaration
+  remains pinned at encoding version 1, while the S2 cross-owner declaration
+  uses encoding version 2. These declarations are complete `CanonicalStruct`
+  frames and are hashed
   under the existing `SystemModule` purpose when deriving the preinstalled
   catalog commitments. They describe the `0xF001` body, `0xF002` arguments,
   `0xF003` event, exact two-object write manifest, rejection conditions, and
   conservation/sequence invariants. They are dev-profile catalog metadata,
   not an alternate balance, transfer, or fee-asset protocol path.
-- **Structural type boundary.** The current WASM host ABI exposes object data
-  but not `type_hash`, `schema_version`, or owner metadata. Node-core still
-  proves both inputs are Address-owned by the authenticated sender and freezes
-  their metadata across each update, while the module verifies the complete
-  self-describing `0xF001` body frame. Therefore this devnet, which seeds no
-  other application object type, has a bounded structural asset-account check,
-  not a general proof that an arbitrary existing object's `type_hash` denotes
-  this module. Revisit a read-only metadata host ABI or a catalog-declared
-  expected type constraint before cross-owner transfer or a second devnet
-  application object type is introduced; neither expansion belongs to this
-  MVP slice.
+- **Committed destination type/owner boundary.** The WASM host ABI still
+  exposes object data but not `type_hash`, `schema_version`, or owner metadata.
+  Before object I/O, node-core resolves the exact trusted preinstalled module
+  once and later requires source access index 0 to be Address-owned by the
+  authenticated sender. Its only owner exception is the catalog policy at
+  destination index 1 for the exact module/version, `transfer` entrypoint,
+  `Write` mode, `asset_account_type_hash()`, and schema version 1. The loaded
+  current destination must be Address-owned and match that type/schema exactly;
+  the module still verifies the complete self-describing `0xF001` body frame,
+  and the effect translator freezes all metadata including both owners.
 - **Dev-profile identities are not protocol claims.** The seeded `AssetId` and
   asset-account `type_hash` are fixed, non-zero dev-profile identifiers so
   clients can render and exercise the local fixture. No mint/metadata object
@@ -1527,7 +1534,7 @@ generation. Direct WASM tests prove successful same-asset movement and
 effect-free rejection of mixed asset IDs. The bounded query API (chain/context
 info, object reads, receipts, and an authenticated sender's next nonce), the
 Rust client (`clients/rust`), the Rust-only CLI (`apps/cli`), and a signed
-duplicate-transfer restart/duplicate HTTP E2E
+cross-owner duplicate-transfer restart/duplicate HTTP E2E
 (`apps/cli/tests/devnet_restart_duplicate_e2e.rs`) are implemented As-Is per
 the designs defined below and in "Rust client library" / "Rust client
 external-signer boundary and Developer MVP CLI". Under the CLI-first
@@ -1539,8 +1546,9 @@ limitations that
 must stay visible at devnet startup and in documentation once implemented:
 single validator; owned-object only (Create, Shared/System ownership, and
 blob bodies remain fail-closed); fee-free (`fee_payment: None`, empty fee
-registry); same-sender-only asset movement (no cross-owner transfer
-authorization); local SQLite only; the four bounded query routes are an
+registry); only the exact policy-bounded existing Address-owned destination
+may differ from the sender, while literal owner reassignment/gifting remains
+fail-closed; local SQLite only; the four bounded query routes are an
 unauthenticated public-read API (any caller can read any object/receipt/
 next-nonce/context — the address in `/v1/senders/{sender}/next-nonce` is a
 public lookup selector, not authorization); query and submission share one
@@ -1820,8 +1828,8 @@ commands: `address` (derives and prints the `AddressIsPublicKey` address
 bound to an explicitly named development seed file — never a keystore, never
 a home-directory default, and the seed is never accepted on argv or printed);
 `context`, `object`, `receipt`, and `next-nonce` (thin wrappers over the
-matching `sunrise-edge-client` query methods); and `transfer`, the one
-same-owner devnet asset transfer command. Every network subcommand targets an
+matching `sunrise-edge-client` query methods); and `transfer`, the bounded
+devnet asset transfer command. Every network subcommand targets an
 explicit `--endpoint`; with neither TLS flag supplied, `--endpoint` must be
 loopback and this binary talks the legacy plaintext `LoopbackHttpTransport`
 (a non-loopback address is rejected before any connection is attempted). With
@@ -1872,13 +1880,16 @@ and both `/v1/objects/{object_id}` results for the caller's exact
 committed profile is `Ed25519` + `AddressIsPublicKey` and that the context
 and next-nonce queries agree on epoch, all before signing; requires both
 objects to be `CurrentInline` (any other status is a typed, actionable
-rejection); constructs the exact two-entry `AccessManifest` with `Write`
+rejection); requires the source owner to equal the signer and the destination
+owner to equal the separately required `--destination-owner` Address before
+signing; constructs the exact two-entry `AccessManifest` with `Write`
 access to source then destination, in that order; builds and signs the
 transaction through `PreparedTransaction`/`build_signed_transaction`; and
 submits it with an explicit, caller-supplied non-zero request id. Every
 asset, including this one, uses the same uniform `AssetId`/account/transfer
-path — there is no native-coin or fee special case, and cross-owner transfer
-remains fail-closed on the existing owned-effects path (see DR-0081).
+path — there is no native-coin or fee special case. Cross-owner destination
+authorization is available only through DR-0086's exact trusted preinstalled-
+module policy; the general owned-effects path remains sender-only.
 `transfer` treats the submission itself as fail-closed, not merely the
 queries that precede it: an empty submit-result `responses()` list, any
 response declaring `NodeResponseStatus::Rejected`, and any response whose
@@ -3183,6 +3194,21 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   effect; freeze, close, delegate, and allowance/approval semantics; Shared/
   System object ownership; blob-backed object bodies and arbitrary module
   upload; and all other production-hardening work already frozen by DR-0076.
+
+  **DR-0086 amendment (current status).** The same-sender-only and deferred
+  cross-owner statements immediately above record DR-0081's original MVP
+  boundary; they are not the current implementation status. S2 now permits
+  the exact policy-bounded existing Address-owned destination described by
+  DR-0086 while preserving both source and destination owners. Literal owner
+  reassignment/gifting remains deferred and fail-closed. S2 is complete As-Is,
+  S3 fee accounting/gas metering is next, and this is not production or
+  mainnet readiness. Compatibility is explicit: this dev profile installs
+  preinstalled asset module version 2 with the `0xF011` semantics declaration
+  version 2; historical module/semantics version 1 bytes remain pinned but are
+  not installed by this profile. The `0xF001` body, `0xF002` arguments, and
+  `0xF003` event stay at schema version 1 and the WASM bytes are unchanged.
+  This profile selection is not a claim that general upgrade activation is
+  implemented.
 - DR-0082: Add the bounded canonical Developer MVP query surface described in
   "Bounded Developer MVP query API". Keep query selectors non-authoritative,
   resolve all chain/domain/epoch/storage authority from trusted composition,
@@ -3259,8 +3285,9 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   criteria 1-6, 10, and 11 are implemented and validated As-Is, so that gate
   has passed without making a production-readiness claim. S0 below is also
   implemented As-Is. S1 below is now also implemented and tested As-Is (see
-  "S1 implementation status" immediately below); the current implementation
-  priority is S2. S3-S5 remain ordered successors, and the TypeScript
+  "S1 implementation status" immediately below), and S2 is implemented and
+  validated As-Is by DR-0086. The current implementation priority is S3.
+  S4-S5 remain ordered successors, and the TypeScript
   client/explorer/wallet surface remains deferred until the complete
   CLI-First Node Production Gate passes.
 
@@ -3437,6 +3464,13 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   required afterward, unchanged, and S2 (cross-owner transfer) is the next
   ordered slice.
 
+  **DR-0086 amendment (current status).** The preceding "S2 is next" sentence
+  records DR-0085's S1 completion point. S2 is now implemented and validated
+  As-Is through the exact committed destination policy, with literal owner
+  reassignment still deferred; S3 is the next ordered slice. S4/S5, Phase
+  16/17 exit criteria, and an independent security audit remain outstanding,
+  so no production/mainnet readiness is claimed.
+
   **CLI-First Node Production Gate.** This new gate sits between the CLI
   Developer MVP Gate and the deferred browser surface. It is a real
   node/persistence/operations gate, not client-library work, and it is
@@ -3485,8 +3519,11 @@ version 1, and fail closed on zero identity/rule version, empty access, or
     result's chain id, protocol version, epoch policy, signature scheme,
     address binding, and transaction auth profile against that expectation
     before any signing occurs.
-  - S2: cross-owner transfer (destination-owner authorization and object
-    owner changes) on the existing owned-effects path.
+  - S2 (implemented As-Is by DR-0086): cross-owner transfer through an exact
+    committed destination-owner policy on the trusted preinstalled-module
+    path. The roadmap phrase "object owner changes" means correct handling of
+    differing source/destination owner projections; it does not authorize
+    literal owner reassignment, which remains fail-closed.
   - S3: fees and gas metering, completed before the devnet's fee-free posture
     is exposed to public live ingress.
   - S4: a secure signer replacing today's development-only `LocalSigner`, and
@@ -3511,3 +3548,71 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   single-validator design; the devnet's current single-validator posture
   remains an explicit MVP-only limitation (see "Local devnet architecture"
   above), not the production target.
+- DR-0086: Implement S2 as a bounded committed cross-owner destination policy,
+  without introducing literal object-owner reassignment.
+
+  **Roadmap interpretation.** DR-0085's S2 phrase "destination-owner
+  authorization and object owner changes" means correctly loading,
+  authorizing, preserving, and committing different source/destination owner
+  projections. It does not mean gifting or reassignment of an object's owner.
+  Existing effect translation still requires an updated object's owner to
+  equal its authenticated pre-state owner, so literal reassignment remains
+  fail-closed and deferred.
+
+  **Generic committed envelope.** A trusted `PreinstalledModuleCatalogEntry`
+  now carries a bounded `PreinstalledModuleSemanticsEnvelope`: opaque
+  application-semantics bytes (at most 64 KiB) plus at most 16 sorted,
+  unique-index `PreinstalledObjectAccessPolicy` records. The policy and
+  envelope use stable canonical type IDs `0xE007` and `0xE008`, encoding
+  version 1, with stable encoding vectors. `SystemModule.semantics_hash`
+  commits the exact full envelope bytes, not only the opaque application
+  declaration. Both startup registry/catalog reconciliation and request-time
+  module resolution independently encode and verify the actual trusted
+  envelope bytes. No request field, storage projection, or caller-supplied
+  digest can create or widen a policy.
+
+  **Authorization and ordering.** The sender still owns signed access index 0,
+  and the general owned-effects entrypoint remains sender-only. On the trusted
+  preinstalled-WASM path only, a policy may authorize a non-sender existing
+  `Owner::Address` object at one exact nonzero signed access index, exact
+  entrypoint, `AccessMode::Write`, exact type hash, and exact schema version.
+  Policy resolution occurs exactly once per non-replay execution, after receipt
+  and nonce reconciliation but before object I/O; the resolved module is reused
+  for authorization and execution. Therefore an exact replay still reconciles
+  before policy/module/object work and never reapplies effects. Source-index
+  policy, `Read`/`Consume`, wrong index/mode/type/schema/entrypoint/module,
+  missing policy, and Shared/System/Immutable ownership all fail closed.
+
+  **Devnet policy and startup.** The devnet catalog declares exactly one policy:
+  signed destination index 1, `transfer`, `Write`, the exact asset-account type
+  hash, and schema version 1. The opaque devnet semantics states that source
+  index 0 is sender-owned, the existing destination may have another Address
+  owner, and both owners remain unchanged. Startup seed reconciliation no
+  longer assumes per-owner source/destination balance totals or paired
+  sequences, because legitimate cross-owner movement invalidates both
+  assumptions. It still verifies exact current owner/id/type/schema/canonical
+  body/digest/provenance, immutable version-one history, and the seed receipt
+  for every account, then performs one checked global fixed-supply invariant
+  over the bounded configured-owner set before serving.
+
+  **CLI and evidence.** `apps/cli transfer` requires an explicit
+  `--destination-owner <32-byte-hex-address>`. Before signing it requires the
+  queried source owner to equal the local signer and the queried destination
+  owner to equal that explicit expected address. The real file-backed SQLite
+  E2E seeds separate sender and recipient owners, transfers into the recipient
+  destination, proves both balances change and the recipient owner remains
+  unchanged, closes every store/router reference, reopens under writer
+  generation N+1, and proves exact same-boot and post-restart request replay
+  returns byte-identical submit/receipt results without reapplication. Reusing
+  a committed request ID with different signed bytes returns HTTP 409 while
+  both canonical object query results, both relevant receipts, and the sender
+  nonce remain unchanged; the old writer generation remains fenced.
+
+  This implementation preserves established canonical transaction,
+  `ObjectEffect`, `Object`, receipt, nonce, and submit-result bytes. S2 is
+  implemented and validated As-Is only: the local devnet remains fee-free,
+  single-validator, SQLite-backed, and non-production. S3 uniform asset fee
+  accounting and gas metering is next. The TypeScript client, explorer, wallet,
+  S4 secure signer/Ledger work, and S5 persistence/provider/operations/release
+  evidence remain deferred, and Phase 16/17 exit criteria plus an independent
+  security audit remain mandatory.

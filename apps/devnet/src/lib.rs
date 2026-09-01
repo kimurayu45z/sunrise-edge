@@ -35,5 +35,6 @@ pub use identities::DevnetOutboxIdentitySource;
 pub use machine::DevnetMachine;
 pub use seed::{
     DevnetSeedError, SeedAssetAccountsOutcome, SeededAssetAccounts, seed_asset_accounts,
+    verify_seeded_asset_supply,
 };
 pub use transport::DevnetTransport;

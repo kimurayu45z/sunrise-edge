@@ -18,15 +18,16 @@ pub const MAX_DEVNET_OWNERS: usize = 64;
 
 /// Known-limitations banner printed once at every devnet startup.
 ///
-/// Besides the pre-existing dev-profile constraints, this names the two
-/// facts that only became true once the bounded query API was wired in:
+/// Besides the pre-existing dev-profile constraints, this names the exact S2
+/// posture (policy-bounded cross-owner destination, no literal owner change)
+/// and the two facts that became true once the bounded query API was wired in:
 /// the four `GET` query routes are an unauthenticated public-read API (any
 /// caller can read any object, receipt, next-nonce, or context; the address
 /// in `/v1/senders/{sender}/next-nonce` is a public lookup selector, not
 /// authorization), and query and submission share one admission budget
 /// (the single `NativeBlockingExecutor` constructed by the native router), so
 /// a burst of one can starve the other.
-pub const DEVNET_STARTUP_LIMITATIONS_BANNER: &str = "single-validator,owned-objects-only,cross-owner-transfer-fail-closed,fee-free,local-sqlite,unauthenticated-bounded-public-read-query-api,shared-query-submission-admission-budget,non-production";
+pub const DEVNET_STARTUP_LIMITATIONS_BANNER: &str = "single-validator,owned-objects-only,policy-bounded-cross-owner-destination,literal-owner-reassignment-fail-closed,fee-free,local-sqlite,unauthenticated-bounded-public-read-query-api,shared-query-submission-admission-budget,non-production";
 
 /// One browser/client-controlled development owner address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -509,6 +510,12 @@ mod tests {
 
     #[test]
     fn startup_limitations_banner_names_bounded_query_read_and_shared_admission() {
+        assert!(
+            DEVNET_STARTUP_LIMITATIONS_BANNER.contains("policy-bounded-cross-owner-destination")
+        );
+        assert!(
+            DEVNET_STARTUP_LIMITATIONS_BANNER.contains("literal-owner-reassignment-fail-closed")
+        );
         assert!(
             DEVNET_STARTUP_LIMITATIONS_BANNER
                 .contains("unauthenticated-bounded-public-read-query-api")

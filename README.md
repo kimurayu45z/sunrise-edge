@@ -529,10 +529,10 @@ independent security review.
 The [CLI Developer MVP Gate](TODO.md#cli-developer-mvp-gate) is satisfied
 As-Is: a real Rust client and CLI exercise the local end-to-end product,
 including orderly restart and duplicate-request evidence. Under the CLI-first
-production-strategy pivot (see `ARCHITECTURE.md` DR-0085), S1 of the
+production-strategy pivot (see `ARCHITECTURE.md` DR-0085), S2 of the
 [CLI-First Node Production Gate](TODO.md#cli-first-node-production-gate) is
-now implemented As-Is, and the current milestone is S2 — S1 is a real
-node/persistence/operations gate slice defined by reference to the existing,
+now implemented As-Is, and the current milestone is S3 — S0-S2 are real
+node/persistence/operations gate slices defined by reference to the existing,
 unchanged Phase 15 production exit criteria, the Post-MVP persistence
 implementation order, and the cross-phase release gate. S1 has two separate
 concerns, both now implemented: remote TLS transport, and a separate locally
@@ -567,13 +567,21 @@ expected-context check, and passing the context check never widens what the
 TLS layer trusts. This slice ships no mTLS, no certificate
 revocation/rotation/lifecycle handling, and no deployment/operations
 evidence for issuing or distributing that CA material; those remain
-explicitly deferred, not silently assumed. The TypeScript-client/explorer/
+explicitly deferred, not silently assumed. S2 adds one bounded committed
+preinstalled-module policy in dev-profile asset module version 2: only the
+exact destination at signed access index
+1, for the exact module/version and `transfer` entrypoint, `Write` mode,
+asset-account type hash, and schema version may be Address-owned by someone
+other than the signer. The source at index 0 remains signer-owned and the
+destination owner remains unchanged. Literal ownership reassignment/gifting,
+`Consume`, wrong position/mode/type/schema/entrypoint/module, and Shared/
+System/Immutable owners remain fail-closed. The TypeScript-client/explorer/
 wallet criteria remain unchanged but are deferred until the CLI-First Node
-Production Gate passes. Passing S1 is explicitly not mainnet readiness; S2
+Production Gate passes. Passing S2 is explicitly not mainnet readiness; S3
 through S5, the Phase 16/17 production exit criteria, and an independent
 security audit remain required afterward. The owned-object Write/Consume
-durable
-composition and an additive trusted preinstalled-WASM node-core entrypoint are
+durable composition and an additive trusted preinstalled-WASM node-core
+entrypoint are
 now available. The latter resolves the exact active module record captured
 from committed `ProtocolConfig`, checks the preinstalled
 code/manifest/semantics commitments under dedicated hash domains, remains
@@ -613,14 +621,20 @@ cadence exists, and E2E can target a released devnet artifact.
 
 The devnet demonstration contract is a preinstalled
 `sunrise.devnet.asset_account.v1` module with one `transfer` entrypoint
-between two ordinary, same-sender-owned asset-account objects, using the same
+between two ordinary Address-owned asset-account objects, using the same
 single `AssetId`/account/transfer path as every other asset — there is no
 privileged native coin or special-cased balance/transfer/fee path. It enforces
 conservation and fails closed on zero amount, underflow, overflow, and
 asset-ID mismatch.
-Because cross-owner destination authorization and object owner changes remain
-fail-closed on the existing owned-effects path, this demonstrates only
-same-sender asset movement, not user-to-user transfer; the devnet's fee
+The module name and its `0xF001` body, `0xF002` arguments, and `0xF003` event
+schemas remain version 1, but the installed preinstalled module version is 2:
+its `0xF011` version-2 semantics declaration commits the S2 policy. Historical
+module/semantics version 1 bytes remain pinned for compatibility and are not
+installed by this dev profile; the WASM bytes are unchanged. This is a bounded
+dev-profile selection, not a general module-upgrade activation architecture.
+The trusted devnet catalog may authorize an existing destination owned by a
+different configured address while leaving both object owners unchanged;
+literal object-owner reassignment remains fail-closed. The devnet's fee
 registry stays empty and every transaction commits with `fee_payment: None`.
 The MVP remains single-validator, owned-object only, fee-free, local-SQLite,
 and explicitly non-production.
@@ -709,11 +723,13 @@ and no independent canonical encode/decode, signing, or RPC path. It provides
 non-keystore development seed file — never a home-directory default, never
 accepted on argv, never printed, and checked for symlinks/insecure Unix
 permissions/exact length), `context`, `object`, `receipt`, `next-nonce`, and
-`transfer` — the one same-owner devnet asset transfer command. `transfer`
+`transfer` — the bounded devnet asset transfer command. `transfer`
 requires five `--expected-*` flags (`--expected-chain-id`,
 `--expected-protocol-version`, `--expected-epoch`, `--expected-hash-suite-id`,
-`--expected-domain`), rejects a missing, zero, or malformed value before any
-network dispatch, and builds a `clients/rust` `ExpectedProtocolContext` from
+`--expected-domain`) plus an explicit required `--destination-owner`. It
+rejects a missing, zero, or malformed expected-context value and a missing or
+malformed destination address before any network dispatch, and builds a
+`clients/rust` `ExpectedProtocolContext` from
 them plus the locally implemented Ed25519/`AddressIsPublicKey` transaction-
 auth-profile/signature-scheme/address-binding constants (still independently
 compared by the client verifier, not merely assumed). It then calls
@@ -721,8 +737,10 @@ compared by the client verifier, not merely assumed). It then calls
 uses only that verified context, never anything derived from the raw remote
 response, for the next-nonce/both-object queries, transaction construction,
 signing, and submission that follow; a mismatch on any field stops the
-command immediately after that one context request. It then builds the exact
-two-`Write` access manifest in source/destination order, signs and submits
+command immediately after that one context request. It requires the source
+owner to equal the signer and the destination owner to equal the explicit
+expected address, then builds the exact two-`Write` access manifest in source/
+destination order, signs and submits
 through `clients/rust`, and can optionally wait for a receipt under
 caller-supplied, finite poll bounds (`--wait` requires all four `--wait-*`
 bounds together; no hidden default). Output is deterministic `key=value`
@@ -745,23 +763,27 @@ implemented As-Is at
 `apps/cli/tests/devnet_restart_duplicate_e2e.rs`: it closes and reopens a
 real file-backed SQLite database (dropping every store/router reference so
 the file is genuinely closed first), verifies the writer generation advances
-and the same seeded accounts reconcile, and proves the canonical object,
+and the same seeded accounts reconcile, and proves a real cross-owner transfer
+leaves the recipient destination owner unchanged while the canonical object,
 receipt, next-nonce, and submit-result bytes survive restart exactly. The
 same signed request is replayed both within one boot and after restart without
 re-applying its effects; reusing a committed request id for a
-different transaction is a typed fail-closed HTTP conflict, and the
+different transaction is a typed fail-closed HTTP conflict with both objects,
+both relevant receipts, and the sender nonce unchanged, and the
 pre-restart writer generation is fenced on the reopened store. This proves
 only orderly stop/reopen — not `kill -9`, power loss, torn writes, load,
 concurrency, or SQLite's production suitability.
 
 The Phase 15-17 production exit criteria and accepted persistence designs are
-preserved. The CLI Developer MVP Gate and S0-S1 of the CLI-First Node
+preserved. The CLI Developer MVP Gate and S0-S2 of the CLI-First Node
 Production Gate are satisfied As-Is: S1's expected-protocol-context
 verification slice and its remote TLS transport slice are both now
-implemented and tested, so S1 as a whole is complete, and the current
-milestone is S2. This is real node/persistence/operations and remote-CLI
+implemented and tested, so S1 as a whole is complete; S2's committed
+cross-owner destination policy and restart/replay evidence are also complete
+As-Is, and the current milestone is S3, uniform asset fee accounting and gas
+metering. This is real node/persistence/operations and remote-CLI
 evidence, not a mainnet-readiness or production-certification claim: passing
-S1 does not authorize skipping directly to later production claims.
+S2 does not authorize skipping directly to later production claims.
 Additional capacity/load/soak evidence, PITR, HA/failover, and provider-managed
 certification remain frozen until S5's certification work or an explicit SLO
 requires them. The
@@ -837,33 +859,35 @@ workspace has already been built once (`cargo build --workspace`). The devnet
 binds loopback only, is single-validator, and must never be used to custody
 real assets or exposed beyond your own machine.
 
-1. In terminal A, choose explicit paths and create a development seed file:
-   a private, non-keystore development
-   secret consisting of exactly 64 hexadecimal characters, with permission
+1. In terminal A, choose explicit paths and create sender and recipient
+   development seed files: private, non-keystore development secrets each
+   consisting of exactly 64 hexadecimal characters, with permission
    `0600` and never a symlink (`apps/cli`'s `address`/`transfer` commands
    reject anything else). For example:
 
    ```bash
-   SEED_FILE=/tmp/sunrise-edge-dev-seed
+   SENDER_SEED_FILE=/tmp/sunrise-edge-sender-seed
+   RECIPIENT_SEED_FILE=/tmp/sunrise-edge-recipient-seed
    DEVNET_DATA_DIR=/tmp/sunrise-edge-devnet
    umask 077
-   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$SEED_FILE"
-   chmod 600 "$SEED_FILE"
+   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$SENDER_SEED_FILE"
+   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$RECIPIENT_SEED_FILE"
+   chmod 600 "$SENDER_SEED_FILE" "$RECIPIENT_SEED_FILE"
    ```
 
-2. Derive the address bound to that seed file. This prints exactly one
-   `address=<64-hex-character address>` line; copy the printed address for
-   the next step (it depends on the random seed generated above, so it is
-   not written out here):
+2. Derive both addresses. Each command prints exactly one
+   `address=<64-hex-character address>` line (the values depend on the random
+   seeds above, so they are not written out here):
 
    ```bash
-   ADDRESS_LINE="$(cargo run -p sunrise-edge-cli -- address --seed-file "$SEED_FILE")"
-   DEV_OWNER="${ADDRESS_LINE#address=}"
-   printf 'DEV_OWNER=%s\n' "$DEV_OWNER"
+   SENDER_ADDRESS_LINE="$(cargo run -p sunrise-edge-cli -- address --seed-file "$SENDER_SEED_FILE")"
+   RECIPIENT_ADDRESS_LINE="$(cargo run -p sunrise-edge-cli -- address --seed-file "$RECIPIENT_SEED_FILE")"
+   SENDER_OWNER="${SENDER_ADDRESS_LINE#address=}"
+   RECIPIENT_OWNER="${RECIPIENT_ADDRESS_LINE#address=}"
+   printf 'SENDER_OWNER=%s\nRECIPIENT_OWNER=%s\n' "$SENDER_OWNER" "$RECIPIENT_OWNER"
    ```
 
-3. Start the local devnet in its own terminal, using the address printed in
-   step 2 as `--dev-owner`:
+3. Start the local devnet in its own terminal with both addresses configured:
 
    ```bash
    cargo run -p sunrise-edge-devnet -- \
@@ -871,7 +895,8 @@ real assets or exposed beyond your own machine.
      --listen 127.0.0.1:7400 \
      --chain-id sunrise-local-devnet \
      --epoch 0 \
-     --dev-owner "$DEV_OWNER" \
+     --dev-owner "$SENDER_OWNER" \
+     --dev-owner "$RECIPIENT_OWNER" \
      --max-concurrent 16
    ```
 
@@ -879,8 +904,9 @@ real assets or exposed beyond your own machine.
    `owner=<owner> seed_status=<created|verified-existing> source=<object id> destination=<object id>`,
    and one line with the preinstalled module identity:
    `asset_id=<...> asset_account_type=<...> module_id=<...> module_version=<...> module_digest=<algorithm-label>:<hex digest>`.
-   Copy `source`, `destination`, `module_id`, and `module_version` from these
-   printed lines for step 5. `module_digest` prints as
+   Copy the sender owner's `source`, the recipient owner's `destination`, and
+   `module_id`/`module_version` from these printed lines for step 5.
+   `module_digest` prints as
    `<algorithm-label>:<hex>` (currently always `sha2-256:<hex>`, the only
    implemented digest algorithm, whose committed numeric `HashAlgorithmId` is
    `1`): pass `1` for `--module-digest-algorithm` below, and only the hex
@@ -892,10 +918,11 @@ real assets or exposed beyond your own machine.
    (these commands do not change state):
 
    ```bash
-   SEED_FILE=/tmp/sunrise-edge-dev-seed
-   DEV_OWNER="PASTE_ADDRESS_PRINTED_IN_STEP_2"
-   SOURCE_OBJECT_ID="PASTE_SOURCE_OBJECT_ID_PRINTED_IN_STEP_3"
-   DESTINATION_OBJECT_ID="PASTE_DESTINATION_OBJECT_ID_PRINTED_IN_STEP_3"
+   SENDER_SEED_FILE=/tmp/sunrise-edge-sender-seed
+   SENDER_OWNER="PASTE_SENDER_ADDRESS_PRINTED_IN_STEP_2"
+   RECIPIENT_OWNER="PASTE_RECIPIENT_ADDRESS_PRINTED_IN_STEP_2"
+   SOURCE_OBJECT_ID="PASTE_SENDER_SOURCE_OBJECT_ID_PRINTED_IN_STEP_3"
+   DESTINATION_OBJECT_ID="PASTE_RECIPIENT_DESTINATION_OBJECT_ID_PRINTED_IN_STEP_3"
    MODULE_ID="PASTE_MODULE_ID_PRINTED_IN_STEP_3"
    MODULE_VERSION="PASTE_MODULE_VERSION_PRINTED_IN_STEP_3"
    MODULE_DIGEST_HEX="PASTE_HEX_AFTER_THE_MODULE_DIGEST_COLON"
@@ -917,26 +944,27 @@ real assets or exposed beyond your own machine.
 
    cargo run -p sunrise-edge-cli -- context --endpoint 127.0.0.1:7400
    cargo run -p sunrise-edge-cli -- next-nonce --endpoint 127.0.0.1:7400 \
-     --sender "$DEV_OWNER"
+     --sender "$SENDER_OWNER"
    cargo run -p sunrise-edge-cli -- object --endpoint 127.0.0.1:7400 \
      --object-id "$SOURCE_OBJECT_ID"
    ```
 
-5. Submit the one implemented, same-owner devnet asset transfer (moves
-   balance from the seeded source account to the seeded destination account,
-   both owned by the address from step 2; amount is in the asset's smallest
-   unit):
+5. Submit the implemented cross-owner devnet asset transfer. The sender signs
+   a debit from its seeded source into the recipient's existing seeded
+   destination; the destination remains owned by `RECIPIENT_OWNER` before and
+   after the transfer (amount is in the asset's smallest unit):
 
    ```bash
    cargo run -p sunrise-edge-cli -- transfer \
      --endpoint 127.0.0.1:7400 \
-     --seed-file "$SEED_FILE" \
+     --seed-file "$SENDER_SEED_FILE" \
      --module-id "$MODULE_ID" \
      --module-version "$MODULE_VERSION" \
      --module-digest-algorithm 1 \
      --module-digest "$MODULE_DIGEST_HEX" \
      --source-object "$SOURCE_OBJECT_ID" \
      --destination-object "$DESTINATION_OBJECT_ID" \
+     --destination-owner "$RECIPIENT_OWNER" \
      --amount 250 \
      --gas-limit 1000000 \
      --request-id "$REQUEST_ID" \
@@ -952,12 +980,16 @@ real assets or exposed beyond your own machine.
      --wait-max-elapsed-ms 5000
    ```
 
-   `transfer` requires the five `--expected-*` flags above and rejects a
-   missing, zero, or malformed value before any network dispatch. Before any
+   `transfer` requires `--destination-owner` and the five `--expected-*`
+   flags above. It rejects a missing or malformed destination address and a
+   missing, zero, or malformed expected-context value before any network
+   dispatch. Before any
    nonce/object query or signing, it also requires the queried `/v1/context`
    result to exactly match that locally configured expectation (see "Current
    status" below and `ARCHITECTURE.md` DR-0085); a mismatch on any field
-   stops the command immediately after that one context request. `transfer`
+   stops the command immediately after that one context request. It also
+   requires the queried source owner to equal the signer and the queried
+   destination owner to equal `--destination-owner` before signing. `transfer`
    also treats a rejected or execution-failed submission as a typed,
    non-zero-exit error even with `--wait`; it never reports a rejected or
    failed transaction as success.
@@ -975,12 +1007,12 @@ real assets or exposed beyond your own machine.
    cargo run -p sunrise-edge-cli -- object --endpoint 127.0.0.1:7400 \
      --object-id "$DESTINATION_OBJECT_ID" > "$OBSERVATION_PREFIX.destination"
    cargo run -p sunrise-edge-cli -- next-nonce --endpoint 127.0.0.1:7400 \
-     --sender "$DEV_OWNER" > "$OBSERVATION_PREFIX.nonce"
+     --sender "$SENDER_OWNER" > "$OBSERVATION_PREFIX.nonce"
    ```
 
 7. Stop the devnet in terminal A with `Ctrl-C`, rerun the exact command from
-   step 3 with the same data directory, chain id, and owner, and wait for
-   `seed_status=verified-existing`. In terminal B, compare fresh queries with
+   step 3 with the same data directory, chain id, and both owners, and wait for
+   both `seed_status=verified-existing` lines. In terminal B, compare fresh queries with
    the pre-restart outputs; every `diff` must exit successfully with no output:
 
    ```bash
@@ -998,7 +1030,7 @@ real assets or exposed beyond your own machine.
    )
    diff -u "$OBSERVATION_PREFIX.nonce" <(
      cargo run -p sunrise-edge-cli -- next-nonce --endpoint 127.0.0.1:7400 \
-       --sender "$DEV_OWNER"
+       --sender "$SENDER_OWNER"
    )
    ```
 

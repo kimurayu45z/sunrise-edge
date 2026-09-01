@@ -311,6 +311,8 @@ fn cli_transfer_command_over_tls_stops_after_one_mismatched_context_request() {
         OsString::from("10".repeat(32)),
         OsString::from("--destination-object"),
         OsString::from("20".repeat(32)),
+        OsString::from("--destination-owner"),
+        OsString::from("88".repeat(32)),
         OsString::from("--amount"),
         OsString::from("250"),
         OsString::from("--gas-limit"),

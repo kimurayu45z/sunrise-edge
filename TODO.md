@@ -1746,11 +1746,13 @@ HA/failover、provider-managed pooler、real-provider certification、provider d
 
 **Current status (2026-09-01): criteria 1-6・10・11はimplemented and validated
 As-Isであり、CLI Developer MVP Gateは通過済みである。** これはproduction readinessの
-宣言ではない。CLI-First Node Production GateのS0・S1もimplemented and validated
+宣言ではない。CLI-First Node Production GateのS0-S2もimplemented and validated
 As-Isであり（S1のremote TLS transportとsigning前の独立したtrusted
 protocol-context validationの両方。詳細は
 ["CLI-First Node Production Gate"](#cli-first-node-production-gate)のS1参照）、
-現在のimplementation priorityはS2である。S3-S5は順序を飛ばさず後続する。
+S2のcross-owner destination policyとreal restart/replay E2EはDR-0086のとおり
+implemented As-Isである。現在のimplementation priorityはS3（uniform asset fee
+accounting/gas metering）である。S4-S5は順序を飛ばさず後続する。
 
 CLI Developer MVP completion criteria（capability criteria 2-3を満たしながら、product
 surfaceはARCHITECTURE.md DR-0081の順序に従う: local devnet、bounded query API、Rust
@@ -1811,8 +1813,8 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
     `kill -9`、power loss、torn write、load、concurrency、SQLiteのproduction適性は
     証明しない。下記S0参照）。
 11. single validator、owned-object only、fee-free dev profile、local SQLite、
-    same-sender-only asset movement（cross-owner transfer authorizationは未実装のためfail
-    closed）、4 bounded query routeがunauthenticated public-read API（呼び出し元は誰でも
+    cross-owner movementはexact committed destination policyだけ（literal owner reassignment/
+    giftingはfail closed）、4 bounded query routeがunauthenticated public-read API（呼び出し元は誰でも
     任意のobject/receipt/next-nonce/contextを読める。`/v1/senders/{sender}/next-nonce`の
     addressはpublic lookup selectorでありauthorizationではない）であること、queryと
     submissionが単一の共有admission budget（`NativeBlockingExecutor`／
@@ -1884,6 +1886,12 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    user-to-user transferではない。devnetのfee registryは空のままとし、すべてのtransactionは
    `fee_payment: None`でcommitする（fee assetもordinaryなasset accountの上のprotocol policyに
    過ぎず、native coinや別実装のbalance/transfer/fee pathを持たない。DR-0081参照）。
+   **DR-0086 amendment（current status）：** 直前のsame-sender-only/cross-owner
+   fail-closed記述はDR-0081当時のMVP境界を記録したhistorical textであり、現在の実装状況ではない。
+   S2はexact committed policyで既存の別Address-owned destinationを許可し、source/destination
+   ownerをどちらも保存する形でimplemented and validated As-Is。literal owner reassignment/
+   giftingは引き続きdeferredかつfail closedで、次はS3 fee accounting/gas meteringである。
+   production/mainnet readinessは未達である。
    前提として、`runtime-sqlite`へ`StructuredDurableDomainStateStore`/`IndexedOutboxRepository`を
    実装するadditive、local-only、non-productionな`SqliteDurableStore`を追加済み
    （implemented As-Is）。既存のopaque `SqliteStateStore`とは別テーブル・別`PRAGMA application_id`で、
@@ -2002,8 +2010,9 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    strict `--flag value` parserで、duplicate flag・unknown flag・flag値なし・宣言外の
    positional argumentをすべて拒否する。`address`（明示的に指定したdevelopment seed
    fileからAddressIsPublicKeyのaddressを導出）、`context`/`object`/`receipt`/`next-nonce`
-   （`clients/rust`の対応するquery methodへの薄いwrapper）、`transfer`（single same-owner
-   devnet asset transfer）の6コマンドを提供する。`--tls-server-name`/
+   （`clients/rust`の対応するquery methodへの薄いwrapper）、`transfer`（explicitな
+   destination ownerを要求するbounded devnet asset transfer）の6コマンドを提供する。
+   `--tls-server-name`/
    `--tls-ca-cert-der-file`をいずれも指定しない場合、`--endpoint`はplaintext
    `LoopbackHttpTransport`の下でloopbackのみを受理する。S1実装後は、両方の
    TLSフラグを指定した場合のみ`--endpoint`を既に解決済みの`SocketAddr`として
@@ -2017,12 +2026,15 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    `transfer`は`/v1/context`・sender自身の`/v1/senders/{sender}/next-nonce`・
    `--source-object`/`--destination-object`の`/v1/objects/{object_id}`結果を照会し、
    committed profileがEd25519 + AddressIsPublicKeyであること、contextとnext-nonceの
-   epochが一致することを署名前に検証し、両objectがCurrentInlineであることを要求し、
+   epochが一致することを署名前に検証し、両objectがCurrentInlineであること、source ownerが
+   signerであること、destination ownerが必須`--destination-owner` Addressと一致することを要求し、
    source→destinationの順でexactly two `Write` access manifestを構築し、
    `clients/rust`経由でtransactionをbuild・signし、caller指定のnon-zero request idで
    submitする。あらゆるassetは同一の`AssetId`/account/transfer pathを使い、native coinや
-   feeの特別扱いは無く、cross-owner transferは既存のowned-effects pathの上で引き続き
-   fail closedのままである（DR-0081参照）。`transfer`はsubmission自体もfail closedとして
+   feeの特別扱いは無い。cross-owner destination authorizationはDR-0086のtrusted
+   preinstalled-module exact policyだけで可能であり、general owned-effects pathは
+   sender-onlyのままである。literal ownership reassignment/giftingはfail closedである。
+   `transfer`はsubmission自体もfail closedとして
    扱い、それはsubmissionに先立つqueryだけではない：submit resultの`responses()`が
    空である場合、いずれかのresponseが`NodeResponseStatus::Rejected`を宣言している場合、
    およびいずれかのresponseのpayloadがdecodeした結果`ExecutionStatus::Failure`である場合
@@ -2095,8 +2107,10 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    `apps/cli/tests/devnet_restart_duplicate_e2e.rs`として実装した（implemented As-Is）。
    real file-backed `SqliteDurableStore`、実際にcomposeしたdevnet router、real loopback
    TCP、user-facing transfer legとしての`sunrise-edge-cli::run`、独立検証としての
-   `sunrise-edge-client`を使う。amount 250のCLI transferをbounded waitで実行し、両account
-   のdecoded stateとreceipt/next-nonceを独立にcaptureしたうえで、serverをgraceful HTTP
+   `sunrise-edge-client`を使う。別々にconfigured/seededしたsender sourceからrecipient
+   destinationへのamount 250のCLI transferをbounded waitで実行し、両accountのbalance変化と
+   recipient ownerが前後で不変であること、decoded stateとreceipt/next-nonceを独立にcaptureした
+   うえで、serverをgraceful HTTP
    shutdownでstopしserver taskをawaitし、`Arc<SqliteDurableStore>`をすべてdropしてSQLite
    fileを真にcloseしてから、`boot_local_store`で再openしてwriter generationがN+1へ
    進むことをassertし、reseedがExisting outcomeで同一account identityを返すことを検証し、
@@ -2106,7 +2120,8 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    signed `SubmitTransactionRequest`をsame boot内とrestart後の両方でbyte-identicalに
    再送信し、canonical response bytesが同一でeffectが二重適用されないことを証明する。already-committed
    なrequest idを別のtransactionへ再利用するとtypedでnonzeroなfail-closed HTTP conflict
-   （409）になりstate変化が無いことも検証する。さらに、reopen後のstoreへpre-restart
+   （409）になり、両object queryのcanonical bytes、CLI transferとraw transferの両receipt、
+   sender nonceがすべて不変であることも検証する。さらに、reopen後のstoreへpre-restart
    writer generationのcontextで読み取りを試み、`WriterFenced`を返すことでold writer
    generationがfencedであることを直接証明する。これはorderly stop/reopenのみの証明であり、
    `kill -9`、power loss、torn write、load、concurrency、SQLiteのproduction適性は
@@ -2277,10 +2292,37 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
   意図的に統合しない：TLS handshakeの成功がprotocol-context検証を代替すること
   はなく、検証済みcontextがTLS層の信頼範囲を広げることもない。これは
   mainnet readinessやproduction certificationの主張ではない：Phase 16/17の
-  production exit criteriaと独立したsecurity auditは引き続き必須であり、次の
-  優先slice はS2（cross-owner transfer）である。
-- **S2**: cross-owner transfer（destination-owner authorizationとobject owner
-  変更）を既存のowned-effects pathの上へ実装する。
+  production exit criteriaと独立したsecurity auditは引き続き必須である。
+- **S2**: **implemented and validated As-Is（2026-09-01、DR-0086）。**
+  cross-owner transferをtrusted preinstalled-module pathのexact committed policyとして
+  実装した。senderが所有するsigned access index 0は例外不可。non-senderの既存
+  `Owner::Address` destinationは、exact module/version・`transfer` entrypoint・signed
+  access index 1・`Write`・exact asset-account type hash/schema versionの場合だけ許可する。
+  policyはreceipt/nonce reconciliation後かつobject I/O前にexactly once resolveし、同じ
+  resolved moduleをauthorization/executionで再利用する。general owned-effects pathは
+  sender-onlyのまま、source policy・`Consume`・wrong position/mode/type/schema/entrypoint/
+  module・Shared/System/Immutableはfail closed。roadmapの「object owner変更」は異なる
+  source/destination owner projectionを正しく扱い保存する意味であり、literal owner
+  reassignment/giftingは実装せずfail closedのままdeferする。
+
+  `SystemModule.semantics_hash`はopaque app semanticsとbounded policy集合を含むexact generic
+  semantics envelope bytes（stable canonical type IDs `0xE007`/`0xE008`, v1）へcommitし、
+  startup reconciliationとrequest resolutionがそれぞれactual bytesを独立検証する。
+  S2 dev profileがinstallするasset moduleはversion 2で、`0xF011` semantics declarationも
+  version 2とする。historical same-sender module/semantics version 1 bytesはstable vectorとして
+  保持するが、このdev profileのregistry/catalogにはinstallしない。`0xF001` body・`0xF002`
+  args・`0xF003` event schemaはversion 1のまま、WASM bytesも不変である。これはboundedな
+  profile selectionであり、general module-upgrade activation architectureの完成を主張しない。
+  established Transaction/ObjectEffect/Object/receipt/nonce/submit bytesは不変。devnet startupは
+  per-owner balance/paired-sequence invariantを仮定せず、各current objectとversion-one history/
+  receiptを厳密検証後、bounded configured-owner集合のfixed global seeded supplyをchecked検証する。
+  CLIは必須`--destination-owner`をAddressとしてparseし、source=signer・destination=explicit
+  expected ownerを署名前に検証する。real file-backed SQLite E2Eはcross-owner balance変化、
+  recipient owner不変、same-boot/post-close-reopen exact replayのbyte-identical response/receiptと
+  non-reapplication、changed signed requestによるrequest-id reuse 409時の両object canonical bytes・
+  両receipt・sender nonce不変、writer-generation fencingを証明する。
+  これはS2 As-Isのみでproduction/mainnet readinessではない。次はS3。TypeScript client/
+  explorer/walletとS4/S5は引き続きdeferredである。
 - **S3**: fees/gas metering。public live ingressの前に実装を完了する（fee-free
   devnetをpublicへ晒したままにしない）。
 - **S4**: secure signer（`LocalSigner`の development-only in-memory鍵に代わる
@@ -3006,7 +3048,7 @@ Post-MVP Production Hardening: Phase 15 persistence implementation order（To-Be
 restart safety、fail-closed behaviorを直接満たすために必要な既存contract修正は先行して
 よいものとしていた。CLI Developer MVP Gateは現在通過済みであり、以下の項目は
 ["CLI-First Node Production Gate"](#cli-first-node-production-gate)のS5が参照する
-production persistence作業そのものである。現在はS2がpriorityであり、capacity/PITR/HA等の
+production persistence作業そのものである。現在はS3がpriorityであり、capacity/PITR/HA等の
 S5 certification項目はS5または明示的なSLOがtriggerするまで引き続き凍結する。
 
 1. SQLite既存dataを暗黙migrationせず、writer fence、deadline、typed conflict/indeterminate failureを持つ

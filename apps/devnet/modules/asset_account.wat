@@ -1,8 +1,9 @@
 (module
   ;; The host currently supplies object bodies but not their type hashes, schema
   ;; versions, IDs, or owners. This module consequently validates the complete
-  ;; self-describing body frame; node-core separately authenticates same-sender
-  ;; ownership and freezes object metadata across each update.
+  ;; self-describing body frame; node-core separately authenticates the
+  ;; sender-owned source, enforces the committed destination policy, and freezes
+  ;; object metadata including both owners across each update.
   (import "env" "get_object_count" (func $get_object_count (result i32)))
   (import "env" "get_object_data_len" (func $get_object_data_len (param i32) (result i32)))
   (import "env" "read_object_data" (func $read_object_data (param i32 i32 i32 i32) (result i32)))
