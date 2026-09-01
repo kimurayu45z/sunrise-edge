@@ -874,6 +874,7 @@ dependencies = [
  "execution",
  "hashing",
  "node-core",
+ "node-wire",
  "objects",
  "protocol-config",
  "protocol-types",
@@ -901,6 +902,17 @@ dependencies = [
  "runtime",
  "system-modules",
  "wat",
+]
+
+[[package]]
+name = "node-wire"
+version = "0.1.0"
+dependencies = [
+ "canonical-encoding",
+ "node-core",
+ "objects",
+ "protocol-types",
+ "runtime",
 ]
 
 [[package]]
@@ -1530,6 +1542,25 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "sunrise-edge-client"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "crypto",
+ "ed25519-zebra",
+ "execution",
+ "fees",
+ "native-http",
+ "node-core",
+ "node-wire",
+ "objects",
+ "protocol-config",
+ "protocol-types",
+ "sunrise-edge-devnet",
+ "tokio",
+]
 
 [[package]]
 name = "sunrise-edge-devnet"

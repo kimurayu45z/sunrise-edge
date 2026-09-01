@@ -13,19 +13,14 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use canonical_encoding::{
-    CanonicalDecodingError, CanonicalEncodingError, CanonicalStruct, decode_canonical_frame,
-};
 use core::fmt;
 use execution::{ExecutionError, WasmExecutionEngine};
 use hashing::HashSuiteResolver;
 use node_core::{
-    AuthenticatedSubmitTransaction, MAX_AUTHENTICATED_OBJECT_BODY_BYTES, MAX_CHAIN_ID_BYTES,
-    MAX_NODE_OUTPUT_ITEMS, MAX_NODE_PAYLOAD_BYTES, NodeConfig, NodeCoreError, NodeDedupRecord,
-    NodeEvent, NodeEventKind, NodeOutboxBatch, NodeOutboxDelivery, NodeResponse,
-    ObjectQueryResult as NodeObjectQueryResult, OutboxClaim, OutboxLeaseId,
-    PreinstalledModuleCatalog, ReceiptQueryResult as NodeReceiptQueryResult, RequestId,
-    TransactionAuthError, TransactionalNodeStateMachine, acknowledge_outbox_message,
+    AuthenticatedSubmitTransaction, MAX_NODE_OUTPUT_ITEMS, MAX_NODE_PAYLOAD_BYTES, NodeConfig,
+    NodeCoreError, NodeEvent, NodeEventKind, NodeOutboxBatch, NodeOutboxDelivery, OutboxClaim,
+    OutboxLeaseId, PreinstalledModuleCatalog, RequestId, TransactionAuthError,
+    TransactionalNodeStateMachine, acknowledge_outbox_message,
     acknowledge_outbox_message_in_domain, authenticate_submit_transaction_event,
     claim_next_outbox_message, claim_next_outbox_message_in_domain,
     handle_authenticated_resolved_durable_submit_transaction,
@@ -33,20 +28,19 @@ use node_core::{
     handle_idempotent_event, handle_resolved_durable_idempotent_event,
     handle_resolved_idempotent_event, query_object, query_request_receipt, query_sender_next_nonce,
 };
-use objects::{Address, ObjectId, decode_object};
+use objects::{Address, ObjectId};
 use protocol_config::{
     DomainPlacementManifest, ProtocolConfig, ProtocolConfigError, resolve_transaction_auth_profile,
 };
-use protocol_types::{ChainId, Digest32, Epoch, HashAlgorithmId, HashSuiteId, ProtocolVersion};
+use protocol_types::ProtocolVersion;
 use runtime::{
     AtomicityDomainId, Clock, DomainTransactionalStateStore, DueOutboxClaimRequest,
-    DurableObjectVersion, DurableOperationContext, DurableOutboxAcknowledgement,
-    DurableOutboxAcknowledgementOutcome, DurableOutboxAcknowledgementRejection,
-    DurableOutboxClaimOutcome, DurableOutboxClaimRejection, DurableOutboxLeaseId,
-    IndeterminateCommitReason, IndexedOutboxContractError, IndexedOutboxRepository,
-    InvocationCancellation, MAX_DURABLE_OUTBOX_LEASE_MILLIS, MAX_DURABLE_RECEIPT_BYTES,
-    ObjectHeadRevision, OutboxRequestId, PersistenceLayout, RequestOutboxClaimRequest, Runtime,
-    RuntimeError, StateKeyScan, StateKeyScanner, StorageCorrelationId, StorageDeadline,
+    DurableOperationContext, DurableOutboxAcknowledgement, DurableOutboxAcknowledgementOutcome,
+    DurableOutboxAcknowledgementRejection, DurableOutboxClaimOutcome, DurableOutboxClaimRejection,
+    DurableOutboxLeaseId, IndeterminateCommitReason, IndexedOutboxContractError,
+    IndexedOutboxRepository, InvocationCancellation, MAX_DURABLE_OUTBOX_LEASE_MILLIS,
+    OutboxRequestId, PersistenceLayout, RequestOutboxClaimRequest, Runtime, RuntimeError,
+    StateKeyScan, StateKeyScanner, StorageCorrelationId, StorageDeadline,
     StructuredDurableDomainStateStore, TransactionalStateStore, Transport, WriterFenceGeneration,
 };
 use std::{
@@ -57,38 +51,19 @@ use std::{
 };
 use tokio::sync::{Semaphore, TryAcquireError};
 
-const HTTP_RESULT_TYPE_ID: u16 = 0xE101;
-const HTTP_RESULT_ENCODING_VERSION: u16 = 1;
-const QUERY_RESULT_ENCODING_VERSION: u16 = 1;
+// Canonical HTTP event/query-result codecs and route/media-type constants
+// live in `node-wire` (DR-0083) and are re-exported below so existing
+// callers keep their original `native-http` import paths and byte-identical
+// wire behavior.
+pub use node_wire::{
+    CONTEXT_QUERY_RESULT_TYPE_ID, HttpContextQueryResult, HttpContractError,
+    HttpNextNonceQueryResult, HttpNodeResult, HttpObjectQueryResult, HttpReceiptQueryResult,
+    LIVENESS_PATH, NEXT_NONCE_QUERY_RESULT_TYPE_ID, NODE_EVENT_MEDIA_TYPE, NODE_EVENT_PATH,
+    NODE_RESULT_MEDIA_TYPE, OBJECT_QUERY_RESULT_TYPE_ID, ObjectQueryStatus, QUERY_CONTEXT_PATH,
+    QUERY_NEXT_NONCE_PATH, QUERY_OBJECT_PATH, QUERY_RECEIPT_PATH, QUERY_RESULT_MEDIA_TYPE,
+    QueryResultError, RECEIPT_QUERY_RESULT_TYPE_ID, ReceiptQueryStatus, http_receipt_query_result,
+};
 
-/// Canonical type identifier for [`HttpContextQueryResult`] (DR-0082).
-pub const CONTEXT_QUERY_RESULT_TYPE_ID: u16 = 0xE102;
-/// Canonical type identifier for [`HttpObjectQueryResult`] (DR-0082).
-pub const OBJECT_QUERY_RESULT_TYPE_ID: u16 = 0xE103;
-/// Canonical type identifier for [`HttpReceiptQueryResult`] (DR-0082).
-pub const RECEIPT_QUERY_RESULT_TYPE_ID: u16 = 0xE104;
-/// Canonical type identifier for [`HttpNextNonceQueryResult`] (DR-0082).
-pub const NEXT_NONCE_QUERY_RESULT_TYPE_ID: u16 = 0xE105;
-
-/// Versioned media type returned by every bounded query route (DR-0082).
-pub const QUERY_RESULT_MEDIA_TYPE: &str = "application/vnd.sunrise-edge.query-result";
-/// Bounded query route returning trusted chain/protocol/domain context.
-pub const QUERY_CONTEXT_PATH: &str = "/v1/context";
-/// Bounded query route returning one durable object by identifier.
-pub const QUERY_OBJECT_PATH: &str = "/v1/objects/{object_id}";
-/// Bounded query route returning one durable receipt by request identifier.
-pub const QUERY_RECEIPT_PATH: &str = "/v1/receipts/{request_id}";
-/// Bounded query route returning one sender's current-epoch next nonce.
-pub const QUERY_NEXT_NONCE_PATH: &str = "/v1/senders/{sender}/next-nonce";
-
-/// Versioned media type accepted by the event endpoint.
-pub const NODE_EVENT_MEDIA_TYPE: &str = "application/vnd.sunrise-edge.node-event";
-/// Versioned media type returned for a successful invocation.
-pub const NODE_RESULT_MEDIA_TYPE: &str = "application/vnd.sunrise-edge.node-result";
-/// Native route that accepts one canonical node event.
-pub const NODE_EVENT_PATH: &str = "/v1/events";
-/// Liveness route. It intentionally performs no storage or protocol checks.
-pub const LIVENESS_PATH: &str = "/health/live";
 /// Maximum HTTP body size. The allowance above the inner payload covers framing.
 pub const MAX_HTTP_EVENT_BODY_BYTES: usize = MAX_NODE_PAYLOAD_BYTES + 512;
 /// Bounded native delivery lease; expired work is deliberately redelivered.
@@ -484,1153 +459,6 @@ impl fmt::Display for IndexedOutboxIdentitySourceError {
 }
 
 impl Error for IndexedOutboxIdentitySourceError {}
-
-/// Errors in the canonical HTTP result contract.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HttpContractError {
-    /// Canonical encoding failed.
-    CanonicalEncoding(CanonicalEncodingError),
-    /// Canonical decoding failed.
-    CanonicalDecoding(CanonicalDecodingError),
-    /// A nested node response failed validation.
-    NodeCore(NodeCoreError),
-    /// A result carried more responses than one invocation allows.
-    TooManyResponses(usize),
-    /// A response belonged to another request.
-    RequestMismatch {
-        /// Result request identifier.
-        expected: RequestId,
-        /// Nested response request identifier.
-        actual: RequestId,
-    },
-    /// A request identifier had the wrong length.
-    InvalidRequestIdLength(usize),
-    /// The response-list bytes ended early.
-    TruncatedResponseList,
-    /// The response list contained trailing bytes.
-    TrailingResponseListBytes(usize),
-    /// A nested response length could not be represented safely.
-    ResponseLengthOverflow(usize),
-}
-
-impl fmt::Display for HttpContractError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CanonicalEncoding(error) => write!(f, "canonical encoding failed: {error}"),
-            Self::CanonicalDecoding(error) => write!(f, "canonical decoding failed: {error}"),
-            Self::NodeCore(error) => write!(f, "node response validation failed: {error}"),
-            Self::TooManyResponses(count) => write!(
-                f,
-                "HTTP result has {count} responses, maximum is {MAX_NODE_OUTPUT_ITEMS}"
-            ),
-            Self::RequestMismatch { expected, actual } => write!(
-                f,
-                "HTTP result response mismatch: expected {expected}, got {actual}"
-            ),
-            Self::InvalidRequestIdLength(length) => {
-                write!(f, "HTTP result request id is {length} bytes, expected 32")
-            }
-            Self::TruncatedResponseList => f.write_str("HTTP result response list is truncated"),
-            Self::TrailingResponseListBytes(length) => {
-                write!(f, "HTTP result response list has {length} trailing bytes")
-            }
-            Self::ResponseLengthOverflow(length) => {
-                write!(
-                    f,
-                    "HTTP result response is too large to frame: {length} bytes"
-                )
-            }
-        }
-    }
-}
-
-impl Error for HttpContractError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::CanonicalEncoding(error) => Some(error),
-            Self::CanonicalDecoding(error) => Some(error),
-            Self::NodeCore(error) => Some(error),
-            _ => None,
-        }
-    }
-}
-
-impl From<CanonicalEncodingError> for HttpContractError {
-    fn from(value: CanonicalEncodingError) -> Self {
-        Self::CanonicalEncoding(value)
-    }
-}
-
-impl From<CanonicalDecodingError> for HttpContractError {
-    fn from(value: CanonicalDecodingError) -> Self {
-        Self::CanonicalDecoding(value)
-    }
-}
-
-impl From<NodeCoreError> for HttpContractError {
-    fn from(value: NodeCoreError) -> Self {
-        Self::NodeCore(value)
-    }
-}
-
-/// Canonical success body shared by native and future edge HTTP adapters.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HttpNodeResult {
-    request_id: RequestId,
-    responses: Vec<NodeResponse>,
-}
-
-impl HttpNodeResult {
-    /// Creates a bounded result whose responses all match the request.
-    pub fn new(
-        request_id: RequestId,
-        responses: Vec<NodeResponse>,
-    ) -> Result<Self, HttpContractError> {
-        if responses.len() > MAX_NODE_OUTPUT_ITEMS {
-            return Err(HttpContractError::TooManyResponses(responses.len()));
-        }
-        for response in &responses {
-            if response.request_id() != request_id {
-                return Err(HttpContractError::RequestMismatch {
-                    expected: request_id,
-                    actual: response.request_id(),
-                });
-            }
-        }
-        Ok(Self {
-            request_id,
-            responses,
-        })
-    }
-
-    /// Returns the request identifier.
-    #[must_use]
-    pub const fn request_id(&self) -> RequestId {
-        self.request_id
-    }
-
-    /// Returns responses in deterministic transition order.
-    #[must_use]
-    pub fn responses(&self) -> &[NodeResponse] {
-        &self.responses
-    }
-
-    /// Encodes the complete HTTP success body.
-    pub fn encode(&self) -> Result<Vec<u8>, HttpContractError> {
-        let mut response_list = Vec::new();
-        for response in &self.responses {
-            let encoded = response.encode()?;
-            let length = u32::try_from(encoded.len())
-                .map_err(|_| HttpContractError::ResponseLengthOverflow(encoded.len()))?;
-            response_list.extend_from_slice(&length.to_le_bytes());
-            response_list.extend_from_slice(&encoded);
-        }
-
-        let count = u32::try_from(self.responses.len())
-            .map_err(|_| HttpContractError::TooManyResponses(self.responses.len()))?;
-        let mut frame = CanonicalStruct::new(HTTP_RESULT_TYPE_ID, HTTP_RESULT_ENCODING_VERSION);
-        frame.field_bytes(1, self.request_id.as_bytes().to_vec())?;
-        frame.field_u32(2, count)?;
-        frame.field_bytes(3, response_list)?;
-        Ok(frame.finish()?)
-    }
-
-    /// Decodes a complete HTTP success body and all nested responses.
-    pub fn decode(bytes: &[u8]) -> Result<Self, HttpContractError> {
-        let frame = decode_canonical_frame(bytes)?;
-        frame.require_type(HTTP_RESULT_TYPE_ID)?;
-        frame.require_version(HTTP_RESULT_ENCODING_VERSION)?;
-        frame.require_only_fields(&[1, 2, 3])?;
-
-        let request_bytes = frame.required_field(1)?;
-        let request_array: [u8; 32] = request_bytes
-            .try_into()
-            .map_err(|_| HttpContractError::InvalidRequestIdLength(request_bytes.len()))?;
-        let request_id = RequestId::new(request_array)?;
-        let count = usize::try_from(frame.required_u32(2)?)
-            .map_err(|_| HttpContractError::TooManyResponses(usize::MAX))?;
-        if count > MAX_NODE_OUTPUT_ITEMS {
-            return Err(HttpContractError::TooManyResponses(count));
-        }
-
-        let list = frame.required_field(3)?;
-        let mut offset = 0_usize;
-        let mut responses = Vec::with_capacity(count);
-        for _ in 0..count {
-            let length_bytes = take_list_bytes(list, &mut offset, 4)?;
-            let length = usize::try_from(u32::from_le_bytes([
-                length_bytes[0],
-                length_bytes[1],
-                length_bytes[2],
-                length_bytes[3],
-            ]))
-            .map_err(|_| HttpContractError::ResponseLengthOverflow(usize::MAX))?;
-            let encoded = take_list_bytes(list, &mut offset, length)?;
-            responses.push(NodeResponse::decode(encoded)?);
-        }
-        if offset != list.len() {
-            return Err(HttpContractError::TrailingResponseListBytes(
-                list.len() - offset,
-            ));
-        }
-        Self::new(request_id, responses)
-    }
-}
-
-/// Errors from encoding or decoding a bounded query-result frame (DR-0082).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QueryResultError {
-    /// Canonical encoding failed.
-    CanonicalEncoding(CanonicalEncodingError),
-    /// Canonical decoding failed.
-    CanonicalDecoding(CanonicalDecodingError),
-    /// A decoded chain identifier was invalid.
-    InvalidChainId(protocol_types::TypeError),
-    /// A chain identifier exceeded node-core's ingress resource bound.
-    ChainIdTooLong(usize),
-    /// A decoded atomicity-domain identifier was invalid.
-    InvalidDomain(protocol_types::TypeError),
-    /// A decoded atomicity-domain field had the wrong byte length.
-    InvalidDomainLength(usize),
-    /// A decoded object identifier field had the wrong byte length.
-    InvalidObjectIdLength(usize),
-    /// A decoded request identifier field had the wrong byte length.
-    InvalidRequestIdLength(usize),
-    /// A decoded sender address field had the wrong byte length.
-    InvalidSenderLength(usize),
-    /// A decoded digest named an unknown hash algorithm.
-    InvalidDigestAlgorithm(protocol_types::TypeError),
-    /// A decoded digest field had the wrong byte length.
-    InvalidDigestLength(usize),
-    /// A decoded object-head revision was zero.
-    InvalidHeadRevision(u64),
-    /// A decoded immutable object version was zero.
-    InvalidObjectVersion(u64),
-    /// An object query-result status identifier is unknown.
-    UnknownObjectStatus(u16),
-    /// A receipt query-result status identifier is unknown.
-    UnknownReceiptStatus(u16),
-    /// The context's protocol version was zero.
-    ZeroProtocolVersion,
-    /// The context's active hash-suite identifier was zero.
-    ZeroHashSuiteId,
-    /// The context's transaction-authentication profile identifier was zero.
-    ZeroTransactionAuthProfileId,
-    /// The context's signature-scheme identifier was zero.
-    ZeroSignatureSchemeId,
-    /// The context's address-binding identifier was zero.
-    ZeroAddressBindingId,
-    /// The context's canonical `ProtocolConfig` bytes were empty.
-    EmptyProtocolConfigBytes,
-    /// An inline object body exceeded the pre-activation verification bound.
-    ObjectBodyTooLarge {
-        /// Actual inline body length in bytes.
-        actual: usize,
-        /// Maximum accepted inline body length in bytes.
-        maximum: usize,
-    },
-    /// The nested canonical `objects::Object` failed to decode.
-    InvalidCanonicalObject(objects::ObjectError),
-    /// The nested canonical object's identifier disagreed with the outer selector.
-    ObjectIdentityMismatch {
-        /// Object identifier carried by the outer result.
-        expected: ObjectId,
-        /// Object identifier decoded from the nested canonical body.
-        actual: ObjectId,
-    },
-    /// The nested canonical object's version disagreed with the outer field.
-    ObjectVersionMismatch {
-        /// Version carried by the outer result.
-        expected: u64,
-        /// Version decoded from the nested canonical body.
-        actual: u64,
-    },
-    /// A durable receipt body exceeded the durable receipt resource bound.
-    ReceiptTooLarge {
-        /// Actual receipt length in bytes.
-        actual: usize,
-        /// Maximum accepted receipt length in bytes.
-        maximum: usize,
-    },
-    /// The nested canonical `NodeDedupRecord` failed to decode or re-encode.
-    InvalidDedupRecord(NodeCoreError),
-    /// The nested dedup record's request id disagreed with the outer selector.
-    RequestIdentityMismatch {
-        /// Request identifier carried by the outer result.
-        expected: RequestId,
-        /// Request identifier decoded from the nested dedup record.
-        actual: RequestId,
-    },
-    /// The nested dedup record's event digest disagreed with the outer field.
-    EventDigestMismatch,
-    /// The nested dedup record did not re-encode to exactly its persisted bytes.
-    NonCanonicalReEncoding,
-}
-
-impl fmt::Display for QueryResultError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CanonicalEncoding(error) => write!(f, "canonical encoding failed: {error}"),
-            Self::CanonicalDecoding(error) => write!(f, "canonical decoding failed: {error}"),
-            Self::InvalidChainId(error) => write!(f, "invalid chain id: {error}"),
-            Self::ChainIdTooLong(length) => {
-                write!(
-                    f,
-                    "chain id is {length} bytes, maximum is {MAX_CHAIN_ID_BYTES}"
-                )
-            }
-            Self::InvalidDomain(error) => write!(f, "invalid atomicity domain id: {error}"),
-            Self::InvalidDomainLength(length) => {
-                write!(f, "atomicity domain field is {length} bytes, expected 32")
-            }
-            Self::InvalidObjectIdLength(length) => {
-                write!(f, "object id field is {length} bytes, expected 32")
-            }
-            Self::InvalidRequestIdLength(length) => {
-                write!(f, "request id field is {length} bytes, expected 32")
-            }
-            Self::InvalidSenderLength(length) => {
-                write!(f, "sender field is {length} bytes, expected 32")
-            }
-            Self::InvalidDigestAlgorithm(error) => write!(f, "invalid digest algorithm: {error}"),
-            Self::InvalidDigestLength(length) => {
-                write!(f, "digest field is {length} bytes, expected 32")
-            }
-            Self::InvalidHeadRevision(value) => {
-                write!(f, "object head revision must not be zero, got {value}")
-            }
-            Self::InvalidObjectVersion(value) => {
-                write!(f, "object version must not be zero, got {value}")
-            }
-            Self::UnknownObjectStatus(id) => write!(f, "unknown object query status id: {id}"),
-            Self::UnknownReceiptStatus(id) => write!(f, "unknown receipt query status id: {id}"),
-            Self::ZeroProtocolVersion => f.write_str("context protocol version must not be zero"),
-            Self::ZeroHashSuiteId => f.write_str("context hash suite id must not be zero"),
-            Self::ZeroTransactionAuthProfileId => {
-                f.write_str("context transaction auth profile id must not be zero")
-            }
-            Self::ZeroSignatureSchemeId => {
-                f.write_str("context signature scheme id must not be zero")
-            }
-            Self::ZeroAddressBindingId => {
-                f.write_str("context address binding id must not be zero")
-            }
-            Self::EmptyProtocolConfigBytes => {
-                f.write_str("context canonical protocol config bytes must not be empty")
-            }
-            Self::ObjectBodyTooLarge { actual, maximum } => write!(
-                f,
-                "inline object body is {actual} bytes, maximum is {maximum}"
-            ),
-            Self::InvalidCanonicalObject(error) => {
-                write!(f, "nested canonical object is invalid: {error}")
-            }
-            Self::ObjectIdentityMismatch { expected, actual } => write!(
-                f,
-                "nested canonical object id {actual} disagrees with outer selector {expected}"
-            ),
-            Self::ObjectVersionMismatch { expected, actual } => write!(
-                f,
-                "nested canonical object version {actual} disagrees with outer field {expected}"
-            ),
-            Self::ReceiptTooLarge { actual, maximum } => {
-                write!(f, "receipt body is {actual} bytes, maximum is {maximum}")
-            }
-            Self::InvalidDedupRecord(error) => {
-                write!(f, "nested dedup record is invalid: {error}")
-            }
-            Self::RequestIdentityMismatch { expected, actual } => write!(
-                f,
-                "nested dedup record request id {actual} disagrees with outer selector {expected}"
-            ),
-            Self::EventDigestMismatch => {
-                f.write_str("nested dedup record event digest disagrees with outer field")
-            }
-            Self::NonCanonicalReEncoding => {
-                f.write_str("nested dedup record does not re-encode to its persisted bytes")
-            }
-        }
-    }
-}
-
-impl Error for QueryResultError {}
-
-impl From<CanonicalEncodingError> for QueryResultError {
-    fn from(value: CanonicalEncodingError) -> Self {
-        Self::CanonicalEncoding(value)
-    }
-}
-
-impl From<CanonicalDecodingError> for QueryResultError {
-    fn from(value: CanonicalDecodingError) -> Self {
-        Self::CanonicalDecoding(value)
-    }
-}
-
-fn encode_digest_fields(
-    frame: &mut CanonicalStruct,
-    algorithm_field_id: u16,
-    bytes_field_id: u16,
-    digest: Digest32,
-) -> Result<(), QueryResultError> {
-    frame.field_u16(algorithm_field_id, digest.algorithm().as_u16())?;
-    frame.field_bytes(bytes_field_id, digest.bytes().to_vec())?;
-    Ok(())
-}
-
-fn decode_digest_fields(
-    frame: &canonical_encoding::CanonicalFrame<'_>,
-    algorithm_field_id: u16,
-    bytes_field_id: u16,
-) -> Result<Digest32, QueryResultError> {
-    let algorithm = HashAlgorithmId::try_from(frame.required_u16(algorithm_field_id)?)
-        .map_err(QueryResultError::InvalidDigestAlgorithm)?;
-    let bytes = frame.required_field(bytes_field_id)?;
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| QueryResultError::InvalidDigestLength(bytes.len()))?;
-    Ok(Digest32::new(algorithm, bytes))
-}
-
-fn decode_object_id_field(
-    frame: &canonical_encoding::CanonicalFrame<'_>,
-    field_id: u16,
-) -> Result<ObjectId, QueryResultError> {
-    let bytes = frame.required_field(field_id)?;
-    let array: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| QueryResultError::InvalidObjectIdLength(bytes.len()))?;
-    Ok(ObjectId::new(array))
-}
-
-fn decode_request_id_field(
-    frame: &canonical_encoding::CanonicalFrame<'_>,
-    field_id: u16,
-) -> Result<RequestId, QueryResultError> {
-    let bytes = frame.required_field(field_id)?;
-    let array: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| QueryResultError::InvalidRequestIdLength(bytes.len()))?;
-    RequestId::new(array).map_err(|_| QueryResultError::InvalidRequestIdLength(32))
-}
-
-fn decode_sender_field(
-    frame: &canonical_encoding::CanonicalFrame<'_>,
-    field_id: u16,
-) -> Result<Address, QueryResultError> {
-    let bytes = frame.required_field(field_id)?;
-    let array: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| QueryResultError::InvalidSenderLength(bytes.len()))?;
-    Ok(Address::new(array))
-}
-
-/// Stable status identifiers for [`HttpObjectQueryResult`] (DR-0082).
-#[repr(u16)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ObjectQueryStatus {
-    /// No head row has ever existed for the queried object identifier.
-    Absent = 1,
-    /// A delete retained the last immutable version and head revision.
-    Tombstoned = 2,
-    /// A current, independently verified inline object.
-    CurrentInline = 3,
-    /// A current version whose body is stored externally as a blob.
-    CurrentBlobReference = 4,
-}
-
-impl ObjectQueryStatus {
-    /// Returns the stable wire identifier.
-    #[must_use]
-    pub const fn as_u16(self) -> u16 {
-        self as u16
-    }
-}
-
-impl TryFrom<u16> for ObjectQueryStatus {
-    type Error = QueryResultError;
-
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::Absent),
-            2 => Ok(Self::Tombstoned),
-            3 => Ok(Self::CurrentInline),
-            4 => Ok(Self::CurrentBlobReference),
-            other => Err(QueryResultError::UnknownObjectStatus(other)),
-        }
-    }
-}
-
-/// Stable status identifiers for [`HttpReceiptQueryResult`] (DR-0082).
-#[repr(u16)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReceiptQueryStatus {
-    /// No durable receipt exists for the queried request identifier.
-    Absent = 1,
-    /// A durable receipt exists and was independently re-verified.
-    Present = 2,
-}
-
-impl ReceiptQueryStatus {
-    /// Returns the stable wire identifier.
-    #[must_use]
-    pub const fn as_u16(self) -> u16 {
-        self as u16
-    }
-}
-
-impl TryFrom<u16> for ReceiptQueryStatus {
-    type Error = QueryResultError;
-
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::Absent),
-            2 => Ok(Self::Present),
-            other => Err(QueryResultError::UnknownReceiptStatus(other)),
-        }
-    }
-}
-
-/// Canonical `GET /v1/context` result (DR-0082, type `0xE102`).
-///
-/// This is a directly useful, self-contained client snapshot of trusted
-/// composition: the chain/protocol/epoch replay boundary, the active
-/// cryptographic and transaction-authentication configuration, the single
-/// committed logical atomicity domain, and the exact canonical
-/// `ProtocolConfig` bytes a client can hash or archive verbatim. `/v1/context`
-/// has no request selector to bind against; the other three query results
-/// each bind to their exact requested selector instead (see
-/// [`HttpObjectQueryResult`], [`HttpReceiptQueryResult`], and
-/// [`HttpNextNonceQueryResult`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HttpContextQueryResult {
-    chain_id: ChainId,
-    protocol_version: ProtocolVersion,
-    epoch: Epoch,
-    hash_suite_id: HashSuiteId,
-    transaction_auth_profile_id: u16,
-    signature_scheme_id: u16,
-    address_binding_id: u16,
-    domain: AtomicityDomainId,
-    protocol_config_bytes: Vec<u8>,
-}
-
-impl HttpContextQueryResult {
-    /// Creates a context query result from already-trusted composition
-    /// values, rejecting a zero protocol version, hash-suite id,
-    /// transaction-auth-profile id, signature-scheme id, or address-binding
-    /// id; a chain id beyond node-core's `MAX_CHAIN_ID_BYTES`; and empty
-    /// canonical `ProtocolConfig` bytes.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        chain_id: ChainId,
-        protocol_version: ProtocolVersion,
-        epoch: Epoch,
-        hash_suite_id: HashSuiteId,
-        transaction_auth_profile_id: u16,
-        signature_scheme_id: u16,
-        address_binding_id: u16,
-        domain: AtomicityDomainId,
-        protocol_config_bytes: Vec<u8>,
-    ) -> Result<Self, QueryResultError> {
-        let result = Self {
-            chain_id,
-            protocol_version,
-            epoch,
-            hash_suite_id,
-            transaction_auth_profile_id,
-            signature_scheme_id,
-            address_binding_id,
-            domain,
-            protocol_config_bytes,
-        };
-        result.validate()?;
-        Ok(result)
-    }
-
-    fn validate(&self) -> Result<(), QueryResultError> {
-        if self.protocol_version.get() == 0 {
-            return Err(QueryResultError::ZeroProtocolVersion);
-        }
-        if self.hash_suite_id.get() == 0 {
-            return Err(QueryResultError::ZeroHashSuiteId);
-        }
-        if self.transaction_auth_profile_id == 0 {
-            return Err(QueryResultError::ZeroTransactionAuthProfileId);
-        }
-        if self.signature_scheme_id == 0 {
-            return Err(QueryResultError::ZeroSignatureSchemeId);
-        }
-        if self.address_binding_id == 0 {
-            return Err(QueryResultError::ZeroAddressBindingId);
-        }
-        let chain_id_length = self.chain_id.as_str().len();
-        if chain_id_length > MAX_CHAIN_ID_BYTES {
-            return Err(QueryResultError::ChainIdTooLong(chain_id_length));
-        }
-        if self.protocol_config_bytes.is_empty() {
-            return Err(QueryResultError::EmptyProtocolConfigBytes);
-        }
-        Ok(())
-    }
-
-    /// Returns the trusted chain identifier.
-    #[must_use]
-    pub const fn chain_id(&self) -> &ChainId {
-        &self.chain_id
-    }
-
-    /// Returns the trusted protocol version.
-    #[must_use]
-    pub const fn protocol_version(&self) -> ProtocolVersion {
-        self.protocol_version
-    }
-
-    /// Returns the trusted current epoch.
-    #[must_use]
-    pub const fn epoch(&self) -> Epoch {
-        self.epoch
-    }
-
-    /// Returns the active hash-suite identifier.
-    #[must_use]
-    pub const fn hash_suite_id(&self) -> HashSuiteId {
-        self.hash_suite_id
-    }
-
-    /// Returns the committed transaction-authentication profile identifier.
-    #[must_use]
-    pub const fn transaction_auth_profile_id(&self) -> u16 {
-        self.transaction_auth_profile_id
-    }
-
-    /// Returns the committed signature-scheme identifier.
-    #[must_use]
-    pub const fn signature_scheme_id(&self) -> u16 {
-        self.signature_scheme_id
-    }
-
-    /// Returns the committed address-binding identifier.
-    #[must_use]
-    pub const fn address_binding_id(&self) -> u16 {
-        self.address_binding_id
-    }
-
-    /// Returns the single committed logical atomicity domain.
-    #[must_use]
-    pub const fn domain(&self) -> AtomicityDomainId {
-        self.domain
-    }
-
-    /// Returns the exact canonical `ProtocolConfig` bytes.
-    #[must_use]
-    pub fn protocol_config_bytes(&self) -> &[u8] {
-        &self.protocol_config_bytes
-    }
-
-    /// Encodes the canonical `0xE102` context query result.
-    pub fn encode(&self) -> Result<Vec<u8>, QueryResultError> {
-        let mut frame =
-            CanonicalStruct::new(CONTEXT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
-        frame.field_str(1, self.chain_id.as_str())?;
-        frame.field_u32(2, self.protocol_version.get())?;
-        frame.field_u64(3, self.epoch.get())?;
-        frame.field_u16(4, self.hash_suite_id.get())?;
-        frame.field_u16(5, self.transaction_auth_profile_id)?;
-        frame.field_u16(6, self.signature_scheme_id)?;
-        frame.field_u16(7, self.address_binding_id)?;
-        frame.field_bytes(8, self.domain.as_bytes().to_vec())?;
-        frame.field_bytes(9, self.protocol_config_bytes.clone())?;
-        Ok(frame.finish()?)
-    }
-
-    /// Decodes and strictly validates one canonical context query result.
-    pub fn decode(bytes: &[u8]) -> Result<Self, QueryResultError> {
-        let frame = decode_canonical_frame(bytes)?;
-        frame.require_type(CONTEXT_QUERY_RESULT_TYPE_ID)?;
-        frame.require_version(QUERY_RESULT_ENCODING_VERSION)?;
-        frame.require_only_fields(&[1, 2, 3, 4, 5, 6, 7, 8, 9])?;
-
-        let chain_id =
-            ChainId::new(frame.required_str(1)?).map_err(QueryResultError::InvalidChainId)?;
-        let protocol_version = ProtocolVersion::new(frame.required_u32(2)?);
-        let epoch = Epoch::new(frame.required_u64(3)?);
-        let hash_suite_id = HashSuiteId::new(frame.required_u16(4)?);
-        let transaction_auth_profile_id = frame.required_u16(5)?;
-        let signature_scheme_id = frame.required_u16(6)?;
-        let address_binding_id = frame.required_u16(7)?;
-        let domain_bytes = frame.required_field(8)?;
-        let domain_array: [u8; 32] = domain_bytes
-            .try_into()
-            .map_err(|_| QueryResultError::InvalidDomainLength(domain_bytes.len()))?;
-        let domain =
-            AtomicityDomainId::new(domain_array).map_err(QueryResultError::InvalidDomain)?;
-        let protocol_config_bytes = frame.required_field(9)?.to_vec();
-
-        Self::new(
-            chain_id,
-            protocol_version,
-            epoch,
-            hash_suite_id,
-            transaction_auth_profile_id,
-            signature_scheme_id,
-            address_binding_id,
-            domain,
-            protocol_config_bytes,
-        )
-    }
-}
-
-/// Canonical `GET /v1/objects/{object_id}` result (DR-0082, type `0xE103`).
-///
-/// Absence, a retained tombstone, a verified current inline object, and a
-/// current blob reference are represented explicitly; a blob-backed version
-/// never claims to have verified an unavailable blob body. Every status
-/// carries the exact `object_id` this result answers, so a caller can never
-/// mistake it for the answer to a different selector.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum HttpObjectQueryResult {
-    /// No head row has ever existed for the queried object identifier.
-    Absent {
-        /// The exact object identifier this result answers.
-        object_id: ObjectId,
-    },
-    /// A delete retained the last immutable version and head revision.
-    Tombstoned {
-        /// The exact object identifier this result answers.
-        object_id: ObjectId,
-        /// ABA-safe revision installed by the delete.
-        head_revision: ObjectHeadRevision,
-        /// Last immutable version reconstructed from retained history.
-        last_object_version: DurableObjectVersion,
-    },
-    /// A current, independently verified inline object.
-    CurrentInline {
-        /// The exact object identifier this result answers.
-        object_id: ObjectId,
-        /// ABA-safe revision installed by the latest write.
-        head_revision: ObjectHeadRevision,
-        /// Current immutable object version.
-        object_version: DurableObjectVersion,
-        /// Self-describing digest of the current object version, independently
-        /// recomputed and verified against the returned canonical body.
-        digest: Digest32,
-        /// Exact canonical `objects::Object` bytes, digest-verified.
-        canonical_object_bytes: Vec<u8>,
-    },
-    /// A current version whose body is stored externally as a blob.
-    ///
-    /// Neither `digest` nor `blob_digest` is verified against fetched bytes:
-    /// both are the values recorded on the immutable version, cross-checked
-    /// against the head.
-    CurrentBlobReference {
-        /// The exact object identifier this result answers.
-        object_id: ObjectId,
-        /// ABA-safe revision installed by the latest write.
-        head_revision: ObjectHeadRevision,
-        /// Current immutable object version.
-        object_version: DurableObjectVersion,
-        /// Self-describing digest of the current object version, as recorded
-        /// on the immutable version and cross-checked against the head. Not
-        /// body-verified: the referenced body is never fetched.
-        digest: Digest32,
-        /// Self-describing digest of the externally stored blob content, as
-        /// recorded on the immutable version. Never fetched or verified.
-        blob_digest: Digest32,
-    },
-}
-
-impl HttpObjectQueryResult {
-    /// Returns the exact object identifier this result answers, regardless
-    /// of status.
-    #[must_use]
-    pub const fn object_id(&self) -> ObjectId {
-        match self {
-            Self::Absent { object_id }
-            | Self::Tombstoned { object_id, .. }
-            | Self::CurrentInline { object_id, .. }
-            | Self::CurrentBlobReference { object_id, .. } => *object_id,
-        }
-    }
-}
-
-impl From<NodeObjectQueryResult> for HttpObjectQueryResult {
-    fn from(value: NodeObjectQueryResult) -> Self {
-        match value {
-            NodeObjectQueryResult::Absent { object_id } => Self::Absent { object_id },
-            NodeObjectQueryResult::Tombstoned {
-                object_id,
-                head_revision,
-                last_object_version,
-            } => Self::Tombstoned {
-                object_id,
-                head_revision,
-                last_object_version,
-            },
-            NodeObjectQueryResult::CurrentInline {
-                object_id,
-                head_revision,
-                object_version,
-                digest,
-                canonical_object_bytes,
-            } => Self::CurrentInline {
-                object_id,
-                head_revision,
-                object_version,
-                digest,
-                canonical_object_bytes,
-            },
-            NodeObjectQueryResult::CurrentBlobReference {
-                object_id,
-                head_revision,
-                object_version,
-                digest,
-                blob_digest,
-            } => Self::CurrentBlobReference {
-                object_id,
-                head_revision,
-                object_version,
-                digest,
-                blob_digest,
-            },
-        }
-    }
-}
-
-impl HttpObjectQueryResult {
-    /// Encodes the canonical `0xE103` object query result.
-    pub fn encode(&self) -> Result<Vec<u8>, QueryResultError> {
-        let mut frame =
-            CanonicalStruct::new(OBJECT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
-        match self {
-            Self::Absent { object_id } => {
-                frame.field_u16(1, ObjectQueryStatus::Absent.as_u16())?;
-                frame.field_bytes(2, object_id.as_bytes().to_vec())?;
-            }
-            Self::Tombstoned {
-                object_id,
-                head_revision,
-                last_object_version,
-            } => {
-                frame.field_u16(1, ObjectQueryStatus::Tombstoned.as_u16())?;
-                frame.field_bytes(2, object_id.as_bytes().to_vec())?;
-                frame.field_u64(3, head_revision.get())?;
-                frame.field_u64(4, last_object_version.get())?;
-            }
-            Self::CurrentInline {
-                object_id,
-                head_revision,
-                object_version,
-                digest,
-                canonical_object_bytes,
-            } => {
-                frame.field_u16(1, ObjectQueryStatus::CurrentInline.as_u16())?;
-                frame.field_bytes(2, object_id.as_bytes().to_vec())?;
-                frame.field_u64(3, head_revision.get())?;
-                frame.field_u64(4, object_version.get())?;
-                encode_digest_fields(&mut frame, 5, 6, *digest)?;
-                frame.field_bytes(7, canonical_object_bytes.clone())?;
-            }
-            Self::CurrentBlobReference {
-                object_id,
-                head_revision,
-                object_version,
-                digest,
-                blob_digest,
-            } => {
-                frame.field_u16(1, ObjectQueryStatus::CurrentBlobReference.as_u16())?;
-                frame.field_bytes(2, object_id.as_bytes().to_vec())?;
-                frame.field_u64(3, head_revision.get())?;
-                frame.field_u64(4, object_version.get())?;
-                encode_digest_fields(&mut frame, 5, 6, *digest)?;
-                encode_digest_fields(&mut frame, 8, 9, *blob_digest)?;
-            }
-        }
-        Ok(frame.finish()?)
-    }
-
-    /// Decodes and strictly validates one canonical object query result.
-    ///
-    /// A `CurrentInline` frame is rejected if its inline body exceeds
-    /// node-core's `MAX_AUTHENTICATED_OBJECT_BODY_BYTES`, fails to decode as
-    /// a canonical `objects::Object`, or decodes to an id/version other than
-    /// the outer `object_id`/`object_version` fields.
-    pub fn decode(bytes: &[u8]) -> Result<Self, QueryResultError> {
-        let frame = decode_canonical_frame(bytes)?;
-        frame.require_type(OBJECT_QUERY_RESULT_TYPE_ID)?;
-        frame.require_version(QUERY_RESULT_ENCODING_VERSION)?;
-        frame.require_only_fields(&[1, 2, 3, 4, 5, 6, 7, 8, 9])?;
-
-        let status = ObjectQueryStatus::try_from(frame.required_u16(1)?)?;
-        let object_id = decode_object_id_field(&frame, 2)?;
-        match status {
-            ObjectQueryStatus::Absent => {
-                frame.require_only_fields(&[1, 2])?;
-                Ok(Self::Absent { object_id })
-            }
-            ObjectQueryStatus::Tombstoned => {
-                frame.require_only_fields(&[1, 2, 3, 4])?;
-                let head_revision = decode_head_revision(frame.required_u64(3)?)?;
-                let last_object_version = decode_object_version(frame.required_u64(4)?)?;
-                Ok(Self::Tombstoned {
-                    object_id,
-                    head_revision,
-                    last_object_version,
-                })
-            }
-            ObjectQueryStatus::CurrentInline => {
-                frame.require_only_fields(&[1, 2, 3, 4, 5, 6, 7])?;
-                let head_revision = decode_head_revision(frame.required_u64(3)?)?;
-                let object_version = decode_object_version(frame.required_u64(4)?)?;
-                let digest = decode_digest_fields(&frame, 5, 6)?;
-                let canonical_object_bytes = frame.required_field(7)?.to_vec();
-                if canonical_object_bytes.len() > MAX_AUTHENTICATED_OBJECT_BODY_BYTES {
-                    return Err(QueryResultError::ObjectBodyTooLarge {
-                        actual: canonical_object_bytes.len(),
-                        maximum: MAX_AUTHENTICATED_OBJECT_BODY_BYTES,
-                    });
-                }
-                let nested = decode_object(&canonical_object_bytes)
-                    .map_err(QueryResultError::InvalidCanonicalObject)?;
-                if nested.id != object_id {
-                    return Err(QueryResultError::ObjectIdentityMismatch {
-                        expected: object_id,
-                        actual: nested.id,
-                    });
-                }
-                if nested.version != object_version.get() {
-                    return Err(QueryResultError::ObjectVersionMismatch {
-                        expected: object_version.get(),
-                        actual: nested.version,
-                    });
-                }
-                Ok(Self::CurrentInline {
-                    object_id,
-                    head_revision,
-                    object_version,
-                    digest,
-                    canonical_object_bytes,
-                })
-            }
-            ObjectQueryStatus::CurrentBlobReference => {
-                frame.require_only_fields(&[1, 2, 3, 4, 5, 6, 8, 9])?;
-                let head_revision = decode_head_revision(frame.required_u64(3)?)?;
-                let object_version = decode_object_version(frame.required_u64(4)?)?;
-                let digest = decode_digest_fields(&frame, 5, 6)?;
-                let blob_digest = decode_digest_fields(&frame, 8, 9)?;
-                Ok(Self::CurrentBlobReference {
-                    object_id,
-                    head_revision,
-                    object_version,
-                    digest,
-                    blob_digest,
-                })
-            }
-        }
-    }
-}
-
-fn decode_head_revision(value: u64) -> Result<ObjectHeadRevision, QueryResultError> {
-    ObjectHeadRevision::new(value).ok_or(QueryResultError::InvalidHeadRevision(value))
-}
-
-fn decode_object_version(value: u64) -> Result<DurableObjectVersion, QueryResultError> {
-    DurableObjectVersion::new(value).ok_or(QueryResultError::InvalidObjectVersion(value))
-}
-
-/// Canonical `GET /v1/receipts/{request_id}` result (DR-0082, type `0xE104`).
-///
-/// Both statuses carry the exact `request_id` this result answers.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum HttpReceiptQueryResult {
-    /// No durable receipt exists for the queried request identifier.
-    Absent {
-        /// The exact request identifier this result answers.
-        request_id: RequestId,
-    },
-    /// A durable receipt exists and was independently re-verified.
-    Present {
-        /// The exact request identifier this result answers.
-        request_id: RequestId,
-        /// Digest of the complete canonical input event that produced this receipt.
-        event_digest: Digest32,
-        /// The exact canonical `NodeDedupRecord` bytes, re-encoding-checked.
-        dedup_record_bytes: Vec<u8>,
-    },
-}
-
-impl HttpReceiptQueryResult {
-    /// Returns the exact request identifier this result answers, regardless
-    /// of status.
-    #[must_use]
-    pub const fn request_id(&self) -> RequestId {
-        match self {
-            Self::Absent { request_id } | Self::Present { request_id, .. } => *request_id,
-        }
-    }
-
-    /// Encodes the canonical `0xE104` receipt query result.
-    pub fn encode(&self) -> Result<Vec<u8>, QueryResultError> {
-        let mut frame =
-            CanonicalStruct::new(RECEIPT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
-        match self {
-            Self::Absent { request_id } => {
-                frame.field_u16(1, ReceiptQueryStatus::Absent.as_u16())?;
-                frame.field_bytes(2, request_id.as_bytes().to_vec())?;
-            }
-            Self::Present {
-                request_id,
-                event_digest,
-                dedup_record_bytes,
-            } => {
-                frame.field_u16(1, ReceiptQueryStatus::Present.as_u16())?;
-                frame.field_bytes(2, request_id.as_bytes().to_vec())?;
-                encode_digest_fields(&mut frame, 3, 4, *event_digest)?;
-                frame.field_bytes(5, dedup_record_bytes.clone())?;
-            }
-        }
-        Ok(frame.finish()?)
-    }
-
-    /// Decodes and strictly validates one canonical receipt query result.
-    ///
-    /// A `Present` frame is rejected if its dedup-record body exceeds
-    /// `runtime::MAX_DURABLE_RECEIPT_BYTES`, fails to decode as a canonical
-    /// `NodeDedupRecord`, decodes to a request id/event digest other than the
-    /// outer fields, or does not re-encode to exactly its persisted bytes.
-    pub fn decode(bytes: &[u8]) -> Result<Self, QueryResultError> {
-        let frame = decode_canonical_frame(bytes)?;
-        frame.require_type(RECEIPT_QUERY_RESULT_TYPE_ID)?;
-        frame.require_version(QUERY_RESULT_ENCODING_VERSION)?;
-        frame.require_only_fields(&[1, 2, 3, 4, 5])?;
-
-        let status = ReceiptQueryStatus::try_from(frame.required_u16(1)?)?;
-        let request_id = decode_request_id_field(&frame, 2)?;
-        match status {
-            ReceiptQueryStatus::Absent => {
-                frame.require_only_fields(&[1, 2])?;
-                Ok(Self::Absent { request_id })
-            }
-            ReceiptQueryStatus::Present => {
-                frame.require_only_fields(&[1, 2, 3, 4, 5])?;
-                let event_digest = decode_digest_fields(&frame, 3, 4)?;
-                let dedup_record_bytes = frame.required_field(5)?.to_vec();
-                if dedup_record_bytes.len() > MAX_DURABLE_RECEIPT_BYTES {
-                    return Err(QueryResultError::ReceiptTooLarge {
-                        actual: dedup_record_bytes.len(),
-                        maximum: MAX_DURABLE_RECEIPT_BYTES,
-                    });
-                }
-                let nested = NodeDedupRecord::decode(&dedup_record_bytes)
-                    .map_err(QueryResultError::InvalidDedupRecord)?;
-                if nested.request_id() != request_id {
-                    return Err(QueryResultError::RequestIdentityMismatch {
-                        expected: request_id,
-                        actual: nested.request_id(),
-                    });
-                }
-                if nested.event_digest() != event_digest {
-                    return Err(QueryResultError::EventDigestMismatch);
-                }
-                let re_encoded = nested
-                    .encode()
-                    .map_err(QueryResultError::InvalidDedupRecord)?;
-                if re_encoded != dedup_record_bytes {
-                    return Err(QueryResultError::NonCanonicalReEncoding);
-                }
-                Ok(Self::Present {
-                    request_id,
-                    event_digest,
-                    dedup_record_bytes,
-                })
-            }
-        }
-    }
-}
-
-fn http_receipt_query_result(
-    result: NodeReceiptQueryResult,
-) -> Result<HttpReceiptQueryResult, NodeCoreError> {
-    match result {
-        NodeReceiptQueryResult::Absent { request_id } => {
-            Ok(HttpReceiptQueryResult::Absent { request_id })
-        }
-        NodeReceiptQueryResult::Present {
-            request_id,
-            event_digest,
-            record,
-        } => Ok(HttpReceiptQueryResult::Present {
-            request_id,
-            event_digest,
-            dedup_record_bytes: record.encode()?,
-        }),
-    }
-}
-
-/// Canonical `GET /v1/senders/{sender}/next-nonce` result (DR-0082, type `0xE105`).
-///
-/// Carries the exact `sender` this result answers alongside the trusted
-/// epoch it was resolved under.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HttpNextNonceQueryResult {
-    sender: Address,
-    epoch: Epoch,
-    next_nonce: u64,
-}
-
-impl HttpNextNonceQueryResult {
-    /// Creates a next-nonce query result.
-    #[must_use]
-    pub const fn new(sender: Address, epoch: Epoch, next_nonce: u64) -> Self {
-        Self {
-            sender,
-            epoch,
-            next_nonce,
-        }
-    }
-
-    /// Returns the exact sender this result answers.
-    #[must_use]
-    pub const fn sender(&self) -> Address {
-        self.sender
-    }
-
-    /// Returns the current trusted epoch this next nonce was resolved under.
-    #[must_use]
-    pub const fn epoch(&self) -> Epoch {
-        self.epoch
-    }
-
-    /// Returns the next nonce expected from this sender at this epoch.
-    #[must_use]
-    pub const fn next_nonce(&self) -> u64 {
-        self.next_nonce
-    }
-
-    /// Encodes the canonical `0xE105` next-nonce query result.
-    pub fn encode(&self) -> Result<Vec<u8>, QueryResultError> {
-        let mut frame = CanonicalStruct::new(
-            NEXT_NONCE_QUERY_RESULT_TYPE_ID,
-            QUERY_RESULT_ENCODING_VERSION,
-        );
-        frame.field_bytes(1, self.sender.as_bytes().to_vec())?;
-        frame.field_u64(2, self.epoch.get())?;
-        frame.field_u64(3, self.next_nonce)?;
-        Ok(frame.finish()?)
-    }
-
-    /// Decodes and strictly validates one canonical next-nonce query result.
-    pub fn decode(bytes: &[u8]) -> Result<Self, QueryResultError> {
-        let frame = decode_canonical_frame(bytes)?;
-        frame.require_type(NEXT_NONCE_QUERY_RESULT_TYPE_ID)?;
-        frame.require_version(QUERY_RESULT_ENCODING_VERSION)?;
-        frame.require_only_fields(&[1, 2, 3])?;
-        let sender = decode_sender_field(&frame, 1)?;
-        let epoch = Epoch::new(frame.required_u64(2)?);
-        let next_nonce = frame.required_u64(3)?;
-        Ok(Self::new(sender, epoch, next_nonce))
-    }
-}
 
 struct NativeHttpState<R, M, L> {
     runtime: Arc<R>,
@@ -4186,6 +3014,11 @@ fn execution_error_response(error: &ExecutionError) -> (StatusCode, &'static str
         | ExecutionError::EmptySignature
         | ExecutionError::TransactionFieldTooLarge { .. }
         | ExecutionError::NonCanonicalTransactionEncoding
+        | ExecutionError::UnknownExecutionStatusTag(_)
+        | ExecutionError::UnknownObjectEffectTag(_)
+        | ExecutionError::TooManyObjectEffects(_)
+        | ExecutionError::TooManyEvents(_)
+        | ExecutionError::NonCanonicalExecutionEffectsEncoding
         | ExecutionError::HashChainMismatch
         | ExecutionError::HashProtocolVersionMismatch { .. } => {
             (StatusCode::INTERNAL_SERVER_ERROR, "invalid-node-output")
@@ -4247,21 +3080,6 @@ fn overload_response() -> Response {
         .into_response()
 }
 
-fn take_list_bytes<'a>(
-    bytes: &'a [u8],
-    offset: &mut usize,
-    length: usize,
-) -> Result<&'a [u8], HttpContractError> {
-    let end = offset
-        .checked_add(length)
-        .ok_or(HttpContractError::TruncatedResponseList)?;
-    let value = bytes
-        .get(*offset..end)
-        .ok_or(HttpContractError::TruncatedResponseList)?;
-    *offset = end;
-    Ok(value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4270,21 +3088,22 @@ mod tests {
         body::{Body, to_bytes},
         http::Request,
     };
-    use canonical_encoding::CanonicalStruct;
+    use canonical_encoding::{CanonicalDecodingError, CanonicalStruct, decode_canonical_frame};
     use crypto::{SignatureDomain, SignatureMessageType};
     use execution::{
         Transaction, decode_transaction, encode_transaction, encode_transaction_signable,
     };
     use node_core::{
-        NodeDedupRecord, NodeOutboxDelivery, NodeOutput, NodeResponseStatus, NodeStateAccess,
+        MAX_AUTHENTICATED_OBJECT_BODY_BYTES, MAX_CHAIN_ID_BYTES, NodeDedupRecord,
+        NodeOutboxDelivery, NodeOutput, NodeResponse, NodeResponseStatus, NodeStateAccess,
         NodeStateAccessMode, NodeStateAccessPlan, NodeStateSnapshot, NodeStateUpdate,
         OutboundMessage, PreinstalledModuleCatalogEntry, TransactionalNodeTransition,
     };
     use objects::{AccessMode, Address, Object, ObjectId, ObjectRef, Owner, encode_object};
     use protocol_config::TransactionAuthProfile;
     use protocol_types::{
-        ChainId, Digest32, Epoch, HashAlgorithmId, HashPurpose, HashSuite, HashSuiteSchedule,
-        ProtocolVersion, SignatureSchemeId, ValidatorId,
+        ChainId, Digest32, Epoch, HashAlgorithmId, HashPurpose, HashSuite, HashSuiteId,
+        HashSuiteSchedule, ProtocolVersion, SignatureSchemeId, ValidatorId,
     };
     use runtime::{
         AtomicStateMutationSet, AtomicStateReadSet, AtomicStateTransaction, CompareAndSwapResult,
@@ -6700,8 +5519,10 @@ mod tests {
 
     #[test]
     fn context_query_result_rejects_unexpected_field() {
-        let mut frame =
-            CanonicalStruct::new(CONTEXT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
+        let mut frame = CanonicalStruct::new(
+            CONTEXT_QUERY_RESULT_TYPE_ID,
+            1, /* query-result encoding version, see node_wire */
+        );
         frame.field_str(1, "sunrise-test").unwrap();
         frame.field_u32(2, 3).unwrap();
         frame.field_u64(3, 7).unwrap();
@@ -6861,8 +5682,10 @@ mod tests {
 
     #[test]
     fn object_query_result_rejects_unknown_status_id() {
-        let mut frame =
-            CanonicalStruct::new(OBJECT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
+        let mut frame = CanonicalStruct::new(
+            OBJECT_QUERY_RESULT_TYPE_ID,
+            1, /* query-result encoding version, see node_wire */
+        );
         frame.field_u16(1, 99).unwrap();
         frame
             .field_bytes(2, ObjectId::new([0x01; 32]).as_bytes().to_vec())
@@ -6878,8 +5701,10 @@ mod tests {
     #[test]
     fn object_query_result_absent_rejects_a_field_only_valid_for_another_status() {
         let object_id = ObjectId::new([0x32; 32]);
-        let mut frame =
-            CanonicalStruct::new(OBJECT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
+        let mut frame = CanonicalStruct::new(
+            OBJECT_QUERY_RESULT_TYPE_ID,
+            1, /* query-result encoding version, see node_wire */
+        );
         frame
             .field_u16(1, ObjectQueryStatus::Absent.as_u16())
             .unwrap();
@@ -6915,8 +5740,10 @@ mod tests {
         object_version: u64,
         canonical_object_bytes: Vec<u8>,
     ) -> Vec<u8> {
-        let mut frame =
-            CanonicalStruct::new(OBJECT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
+        let mut frame = CanonicalStruct::new(
+            OBJECT_QUERY_RESULT_TYPE_ID,
+            1, /* query-result encoding version, see node_wire */
+        );
         frame
             .field_u16(1, ObjectQueryStatus::CurrentInline.as_u16())
             .unwrap();
@@ -7048,8 +5875,10 @@ mod tests {
 
     #[test]
     fn receipt_query_result_rejects_unknown_status_id() {
-        let mut frame =
-            CanonicalStruct::new(RECEIPT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
+        let mut frame = CanonicalStruct::new(
+            RECEIPT_QUERY_RESULT_TYPE_ID,
+            1, /* query-result encoding version, see node_wire */
+        );
         frame.field_u16(1, 7).unwrap();
         frame
             .field_bytes(2, request_id(0x01).as_bytes().to_vec())
@@ -7067,8 +5896,10 @@ mod tests {
         event_digest: Digest32,
         dedup_record_bytes: Vec<u8>,
     ) -> Vec<u8> {
-        let mut frame =
-            CanonicalStruct::new(RECEIPT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
+        let mut frame = CanonicalStruct::new(
+            RECEIPT_QUERY_RESULT_TYPE_ID,
+            1, /* query-result encoding version, see node_wire */
+        );
         frame
             .field_u16(1, ReceiptQueryStatus::Present.as_u16())
             .unwrap();

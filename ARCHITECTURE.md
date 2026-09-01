@@ -1715,6 +1715,22 @@ capabilities, production transports, key generation/keystores, CLI policy, and
 application-specific helpers remain deferred until the MVP consumers require
 them.
 
+Current vs. planned: this slice is implemented As-Is. `node-wire` owns the
+previously server-local codecs without changing their stable vectors, and
+`native-http` re-exports the same public names. `execution` now strictly
+decodes event records, object effects, and complete execution effects;
+`clients/rust` re-exports those decoders for response consumers. The client
+checks every returned object/request/sender selector against the exact query,
+and the loopback transport rejects request framing injection, over-bound
+headers/bodies, transfer encoding, ambiguous lengths, malformed status/header
+syntax, truncation, trailing bytes, and failure to close a `Connection: close`
+response within its timeout. Tests pin the existing signed transaction vector,
+authenticate freshly client-signed bytes through node-core, exercise fake
+submission/receipt behavior, exercise adversarial raw TCP responses, and query
+`/v1/context` through a real composed devnet router over TCP. A live signed
+asset transfer, duplicate replay, and restart sequence remains Developer MVP
+criterion 10 work; this client slice does not claim that later E2E.
+
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
 - DR-0002: Keep `HashAlgorithmId` broader than the currently enabled built-ins so future support can be added without changing digest shape.

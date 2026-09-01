@@ -404,7 +404,8 @@ pub fn encode_object(object: &Object) -> Result<Vec<u8>, ObjectError> {
     Ok(canonical.finish()?)
 }
 
-fn decode_object_id(input: &[u8]) -> Result<ObjectId, ObjectError> {
+/// Decodes one canonical [`ObjectId`] frame without changing its stable encoding.
+pub fn decode_object_id(input: &[u8]) -> Result<ObjectId, ObjectError> {
     let frame: CanonicalFrame<'_> = decode_canonical_frame(input)?;
     frame.require_type(OBJECT_ID_TYPE_ID)?;
     frame.require_version(ENCODING_VERSION)?;

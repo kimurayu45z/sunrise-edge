@@ -63,8 +63,8 @@ pub use query::{
     query_sender_next_nonce,
 };
 pub use transaction_auth::{
-    AuthenticatedTransaction, MAX_TRANSACTION_SIGNABLE_BYTES, TransactionAuthError,
-    TrustedTransactionContext, authenticate_transaction_bytes,
+    AuthenticatedTransaction, MAX_TRANSACTION_SIGNABLE_BYTES, TRANSACTION_V1_MESSAGE_TYPE,
+    TransactionAuthError, TrustedTransactionContext, authenticate_transaction_bytes,
 };
 
 const NODE_EVENT_TYPE_ID: u16 = 0xE001;

@@ -51,8 +51,10 @@ use protocol_types::{ChainId, Epoch, ProtocolVersion};
 /// This string is part of the signed byte layout via
 /// [`crypto::frame_signature_message`]. Changing it changes every future
 /// transaction signature and must go through the same protocol-critical
-/// change process as any other wire constant.
-const TRANSACTION_V1_MESSAGE_TYPE: &str = "transaction-v1";
+/// change process as any other wire constant. It is `pub` so a client that
+/// builds and signs a transaction (see `clients/rust`) uses this exact,
+/// single-sourced value rather than duplicating the literal.
+pub const TRANSACTION_V1_MESSAGE_TYPE: &str = "transaction-v1";
 
 /// Deterministic upper bound on a transaction's canonical *signable* byte
 /// length (the [`execution::encode_transaction_signable`] output), enforced

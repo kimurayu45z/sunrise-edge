@@ -22,8 +22,10 @@ members = [
     "crates/validator-set",
     "crates/consensus",
     "crates/node-core",
+    "crates/node-wire",
     "crates/native-http",
     "apps/devnet",
+    "clients/rust",
 ]
 resolver = "3"
 
@@ -55,7 +57,10 @@ protocol-upgrades = { path = "crates/protocol-upgrades" }
 validator-set = { path = "crates/validator-set" }
 consensus = { path = "crates/consensus" }
 node-core = { path = "crates/node-core" }
+node-wire = { path = "crates/node-wire" }
 native-http = { path = "crates/native-http" }
+sunrise-edge-client = { path = "clients/rust" }
+sunrise-edge-devnet = { path = "apps/devnet" }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
 ed25519-zebra = { version = "=4.2.0", default-features = false }
 postgres = "=0.19.14"
