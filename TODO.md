@@ -1993,16 +1993,22 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    restart E2Eはstep 9（S0）で実装した。
 8. criterion 6の`apps/cli`を、実行時（non-dev）の直接依存が`clients/rust`のみのRust-only
    binaryとして実装した（`Cargo.toml`の`[dev-dependencies]`にはtest専用でreal devnetの
-   composeとfixture構築、および decoded execution-effects fixtureの構築のためだけの
-   `execution`/`objects`/`runtime`/`native-http`/`sunrise-edge-devnet`/`tokio`が
-   あるが、いずれもnon-test buildからは到達できない。implemented As-Is;
+   composeとfixture構築、decoded execution-effects fixtureの構築、およびreal TLS E2E
+   fixture構築のためだけの`execution`/`objects`/`runtime`/`native-http`/
+   `sunrise-edge-devnet`/`tokio`/`rcgen`/`rustls`があるが、いずれもnon-test buildからは
+   到達できない。implemented As-Is;
    ARCHITECTURE.md DR-0084）。Node/browser runtime、独自canonical codec、
    独自signing/RPC pathは導入していない。引数parsingはclap等を使わない小さな手書きの
    strict `--flag value` parserで、duplicate flag・unknown flag・flag値なし・宣言外の
    positional argumentをすべて拒否する。`address`（明示的に指定したdevelopment seed
    fileからAddressIsPublicKeyのaddressを導出）、`context`/`object`/`receipt`/`next-nonce`
    （`clients/rust`の対応するquery methodへの薄いwrapper）、`transfer`（single same-owner
-   devnet asset transfer）の6コマンドを提供する。`--endpoint`はすべてloopbackのみを受理し、
+   devnet asset transfer）の6コマンドを提供する。`--tls-server-name`/
+   `--tls-ca-cert-der-file`をいずれも指定しない場合、`--endpoint`はplaintext
+   `LoopbackHttpTransport`の下でloopbackのみを受理する。S1実装後は、両方の
+   TLSフラグを指定した場合のみ`--endpoint`を既に解決済みの`SocketAddr`として
+   扱う`RemoteTlsHttpTransport`を使い、loopback制限は課さない。片方だけの指定は
+   networkへ出る前にfail closedする（詳細はS1参照）。
    出力はdeterministicなline-oriented `key=value`テキスト、すべてのエラーはtypedな
    `CliError`でexit non-zeroとなる。development seed fileは明示的なpathのみを受理し
    （home directoryのdefault path無し）、symlinkと非regular fileを拒否し、Unix上では

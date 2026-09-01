@@ -655,9 +655,9 @@ methods. It provides two synchronous HTTP/1.1 transports sharing the same
 strict timeouts, header/body bounds, selector binding, and ambiguous-framing
 rejection: the local plaintext `LoopbackHttpTransport`, which stays
 loopback-only, and the bounded S1 `RemoteTlsHttpTransport`, which dials an
-already-resolved non-loopback `SocketAddr` over `rustls` with a
-caller-supplied DNS server name and CA trust anchor (no system trust store,
-no mTLS, no proxy/redirects). Neither is a mainnet-readiness or
+already-resolved `SocketAddr` with no loopback restriction over `rustls`
+with a caller-supplied DNS server name and CA trust anchor (no system trust
+store, no mTLS, no proxy/redirects). Neither is a mainnet-readiness or
 production-certification claim. Stable signed
 transaction bytes are accepted directly by node-core, parser adversarial tests
 use real TCP, and all four query methods reach the composed devnet router over

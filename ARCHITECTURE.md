@@ -1805,10 +1805,11 @@ implemented or claimed here.
 `apps/cli` is a new, additive, Rust-only Developer MVP CLI with exactly one
 non-development/runtime dependency: `sunrise-edge-client`. (`Cargo.toml` also
 declares a handful of `[dev-dependencies]` — `execution`, `native-http`,
-`objects`, `runtime`, `sunrise-edge-devnet`, `tokio` — used only to compose a
-real local devnet, build canonical test fixtures, and build a decoded
-execution-effects fixture directly in this crate's own test suite; none of
-them are reachable from `main`, `lib`, or any non-test build.) It has no
+`objects`, `rcgen`, `runtime`, `rustls`, `sunrise-edge-devnet`, `tokio` —
+used only to compose a real local devnet, build canonical test fixtures,
+build a decoded execution-effects fixture directly in this crate's own test
+suite, and (`rcgen`/`rustls`) construct real TLS end-to-end test fixtures;
+none of them are reachable from `main`, `lib`, or any non-test build.) It has no
 Node/browser runtime, no argument-parsing crate (flags are
 parsed by a small hand-written, strict `--flag value` parser that rejects
 duplicates, unknown flags, and any non-flag/extra positional token), no
