@@ -25,6 +25,7 @@ members = [
     "crates/node-wire",
     "crates/native-http",
     "apps/devnet",
+    "apps/cli",
     "clients/rust",
 ]
 resolver = "3"

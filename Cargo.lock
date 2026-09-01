@@ -1544,10 +1544,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
+name = "sunrise-edge-cli"
+version = "0.1.0"
+dependencies = [
+ "execution",
+ "native-http",
+ "objects",
+ "runtime",
+ "sunrise-edge-client",
+ "sunrise-edge-devnet",
+ "tokio",
+]
+
+[[package]]
 name = "sunrise-edge-client"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "canonical-encoding",
  "crypto",
  "ed25519-zebra",
  "execution",
@@ -1558,6 +1572,7 @@ dependencies = [
  "objects",
  "protocol-config",
  "protocol-types",
+ "runtime",
  "sunrise-edge-devnet",
  "tokio",
 ]

@@ -607,8 +607,56 @@ transaction bytes are accepted directly by node-core, parser adversarial tests
 use real TCP, and all four query methods reach the composed devnet router over
 TCP. A caller deadline bounds the complete exchange, including slow-drip
 responses, rather than resetting on each received byte.
-`apps/cli` is the next product-surface slice. A signed duplicate-transfer HTTP
-E2E remains required later by the Developer MVP Gate and is not claimed here.
+`clients/rust`'s transaction construction is now also available as a safe,
+additive two-stage external-signer API (`transaction::PreparedTransaction`):
+`prepare` fixes an immutable transaction from an explicit sender, the active
+signature scheme, and a `TransactionRequest`, rejecting any scheme other than
+the one implemented `Ed25519`/`AddressIsPublicKey` combination before any
+framing; `signable_frame` exposes the exact bytes an external signer must
+sign; and `finalize` produces output only after independently verifying a
+returned signature's exact length and cryptographic validity against the
+sender. `build_signed_transaction` is unchanged in its stable output and is
+now implemented through this same path. This boundary is Ledger-*ready*, not
+a Ledger *integration*: no USB/HID/Ledger dependency exists anywhere in this
+workspace, and a real integration would additionally require a dedicated
+Sunrise Edge Ledger device application, an APDU/host transport, on-device
+clear signing of the exact canonical signature frame, derivation-path policy,
+device/app/version checks, explicit user confirmation, host-side verification
+(already provided), and hardware-in-the-loop tests — existing Solana or
+Ethereum Ledger apps must never be reused for Sunrise signing (see
+`ARCHITECTURE.md` DR-0084).
+
+`apps/cli` is now implemented As-Is: a Rust-only Developer MVP CLI with
+exactly one non-development/runtime dependency, `sunrise-edge-client` (a
+handful of crates are `[dev-dependencies]` only, to compose a real local
+devnet and build fixtures for this crate's own tests; none are reachable
+from a non-test build), with a strict hand-written `--flag value`
+argument parser (no clap or other argument crate), `#![forbid(unsafe_code)]`,
+and no independent canonical encode/decode, signing, or RPC path. It provides
+`address` (derives an `AddressIsPublicKey` address from an explicitly named,
+non-keystore development seed file — never a home-directory default, never
+accepted on argv, never printed, and checked for symlinks/insecure Unix
+permissions/exact length), `context`, `object`, `receipt`, `next-nonce`, and
+`transfer` — the one same-owner devnet asset transfer command, which queries
+context/next-nonce/both objects, validates the profile and epoch before
+signing, builds the exact two-`Write` access manifest in source/destination
+order, signs and submits through `clients/rust`, and can optionally wait for
+a receipt under caller-supplied, finite poll bounds (`--wait` requires all
+four `--wait-*` bounds together; no hidden default). Output is deterministic
+`key=value` text; every error is typed and exits non-zero. Devnet-specific
+knowledge (the module's entrypoint name and argument frame) lives only in
+`apps/cli`; `clients/rust` gained only a small, generic re-export surface
+(access-manifest/canonical-struct/protocol-type re-exports, an
+`AddressIsPublicKey` binding-id constant, and a generic current-inline
+`ObjectRef` extractor) to support it, adding no application semantics of its
+own. Tests cover parser/seed-file adversarial cases, two-stage signer
+adversarial cases (mismatched scheme, malformed/wrong/tampered signatures),
+fake-`Transport` unit tests per command, and two real loopback-TCP tests
+against a composed local devnet router — one exercising the query commands
+and one exercising a complete signed `transfer` against freshly seeded
+accounts through to a waited, present receipt. A signed duplicate-transfer
+restart E2E remains required later by the Developer MVP Gate and is not
+claimed here.
 
 The Phase 15-17 production exit criteria and accepted persistence designs are
 preserved. Additional capacity/load/soak evidence, PITR, HA/failover,
