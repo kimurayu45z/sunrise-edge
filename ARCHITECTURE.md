@@ -1692,12 +1692,15 @@ type is exported from node-core rather than duplicated by a client.
 
 The initial transport is synchronous and deliberately local-development-only.
 A small transport trait permits deterministic tests; the provided HTTP/1.1
-implementation connects only to an explicit loopback address, opens one
-bounded `TcpStream` per request, applies connect/read/write timeouts and header/
-body limits, requires an exact `Content-Length`, and rejects transfer encoding,
-ambiguous lengths, truncated or trailing bodies, unexpected content types, and
-non-loopback targets. It provides no TLS, authentication, proxy, redirect,
-persistent connection, async runtime, or production remote-node claim.
+implementation (`LoopbackHttpTransport`) connects only to an explicit loopback
+address, opens one bounded `TcpStream` per request, applies connect/read/write
+timeouts and header/body limits, requires an exact `Content-Length`, and
+rejects transfer encoding, ambiguous lengths, truncated or trailing bodies,
+unexpected content types, and non-loopback targets. It provides no TLS,
+authentication, proxy, redirect, persistent connection, async runtime, or
+production remote-node claim. (A separate, later-added `RemoteTlsHttpTransport`
+lifts the loopback-only and no-TLS restrictions within S1's documented
+bounds — see DR-0085 below — without changing this transport's own scope.)
 
 `/v1/context` remains authoritative for chain, epoch, protocol-version, hash-
 suite, authentication-profile, signature-scheme, binding, and atomicity-domain
@@ -1817,9 +1820,15 @@ bound to an explicitly named development seed file — never a keystore, never
 a home-directory default, and the seed is never accepted on argv or printed);
 `context`, `object`, `receipt`, and `next-nonce` (thin wrappers over the
 matching `sunrise-edge-client` query methods); and `transfer`, the one
-same-owner devnet asset transfer command. All network commands target an
-explicit, strictly loopback-only `--endpoint`; a non-loopback address is
-rejected before any connection is attempted. Output is deterministic,
+same-owner devnet asset transfer command. Every network subcommand targets an
+explicit `--endpoint`; with neither TLS flag supplied, `--endpoint` must be
+loopback and this binary talks the legacy plaintext `LoopbackHttpTransport`
+(a non-loopback address is rejected before any connection is attempted). With
+both paired `--tls-server-name`/`--tls-ca-cert-der-file` flags supplied,
+`--endpoint` is instead treated as an already-resolved `SocketAddr` with no
+loopback restriction, and this binary dials `RemoteTlsHttpTransport`; this binary
+performs no DNS resolution of its own, so `--endpoint` remains a literal
+address either way. Output is deterministic,
 line-oriented `key=value` text; every error is a typed, actionable
 `CliError`, and every error exits the process non-zero. A successful node
 response payload is decoded through `sunrise-edge-client`'s already-generic

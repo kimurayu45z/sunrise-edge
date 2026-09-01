@@ -651,9 +651,14 @@ result codecs and route/media constants live in the shared, transport-neutral
 `node-wire` crate and remain re-exported by `native-http`. The client provides
 seed-based Ed25519 key/address handling, Transaction v1 construction/signing,
 explicit-request-ID submission, bounded receipt polling, and all four query
-methods. Its provided HTTP/1.1 transport is synchronous and loopback-only,
-with strict timeouts, header/body bounds, selector binding, and ambiguous-
-framing rejection; it is not a production remote transport. Stable signed
+methods. It provides two synchronous HTTP/1.1 transports sharing the same
+strict timeouts, header/body bounds, selector binding, and ambiguous-framing
+rejection: the local plaintext `LoopbackHttpTransport`, which stays
+loopback-only, and the bounded S1 `RemoteTlsHttpTransport`, which dials an
+already-resolved non-loopback `SocketAddr` over `rustls` with a
+caller-supplied DNS server name and CA trust anchor (no system trust store,
+no mTLS, no proxy/redirects). Neither is a mainnet-readiness or
+production-certification claim. Stable signed
 transaction bytes are accepted directly by node-core, parser adversarial tests
 use real TCP, and all four query methods reach the composed devnet router over
 TCP. A caller deadline bounds the complete exchange, including slow-drip
@@ -778,7 +783,7 @@ permanently single-operator service.
 | Execution | `execution`, `contract-sdk`, `chain-ir`, `system-modules` | Transactions/effects, deterministic WASM, proof envelopes/verifier interfaces, contract host APIs, portable IR, and governed modules |
 | Economics and governance | `fees`, `bonds`, `governance`, `protocol-upgrades`, `protocol-config` | Stablecoin fees/bonds, admission, governance actions, upgrades, migrations, and committed configuration |
 | Runtime and consensus | `runtime`, `runtime-sqlite`, `runtime-postgres`, `validator-set`, `consensus`, `node-core` | Persistence/runtime interfaces, local durable SQLite state plus a local-only non-production structured SQLite adapter, normalized PostgreSQL structured commit and indexed outbox adapter, epoch validator snapshots, event-driven shared-object ordering, and one-event conditional transitions |
-| Client wire and SDK | `node-wire`, `clients/rust` | Shared canonical HTTP/query frames plus the bounded loopback-only Rust Developer MVP client |
+| Client wire and SDK | `node-wire`, `clients/rust` | Shared canonical HTTP/query frames plus the bounded Rust Developer MVP client, with a loopback plaintext transport, a bounded S1 remote TLS transport, and expected-protocol-context verification |
 | Adapters | `native-http`, `adapters/shared`, `adapters/cloudflare-workers`, `adapters/deno`, `adapters/vercel`, `adapters/supabase-edge`, `adapters/aws-lambda` | Bounded native routing, shared Web ingress, Cloudflare Service-Binding ingress, authenticated Deno/Vercel/Supabase ingress, and AWS HTTP API v2 mapping around the canonical contract |
 
 The repository intentionally keeps vendor-specific dependencies out of the
