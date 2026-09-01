@@ -529,32 +529,50 @@ independent security review.
 The [CLI Developer MVP Gate](TODO.md#cli-developer-mvp-gate) is satisfied
 As-Is: a real Rust client and CLI exercise the local end-to-end product,
 including orderly restart and duplicate-request evidence. Under the CLI-first
-production-strategy pivot (see `ARCHITECTURE.md` DR-0085), the current
-milestone is S1 of the
-[CLI-First Node Production Gate](TODO.md#cli-first-node-production-gate) — a
-real node/persistence/operations gate defined by reference to the existing,
+production-strategy pivot (see `ARCHITECTURE.md` DR-0085), S1 of the
+[CLI-First Node Production Gate](TODO.md#cli-first-node-production-gate) is
+now implemented As-Is, and the current milestone is S2 — S1 is a real
+node/persistence/operations gate slice defined by reference to the existing,
 unchanged Phase 15 production exit criteria, the Post-MVP persistence
 implementation order, and the cross-phase release gate. S1 has two separate
-concerns: remote TLS transport, and a separate locally configured expected
-protocol-context check before signing. Only the second (S1a) is implemented
-As-Is: `clients/rust` now has a typed, production-oriented
-`ExpectedProtocolContext` verification boundary
-(`clients::context::ExpectedProtocolContext`), and `apps/cli`'s `transfer`
-requires five `--expected-*` flags (chain id, protocol version, exact epoch,
-hash-suite id, and domain) and rejects a missing, zero, or malformed value
-before any network dispatch. `transfer` now uses only
+concerns, both now implemented: remote TLS transport, and a separate locally
+configured expected protocol-context check before signing. `clients/rust` now
+has a typed, production-oriented `ExpectedProtocolContext` verification
+boundary (`clients::context::ExpectedProtocolContext`), and `apps/cli`'s
+`transfer` requires five `--expected-*` flags (chain id, protocol version,
+exact epoch, hash-suite id, and domain) and rejects a missing, zero, or
+malformed value before any network dispatch. `transfer` now uses only
 `Client::query_verified_context` — never the unverified `query_context` — and
 that verified context, for its nonce/object queries, transaction
 construction, signing, and submission, so a mismatch on any field stops the
 command immediately after the one context request, before anything else runs
-against the server. Remote TLS transport itself remains unimplemented:
-`clients/rust`'s provided transport is still the loopback-only, plaintext
-`LoopbackHttpTransport` described below, so S1 as a whole is not yet
-complete. The TypeScript-client/explorer/wallet criteria remain
-unchanged but are deferred until that production gate passes. Passing it is
-explicitly not mainnet readiness; the Phase 16/17 production exit criteria
-and an independent security audit remain required afterward. The owned-object
-Write/Consume durable
+against the server. `clients/rust` also now provides
+`transport::RemoteTlsHttpTransport`: a strict, synchronous HTTP/1.1-over-TLS
+transport sharing the exact same bounded request/response framing as
+`LoopbackHttpTransport`, requiring one caller-supplied DNS server name (used
+for both SNI and hostname validation) and one caller-supplied, bounded
+DER-encoded CA trust anchor — never a system trust store, PEM/bundle loading,
+mTLS, or IP-address hostname fallback — with no DNS resolution of its own
+(the caller supplies an already-resolved `SocketAddr`). `apps/cli`'s
+`context`, `object`, `receipt`, `next-nonce`, and `transfer` commands each
+accept a paired, optional `--tls-server-name`/`--tls-ca-cert-der-file` flag
+set (see "Run the local devnet and CLI" below): with neither flag, a command
+still uses the legacy loopback-only plaintext `LoopbackHttpTransport`; with
+both, it dials `RemoteTlsHttpTransport` against the supplied endpoint;
+supplying exactly one of the two flags is a local configuration error that
+fails closed before any network dispatch. TLS endpoint authentication and the
+`--expected-*` protocol-context check remain two separate, independently
+enforced boundaries — a successful TLS handshake never substitutes for the
+expected-context check, and passing the context check never widens what the
+TLS layer trusts. This slice ships no mTLS, no certificate
+revocation/rotation/lifecycle handling, and no deployment/operations
+evidence for issuing or distributing that CA material; those remain
+explicitly deferred, not silently assumed. The TypeScript-client/explorer/
+wallet criteria remain unchanged but are deferred until the CLI-First Node
+Production Gate passes. Passing S1 is explicitly not mainnet readiness; S2
+through S5, the Phase 16/17 production exit criteria, and an independent
+security audit remain required afterward. The owned-object Write/Consume
+durable
 composition and an additive trusted preinstalled-WASM node-core entrypoint are
 now available. The latter resolves the exact active module record captured
 from committed `ProtocolConfig`, checks the preinstalled
@@ -731,11 +749,13 @@ only orderly stop/reopen — not `kill -9`, power loss, torn writes, load,
 concurrency, or SQLite's production suitability.
 
 The Phase 15-17 production exit criteria and accepted persistence designs are
-preserved. The CLI Developer MVP Gate and S0 of the CLI-First Node Production
-Gate are satisfied As-Is. S1's expected-protocol-context verification slice
-(S1a) is now implemented As-Is; S1's remote TLS transport slice remains
-unimplemented, so S1 as a whole is not complete. Completing the CLI gate does
-not authorize skipping directly to later production claims.
+preserved. The CLI Developer MVP Gate and S0-S1 of the CLI-First Node
+Production Gate are satisfied As-Is: S1's expected-protocol-context
+verification slice and its remote TLS transport slice are both now
+implemented and tested, so S1 as a whole is complete, and the current
+milestone is S2. This is real node/persistence/operations and remote-CLI
+evidence, not a mainnet-readiness or production-certification claim: passing
+S1 does not authorize skipping directly to later production claims.
 Additional capacity/load/soak evidence, PITR, HA/failover, and provider-managed
 certification remain frozen until S5's certification work or an explicit SLO
 requires them. The
@@ -989,6 +1009,47 @@ and persisted state. The automated E2E additionally replays one
 byte-identical signed request before and after restart; the CLI does not expose
 a raw replay command because `transfer` intentionally re-queries the current
 nonce and object references before signing.
+
+### Optional remote TLS transport (S1)
+
+Every network subcommand above (`context`, `object`, `receipt`, `next-nonce`,
+`transfer`; not `address`, which never dials out) also accepts a paired,
+optional `--tls-server-name <dns-name> --tls-ca-cert-der-file <path>` flag
+set. With neither flag, `--endpoint` must be loopback and the command uses
+the plaintext `LoopbackHttpTransport` shown throughout this walkthrough. With
+both flags, `--endpoint` is instead treated as an already-resolved remote
+`SocketAddr` — this binary never performs DNS resolution itself — and the
+command dials `RemoteTlsHttpTransport` against it. Supplying exactly one of
+the two flags is a local configuration error and fails closed before any
+network dispatch. For example, against a remote node whose TLS leaf
+certificate is issued for `node.example.internal` under a private CA whose
+DER-encoded certificate is at `/etc/sunrise-edge/ca.der`:
+
+```bash
+cargo run -p sunrise-edge-cli -- context \
+  --endpoint 203.0.113.10:7443 \
+  --tls-server-name node.example.internal \
+  --tls-ca-cert-der-file /etc/sunrise-edge/ca.der
+```
+
+`--tls-server-name` is used for both the TLS SNI extension and post-handshake
+hostname validation against the supplied CA — never resolved and never
+inferred from `--endpoint`'s IP. `--tls-ca-cert-der-file` must name exactly
+one non-empty, DER-encoded (not PEM/bundle) X.509 certificate no larger than
+`sunrise_edge_client::MAX_CA_CERTIFICATE_DER_BYTES` (16 KiB); this is the
+transport's sole trust anchor, so a system trust store is never consulted, no
+certificate chain is ever combined across multiple files, and no mTLS client
+certificate is ever presented. `transfer`'s `--expected-*` flags are still
+required in this mode, and are still this operator's own locally trusted
+expectation, never a value copied from `context`'s output over that same TLS
+connection: authenticating the TLS endpoint proves only that the client
+reached a server holding a trusted key for `--tls-server-name`, never that it
+speaks the caller's intended chain/protocol, so the separate expected-context
+check in "Current status" below still runs, and still stops `transfer` after
+exactly one `/v1/context` request on any mismatch. This slice ships no
+certificate revocation, rotation, or lifecycle handling, and no guidance on
+how a CA certificate reaches an operator's filesystem; both remain out of
+scope here (see `ARCHITECTURE.md` DR-0085).
 
 ## Protocol invariants
 

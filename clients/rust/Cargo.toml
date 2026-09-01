@@ -15,10 +15,12 @@ node-core.workspace = true
 node-wire.workspace = true
 objects.workspace = true
 protocol-types.workspace = true
+rustls.workspace = true
 
 [dev-dependencies]
 native-http.workspace = true
 protocol-config.workspace = true
+rcgen.workspace = true
 runtime.workspace = true
 sunrise-edge-devnet.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }

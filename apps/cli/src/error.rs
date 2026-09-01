@@ -36,6 +36,33 @@ pub enum CliError {
     },
     /// `--endpoint` was not a loopback address.
     NonLoopbackEndpoint(SocketAddr),
+    /// Exactly one of the paired `--tls-server-name`/`--tls-ca-cert-der-file`
+    /// flags was supplied; both or neither are required, and this is
+    /// reported before any network dispatch.
+    PartialTlsConfiguration {
+        /// The flag that must also be supplied to complete the pair.
+        missing: &'static str,
+    },
+    /// The `--tls-ca-cert-der-file` path could not be opened or read.
+    CaCertificateFileRead {
+        /// The rejected path.
+        path: String,
+        /// The underlying I/O failure.
+        source: std::io::Error,
+    },
+    /// The `--tls-ca-cert-der-file` contents were empty.
+    CaCertificateFileEmpty {
+        /// The rejected path.
+        path: String,
+    },
+    /// The `--tls-ca-cert-der-file` contents exceeded the client's maximum
+    /// accepted CA trust-anchor DER length.
+    CaCertificateFileTooLarge {
+        /// The rejected path.
+        path: String,
+        /// The configured maximum, in bytes.
+        maximum: usize,
+    },
     /// A decimal integer argument was invalid.
     InvalidInteger {
         /// Flag name.
@@ -151,6 +178,20 @@ impl fmt::Display for CliError {
             Self::NonLoopbackEndpoint(addr) => {
                 write!(f, "--endpoint must be a loopback address, got {addr}")
             }
+            Self::PartialTlsConfiguration { missing } => write!(
+                f,
+                "--tls-server-name and --tls-ca-cert-der-file must both be supplied together; missing {missing}"
+            ),
+            Self::CaCertificateFileRead { path, source } => {
+                write!(f, "failed to read --tls-ca-cert-der-file {path:?}: {source}")
+            }
+            Self::CaCertificateFileEmpty { path } => {
+                write!(f, "--tls-ca-cert-der-file {path:?} was empty")
+            }
+            Self::CaCertificateFileTooLarge { path, maximum } => write!(
+                f,
+                "--tls-ca-cert-der-file {path:?} exceeded the maximum accepted {maximum} bytes"
+            ),
             Self::InvalidInteger { flag, value, source } => {
                 write!(f, "invalid decimal integer for {flag}: {value:?}: {source}")
             }
@@ -229,6 +270,7 @@ impl std::error::Error for CliError {
             Self::Hex(error) => Some(error),
             Self::Seed(error) => Some(error),
             Self::InvalidEndpoint { source, .. } => Some(source),
+            Self::CaCertificateFileRead { source, .. } => Some(source),
             Self::InvalidInteger { source, .. } => Some(source),
             Self::ObjectBodyDecodeFailed { source, .. } => Some(source),
             Self::CanonicalEncoding(error) => Some(error),

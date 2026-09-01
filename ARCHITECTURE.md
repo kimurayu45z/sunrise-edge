@@ -3248,16 +3248,16 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   **Current implementation status (2026-09-01).** The CLI Developer MVP Gate's
   criteria 1-6, 10, and 11 are implemented and validated As-Is, so that gate
   has passed without making a production-readiness claim. S0 below is also
-  implemented As-Is. The current implementation priority is S1; S2-S5 remain
-  ordered successors, and the TypeScript client/explorer/wallet surface remains
-  deferred until the complete CLI-First Node Production Gate passes.
+  implemented As-Is. S1 below is now also implemented and tested As-Is (see
+  "S1 implementation status" immediately below); the current implementation
+  priority is S2. S3-S5 remain ordered successors, and the TypeScript
+  client/explorer/wallet surface remains deferred until the complete
+  CLI-First Node Production Gate passes.
 
-  **S1a implementation status (2026-09-01): expected-protocol-context
-  verification is implemented As-Is; S1 as a whole is not complete.** S1
-  below names two separate concerns. Only the second — mandatory trusted
-  protocol-context verification before signing — is implemented by this
-  update; remote TLS transport is not, so S1 remains incomplete overall and
-  must not be described as done. `clients/rust` adds a public
+  **S1 implementation status (2026-09-01): both remote TLS transport and
+  expected-protocol-context verification are implemented and tested As-Is;
+  S1 as a whole is complete.** S1 below names two separate concerns, and both
+  are now implemented by this update. `clients/rust` adds a public
   `context::ExpectedProtocolContext`: a caller supplies the exact locally
   trusted `chain_id`, `protocol_version`, an exact-epoch policy (this initial
   slice trusts one caller-supplied epoch exactly, not a floor or range —
@@ -3321,12 +3321,111 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   parser/seed-file/two-stage-signer/owner-check behavior are all preserved
   unchanged; only the pre-signing context check moved from three ad hoc
   per-field comparisons inside `transfer` into the new typed, reusable
-  `clients/rust` verification boundary, and gained the two additional
+  `clients/rust` verification boundary, and gained the five additional
   chain-id/protocol-version/epoch/hash-suite/domain comparisons S1a requires.
-  Remote TLS transport remains entirely unimplemented: `LoopbackHttpTransport`
-  is unchanged and still loopback-only plaintext HTTP/1.1, so a real deployed
-  client still cannot reach a remote validator safely. S1 is not complete
-  until that separate TLS slice lands.
+
+  **S1's remote TLS transport slice.** `clients/rust` adds
+  `transport::RemoteTlsHttpTransport`, a second production `Transport`
+  implementation alongside the unchanged, still loopback-only plaintext
+  `LoopbackHttpTransport`. Both share one private bounded-stream abstraction
+  (`BoundedTransportIo`), so the exact same HTTP/1.1 request/response byte
+  framing, header/body bounds, and per-stage monotonic-deadline handling
+  apply to plaintext and TLS traffic alike; `RemoteTlsHttpTransport` differs
+  only in driving a real `rustls` `ClientConnection` — including its own
+  deadline-checked `read_tls`/`write_tls`/`process_new_packets` handshake
+  pump, never `rustls`'s unbounded `complete_io` — ahead of that shared
+  framing. `RemoteTlsHttpTransport::new` requires one caller-supplied
+  `SocketAddr` (this transport performs no DNS resolution of its own — the
+  caller must already have resolved one), one caller-supplied DNS server
+  name (used for both the TLS SNI extension and post-handshake hostname
+  validation, and rejected if empty or an IP-address literal — this
+  transport never falls back to validating the connection's IP as a
+  hostname), and one caller-supplied CA trust-anchor DER, capped at the new
+  public `transport::MAX_CA_CERTIFICATE_DER_BYTES` (16 KiB) and rejected if
+  empty, oversized, or not a valid X.509 certificate; that DER is the
+  transport's sole trust anchor; no system root store is ever consulted, no
+  PEM/bundle format is accepted, and no client certificate (mTLS) is ever
+  presented. Every timeout (connect, TLS-handshake read/write, and
+  post-handshake read/write) must be nonzero and forms one hard total
+  request budget by checked addition, exactly like
+  `LoopbackHttpTransport`'s; a `WireRequest::deadline` may only tighten that
+  budget, never extend it. Real loopback-TCP tests
+  (`clients/rust/tests/remote_tls_transport.rs`) issue an ephemeral
+  `rcgen`-issued CA/leaf pair and drive a real `rustls` `ServerConnection`
+  server against the real client code (never a fake `Transport`), proving:
+  a correct hostname/CA succeeds and sends the exact validated-DNS-name
+  `Host` header (never the connected `SocketAddr`'s IP); a wrong hostname
+  and a wrong CA each fail with a TLS protocol error during the handshake; a
+  stalled handshake and a peer that closes before the handshake completes
+  each fail promptly rather than busy-spinning or blocking past the
+  deadline; a short caller deadline tightens a much larger configured
+  budget; and every malformed-constructor input (bad DNS name, an IP
+  literal, empty/oversized/invalid CA DER, a zero timeout) is rejected
+  before any network I/O. A dedicated regression test in the same file also
+  proves the shared bounded-stream refactor left `LoopbackHttpTransport`'s
+  plaintext framing byte-for-byte unchanged.
+
+  `apps/cli`'s `context`, `object`, `receipt`, `next-nonce`, and `transfer`
+  commands each gain one paired, optional
+  `--tls-server-name`/`--tls-ca-cert-der-file` flag set, parsed centrally in
+  `apps/cli/src/net.rs` into exactly one new `CliTransport` enum
+  (`Loopback`/`RemoteTls`) implementing `Transport`, so every command's
+  generic `execute<T: Transport>` body is unchanged regardless of which mode
+  a given invocation selected. With neither flag, a command behaves exactly
+  as before (loopback-only plaintext, `CliError::NonLoopbackEndpoint` on a
+  non-loopback `--endpoint`). With both flags, `--endpoint` is parsed as an
+  already-resolved `SocketAddr` (no loopback restriction, and still no DNS
+  resolution) and the command dials `RemoteTlsHttpTransport`. Supplying
+  exactly one of the two flags returns a new typed
+  `CliError::PartialTlsConfiguration` before any network dispatch. The CA
+  file is read with `std` only, through a bounded `Read::take` adaptor
+  capped at one byte more than the same public
+  `MAX_CA_CERTIFICATE_DER_BYTES` the transport itself enforces, so a
+  mistaken or hostile oversized file can never make this binary buffer an
+  unbounded amount of data before rejecting it; an empty file, an oversized
+  file, and any I/O failure each return their own typed, actionable
+  `CliError` variant naming the file path but never its contents.
+  `apps/cli/tests/tls_cli_e2e.rs` adds two deterministic local TLS
+  integration tests (again a real `rcgen`/`rustls` loopback TLS server, no
+  fake transport, no external network): one proves a real `context`
+  invocation succeeds over TLS with the exact expected `Host` authority; the
+  other proves that when a `transfer` invocation successfully authenticates
+  TLS against a server whose `/v1/context` result disagrees with
+  `--expected-chain-id`, it dispatches exactly one `/v1/context` request —
+  confirmed by the test server's own connection counter, which would observe
+  a second connection attempt if one occurred — and returns the typed
+  `ProtocolContextMismatch` before ever reaching the nonce/object/sign/submit
+  steps that a verified context would unlock. This is the same ordering and
+  same typed-mismatch guarantee S1a's existing fake-`Transport` unit tests
+  already proved, now demonstrated over a real authenticated TLS connection
+  instead of a fake transport, which is exactly why TLS endpoint
+  authentication and the expected-context check must remain two independent
+  boundaries: successfully authenticating the TLS endpoint above proves only
+  that the CLI reached a server holding a trusted key for
+  `--tls-server-name`, never that the server speaks the caller's intended
+  chain/protocol, so the pre-existing S1a check is what actually stops the
+  transfer here.
+
+  **Explicit limits (not silently assumed).** This slice performs no DNS
+  resolution anywhere; the caller must always supply an already-resolved
+  `SocketAddr`. It trusts exactly one caller-supplied CA DER file as the sole
+  anchor — never a system/OS trust store, never a PEM/bundle format, never
+  more than one combined anchor. It never performs mTLS (no client
+  certificate is ever presented). It has no certificate revocation checking
+  (no CRL/OCSP), no certificate rotation or lifecycle handling, and no
+  deployment/operations evidence for how a CA certificate reaches an
+  operator's filesystem or how it is rotated over a validator's lifetime —
+  all of that remains explicitly deferred to later CLI-First Node Production
+  Gate slices (S5) or the Post-MVP Production Hardening persistence/
+  operations work, not silently approximated here. TLS endpoint
+  authentication and the separate `ExpectedProtocolContext` check are
+  intentionally never merged into one another: a successful TLS handshake
+  never substitutes for the expected-context check, and a verified context
+  never widens what the TLS layer itself trusts. This is real S1 evidence,
+  not a mainnet-readiness or production-certification claim: Phase 16/17's
+  production exit criteria and an independent security audit remain
+  required afterward, unchanged, and S2 (cross-owner transfer) is the next
+  ordered slice.
 
   **CLI-First Node Production Gate.** This new gate sits between the CLI
   Developer MVP Gate and the deferred browser surface. It is a real
@@ -3360,21 +3459,22 @@ version 1, and fail closed on zero identity/rule version, empty access, or
     proves (implemented As-Is by this decision; see criterion 10,
     `apps/cli/tests/devnet_restart_duplicate_e2e.rs`, and README "Run the
     local devnet and CLI").
-  - S1: remote TLS transport and mandatory trusted protocol-context
-    validation before signing, as two separate concerns. The transport
-    performs normal TLS server-identity and hostname validation under an
-    explicit trust policy (for example, system CA plus hostname validation,
-    or an explicitly configured CA/anchor); this does not require brittle
-    leaf-certificate pinning as the only valid TLS trust design. Separately,
-    because a successful TLS handshake authenticates the transport endpoint,
-    not the protocol context, a valid TLS connection alone does not prove
-    the remote server speaks the client's intended chain/protocol and does
-    not by itself prevent cross-chain signing. The client/CLI must therefore
-    require a locally configured expected chain identity and protocol
-    policy, and compare the remote `/v1/context` result's chain id, protocol
-    version, epoch policy, signature scheme, address binding, and
-    transaction auth profile against that expectation before any signing
-    occurs.
+  - S1 (implemented As-Is; see "S1 implementation status" above): remote TLS
+    transport and mandatory trusted protocol-context validation before
+    signing, as two separate concerns. The transport performs normal TLS
+    server-identity and hostname validation under an explicit trust policy
+    (this slice's `RemoteTlsHttpTransport` uses one explicitly configured
+    CA/anchor and DNS name, never a system CA store); this does not require
+    brittle leaf-certificate pinning as the only valid TLS trust design.
+    Separately, because a successful TLS handshake authenticates the
+    transport endpoint, not the protocol context, a valid TLS connection
+    alone does not prove the remote server speaks the client's intended
+    chain/protocol and does not by itself prevent cross-chain signing. The
+    client/CLI therefore also requires a locally configured expected chain
+    identity and protocol policy, and compares the remote `/v1/context`
+    result's chain id, protocol version, epoch policy, signature scheme,
+    address binding, and transaction auth profile against that expectation
+    before any signing occurs.
   - S2: cross-owner transfer (destination-owner authorization and object
     owner changes) on the existing owned-effects path.
   - S3: fees and gas metering, completed before the devnet's fee-free posture

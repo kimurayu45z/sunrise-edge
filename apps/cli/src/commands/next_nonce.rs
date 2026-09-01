@@ -7,21 +7,24 @@ use sunrise_edge_client::{Address, Client, Transport};
 use crate::args::{parse_flags, scalar};
 use crate::error::CliError;
 use crate::hex::decode_hex_32;
-use crate::net::connect;
+use crate::net::{connect, tls_flag_specs};
 
 const ENDPOINT: &str = "--endpoint";
 const SENDER: &str = "--sender";
 
-/// Runs `next-nonce --endpoint <host:port> --sender <hex>`.
+/// Runs `next-nonce --endpoint <host:port> --sender <hex> [--tls-server-name
+/// <dns-name> --tls-ca-cert-der-file <path>]`.
 pub fn run<I>(args: I) -> Result<(), CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let parsed = parse_flags(args, &[scalar(ENDPOINT), scalar(SENDER)])?;
+    let mut specs = vec![scalar(ENDPOINT), scalar(SENDER)];
+    specs.extend(tls_flag_specs());
+    let parsed = parse_flags(args, &specs)?;
     let endpoint = parsed.require(ENDPOINT)?;
     let sender = Address::new(decode_hex_32(SENDER, parsed.require(SENDER)?)?);
 
-    let client = connect(endpoint)?;
+    let client = connect(endpoint, &parsed)?;
     execute(&client, sender)
 }
 

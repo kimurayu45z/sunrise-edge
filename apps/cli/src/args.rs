@@ -58,6 +58,13 @@ impl ParsedArgs {
             .map(String::as_str)
             .ok_or(ArgsError::MissingFlag(name))
     }
+
+    /// Returns an optional scalar flag's value, or `None` if it was never
+    /// supplied.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.values.get(name).map(String::as_str)
+    }
 }
 
 /// Parses `args` against the declared `specs`, in any order.

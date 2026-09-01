@@ -19,6 +19,8 @@ sunrise-edge-client.workspace = true
 execution.workspace = true
 native-http.workspace = true
 objects.workspace = true
+rcgen.workspace = true
 runtime.workspace = true
+rustls.workspace = true
 sunrise-edge-devnet.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }

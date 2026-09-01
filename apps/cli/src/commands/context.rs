@@ -6,20 +6,23 @@ use sunrise_edge_client::{Client, Transport};
 
 use crate::args::{parse_flags, scalar};
 use crate::error::CliError;
-use crate::net::connect;
+use crate::net::{connect, tls_flag_specs};
 use crate::output::{bounded_hex_field, sanitize_line};
 
 const ENDPOINT: &str = "--endpoint";
 
-/// Runs `context --endpoint <host:port>`.
+/// Runs `context --endpoint <host:port> [--tls-server-name <dns-name>
+/// --tls-ca-cert-der-file <path>]`.
 pub fn run<I>(args: I) -> Result<(), CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let parsed = parse_flags(args, &[scalar(ENDPOINT)])?;
+    let mut specs = vec![scalar(ENDPOINT)];
+    specs.extend(tls_flag_specs());
+    let parsed = parse_flags(args, &specs)?;
     let endpoint = parsed.require(ENDPOINT)?;
 
-    let client = connect(endpoint)?;
+    let client = connect(endpoint, &parsed)?;
     execute(&client)
 }
 

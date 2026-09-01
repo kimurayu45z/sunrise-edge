@@ -14,12 +14,15 @@
 //! It depends on `node-core` and `node-wire` for the canonical wire
 //! contract and never on Axum or `native-http`. The provided
 //! [`transport::LoopbackHttpTransport`] is a strict, synchronous,
-//! loopback-only HTTP/1.1 implementation for local development; the
+//! loopback-only plaintext HTTP/1.1 implementation for local development;
+//! [`transport::RemoteTlsHttpTransport`] is this crate's `CLI-First Node
+//! Production Gate` S1 remote transport slice (see `ARCHITECTURE.md`
+//! DR-0085): a strict, synchronous HTTP/1.1-over-TLS implementation that
+//! shares the identical request/response framing but requires an explicit
+//! DNS server name and CA trust anchor and performs normal TLS
+//! server-identity and hostname validation instead of trusting loopback. The
 //! [`transport::Transport`] trait exists so tests and other embedders can
-//! supply a deterministic fake instead. `LoopbackHttpTransport` speaks
-//! plaintext HTTP/1.1 only; remote TLS transport is a separate, not-yet-
-//! implemented `CLI-First Node Production Gate` S1 slice (see
-//! `ARCHITECTURE.md` DR-0085).
+//! supply a deterministic fake instead.
 //!
 //! [`context::ExpectedProtocolContext`] implements that same S1 slice's
 //! other, separate concern: a mandatory, locally trusted expected-
@@ -61,7 +64,8 @@ pub use support::{
 };
 pub use transaction::{PreparedTransaction, TransactionRequest, build_signed_transaction};
 pub use transport::{
-    LoopbackHttpTransport, Method, Transport, TransportError, WireRequest, WireResponse,
+    LoopbackHttpTransport, MAX_CA_CERTIFICATE_DER_BYTES, Method, RemoteTlsHttpTransport, Transport,
+    TransportError, WireRequest, WireResponse,
 };
 
 // Re-exported for convenience: every `Client` query method returns one of

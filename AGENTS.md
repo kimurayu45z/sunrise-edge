@@ -210,30 +210,67 @@ criterion after context compaction. Re-check `main`, the open stacked PR chain,
 and `TODO.md` before starting because repository state may have advanced. The
 explicit `CLI Developer MVP Gate` (`TODO.md`; renamed and narrowed from the
 earlier `Developer MVP Gate` to node/client/CLI capability criteria 1-6/10/11)
-and S0 of the production sequence are satisfied As-Is. The current priority is
-S1 of the `CLI-First Node Production Gate` (`TODO.md`) — a real node/persistence/
-operations gate defined entirely by reference to existing, unchanged Phase 15
-To-Be exit criteria, the Post-MVP persistence implementation order, and the
-cross-phase release gate; passing it is explicitly not mainnet readiness (see
-ARCHITECTURE.md DR-0085 for the full rationale and the S0-S5 ordered slices).
-S1 implements remote TLS transport plus a separate locally configured expected
-protocol-context check before signing; these are two independent slices. As of
-2026-09-01, only the second (S1a, mandatory trusted protocol-context
-verification before signing) is implemented As-Is: `clients/rust` has a public
+and S0-S1 of the production sequence are satisfied As-Is. The current
+priority is S2 of the `CLI-First Node Production Gate` (`TODO.md`) — a real
+node/persistence/operations gate defined entirely by reference to existing,
+unchanged Phase 15 To-Be exit criteria, the Post-MVP persistence
+implementation order, and the cross-phase release gate; passing it is
+explicitly not mainnet readiness (see ARCHITECTURE.md DR-0085 for the full
+rationale and the S0-S5 ordered slices). S1 implements remote TLS transport
+plus a separate locally configured expected protocol-context check before
+signing; these are two independent slices, and as of 2026-09-01 both are
+implemented and tested As-Is, so S1 as a whole is complete. The
+protocol-context slice: `clients/rust` has a public
 `context::ExpectedProtocolContext` and `Client::query_verified_context`
 covering chain id, protocol version, an exact-epoch policy, hash-suite id,
 transaction-auth profile id, signature-scheme id, address-binding id, and the
 logical `AtomicityDomainId` (never `protocol_config_bytes`, and never folded
 into `crypto::SignatureDomain`), and `apps/cli`'s `transfer` requires five
 `--expected-*` flags, rejects a missing/zero/malformed value before any
-network dispatch, and uses only the verified context for every later
-nonce/object query, transaction construction, signing, and submission step.
-Remote TLS transport remains unimplemented (`LoopbackHttpTransport` is still
-loopback-only plaintext), so S1 as a whole is not complete. TypeScript-client/
-explorer/wallet criteria 7-9 are kept verbatim, not completed or deleted, and
-remain deferred until the complete production gate passes. Existing production
-exit criteria remain mandatory; capacity/PITR/HA/provider-certification work
-remains frozen
+network dispatch, calls `query_verified_context` as its first network
+request, and uses only the verified context for every later nonce/object
+query, transaction construction, signing, and submission step; adversarial
+tests prove every one of the eight compared fields stops `transfer` after
+exactly one context request, before any later dispatch. The remote-TLS
+slice: `clients/rust` adds `transport::RemoteTlsHttpTransport`, sharing
+`LoopbackHttpTransport`'s exact bounded HTTP/1.1 request/response framing
+and per-stage monotonic deadlines but driving a real `rustls`
+`ClientConnection` handshake, requiring one caller-resolved `SocketAddr` (no
+DNS resolution of its own), one caller-supplied DNS server name (used for
+both SNI and hostname validation, never IP-hostname fallback), and one
+caller-supplied CA trust-anchor DER capped at the public
+`transport::MAX_CA_CERTIFICATE_DER_BYTES` — never a system trust store,
+PEM/bundle, or mTLS client certificate;
+`clients/rust/tests/remote_tls_transport.rs` exercises it against a real `rcgen`/`rustls`
+loopback TLS server (correct/wrong hostname, correct/wrong CA, stalled/
+closed handshakes, caller-deadline tightening, malformed-constructor
+rejection, and a `LoopbackHttpTransport` regression check). `apps/cli`'s
+`context`, `object`, `receipt`, `next-nonce`, and `transfer` commands each
+accept a paired, optional `--tls-server-name`/`--tls-ca-cert-der-file` flag
+set, parsed centrally in `apps/cli/src/net.rs` into one `CliTransport` enum:
+neither flag keeps the legacy loopback-only plaintext path (still rejecting
+non-loopback endpoints), both flags dial `RemoteTlsHttpTransport` against the
+supplied endpoint, and exactly one flag fails closed with a typed
+`CliError::PartialTlsConfiguration` before any network dispatch; the CA file
+is read with `std` only, bounded by the same public maximum before the read
+completes, and empty/oversized/unreadable files each return their own typed
+`CliError` naming the path but never the file's contents.
+`apps/cli/tests/tls_cli_e2e.rs` adds two real local TLS integration tests
+(again `rcgen`/`rustls`, no external network): one proves a `context` query
+succeeds over TLS with the exact expected `Host` authority, and the other
+proves that a `transfer` invocation which successfully authenticates TLS
+against a server whose `/v1/context` disagrees with `--expected-chain-id`
+still makes exactly one context request (confirmed via the test server's own
+connection counter) and returns the typed `ProtocolContextMismatch` before
+ever reaching nonce/object/sign/submit — demonstrating that TLS endpoint
+authentication and the expected-protocol-context check are two independent
+boundaries, neither substituting for the other. This slice ships no mTLS, no
+certificate revocation/rotation/lifecycle handling, and no CA
+deployment/operations evidence; those remain explicitly deferred to later
+slices, not silently assumed. TypeScript-client/explorer/wallet criteria 7-9
+are kept verbatim, not completed or deleted, and remain deferred until the
+complete production gate passes. Existing production exit criteria remain
+mandatory; capacity/PITR/HA/provider-certification work remains frozen
 until S5 or an explicit SLO triggers it. Node-core now asserts every
 declared read revision in its atomic write set. Runtime has the explicit atomicity
 domain and dedicated read/mutation envelope with memory conformance; additive
