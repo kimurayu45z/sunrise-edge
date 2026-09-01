@@ -21,4 +21,4 @@ native-http.workspace = true
 objects.workspace = true
 runtime.workspace = true
 sunrise-edge-devnet.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }

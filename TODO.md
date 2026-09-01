@@ -1722,19 +1722,41 @@ production-ready、mainnet-ready、監査済みを意味しない。
 - 各PhaseのPRを完了するときは、TODOのAs-Isと残存production exit criteriaを同時に
   更新する。criteriaを満たしていない項目へ単に`implemented`だけを付けない。
 
-## Developer MVP Gate
+## CLI Developer MVP Gate
 
-Phase 15-17のproduction hardeningを先へ積み上げる前に、クライアントライブラリと
-フロントUIを実際に構築・検証できるsingle-node Developer MVPを完成させる。
+**CLI-first production戦略への転換（本節およびTODO全体でこの決定を"pivot"と呼ぶ）。**
+旧`Developer MVP Gate`は、TypeScript client・explorer・walletというブラウザ向け
+product surfaceの完成をsingle-node MVPのgoalに含めていた。この転換では、gate自体を
+`CLI Developer MVP Gate`と改名し、このgateのgoalをcriteria 1-6・10・11（native devnet、
+authenticated owned object Read/Write/Consume、preinstalled deterministic WASM、bounded
+query API、Rust client library、Rust-only CLI、restart/duplicate E2E、明示的な
+non-production limitations）だけに絞る。criteria 7-9（TypeScript client、explorer、
+wallet）はverbatimのまま以下に残すが、完了済み・削除済み・弱められたとは一切みなさず、
+新設する["CLI-First Node Production Gate"](#cli-first-node-production-gate)を通過した
+"後に"resequenceする。この転換はbrowser向けproduct surfaceを断念するものではなく、
+本物のnodeのproduction hardening（persistence、operations、release evidence）を
+ブラウザ向けUIより先に固めるという順序の変更である。
+
+Phase 15-17のproduction hardeningを先へ積み上げる前に、Rust client libraryとRust-only
+developer CLIを実際に構築・検証できるsingle-node CLI Developer MVPを完成させる。
 このgateはproduction readinessやmainnet readinessを意味せず、既存のTo-Be criteriaを
 削除しない。MVP correctnessを直接妨げる場合を除き、追加のcapacity/load/soak、PITR、
 HA/failover、provider-managed pooler、real-provider certification、provider deploymentの
 作業はgate通過後の`Post-MVP Production Hardening`へ凍結する。
 
-Developer MVP completion criteria（capability criteria 2-3を満たしながら、product
+**Current status (2026-09-01): criteria 1-6・10・11はimplemented and validated
+As-Isであり、CLI Developer MVP Gateは通過済みである。** これはproduction readinessの
+宣言ではない。CLI-First Node Production GateのS0もimplemented As-Isであり、現在の
+implementation priorityはS1（remote TLS transportと、signing前の独立したtrusted
+protocol-context validation）である。S2-S5は順序を飛ばさず後続する。
+
+CLI Developer MVP completion criteria（capability criteria 2-3を満たしながら、product
 surfaceはARCHITECTURE.md DR-0081の順序に従う: local devnet、bounded query API、Rust
 client、Rust CLI、TypeScript client、explorer、wallet、restart/duplicate E2E、
-explicit dev limitations）:
+explicit dev limitations）。**pivot後のgateはcriteria 1-6・10・11だけであり、
+criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以下に残すが、
+["CLI-First Node Production Gate"](#cli-first-node-production-gate)を通過するまで
+明示的にdefer/resequenceする（削除・完了扱い・弱体化ではない）:**
 
 1. native HTTPとlocal durable SQLiteを使い、停止・再起動できるsingle-node local devnetを
    documented commandで起動できる。
@@ -1756,18 +1778,36 @@ explicit dev limitations）:
    すべて`clients/rust`経由とする。
 7. `clients/typescript`でkey/address、canonical transaction encode/sign、submit、
    receipt wait、queryを提供するTypeScript client libraryを実装し、同じstable vectorsを共有する。
+   **（pivot後: この criterion のcontentは変更しない。実装着手は
+   ["CLI-First Node Production Gate"](#cli-first-node-production-gate)通過後まで
+   deferする。）**
 8. `apps/explorer`として、SvelteKit + shadcn-svelte（Luma）によるstatic/CSR専用のexplorer app
    を実装する。request-time server-side rendering、SvelteKit server adapter、
    `+page.server`/`+layout.server`/`+server` route、server actions/remote functions/
    server-held sessionやkeyは一切使わない。dynamic chain dataは`clients/typescript`経由の
    client-side fetchのみとする。
+   **（pivot後: この criterion のcontentは変更しない。実装着手は
+   ["CLI-First Node Production Gate"](#cli-first-node-production-gate)通過後まで
+   deferする。）**
 9. `apps/wallet`として、同様にSvelteKit + shadcn-svelte（Luma）によるstatic/CSR専用のwallet app
    を実装する。制約は8と同一（SSR/server adapter/server route/server actionsなし）に加え、
    signing keyはbrowser内でのみ生成・保持・使用し、server側へ渡したり生成させたりしない。
    `apps/explorer`と`apps/wallet`の間でreal duplicationが発生するまで、共有UI packageは
    導入しない。
+   **（pivot後: この criterion のcontentは変更しない。実装着手は
+   ["CLI-First Node Production Gate"](#cli-first-node-production-gate)通過後まで
+   deferする。）**
 10. devnet再起動後もstate/object/receipt/nonceが保持され、同一request retryがeffectを
-    二重適用しないことを自動E2Eで証明する。
+    二重適用しないことを自動E2Eで証明する（`apps/cli/tests/devnet_restart_duplicate_e2e.rs`
+    でimplemented As-Is。real file-backed `SqliteDurableStore`、composeしたdevnet router、
+    real loopback TCP、`sunrise-edge-cli::run`によるuser-facing transferと
+    `sunrise-edge-client`による独立検証を使い、orderly stop/reopen後のobject・receipt・
+    next-nonce query resultとsubmit resultのcanonical bytes一致、same-bootおよび
+    restart後のbyte-identicalなduplicate submissionの非再適用、already-committedな
+    request idの別transactionでの再利用がfail closedになること、pre-restart writer
+    generationがreopen後にfencedであることを証明する。orderly stop/reopenのみの証明であり、
+    `kill -9`、power loss、torn write、load、concurrency、SQLiteのproduction適性は
+    証明しない。下記S0参照）。
 11. single validator、owned-object only、fee-free dev profile、local SQLite、
     same-sender-only asset movement（cross-owner transfer authorizationは未実装のためfail
     closed）、4 bounded query routeがunauthenticated public-read API（呼び出し元は誰でも
@@ -1877,7 +1917,7 @@ explicit dev limitations）:
    HTTPをserveし、live smokeで`204` livenessと、同一account IDを保った次writer generationでの
    再起動を検証済み。WASM単体実行は同一`AssetId`の送金成功と異なる`AssetId`のeffectなし拒否を
    直接検証する。bounded query APIはDR-0082の設計のとおりstep 6で実装済み（implemented As-Is）。signed
-   duplicate-transfer HTTP E2Eは未実装で、後続sliceに残る。
+   duplicate-transfer HTTP E2Eはstep 9（S0）で実装済み（implemented As-Is）。
 6. DR-0082のbounded canonical query APIを、両方のstructured durable routerへadditiveに
    実装した（implemented As-Is）。`GET /v1/context`、`/v1/objects/{object_id}`、
    `/v1/receipts/{request_id}`、`/v1/senders/{sender}/next-nonce`だけを公開し、64文字の
@@ -1948,7 +1988,7 @@ explicit dev limitations）:
    elapsed boundを更新できない。effects listはdeclared countとexact field countをallocation前に照合する。
    fake transportでsubmit/request bindingとbounded receipt wait、raw loopback TCPでadversarial response、
    実際にcomposeしたdevnet routerへの4 query全てのTCP E2Eを検証済み。live signed transfer/duplicate/
-   restart E2Eはcriterion 10へ残る。
+   restart E2Eはstep 9（S0）で実装した。
 8. criterion 6の`apps/cli`を、実行時（non-dev）の直接依存が`clients/rust`のみのRust-only
    binaryとして実装した（`Cargo.toml`の`[dev-dependencies]`にはtest専用でreal devnetの
    composeとfixture構築、および decoded execution-effects fixtureの構築のためだけの
@@ -2043,15 +2083,39 @@ explicit dev limitations）:
    objectのadversarial test、実際にcomposeしたdevnet routerへのreal loopback TCP E2E
    （`context`/`next-nonce`/`object`の一括実行と、freshly seedしたaccount間での完全な
    signed `transfer`から`--wait`によるpresent receiptまでの2本）で検証済み。
+9. **S0（restart/duplicate E2E、criterion 10）**を
+   `apps/cli/tests/devnet_restart_duplicate_e2e.rs`として実装した（implemented As-Is）。
+   real file-backed `SqliteDurableStore`、実際にcomposeしたdevnet router、real loopback
+   TCP、user-facing transfer legとしての`sunrise-edge-cli::run`、独立検証としての
+   `sunrise-edge-client`を使う。amount 250のCLI transferをbounded waitで実行し、両account
+   のdecoded stateとreceipt/next-nonceを独立にcaptureしたうえで、serverをgraceful HTTP
+   shutdownでstopしserver taskをawaitし、`Arc<SqliteDurableStore>`をすべてdropしてSQLite
+   fileを真にcloseしてから、`boot_local_store`で再openしてwriter generationがN+1へ
+   進むことをassertし、reseedがExisting outcomeで同一account identityを返すことを検証し、
+   新しいephemeral portでrouterをrecomposeする。restart後、balance/sequenceに加えて
+   object query result・receipt result・complete next-nonce resultのcanonical bytesが
+   restart直前とexactに一致することを検証する。`sunrise-edge-client`で直接構築した1つの
+   signed `SubmitTransactionRequest`をsame boot内とrestart後の両方でbyte-identicalに
+   再送信し、canonical response bytesが同一でeffectが二重適用されないことを証明する。already-committed
+   なrequest idを別のtransactionへ再利用するとtypedでnonzeroなfail-closed HTTP conflict
+   （409）になりstate変化が無いことも検証する。さらに、reopen後のstoreへpre-restart
+   writer generationのcontextで読み取りを試み、`WriterFenced`を返すことでold writer
+   generationがfencedであることを直接証明する。これはorderly stop/reopenのみの証明であり、
+   `kill -9`、power loss、torn write、load、concurrency、SQLiteのproduction適性は
+   証明しない。
 
 **Repository-boundary decision**（ARCHITECTURE.md DR-0081；DR-0080の同名決定のうち
 repository-boundary/counter-demo deliverableのみを置き換える。DR-0080に記録された
 実装済みのnative-http compositionやerror classificationはhistorical recordとして
-変更しない）: Developer MVP completion criteria 5-9のRust client library
+変更しない）: CLI Developer MVP completion criteria 5-9のRust client library
 （`clients/rust`）、Rust CLI（`apps/cli`）、TypeScript client library
 （`clients/typescript`）、explorer app（`apps/explorer`）、wallet app（`apps/wallet`）は、
-Developer MVP Gateを通過するまでこのmonorepo内に留め、実装時点でこれらのtop-level
-ディレクトリとする。`apps/cli`は`clients/rust`にのみ依存するRust-only client（Node/browser
+CLI Developer MVP Gateの実装期間を通じてこのmonorepo内に留め、実装時点でこれらのtop-level
+ディレクトリとする。gate通過後も下記extraction条件を満たすまでは同様とする。pivot後、
+criteria 7-9（`clients/typescript`/`apps/explorer`/
+`apps/wallet`）のディレクトリ作成自体も
+["CLI-First Node Production Gate"](#cli-first-node-production-gate)通過後まで実装着手を
+deferする。`apps/cli`は`clients/rust`にのみ依存するRust-only client（Node/browser
 runtimeには依存しない）。`apps/explorer`と`apps/wallet`は別々のSvelteKit + shadcn-svelte
 （Luma）static/CSR app（request-time SSR、server adapter、`+page.server`/`+layout.server`/
 `+server`、server actions/remote functions/server-held session・keyなし）とし、walletの
@@ -2061,6 +2125,103 @@ signing keyはbrowser限定とする。両app間で共有UI packageは、real du
 (a) canonical wire contracts/共有test vectorsが安定し、(b) 実際のindependent consumerまたは
 独立したrelease cadenceが存在し、(c) E2Eがin-tree buildではなくreleaseされたdevnet
 artifactをtargetできるようになるまで、`clients/*`のいずれについても延期する。
+
+## CLI-First Node Production Gate
+
+CLI Developer MVP Gate（criteria 1-6・10・11）を通過した後、TypeScript client・
+explorer・wallet（criteria 7-9）へ進む前に、本物のnode自体をproduction-orientedへ
+近づけるgateを課す。これはUIより先にnode/persistence/operationsを固める順序の
+決定であり、新しいproduction criteriaを発明するものではない：以下はすべて既存の
+criteriaを変更せず参照するだけである。
+
+**参照する既存criteria（すべてunchanged）:**
+
+- 後述の「Phase 15 To-Be production exit criteria」1-10（NodeEvent kind別のcanonical
+  仕様固定、concrete dispatch実装、read-set revision assertionを持つversioned
+  transaction、request/event-digest dedup、transactional outbox/indexed due-work
+  claim、HTTP contract明文化、adapter policyとしてのretry/backpressure、TLS/認証/
+  rate limiting等を含むproduction deployment検証、conformance/fuzz/load/soak/
+  capacity budget、migration/backup/disaster recovery rehearsalとindependent
+  security review）。
+- 後述の「Post-MVP Production Hardening: Phase 15 persistence implementation order」
+  1-6（durable domain adapter boundary、indexed due-outbox repository、
+  structured durable transaction envelope上のnormalized PostgreSQL schema、
+  write skew/object ABA/lease fencing等を含むshared conformance、real host/power
+  fault・ENOSPC・connection exhaustion・snapshot restore・TLS commit-loss・
+  PgBouncer rehearsalを含むreal fault/capacity/backup rehearsal、Cloudflare
+  Durable ObjectとAWS persistenceでの同一contract実装とreal provider
+  certification）。
+- 後述の「Cross-phase production release gate」（Coding Requirements/Security
+  Invariants充足、experimental/deferred/mock/temporary項目のcriteria未充足ゼロ、
+  protocol specification/migration/disaster recovery/monitoring/capacity
+  planning/key management/validator operationsの再現可能な文書化、supported
+  runtime間でのcanonical bytes/digests/execution effects/commitments/consensus
+  outcomes/proof verificationの一致、fuzz/property/adversarial/long-running test
+  と第三者security auditの重大指摘解消、mainnet genesis前のrelease
+  artifact/dependency/compiler/build provenance固定とreproducible build/upgrade
+  rehearsal）。
+- protocol version 3のfee/module-object-effect/FastCertificateのatomic
+  compositionが完成するまでlive activationを禁止する既存のhard activation
+  constraint（後述の「Phase 15 As-Is scope」参照。fee debit、module/object
+  effect、FastCertificateはこのgateでも引き続き未実装の前提であり、このgate単独で
+  protocol version 3を有効化してよいことにはならない）。
+- `SubmitTransaction`以外の外部から受理されるnode-event family（特にcertificate、
+  protocol upgrade、validator-set change）について、live activation前に
+  `SubmitTransaction`と同等のauthenticated/authorized ingressを要求する既存の
+  hard activation constraint（後述の「Phase 15 As-Is scope」参照。generic node-core
+  handlerが`SubmitTransaction`をrejectすることは、これらの他のfamilyを
+  unauthenticatedのまま受理してよいことを意味しない）。
+
+**このgateを通過してもmainnetではない。** provider Phase 16（Cloudflare）・
+Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
+独立したsecurity auditは、このgate通過後も引き続き必須である。
+
+**ordered slices（S0-S5）:**
+
+- **S0**: automated restart/duplicate E2Eと、それとは別の、local devnet/CLIの
+  start・transfer・receipt・orderly restart・persisted stateをhandsで再現できる
+  documented command列（implemented As-Is；criteria 10、
+  `apps/cli/tests/devnet_restart_duplicate_e2e.rs`が
+  raw byte-identical duplicate replayを証明し、README「Getting started」の
+  local devnet/CLIコマンド列がそれとは独立にstart/transfer/receipt/orderly
+  restart/persisted stateをhandsで再現する。documented commandはraw byte-identical
+  duplicate replay自体を再現するものではない）。
+- **S1**: remote TLS transportと、signing前のmandatory trusted protocol-context
+  検証を実装する。この2つは別の懸念であり、混同しない：(a) remote TLS transportは
+  明示的なtrust policy（例: システムCA + hostname検証、または明示的に設定した
+  CA/anchorの検証）のもとでTLS server identityとhostnameを通常どおり検証する。
+  brittleなleaf-certificate pinningを唯一の有効なTLS trust設計として要求しない。
+  (b) TLS handshakeが成功しても、それだけではclientが意図したchain/protocolに
+  接続していることは証明されない（TLSはtransport endpointを認証するのであって、
+  protocol contextを認証するのではない）。したがってclient/CLIは、locally
+  configuredなexpected chain identityとprotocol policyを要求し、signingの
+  前に`/v1/context`から得たremote contextのchain id、protocol version、epoch
+  policy、signature scheme、address binding、transaction auth profileをその
+  期待値と比較して一致を要求する、という別のmandatory trusted protocol-context
+  検証を実装する。TLS証明書/公開鍵のpinningだけでcross-chain signingを防げると
+  主張しない。
+- **S2**: cross-owner transfer（destination-owner authorizationとobject owner
+  変更）を既存のowned-effects pathの上へ実装する。
+- **S3**: fees/gas metering。public live ingressの前に実装を完了する（fee-free
+  devnetをpublicへ晒したままにしない）。
+- **S4**: secure signer（`LocalSigner`の development-only in-memory鍵に代わる
+  production-oriented signing boundary）と、dedicated Sunrise Edge Ledger device
+  applicationを使った実際のLedger統合（ARCHITECTURE.md DR-0084参照。既存のSolana/
+  Ethereum Ledger appの転用はしない）。
+- **S5**: production persistence（PERSISTENCE.md/POSTGRES.mdのTo-Be）、
+  transactional outbox運用、provider deployment（Cloudflare Durable Object/AWS）、
+  operations（observability、runbook）、security（independent audit）、release
+  evidence（migration/backup/disaster recovery rehearsal、reproducible build）を
+  完成させる。
+
+capacity/PITR/HAは、S5で明示的にtriggerされる（S5のcertificationやSLOが実際に
+それらを要求する）までfrozenのままとする。これは既存の凍結方針
+（`Post-MVP Production Hardening`冒頭の凍結宣言）を変更しない。
+
+**production targetはconservativeにmulti-validator L1であり、single-operator
+serviceではない。** このgateのS0-S5順序と既存のvalidator-set/consensus
+criteriaは、単一operatorが恒久的に運用する前提のserviceではなく、複数
+validatorが独立に運用するL1へ向けたstepとして設計されている。
 
 Phase 1:
 - workspace
@@ -2762,8 +2923,12 @@ Phase 15 To-Be production exit criteria:
 
 Post-MVP Production Hardening: Phase 15 persistence implementation order（To-Beからの逆算）:
 
-以下はDeveloper MVP Gate通過まで凍結する。ただし、MVPのatomic correctness、restart safety、
-fail-closed behaviorを直接満たすために必要な既存contract修正は先行してよい。
+以下はCLI Developer MVP Gate通過まで凍結していた。ただし、MVPのatomic correctness、
+restart safety、fail-closed behaviorを直接満たすために必要な既存contract修正は先行して
+よいものとしていた。CLI Developer MVP Gateは現在通過済みであり、以下の項目は
+["CLI-First Node Production Gate"](#cli-first-node-production-gate)のS5が参照する
+production persistence作業そのものである。現在はS1がpriorityであり、capacity/PITR/HA等の
+S5 certification項目はS5または明示的なSLOがtriggerするまで引き続き凍結する。
 
 1. SQLite既存dataを暗黙migrationせず、writer fence、deadline、typed conflict/indeterminate failureを持つ
    durable domain adapter boundaryを定義する（implemented As-Is; composition/provider implementation pending）。

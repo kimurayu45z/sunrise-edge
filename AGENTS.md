@@ -208,10 +208,20 @@ In `TODO.md`, an implemented Phase is only an As-Is milestone, never a
 production-readiness claim. Preserve and work backward from each To-Be exit
 criterion after context compaction. Re-check `main`, the open stacked PR chain,
 and `TODO.md` before starting because repository state may have advanced. The
-current priority is the explicit Developer MVP Gate before further Phase 15-17
-production hardening. Existing production exit criteria remain mandatory, but
-additional capacity/PITR/HA/provider-certification work is frozen unless it
-blocks MVP correctness or fail-closed behavior. Node-core now asserts every
+explicit `CLI Developer MVP Gate` (`TODO.md`; renamed and narrowed from the
+earlier `Developer MVP Gate` to node/client/CLI capability criteria 1-6/10/11)
+and S0 of the production sequence are satisfied As-Is. The current priority is
+S1 of the `CLI-First Node Production Gate` (`TODO.md`) — a real node/persistence/
+operations gate defined entirely by reference to existing, unchanged Phase 15
+To-Be exit criteria, the Post-MVP persistence implementation order, and the
+cross-phase release gate; passing it is explicitly not mainnet readiness (see
+ARCHITECTURE.md DR-0085 for the full rationale and the S0-S5 ordered slices).
+S1 implements remote TLS transport plus a separate locally configured expected
+protocol-context check before signing. TypeScript-client/explorer/wallet
+criteria 7-9 are kept verbatim, not completed or deleted, and remain deferred
+until the complete production gate passes. Existing production exit criteria
+remain mandatory; capacity/PITR/HA/provider-certification work remains frozen
+until S5 or an explicit SLO triggers it. Node-core now asserts every
 declared read revision in its atomic write set. Runtime has the explicit atomicity
 domain and dedicated read/mutation envelope with memory conformance; additive
 node-core transaction, outbox delivery, and native request entrypoints now use
@@ -293,7 +303,13 @@ and separate static/CSR SvelteKit + shadcn-svelte apps (`apps/explorer`,
 `apps/wallet` — no request-time server-side rendering, server adapter, or
 server-held sessions/keys; fixed-shell build-time prerendering is allowed and
 wallet signing stays browser-only) with restart/duplicate E2E
-evidence. This replaces DR-0080's earlier `clients/typescript`/`demo/counter`
+evidence. `apps/devnet`, the bounded query API, `clients/rust`, `apps/cli`,
+and the restart/duplicate E2E
+(`apps/cli/tests/devnet_restart_duplicate_e2e.rs`) are implemented As-Is.
+Under DR-0085's CLI-first production-strategy pivot, `clients/typescript`,
+`apps/explorer`, and `apps/wallet` remain deferred (kept verbatim, not
+completed or deleted) until the new `CLI-First Node Production Gate`
+(`TODO.md`) passes. This replaces DR-0080's earlier `clients/typescript`/`demo/counter`
 pairing; no `demo/counter` directory is created. The devnet's own
 demonstration contract is `sunrise.devnet.asset_account.v1`
 (`transfer`), moving balance only between two ordinary, same-sender-owned

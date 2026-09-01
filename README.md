@@ -526,9 +526,21 @@ fee-object debiting,
 provider persistence bindings, runtime adapters, networking/RPC surfaces, and
 independent security review.
 
-The next milestone is the explicit [Developer MVP Gate](TODO.md#developer-mvp-gate),
-so client-library and front-end work can exercise a real end-to-end product
-before further production hardening. The owned-object Write/Consume durable
+The [CLI Developer MVP Gate](TODO.md#cli-developer-mvp-gate) is satisfied
+As-Is: a real Rust client and CLI exercise the local end-to-end product,
+including orderly restart and duplicate-request evidence. Under the CLI-first
+production-strategy pivot (see `ARCHITECTURE.md` DR-0085), the current
+milestone is S1 of the
+[CLI-First Node Production Gate](TODO.md#cli-first-node-production-gate) — a
+real node/persistence/operations gate defined by reference to the existing,
+unchanged Phase 15 production exit criteria, the Post-MVP persistence
+implementation order, and the cross-phase release gate. S1 adds remote TLS
+transport and a separate locally configured expected protocol-context check
+before signing. The TypeScript-client/explorer/wallet criteria remain
+unchanged but are deferred until that production gate passes. Passing it is
+explicitly not mainnet readiness; the Phase 16/17 production exit criteria
+and an independent security audit remain required afterward. The owned-object
+Write/Consume durable
 composition and an additive trusted preinstalled-WASM node-core entrypoint are
 now available. The latter resolves the exact active module record captured
 from committed `ProtocolConfig`, checks the preinstalled
@@ -541,20 +553,27 @@ composition, `preinstalled_wasm_structured_durable_router`, now invokes this
 path over HTTP; `structured_durable_router` remains on the read-only
 entrypoint and is unaffected.
 
-The Developer MVP product surface (see `ARCHITECTURE.md` DR-0081) is being
-implemented in this order: `apps/devnet` (a local devnet binary/startup
-composition around the existing preinstalled-WASM route); a separate bounded
-query-API slice in the protocol/native HTTP surfaces for chain/context info,
-objects, receipts, and nonces; `clients/rust`; `apps/cli` (a
-Rust-only developer CLI depending only on `clients/rust`, never a Node/browser
-runtime), `clients/typescript`, `apps/explorer`, and `apps/wallet`. The
-explorer and wallet are separate static/CSR SvelteKit + shadcn-svelte apps —
-no request-time server-side rendering, server adapter, or server-held
-sessions/keys; build-time prerendering of a fixed static shell is allowed, and
-wallet signing keys stay in the browser only. These surfaces occupy six
-product paths under `apps/` and `clients/`. Restart/duplicate-request E2E
-coverage and explicit documented development-only limitations complete the
-gate. This sequence and layout supersede DR-0080's earlier `clients/typescript`/
+The Developer MVP product surface (see `ARCHITECTURE.md` DR-0081) is defined
+in this order: `apps/devnet` (a local devnet binary/startup composition
+around the existing preinstalled-WASM route); a separate bounded query-API
+slice in the protocol/native HTTP surfaces for chain/context info, objects,
+receipts, and nonces; `clients/rust`; `apps/cli` (a Rust-only developer CLI
+depending only on `clients/rust`, never a Node/browser runtime); restart/
+duplicate-request E2E coverage; and explicit documented development-only
+limitations. `apps/devnet`, the query API, `clients/rust`, `apps/cli`, and
+the restart/duplicate E2E
+(`apps/cli/tests/devnet_restart_duplicate_e2e.rs`) are implemented As-Is —
+see "Run the local devnet and CLI" below for exact commands. Under the
+CLI-first production-strategy pivot (`ARCHITECTURE.md` DR-0085), the
+remaining `clients/typescript`, `apps/explorer`, and `apps/wallet` steps are
+kept verbatim from DR-0081 (not completed, deleted, or weakened) but their
+implementation start is deferred until the CLI-First Node Production Gate
+passes. The explorer and wallet, once implemented, are separate static/CSR
+SvelteKit + shadcn-svelte apps — no request-time server-side rendering,
+server adapter, or server-held sessions/keys; build-time prerendering of a
+fixed static shell is allowed, and wallet signing keys stay in the browser
+only. These surfaces occupy six product paths under `apps/` and `clients/`.
+This sequence and layout supersede DR-0080's earlier `clients/typescript`/
 `demo/counter` pairing; no `demo/counter` directory is created. Extraction of
 any `clients/*` directory into its own repository remains deferred until the
 canonical contracts/vectors are stable, a real independent consumer or release
@@ -655,15 +674,34 @@ fake-`Transport` unit tests per command, and two real loopback-TCP tests
 against a composed local devnet router — one exercising the query commands
 and one exercising a complete signed `transfer` against freshly seeded
 accounts through to a waited, present receipt. A signed duplicate-transfer
-restart E2E remains required later by the Developer MVP Gate and is not
-claimed here.
+restart E2E is now implemented As-Is at
+`apps/cli/tests/devnet_restart_duplicate_e2e.rs`: it closes and reopens a
+real file-backed SQLite database (dropping every store/router reference so
+the file is genuinely closed first), verifies the writer generation advances
+and the same seeded accounts reconcile, and proves the canonical object,
+receipt, next-nonce, and submit-result bytes survive restart exactly. The
+same signed request is replayed both within one boot and after restart without
+re-applying its effects; reusing a committed request id for a
+different transaction is a typed fail-closed HTTP conflict, and the
+pre-restart writer generation is fenced on the reopened store. This proves
+only orderly stop/reopen — not `kill -9`, power loss, torn writes, load,
+concurrency, or SQLite's production suitability.
 
 The Phase 15-17 production exit criteria and accepted persistence designs are
-preserved. Additional capacity/load/soak evidence, PITR, HA/failover,
-provider-managed pooler certification, real-provider deployment, provider
-trust, observability, and release rehearsal are frozen until the Developer MVP
-Gate passes unless one is required to protect MVP correctness or fail-closed
-behavior.
+preserved. The CLI Developer MVP Gate and S0 of the CLI-First Node Production
+Gate are satisfied As-Is. Work now proceeds in order from S1; completing the
+CLI gate does not authorize skipping directly to later production claims.
+Additional capacity/load/soak evidence, PITR, HA/failover, and provider-managed
+certification remain frozen until S5's certification work or an explicit SLO
+requires them. The
+[CLI-First Node Production Gate](TODO.md#cli-first-node-production-gate) sits
+between the CLI Developer MVP Gate and the deferred TypeScript
+client/explorer/wallet surface, and sequences S0 through S5 (production
+persistence, provider deployment, operations, security, and release evidence).
+It is itself not mainnet readiness — the Phase 16/17 production exit criteria
+and an independent security audit remain required afterward. The conservative
+production target this sequencing works toward is a multi-validator L1, not a
+permanently single-operator service.
 
 ## Workspace map
 
@@ -718,6 +756,169 @@ cargo test -p native-http
 npm --prefix adapters/cloudflare-workers run check
 cd adapters/deno && deno task check
 ```
+
+### Run the local devnet and CLI
+
+The commands below start the local, non-production devnet
+(`apps/devnet`) and drive it with the Rust CLI (`apps/cli`), using only
+implemented, documented flags — no invented output values. They assume the
+workspace has already been built once (`cargo build --workspace`). The devnet
+binds loopback only, is single-validator, and must never be used to custody
+real assets or exposed beyond your own machine.
+
+1. In terminal A, choose explicit paths and create a development seed file:
+   a private, non-keystore development
+   secret consisting of exactly 64 hexadecimal characters, with permission
+   `0600` and never a symlink (`apps/cli`'s `address`/`transfer` commands
+   reject anything else). For example:
+
+   ```bash
+   SEED_FILE=/tmp/sunrise-edge-dev-seed
+   DEVNET_DATA_DIR=/tmp/sunrise-edge-devnet
+   umask 077
+   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$SEED_FILE"
+   chmod 600 "$SEED_FILE"
+   ```
+
+2. Derive the address bound to that seed file. This prints exactly one
+   `address=<64-hex-character address>` line; copy the printed address for
+   the next step (it depends on the random seed generated above, so it is
+   not written out here):
+
+   ```bash
+   ADDRESS_LINE="$(cargo run -p sunrise-edge-cli -- address --seed-file "$SEED_FILE")"
+   DEV_OWNER="${ADDRESS_LINE#address=}"
+   printf 'DEV_OWNER=%s\n' "$DEV_OWNER"
+   ```
+
+3. Start the local devnet in its own terminal, using the address printed in
+   step 2 as `--dev-owner`:
+
+   ```bash
+   cargo run -p sunrise-edge-devnet -- \
+     --data-dir "$DEVNET_DATA_DIR" \
+     --listen 127.0.0.1:7400 \
+     --chain-id sunrise-local-devnet \
+     --epoch 0 \
+     --dev-owner "$DEV_OWNER" \
+     --max-concurrent 16
+   ```
+
+   Startup prints one line per `--dev-owner`:
+   `owner=<owner> seed_status=<created|verified-existing> source=<object id> destination=<object id>`,
+   and one line with the preinstalled module identity:
+   `asset_id=<...> asset_account_type=<...> module_id=<...> module_version=<...> module_digest=<algorithm-label>:<hex digest>`.
+   Copy `source`, `destination`, `module_id`, and `module_version` from these
+   printed lines for step 5. `module_digest` prints as
+   `<algorithm-label>:<hex>` (currently always `sha2-256:<hex>`, the only
+   implemented digest algorithm, whose committed numeric `HashAlgorithmId` is
+   `1`): pass `1` for `--module-digest-algorithm` below, and only the hex
+   portion after the colon for `--module-digest`.
+
+4. In terminal B, set the exact values printed in terminal A. The quoted
+   uppercase strings below are safe placeholders: replace their contents,
+   rather than copying shell angle brackets. Then query the running devnet
+   (these commands do not change state):
+
+   ```bash
+   SEED_FILE=/tmp/sunrise-edge-dev-seed
+   DEV_OWNER="PASTE_ADDRESS_PRINTED_IN_STEP_2"
+   SOURCE_OBJECT_ID="PASTE_SOURCE_OBJECT_ID_PRINTED_IN_STEP_3"
+   DESTINATION_OBJECT_ID="PASTE_DESTINATION_OBJECT_ID_PRINTED_IN_STEP_3"
+   MODULE_ID="PASTE_MODULE_ID_PRINTED_IN_STEP_3"
+   MODULE_VERSION="PASTE_MODULE_VERSION_PRINTED_IN_STEP_3"
+   MODULE_DIGEST_HEX="PASTE_HEX_AFTER_THE_MODULE_DIGEST_COLON"
+   REQUEST_ID="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+
+   cargo run -p sunrise-edge-cli -- context --endpoint 127.0.0.1:7400
+   cargo run -p sunrise-edge-cli -- next-nonce --endpoint 127.0.0.1:7400 \
+     --sender "$DEV_OWNER"
+   cargo run -p sunrise-edge-cli -- object --endpoint 127.0.0.1:7400 \
+     --object-id "$SOURCE_OBJECT_ID"
+   ```
+
+5. Submit the one implemented, same-owner devnet asset transfer (moves
+   balance from the seeded source account to the seeded destination account,
+   both owned by the address from step 2; amount is in the asset's smallest
+   unit):
+
+   ```bash
+   cargo run -p sunrise-edge-cli -- transfer \
+     --endpoint 127.0.0.1:7400 \
+     --seed-file "$SEED_FILE" \
+     --module-id "$MODULE_ID" \
+     --module-version "$MODULE_VERSION" \
+     --module-digest-algorithm 1 \
+     --module-digest "$MODULE_DIGEST_HEX" \
+     --source-object "$SOURCE_OBJECT_ID" \
+     --destination-object "$DESTINATION_OBJECT_ID" \
+     --amount 250 \
+     --gas-limit 1000000 \
+     --request-id "$REQUEST_ID" \
+     --wait \
+     --wait-max-attempts 20 \
+     --wait-initial-backoff-ms 10 \
+     --wait-max-backoff-ms 50 \
+     --wait-max-elapsed-ms 5000
+   ```
+
+   `transfer` treats a rejected or execution-failed submission as a typed,
+   non-zero-exit error even with `--wait`; it never reports a rejected or
+   failed transaction as success.
+
+6. Independently capture the post-transfer receipt, both updated objects, and
+   next nonce, using the exact identifiers chosen above. These deterministic
+   CLI outputs are the pre-restart observations used in step 7:
+
+   ```bash
+   OBSERVATION_PREFIX="/tmp/sunrise-edge-$REQUEST_ID"
+   cargo run -p sunrise-edge-cli -- receipt --endpoint 127.0.0.1:7400 \
+     --request-id "$REQUEST_ID" > "$OBSERVATION_PREFIX.receipt"
+   cargo run -p sunrise-edge-cli -- object --endpoint 127.0.0.1:7400 \
+     --object-id "$SOURCE_OBJECT_ID" > "$OBSERVATION_PREFIX.source"
+   cargo run -p sunrise-edge-cli -- object --endpoint 127.0.0.1:7400 \
+     --object-id "$DESTINATION_OBJECT_ID" > "$OBSERVATION_PREFIX.destination"
+   cargo run -p sunrise-edge-cli -- next-nonce --endpoint 127.0.0.1:7400 \
+     --sender "$DEV_OWNER" > "$OBSERVATION_PREFIX.nonce"
+   ```
+
+7. Stop the devnet in terminal A with `Ctrl-C`, rerun the exact command from
+   step 3 with the same data directory, chain id, and owner, and wait for
+   `seed_status=verified-existing`. In terminal B, compare fresh queries with
+   the pre-restart outputs; every `diff` must exit successfully with no output:
+
+   ```bash
+   diff -u "$OBSERVATION_PREFIX.receipt" <(
+     cargo run -p sunrise-edge-cli -- receipt --endpoint 127.0.0.1:7400 \
+       --request-id "$REQUEST_ID"
+   )
+   diff -u "$OBSERVATION_PREFIX.source" <(
+     cargo run -p sunrise-edge-cli -- object --endpoint 127.0.0.1:7400 \
+       --object-id "$SOURCE_OBJECT_ID"
+   )
+   diff -u "$OBSERVATION_PREFIX.destination" <(
+     cargo run -p sunrise-edge-cli -- object --endpoint 127.0.0.1:7400 \
+       --object-id "$DESTINATION_OBJECT_ID"
+   )
+   diff -u "$OBSERVATION_PREFIX.nonce" <(
+     cargo run -p sunrise-edge-cli -- next-nonce --endpoint 127.0.0.1:7400 \
+       --sender "$DEV_OWNER"
+   )
+   ```
+
+The uppercase placeholder variables are filled only from earlier command
+output or caller-generated values; this README does not assert any specific
+address, object id, module id, or digest, since each one depends on the random
+seed generated in step 1 and the exact devnet database state at boot time.
+Step 7 reopens the same SQLite database under a new writer generation and
+checks the post-transfer receipt, both current objects, and next nonce are
+identical across the orderly restart (see "Local devnet architecture" in
+`ARCHITECTURE.md` and `apps/cli/tests/devnet_restart_duplicate_e2e.rs`). The
+manual commands demonstrate start, transfer, receipt lookup, orderly restart,
+and persisted state. The automated E2E additionally replays one
+byte-identical signed request before and after restart; the CLI does not expose
+a raw replay command because `transfer` intentionally re-queries the current
+nonce and object references before signing.
 
 ## Protocol invariants
 
