@@ -2085,6 +2085,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn event_records_list_decode_rejects_a_missing_declared_entry() {
+        let mut list = CanonicalStruct::new(EVENT_RECORDS_LIST_TYPE_ID, ENCODING_VERSION);
+        list.field_u32(1, 1).unwrap();
+        let bytes = list.finish().unwrap();
+
+        assert_eq!(
+            decode_event_records_list(&bytes),
+            Err(ExecutionError::ExecutionEffectsListCountMismatch {
+                list: "event-records list",
+                declared_count: 1,
+                field_count: 1,
+            })
+        );
+    }
+
     // ── NullExecutionEngine ───────────────────────────────────────────────
 
     #[test]

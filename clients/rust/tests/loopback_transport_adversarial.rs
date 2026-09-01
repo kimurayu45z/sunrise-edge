@@ -272,5 +272,5 @@ fn caller_deadline_stops_a_slow_drip_response() {
     let started = Instant::now();
     let error = bounded.send(&request).unwrap_err();
     assert!(matches!(error, TransportError::RequestDeadlineExceeded));
-    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(started.elapsed() < Duration::from_millis(400));
 }

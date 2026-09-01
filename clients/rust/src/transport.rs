@@ -231,6 +231,12 @@ impl Error for TransportError {
 /// runtime anywhere in this type. These are deliberate limits, not gaps —
 /// production remote transport is explicitly deferred (see
 /// `ARCHITECTURE.md` §44 / DR-0083).
+///
+/// The hard complete-request budget is
+/// `connect_timeout + write_timeout + read_timeout`. A
+/// [`WireRequest::deadline`] may tighten that budget but never extend it;
+/// expiry at any connect/write/read/close stage returns
+/// [`TransportError::RequestDeadlineExceeded`].
 #[derive(Clone, Debug)]
 pub struct LoopbackHttpTransport {
     addr: SocketAddr,
@@ -245,7 +251,8 @@ impl LoopbackHttpTransport {
     /// Creates a bounded transport targeting `addr`.
     ///
     /// Rejects a non-loopback address or a zero timeout before opening any
-    /// connection.
+    /// connection. The three timeouts also form a hard total budget by checked
+    /// addition; an optional per-request deadline can only shorten that total.
     pub fn new(
         addr: SocketAddr,
         connect_timeout: Duration,

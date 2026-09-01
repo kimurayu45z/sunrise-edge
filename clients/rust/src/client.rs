@@ -335,7 +335,7 @@ mod tests {
     impl Transport for DeadlineTransport {
         fn send(&self, request: &WireRequest) -> Result<WireResponse, TransportError> {
             assert!(request.deadline.is_some());
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(150));
             Err(TransportError::RequestDeadlineExceeded)
         }
     }
@@ -628,7 +628,7 @@ mod tests {
             max_attempts: NonZeroU32::new(2).unwrap(),
             initial_backoff: Duration::ZERO,
             max_backoff: Duration::ZERO,
-            max_elapsed: Duration::from_millis(1),
+            max_elapsed: Duration::from_millis(100),
         };
 
         let error = client.wait_for_receipt(request_id, &bounds).unwrap_err();
