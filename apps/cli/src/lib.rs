@@ -36,13 +36,23 @@ pub use error::CliError;
 /// binary's `main` prints on stderr.
 ///
 /// The message is sanitized (control characters, including newlines,
-/// collapsed to spaces) so untrusted, server-derived text embedded in an
-/// error — for example an HTTP error response body echoed back verbatim in
+/// Unicode bidirectional/format characters, and Unicode line/paragraph
+/// separators, collapsed to spaces — see [`output::sanitize_line`]) so
+/// untrusted, server-derived text embedded in an error — for example an
+/// HTTP error response body echoed back verbatim in
 /// [`sunrise_edge_client::ClientError::UnexpectedStatus`] — cannot inject
-/// additional terminal lines.
+/// additional terminal lines or visually reorder/hide output. The sanitized
+/// message is also bounded to [`output::MAX_ERROR_MESSAGE_CHARS`]; a
+/// truncated message is explicitly marked so it is never mistaken for the
+/// complete message.
 #[must_use]
 pub fn render_error_line(error: &CliError) -> String {
-    format!("error={}", output::sanitize_line(&error.to_string()))
+    let (sanitized, truncated) = output::bounded_sanitized_line(&error.to_string());
+    if truncated {
+        format!("error={sanitized}...(truncated)")
+    } else {
+        format!("error={sanitized}")
+    }
 }
 
 /// Runs the CLI against `args` (excluding the program name), dispatching to
@@ -109,5 +119,36 @@ mod tests {
         assert_eq!(rendered.lines().count(), 1);
         assert!(!rendered.contains('\n'));
         assert!(!rendered.contains('\r'));
+    }
+
+    #[test]
+    fn render_error_line_neutralizes_a_bidi_override_in_server_derived_text() {
+        let error = CliError::Client(Box::new(
+            sunrise_edge_client::ClientError::UnexpectedStatus {
+                status: 500,
+                body: "prefix\u{202E}reversed-looking-suffix".to_string(),
+            },
+        ));
+
+        let rendered = render_error_line(&error);
+
+        assert_eq!(rendered.lines().count(), 1);
+        assert!(!rendered.contains('\u{202E}'));
+    }
+
+    #[test]
+    fn render_error_line_bounds_a_long_server_derived_body_and_marks_truncation() {
+        let error = CliError::Client(Box::new(
+            sunrise_edge_client::ClientError::UnexpectedStatus {
+                status: 500,
+                body: "x".repeat(output::MAX_ERROR_MESSAGE_CHARS + 1_000),
+            },
+        ));
+
+        let rendered = render_error_line(&error);
+
+        assert_eq!(rendered.lines().count(), 1);
+        assert!(rendered.ends_with("...(truncated)"));
+        assert!(rendered.len() < output::MAX_ERROR_MESSAGE_CHARS + 1_000);
     }
 }

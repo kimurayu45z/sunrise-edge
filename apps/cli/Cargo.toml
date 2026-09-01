@@ -16,6 +16,7 @@ path = "src/main.rs"
 sunrise-edge-client.workspace = true
 
 [dev-dependencies]
+execution.workspace = true
 native-http.workspace = true
 objects.workspace = true
 runtime.workspace = true

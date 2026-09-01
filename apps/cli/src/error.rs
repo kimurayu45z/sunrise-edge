@@ -104,6 +104,26 @@ pub enum CliError {
         /// (`address:<hex>`, `shared`, `immutable`, or `system`).
         owner: String,
     },
+    /// `submit_transaction` returned zero responses for the submitted
+    /// request.
+    EmptySubmitResponse,
+    /// A submitted transaction's response declared
+    /// `NodeResponseStatus::Rejected`.
+    TransactionRejected {
+        /// Index into the submit result's `responses()` for the rejected
+        /// response.
+        index: usize,
+    },
+    /// A submitted transaction's response was `Accepted` at the node-core
+    /// level, but its decoded execution effects declared
+    /// `ExecutionStatus::Failure`.
+    TransactionExecutionFailed {
+        /// Index into the submit result's `responses()` for the failed
+        /// response.
+        index: usize,
+        /// The sanitized execution failure reason.
+        reason: String,
+    },
     /// Canonical argument-frame encoding failed.
     CanonicalEncoding(CanonicalEncodingError),
     /// A node-core canonical type failed to construct or validate.
@@ -192,6 +212,15 @@ impl fmt::Display for CliError {
                 f,
                 "{flag} {object_id} is not owned by the local signer address (owner={owner})"
             ),
+            Self::EmptySubmitResponse => {
+                f.write_str("submit_transaction returned no responses for the submitted request")
+            }
+            Self::TransactionRejected { index } => {
+                write!(f, "response[{index}] was rejected by the node")
+            }
+            Self::TransactionExecutionFailed { index, reason } => {
+                write!(f, "response[{index}] execution failed: {reason}")
+            }
             Self::CanonicalEncoding(error) => write!(f, "canonical encoding failed: {error}"),
             Self::NodeCore(error) => write!(f, "{error}"),
             Self::Transport(error) => write!(f, "{error}"),

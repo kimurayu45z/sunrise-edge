@@ -230,18 +230,35 @@ where
         signed_transaction_bytes: signed_bytes,
     })?;
 
+    if submit_result.responses().is_empty() {
+        return Err(CliError::EmptySubmitResponse);
+    }
+
     println!("request_id={}", submit_result.request_id());
     println!("responses={}", submit_result.responses().len());
+    // Print every response's diagnostics before failing, but never let a
+    // later `Ok` path (including `--wait`) run once any response was
+    // rejected or its decoded execution failed: the first such outcome wins.
+    let mut outcome: Result<(), CliError> = Ok(());
     for (index, response) in submit_result.responses().iter().enumerate() {
         let status = match response.status() {
             NodeResponseStatus::Accepted => "accepted",
             NodeResponseStatus::Rejected => "rejected",
         };
         println!("response[{index}].status={status}");
-        if let Some(payload) = response.payload() {
-            print_payload(index, payload);
+        if outcome.is_ok() && response.status() == NodeResponseStatus::Rejected {
+            outcome = Err(CliError::TransactionRejected { index });
+        }
+        let failure_reason = response
+            .payload()
+            .and_then(|payload| print_payload(index, payload));
+        if let Some(reason) = failure_reason
+            && outcome.is_ok()
+        {
+            outcome = Err(CliError::TransactionExecutionFailed { index, reason });
         }
     }
+    outcome?;
 
     if let Some(bounds) = inputs.wait_bounds {
         let receipt = client.wait_for_receipt(inputs.request_id, &bounds)?;
@@ -391,7 +408,9 @@ fn object_query_status_label(result: &sunrise_edge_client::HttpObjectQueryResult
     }
 }
 
-fn print_payload(index: usize, payload: &[u8]) {
+/// Prints `payload`'s diagnostics and returns the sanitized execution
+/// failure reason, if its decoded effects declared `ExecutionStatus::Failure`.
+fn print_payload(index: usize, payload: &[u8]) -> Option<String> {
     match sunrise_edge_client::decode_execution_effects(payload) {
         Ok(effects) => print_effects(index, &effects),
         Err(_) => {
@@ -399,23 +418,28 @@ fn print_payload(index: usize, payload: &[u8]) {
             println!("response[{index}].payload_len={}", payload.len());
             println!("response[{index}].payload_truncated={truncated}");
             println!("response[{index}].payload_hex={hex}");
+            None
         }
     }
 }
 
-fn print_effects(index: usize, effects: &ExecutionEffects) {
+/// Prints `effects`'s diagnostics and returns the sanitized execution
+/// failure reason, if any.
+fn print_effects(index: usize, effects: &ExecutionEffects) -> Option<String> {
     println!("response[{index}].tx_hash={}", effects.tx_hash);
     println!("response[{index}].gas_used={}", effects.gas_used);
-    match &effects.status {
-        ExecutionStatus::Success => println!("response[{index}].execution_status=success"),
+    let failure_reason = match &effects.status {
+        ExecutionStatus::Success => {
+            println!("response[{index}].execution_status=success");
+            None
+        }
         ExecutionStatus::Failure { reason } => {
             println!("response[{index}].execution_status=failure");
-            println!(
-                "response[{index}].execution_failure_reason={}",
-                sanitize_line(reason)
-            );
+            let sanitized_reason = sanitize_line(reason);
+            println!("response[{index}].execution_failure_reason={sanitized_reason}");
+            Some(sanitized_reason)
         }
-    }
+    };
     println!(
         "response[{index}].object_effects={}",
         effects.object_effects.len()
@@ -425,9 +449,10 @@ fn print_effects(index: usize, effects: &ExecutionEffects) {
     }
     println!("response[{index}].events={}", effects.events.len());
     for (event_index, event) in effects.events.iter().enumerate() {
-        let (type_tag_hex, _) = bounded_hex_field(&event.type_tag);
+        let (type_tag_hex, type_tag_truncated) = bounded_hex_field(&event.type_tag);
         let (data_hex, data_truncated) = bounded_hex_field(&event.data);
         println!("response[{index}].event[{event_index}].type_tag_hex={type_tag_hex}");
+        println!("response[{index}].event[{event_index}].type_tag_truncated={type_tag_truncated}");
         println!(
             "response[{index}].event[{event_index}].data_len={}",
             event.data.len()
@@ -435,6 +460,7 @@ fn print_effects(index: usize, effects: &ExecutionEffects) {
         println!("response[{index}].event[{event_index}].data_truncated={data_truncated}");
         println!("response[{index}].event[{event_index}].data_hex={data_hex}");
     }
+    failure_reason
 }
 
 fn print_object_effect(response_index: usize, effect_index: usize, effect: &ObjectEffect) {
@@ -505,7 +531,8 @@ mod tests {
     use crate::test_support::{FakeTransport, node_result_ok, query_ok};
     use sunrise_edge_client::{
         AtomicityDomainId, ChainId, Epoch, HashSuiteId, HttpContextQueryResult,
-        HttpNextNonceQueryResult, HttpNodeResult, HttpObjectQueryResult, ProtocolVersion,
+        HttpNextNonceQueryResult, HttpNodeResult, HttpObjectQueryResult, NodeResponse,
+        ProtocolVersion,
     };
 
     fn sample_signer() -> LocalSigner {
@@ -583,7 +610,9 @@ mod tests {
         let nonce = HttpNextNonceQueryResult::new(signer.address(), Epoch::new(5), 3);
         let source = current_inline_owned_by(inputs.source_id, 1, signer.address());
         let destination = current_inline_owned_by(inputs.destination_id, 1, signer.address());
-        let submit = HttpNodeResult::new(inputs.request_id, vec![]).unwrap();
+        let accepted =
+            NodeResponse::new(inputs.request_id, NodeResponseStatus::Accepted, None).unwrap();
+        let submit = HttpNodeResult::new(inputs.request_id, vec![accepted]).unwrap();
 
         let transport = FakeTransport::new(vec![
             query_ok(context.encode().unwrap()),
@@ -600,6 +629,115 @@ mod tests {
         assert_eq!(requests.len(), 5);
         assert_eq!(requests[0].path, "/v1/context");
         assert_eq!(requests[4].method, sunrise_edge_client::Method::Post);
+    }
+
+    #[test]
+    fn execute_rejects_a_rejected_submission_response_even_with_wait_requested() {
+        let signer = sample_signer();
+        let mut inputs = sample_inputs();
+        // `--wait` bounds are set to prove a rejected submission can never
+        // reach `wait_for_receipt` and be turned into success.
+        inputs.wait_bounds = Some(ReceiptPollBounds {
+            max_attempts: NonZeroU32::new(3).unwrap(),
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(10),
+            max_elapsed: Duration::from_millis(100),
+        });
+        let context = sample_context();
+        let nonce = HttpNextNonceQueryResult::new(signer.address(), Epoch::new(5), 3);
+        let source = current_inline_owned_by(inputs.source_id, 1, signer.address());
+        let destination = current_inline_owned_by(inputs.destination_id, 1, signer.address());
+        let rejected =
+            NodeResponse::new(inputs.request_id, NodeResponseStatus::Rejected, None).unwrap();
+        let submit = HttpNodeResult::new(inputs.request_id, vec![rejected]).unwrap();
+
+        let transport = FakeTransport::new(vec![
+            query_ok(context.encode().unwrap()),
+            query_ok(nonce.encode().unwrap()),
+            query_ok(source.encode().unwrap()),
+            query_ok(destination.encode().unwrap()),
+            node_result_ok(submit.encode().unwrap()),
+        ]);
+        let client = Client::new(transport);
+
+        let error = execute(&client, &signer, inputs).unwrap_err();
+        assert!(matches!(error, CliError::TransactionRejected { index: 0 }));
+        // Exactly the 5 request/nonce/object/submit calls were made: no 6th
+        // (receipt-wait) request was ever issued after the rejection.
+        assert_eq!(client.transport().requests().len(), 5);
+    }
+
+    #[test]
+    fn execute_rejects_an_execution_failure_even_when_the_node_response_is_accepted() {
+        let signer = sample_signer();
+        let mut inputs = sample_inputs();
+        inputs.wait_bounds = Some(ReceiptPollBounds {
+            max_attempts: NonZeroU32::new(3).unwrap(),
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(10),
+            max_elapsed: Duration::from_millis(100),
+        });
+        let context = sample_context();
+        let nonce = HttpNextNonceQueryResult::new(signer.address(), Epoch::new(5), 3);
+        let source = current_inline_owned_by(inputs.source_id, 1, signer.address());
+        let destination = current_inline_owned_by(inputs.destination_id, 1, signer.address());
+        let effects = execution::ExecutionEffects {
+            tx_hash: Digest32::new(HashAlgorithmId::Sha2_256, [0x0B; 32]),
+            status: ExecutionStatus::Failure {
+                reason: "trap: out of gas".to_string(),
+            },
+            object_effects: Vec::new(),
+            events: Vec::new(),
+            gas_used: 1_000,
+        };
+        let payload = execution::encode_execution_effects(&effects).unwrap();
+        let accepted = NodeResponse::new(
+            inputs.request_id,
+            NodeResponseStatus::Accepted,
+            Some(payload),
+        )
+        .unwrap();
+        let submit = HttpNodeResult::new(inputs.request_id, vec![accepted]).unwrap();
+
+        let transport = FakeTransport::new(vec![
+            query_ok(context.encode().unwrap()),
+            query_ok(nonce.encode().unwrap()),
+            query_ok(source.encode().unwrap()),
+            query_ok(destination.encode().unwrap()),
+            node_result_ok(submit.encode().unwrap()),
+        ]);
+        let client = Client::new(transport);
+
+        let error = execute(&client, &signer, inputs).unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::TransactionExecutionFailed { index: 0, reason }
+                if reason == "trap: out of gas"
+        ));
+        assert_eq!(client.transport().requests().len(), 5);
+    }
+
+    #[test]
+    fn execute_rejects_an_empty_submit_response() {
+        let signer = sample_signer();
+        let inputs = sample_inputs();
+        let context = sample_context();
+        let nonce = HttpNextNonceQueryResult::new(signer.address(), Epoch::new(5), 3);
+        let source = current_inline_owned_by(inputs.source_id, 1, signer.address());
+        let destination = current_inline_owned_by(inputs.destination_id, 1, signer.address());
+        let submit = HttpNodeResult::new(inputs.request_id, vec![]).unwrap();
+
+        let transport = FakeTransport::new(vec![
+            query_ok(context.encode().unwrap()),
+            query_ok(nonce.encode().unwrap()),
+            query_ok(source.encode().unwrap()),
+            query_ok(destination.encode().unwrap()),
+            node_result_ok(submit.encode().unwrap()),
+        ]);
+        let client = Client::new(transport);
+
+        let error = execute(&client, &signer, inputs).unwrap_err();
+        assert!(matches!(error, CliError::EmptySubmitResponse));
     }
 
     #[test]

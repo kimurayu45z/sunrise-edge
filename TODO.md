@@ -1980,16 +1980,30 @@ explicit dev limitations）:
    `sunrise.devnet.asset_account.v1`のentrypoint名と`CanonicalStruct(0xF002,v1)`引数
    frameは`apps/cli`の`transfer`コマンドだけが知っており、`clients/rust`へdevnet固有の
    意味論は置いていない。そのために`clients/rust`へ追加した最小限のgeneric re-export
-   （`abi::{AccessEntry,AccessManifest}`、`objects::AccessMode`/`Object`、
+   （`abi::{AccessEntry,AccessManifest}`、`objects::{AccessMode,Object,ObjectError,
+   Owner,decode_object}`、`execution::ObjectEffect`、
    `canonical_encoding::{CanonicalStruct,CanonicalEncodingError}`、`protocol_types`の
    基本型群、`current_inline_object_ref`ヘルパー、`ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID`
-   定数）はいずれもapplication固有の意味論を持たない。
+   定数、`ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`定数）はいずれもapplication固有の
+   意味論を持たない。`objects::{ObjectError,Owner,decode_object}`と
+   `execution::ObjectEffect`は、`transfer`がqueryしたobjectのcanonical bodyをdecodeし、
+   client側でownerをdefense-in-depthとして検証し、decoded execution effectsから
+   object effectをprintできるようにするためのものである。
    同時に`clients/rust`のtransaction構築をadditiveなsafe two-stage external-signer API
    （`transaction::PreparedTransaction::prepare`/`finalize`/`sign_and_finalize_with`）へ
    refactorし、`build_signed_transaction`は同じpathで実装することで既存のstable出力
    bytesを変更していない。`prepare`はexplicitなsender/active signature scheme/
    `TransactionRequest`からimmutableな値を構築し、実装済みでない
-   signature schemeをframing前にfail closedで拒否する。`signable_frame`はexternal
+   signature schemeをframing前にfail closedで、専用の
+   `ClientError::UnsupportedSignatureScheme(SignatureSchemeId)`で拒否する。この
+   two-stage API以前は、`build_signed_transaction`は同じunsupported-scheme caseを
+   より遅く・より曖昧に拒否していた：常に`SignatureSigner::sign_canonical`を呼んでおり、
+   そのscheme一致guardが代わりにwrapされた
+   `ClientError::Crypto(CryptoError::SignatureSchemeMismatch)`を返していた。
+   `build_signed_transaction`のこのcaseにおけるcaller可視なerror typeは以前と異なるが、
+   これはpurely additiveでmatchしやすくなったerror-typeの変更であり、protocolの変更ではない：
+   同じcaseがframingや署名より前にrejectされる点、および成功する全caseのstable出力
+   bytesが不変である点は変わらない。`signable_frame`はexternal
    signerが署名すべき正確なframed bytesを公開し、`finalize`は返された署名の長さが
    exact scheme長であることとAddressIsPublicKeyのsender公開鍵に対して暗号学的に
    verifyされることの両方を確認してからのみ出力を生成する（scheme不一致・不正な
@@ -2002,6 +2016,14 @@ explicit dev limitations）:
    verification・hardware-in-the-loop testが別途必要である。既存のSolanaやEthereum
    向けLedger appをSunriseのtransaction署名に転用することはできず、USB/HID/Ledgerへの
    依存はどのprotocol/client crateにも存在しない。
+   **development-only residual: memory zeroizationは無い。** `load_dev_seed`の読み込み
+   bufferとdecodeされた`[u8; 32]` seed、および`LocalSigner`のin-memory signing keyは、
+   このsliceのどこにも`zeroize`-on-drop挙動を持たない通常のRust値であり、process
+   memoryのdisclosure（core dump・swap・attachされたdebugger）によって、それらまたは
+   allocatorがまだ上書きしていないcopyがresidentである間は回収され得る。これは
+   `load_dev_seed`と`LocalSigner`が既存のdocumentationで明示している
+   explicit・non-keystore・development-onlyという位置付け（production key handlingでは
+   ない）と整合しており、暗黙の前提とせずここで明記する。
    parser/development seed file（symlink・permission・length。Unix）のadversarial
    test、`clients/rust`側の two-stage signing adversarial test（scheme不一致・不正な
    署名長・wrong signer・改ざん）、各query commandのfake `Transport` unit test、

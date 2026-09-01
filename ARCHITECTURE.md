@@ -1745,7 +1745,17 @@ its stable output bytes are unchanged. `PreparedTransaction::prepare` takes an
 explicit sender `Address`, the active `SignatureSchemeId` from a trusted
 `/v1/context` result, and a `TransactionRequest`, and returns an immutable
 value with the canonical Transaction v1 fields already fixed; it rejects any
-scheme other than `Ed25519` before any framing happens. `signable_frame`
+scheme other than `Ed25519` before any framing happens, returning a
+dedicated `ClientError::UnsupportedSignatureScheme(SignatureSchemeId)`.
+Before this two-stage API existed, `build_signed_transaction` rejected the
+same unsupported-scheme case later and less specifically: it always called
+`SignatureSigner::sign_canonical`, whose own scheme-match guard returned a
+wrapped `ClientError::Crypto(CryptoError::SignatureSchemeMismatch)` instead.
+`build_signed_transaction`'s caller-visible error type for this case is
+therefore different from before — this is a strictly additive, easier-to-
+match error-type change, not a protocol change: the exact same case is still
+rejected before any framing or signing, and every stable output byte for
+every case that still succeeds is unchanged. `signable_frame`
 exposes the exact centralized-domain-framed bytes
 ([`crypto::frame_signature_message`]) an external signer must produce a raw
 signature over — the same bytes any in-process `SignatureSigner` ultimately
@@ -1818,19 +1828,27 @@ argument frame — `clients/rust` stays application-agnostic. To build that
 frame and the transaction's access manifest without a second direct
 dependency, `clients/rust` additively re-exports a small, generic surface
 that adds no devnet-specific semantics of its own: `abi::{AccessEntry,
-AccessManifest}`, `objects::AccessMode`/`Object`, `canonical_encoding::{
+AccessManifest}`, `objects::{AccessMode, Object, ObjectError, Owner,
+decode_object}`, `execution::ObjectEffect`, `canonical_encoding::{
 CanonicalStruct, CanonicalEncodingError}`, `protocol_types::{AtomicityDomainId,
 ChainId, Digest32, Epoch, HashAlgorithmId, HashSuiteId, ProtocolVersion,
-SignatureSchemeId, TypeError}`, `NODE_RESULT_MEDIA_TYPE`, and two small
-helpers: `current_inline_object_ref` (extracts the exact `ObjectRef` from a
-`CurrentInline` object-query result, `None` for every other status — generic
-over any object, not asset-specific) and the
+SignatureSchemeId, TypeError}`, `NODE_RESULT_MEDIA_TYPE`, and three small
+helpers/constants: `current_inline_object_ref` (extracts the exact `ObjectRef`
+from a `CurrentInline` object-query result, `None` for every other status —
+generic over any object, not asset-specific), the
 `ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID` constant (the `AddressBinding::
 AddressIsPublicKey` wire value, duplicated as a plain `u16` so a caller can
 compare it against `HttpContextQueryResult::address_binding_id()` without a
 direct `protocol-config` dependency; `protocol-config` remains a `clients/rust`
 dev-dependency only, and a dedicated test pins the two values together so
-they cannot silently drift).
+they cannot silently drift), and the `ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`
+constant (the committed `TransactionAuthProfile` id `transfer` checks
+`HttpContextQueryResult::transaction_auth_profile_id()` against before
+signing, duplicated the same way and for the same reason). `objects::{
+ObjectError, Owner, decode_object}` and `execution::ObjectEffect` exist so
+`transfer` can decode a queried object's canonical body, check its owner
+client-side as defense in depth, and print each object effect from decoded
+execution effects, without a direct dependency on either lower crate.
 
 `transfer` queries `/v1/context`, the sender's `/v1/senders/{sender}/next-nonce`,
 and both `/v1/objects/{object_id}` results for the caller's exact
@@ -1874,9 +1892,19 @@ against freshly seeded accounts through to a waited, present receipt. The
 Ledger device application, APDU/host transport, on-device clear signing, and
 hardware-in-the-loop tests described above remain entirely unimplemented and
 are not claimed by `PreparedTransaction`'s readiness for that boundary.
+
+**Development-only residual: no memory zeroization.** `load_dev_seed`'s read
+buffer and decoded `[u8; 32]` seed, and `LocalSigner`'s in-memory signing
+key, are ordinary Rust values with no `zeroize`-on-drop behavior anywhere in
+this slice; a process-memory disclosure (a core dump, swap, or a debugger
+attached to the process) can recover them for as long as they, or a copy the
+allocator has not yet overwritten, remain resident. This is consistent with
+`load_dev_seed`'s and `LocalSigner`'s existing documented status as
+explicit, non-keystore, development-only conveniences — not production key
+handling — and is called out here rather than silently assumed.
 `clients/typescript`, `apps/explorer`, `apps/wallet`, the restart/duplicate
-E2E, and explicit documented development-only limitations remain the
-Developer MVP Gate's next slices (see `TODO.md#developer-mvp-gate`).
+E2E, and any further explicit documented development-only limitations remain
+the Developer MVP Gate's next slices (see `TODO.md#developer-mvp-gate`).
 
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
