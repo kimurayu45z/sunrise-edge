@@ -2,17 +2,20 @@
 
 use crate::{
     catalog::DevnetAssetModule,
+    fee::AssetAccountFeeComposer,
     identities::DevnetOutboxIdentitySource,
     machine::{DEVNET_GENERIC_STATE_KEY, DevnetMachine},
     transport::DevnetTransport,
 };
 use axum::Router;
 use native_http::{
-    IndexedOutboxRecoveryAuthorityError, NativeBlockingPolicy, PreinstalledWasmComposition,
-    StructuredDurableNativeComponents, StructuredDurableRequestAuthority,
-    StructuredDurableRouterError, preinstalled_wasm_structured_durable_router,
+    IndexedOutboxRecoveryAuthorityError, NativeBlockingPolicy, PreinstalledFeeCompositionConfig,
+    PreinstalledWasmComposition, StructuredDurableNativeComponents,
+    StructuredDurableRequestAuthority, StructuredDurableRouterError,
+    preinstalled_wasm_structured_durable_router,
 };
 use node_core::{NodeConfig, NodeCoreError};
+use objects::ObjectId;
 use runtime::{SystemClock, WriterFenceGeneration};
 use runtime_sqlite::SqliteDurableStore;
 use std::{error::Error, fmt, num::NonZeroUsize, sync::Arc};
@@ -24,13 +27,18 @@ const OUTBOX_LEASE_MILLIS: u64 = 30_000;
 ///
 /// `reserved_correlation_sequences` is the number of seed operations already
 /// assigned operational correlation IDs in this boot. Outbox identities begin
-/// strictly after that range.
+/// strictly after that range. `fee_treasury_object_id` is the trusted
+/// composition's fee sink: the seeded fee-treasury owner's ordinary
+/// destination account, never request input. Every preinstalled-WASM
+/// invocation is wired through [`AssetAccountFeeComposer`], the devnet's
+/// trusted `FeeEffectComposer` implementation.
 pub fn compose_devnet_router(
     store: Arc<SqliteDurableStore>,
     asset_module: DevnetAssetModule,
     boot_generation: WriterFenceGeneration,
     max_concurrent: usize,
     reserved_correlation_sequences: usize,
+    fee_treasury_object_id: ObjectId,
 ) -> Result<Router, DevnetCompositionError> {
     let admission: NonZeroUsize =
         NonZeroUsize::new(max_concurrent).ok_or(DevnetCompositionError::InvalidConcurrency)?;
@@ -58,7 +66,11 @@ pub fn compose_devnet_router(
         Arc::new(catalog),
         execution::WasmExecutionEngine,
         boot_generation.get(),
-    );
+    )
+    .with_fee_composition(PreinstalledFeeCompositionConfig::new(
+        fee_treasury_object_id,
+        Arc::new(AssetAccountFeeComposer),
+    ));
     let authority = StructuredDurableRequestAuthority::new(
         boot_generation,
         REQUEST_OPERATION_TIMEOUT_MILLIS,
@@ -168,6 +180,8 @@ mod tests {
             OsString::from("2222222222222222222222222222222222222222222222222222222222222222"),
             OsString::from("--max-concurrent"),
             OsString::from("4"),
+            OsString::from("--fee-treasury-owner"),
+            OsString::from("3333333333333333333333333333333333333333333333333333333333333333"),
         ])
         .unwrap();
         let boot = boot_local_store(&config).unwrap();
@@ -182,6 +196,7 @@ mod tests {
             generation,
             config.max_concurrent(),
             config.dev_owners().len(),
+            ObjectId::new([0xFE; 32]),
         )
         .unwrap();
 

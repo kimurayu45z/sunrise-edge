@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use objects::ObjectId;
 use sunrise_edge_devnet::{
     ASSET_ACCOUNT_WASM, DevnetConfig, boot_local_store, build_asset_module,
     build_devnet_protocol_context, compose_devnet_router,
@@ -48,6 +49,8 @@ async fn cli_context_and_next_nonce_commands_reach_the_real_devnet_router_over_t
         OsString::from("9"),
         OsString::from("--dev-owner"),
         OsString::from("3333333333333333333333333333333333333333333333333333333333333333"),
+        OsString::from("--fee-treasury-owner"),
+        OsString::from("4444444444444444444444444444444444444444444444444444444444444444"),
         OsString::from("--max-concurrent"),
         OsString::from("4"),
     ])
@@ -63,6 +66,7 @@ async fn cli_context_and_next_nonce_commands_reach_the_real_devnet_router_over_t
         generation,
         config.max_concurrent(),
         config.dev_owners().len(),
+        ObjectId::new([0xFE; 32]),
     )
     .unwrap();
 

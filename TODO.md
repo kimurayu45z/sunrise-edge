@@ -1744,15 +1744,16 @@ developer CLIを実際に構築・検証できるsingle-node CLI Developer MVP�
 HA/failover、provider-managed pooler、real-provider certification、provider deploymentの
 作業はgate通過後の`Post-MVP Production Hardening`へ凍結する。
 
-**Current status (2026-09-01): criteria 1-6・10・11はimplemented and validated
+**Current status (2026-09-02): criteria 1-6・10・11はimplemented and validated
 As-Isであり、CLI Developer MVP Gateは通過済みである。** これはproduction readinessの
-宣言ではない。CLI-First Node Production GateのS0-S2もimplemented and validated
+宣言ではない。CLI-First Node Production GateのS0-S3もimplemented and validated
 As-Isであり（S1のremote TLS transportとsigning前の独立したtrusted
 protocol-context validationの両方。詳細は
 ["CLI-First Node Production Gate"](#cli-first-node-production-gate)のS1参照）、
-S2のcross-owner destination policyとreal restart/replay E2EはDR-0086のとおり
-implemented As-Isである。現在のimplementation priorityはS3（uniform asset fee
-accounting/gas metering）である。S4-S5は順序を飛ばさず後続する。
+S2のcross-owner destination policyはDR-0086、S3のuniform ordinary-asset fee
+composition・actual-gas/trap settlement・real restart/replay E2EはDR-0087のとおり
+implemented As-Isである。現在のimplementation priorityはS4 secure signer/Ledgerである。
+S5は順序を飛ばさず後続する。
 
 CLI Developer MVP completion criteria（capability criteria 2-3を満たしながら、product
 surfaceはARCHITECTURE.md DR-0081の順序に従う: local devnet、bounded query API、Rust
@@ -1807,12 +1808,15 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
     real loopback TCP、`sunrise-edge-cli::run`によるuser-facing transferと
     `sunrise-edge-client`による独立検証を使い、orderly stop/reopen後のobject・receipt・
     next-nonce query resultとsubmit resultのcanonical bytes一致、same-bootおよび
-    restart後のbyte-identicalなduplicate submissionの非再適用、already-committedな
+    restart後のbyte-identicalなsuccessfulおよびtrapped fee-only duplicate submissionの
+    非再適用、actual `gas_used`に一致するordinary asset fee debit/treasury credit、
+    already-committedな
     request idの別transactionでの再利用がfail closedになること、pre-restart writer
     generationがreopen後にfencedであることを証明する。orderly stop/reopenのみの証明であり、
     `kill -9`、power loss、torn write、load、concurrency、SQLiteのproduction適性は
     証明しない。下記S0参照）。
-11. single validator、owned-object only、fee-free dev profile、local SQLite、
+11. single validator、owned-object only、1つのfixed ordinary fee assetとdistinct ordinary
+    treasury（validator/certificate distributionやproduction economicsなし）、local SQLite、
     cross-owner movementはexact committed destination policyだけ（literal owner reassignment/
     giftingはfail closed）、4 bounded query routeがunauthenticated public-read API（呼び出し元は誰でも
     任意のobject/receipt/next-nonce/contextを読める。`/v1/senders/{sender}/next-nonce`の
@@ -1890,7 +1894,13 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    fail-closed記述はDR-0081当時のMVP境界を記録したhistorical textであり、現在の実装状況ではない。
    S2はexact committed policyで既存の別Address-owned destinationを許可し、source/destination
    ownerをどちらも保存する形でimplemented and validated As-Is。literal owner reassignment/
-   giftingは引き続きdeferredかつfail closedで、次はS3 fee accounting/gas meteringである。
+   giftingは引き続きdeferredかつfail closedである。
+   **DR-0087 amendment（current status）：** 直前のempty fee registry/
+   `fee_payment: None`記述はDR-0081当時のhistorical MVP境界であり現在の実装状況ではない。
+   S3は同じordinary `AssetAccount`/`DEVNET_ASSET_ID`をfee object/assetとして使い、distinct
+   treasury ownerのordinary destinationへactual `gas_used`由来feeをatomic settlementする。
+   active module/semanticsはv3、historical v1/v2 bytesとWAT/WASM/code hashは不変である。
+   次はS4 secure signer/Ledgerである。
    production/mainnet readinessは未達である。
    前提として、`runtime-sqlite`へ`StructuredDurableDomainStateStore`/`IndexedOutboxRepository`を
    実装するadditive、local-only、non-productionな`SqliteDurableStore`を追加済み
@@ -2321,10 +2331,20 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
   recipient owner不変、same-boot/post-close-reopen exact replayのbyte-identical response/receiptと
   non-reapplication、changed signed requestによるrequest-id reuse 409時の両object canonical bytes・
   両receipt・sender nonce不変、writer-generation fencingを証明する。
-  これはS2 As-Isのみでproduction/mainnet readinessではない。次はS3。TypeScript client/
+  これはS2 As-Isのみでproduction/mainnet readinessではない。S3はDR-0087で後続実装済み。TypeScript client/
   explorer/walletとS4/S5は引き続きdeferredである。
-- **S3**: fees/gas metering。public live ingressの前に実装を完了する（fee-free
-  devnetをpublicへ晒したままにしない）。
+- **S3**: **implemented and validated As-Is（2026-09-02、DR-0087）。** committed
+  scheduleはbase=1、execution=`gas_used`単価=1、他category=0、fee registryは
+  `DEVNET_ASSET_ID`を1:1で1つだけenableする。sourceのsender-owned `Write`をfee objectとし、
+  distinct treasury ownerのordinary destinationをtrusted compositionがfinal `Write`として
+  指定する。treasuryはWASM inputから除外され、successはapplication effectsとactual feeを
+  atomic merge、trapはapplication effects/eventをdiscardしてnormalized full-gas fee-only
+  source/treasury mutationをRejected receiptとcommitする。CLI fee flagsはall-or-noneで、
+  real file-backed SQLite E2Eはexact fee=`1 + gas_used`、event pre-fee balance、trap charge、
+  same-boot/orderly close-reopen replay non-reapplication、writer generation advance/fencing、
+  request-id reuse conflict時のsource/destination/treasury canonical bytes・r1/r2/r3 receipts・
+  nonce不変を証明する。single treasury serialization、insufficient-balance時のbounded
+  execution-then-reject、fee distribution/production gas calibrationはdeferred。
 - **S4**: secure signer（`LocalSigner`の development-only in-memory鍵に代わる
   production-oriented signing boundary）と、dedicated Sunrise Edge Ledger device
   applicationを使った実際のLedger統合（ARCHITECTURE.md DR-0084参照。既存のSolana/

@@ -1,5 +1,5 @@
 //! Real loopback TCP restart/duplicate E2E for the CLI Developer MVP Gate's
-//! S0 slice (see `TODO.md#cli-developer-mvp-gate`).
+//! S3 uniform-fee slice (see `TODO.md#cli-developer-mvp-gate`).
 //!
 //! This uses a real file-backed `SqliteDurableStore`, the real composed
 //! devnet router, real loopback TCP, `sunrise_edge_cli::run` for the
@@ -7,9 +7,10 @@
 //! independent verification and for building/replaying one raw
 //! `SubmitTransactionRequest`. It proves exactly:
 //!
-//! 1. A CLI transfer of amount 250 from a sender-owned source into an
+//! 1. A fee-enabled CLI transfer of amount 250 from a sender-owned source into an
 //!    independently seeded recipient-owned destination, verified
-//!    independently through the client with the recipient owner unchanged.
+//!    independently through the client with the recipient owner unchanged and
+//!    the distinct ordinary treasury credited by the actual committed gas.
 //! 2. An orderly stop (graceful HTTP shutdown, awaited server task, every
 //!    `Arc<SqliteDurableStore>` reference dropped so the SQLite file is
 //!    genuinely closed) followed by a real reopen through `boot_local_store`
@@ -21,9 +22,11 @@
 //! 4. One signed `SubmitTransactionRequest`, built once, replayed
 //!    byte-identically both before and after restart: the canonical response
 //!    bytes are identical and neither duplicate re-applies its effects.
-//! 5. Reusing an already-committed request id for a different transaction is
+//! 5. A trapped invocation discards its application transfer but charges the
+//!    normalized actual gas through fee-only source/treasury writes.
+//! 6. Reusing an already-committed request id for a different transaction is
 //!    a typed, nonzero, fail-closed HTTP conflict with no state change.
-//! 6. The pre-restart writer generation is fenced on the reopened store.
+//! 7. The pre-restart writer generation is fenced on the reopened store.
 //!
 //! This intentionally proves only orderly stop/reopen: it says nothing about
 //! `kill -9`, power loss, torn writes, load, concurrency, or SQLite's
@@ -44,17 +47,17 @@ use runtime::{
     StorageDeadline, StructuredDurableDomainStateStore, SystemClock,
 };
 use sunrise_edge_client::{
-    AccessEntry, AccessManifest, AccessMode, AtomicityDomainId, Client, ClientError,
-    HttpNodeResult, HttpObjectQueryResult, HttpReceiptQueryResult, LocalSigner,
-    LoopbackHttpTransport, NodeResponseStatus, ObjectId, ObjectRef, Owner, RequestId,
+    AccessEntry, AccessManifest, AccessMode, Amount, AtomicityDomainId, Client, ClientError,
+    ExecutionStatus, FeePayment, HttpNodeResult, HttpObjectQueryResult, HttpReceiptQueryResult,
+    LocalSigner, LoopbackHttpTransport, NodeResponseStatus, ObjectId, ObjectRef, Owner, RequestId,
     SignatureSchemeId, SubmitTransactionRequest, TransactionRequest, build_signed_transaction,
     decode_execution_effects, decode_object,
 };
 use sunrise_edge_devnet::{
-    ASSET_ACCOUNT_WASM, AssetAccount, DevOwner, DevnetConfig, SeedAssetAccountsOutcome,
-    SeededAssetAccounts, TransferArgs, boot_local_store, build_asset_module,
-    build_devnet_protocol_context, compose_devnet_router, decode_asset_account,
-    encode_transfer_args,
+    ASSET_ACCOUNT_WASM, AssetAccount, DEVNET_ASSET_ID, DevOwner, DevnetConfig,
+    SeedAssetAccountsOutcome, SeededAssetAccounts, TransferArgs, boot_local_store,
+    build_asset_module, build_devnet_protocol_context, compose_devnet_router, decode_asset_account,
+    decode_transfer_event, encode_transfer_args,
     genesis::{DEVNET_DOMAIN_BYTES, DEVNET_PROTOCOL_VERSION},
     seed_asset_accounts, verify_seeded_asset_supply,
 };
@@ -66,6 +69,8 @@ const TRANSFER_ENTRYPOINT: &str = "transfer";
 const GAS_LIMIT: u64 = 1_000_000;
 const REQUEST_ID_R1_BYTE: u8 = 0x51;
 const REQUEST_ID_R2_BYTE: u8 = 0x52;
+const REQUEST_ID_R3_BYTE: u8 = 0x53;
+const TRAP_GAS_LIMIT: u64 = 10_000;
 const EXPECTED_CHAIN_ID: &str = "cli-restart-duplicate-e2e-devnet";
 const EXPECTED_EPOCH: &str = "13";
 const EXPECTED_HASH_SUITE_ID: &str = "1";
@@ -177,18 +182,27 @@ struct PreRestartState {
     destination_account: AssetAccount,
     source_ref: ObjectRef,
     destination_ref: ObjectRef,
+    treasury_account: AssetAccount,
+    treasury_ref: ObjectRef,
     source_query_bytes: Vec<u8>,
     destination_query_bytes: Vec<u8>,
+    treasury_query_bytes: Vec<u8>,
     cli_receipt: HttpReceiptQueryResult,
     cli_receipt_bytes: Vec<u8>,
     second_transfer_receipt: HttpReceiptQueryResult,
     second_transfer_receipt_bytes: Vec<u8>,
+    trapped_receipt: HttpReceiptQueryResult,
+    trapped_receipt_bytes: Vec<u8>,
     next_nonce: u64,
     next_nonce_query_bytes: Vec<u8>,
     request_id_r2: RequestId,
     signed_transaction_bytes_r2: Vec<u8>,
     submit_result_r2: HttpNodeResult,
     submit_result_r2_bytes: Vec<u8>,
+    request_id_r3: RequestId,
+    signed_transaction_bytes_r3: Vec<u8>,
+    submit_result_r3: HttpNodeResult,
+    submit_result_r3_bytes: Vec<u8>,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -200,6 +214,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
     let seed_file = TempSeedFile::new([0x5B; 32]);
     let dev_owner = DevOwner::new(*owner_address.as_bytes());
     let recipient_dev_owner = DevOwner::new(*recipient_address.as_bytes());
+    let treasury_dev_owner = DevOwner::new([0x7B; 32]);
 
     let directory = TestDirectory::new("restart-duplicate-e2e");
     let config = DevnetConfig::parse_from(vec![
@@ -215,6 +230,8 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         OsString::from(owner_address.to_string()),
         OsString::from("--dev-owner"),
         OsString::from(recipient_address.to_string()),
+        OsString::from("--fee-treasury-owner"),
+        OsString::from("7b".repeat(32)),
         OsString::from("--max-concurrent"),
         OsString::from("4"),
     ])
@@ -264,10 +281,35 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         recipient_seed_outcome,
         SeedAssetAccountsOutcome::Created(_)
     ));
-    verify_seeded_asset_supply(&[seed_outcome.clone(), recipient_seed_outcome.clone()]).unwrap();
+    let treasury_seed_context = DurableOperationContext::new(
+        first_generation,
+        seed_deadline,
+        StorageCorrelationId::new([0x66; 16]).unwrap(),
+    );
+    let treasury_seed_outcome = seed_asset_accounts(
+        first_boot.store(),
+        first_module.resolver(),
+        config.epoch(),
+        treasury_dev_owner,
+        first_generation,
+        &treasury_seed_context,
+    )
+    .unwrap();
+    assert!(matches!(
+        treasury_seed_outcome,
+        SeedAssetAccountsOutcome::Created(_)
+    ));
+    verify_seeded_asset_supply(&[
+        seed_outcome.clone(),
+        recipient_seed_outcome.clone(),
+        treasury_seed_outcome.clone(),
+    ])
+    .unwrap();
     let recipient_accounts: SeededAssetAccounts = recipient_seed_outcome.accounts().clone();
     let source_id = first_accounts.source().id;
     let destination_id = recipient_accounts.destination().id;
+    let treasury_accounts: SeededAssetAccounts = treasury_seed_outcome.accounts().clone();
+    let treasury_id = treasury_accounts.destination().id;
     let module_ref = first_module.module_ref().clone();
 
     // --- Serve on an ephemeral loopback port. ---
@@ -277,7 +319,8 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         first_module,
         first_generation,
         config.max_concurrent(),
-        config.dev_owners().len(),
+        3,
+        treasury_id,
     )
     .unwrap();
     let first_listener =
@@ -304,12 +347,19 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             query_current_account(&verify_client, source_id);
         let (_, destination_baseline, destination_owner_baseline, _) =
             query_current_account(&verify_client, destination_id);
+        let (_, treasury_baseline, treasury_owner_baseline, _) =
+            query_current_account(&verify_client, treasury_id);
         assert_eq!(source_baseline.balance, INITIAL_SOURCE_BALANCE);
         assert_eq!(destination_baseline.balance, 0);
         assert_eq!(source_owner_baseline, Owner::Address(owner_address));
         assert_eq!(
             destination_owner_baseline,
             Owner::Address(recipient_address)
+        );
+        assert_eq!(treasury_baseline.balance, 0);
+        assert_eq!(
+            treasury_owner_baseline,
+            Owner::Address(sunrise_edge_client::Address::new([0x7B; 32]))
         );
 
         // Property 1: user-facing transfer leg through the real CLI binary
@@ -338,6 +388,12 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             OsString::from(CLI_TRANSFER_AMOUNT.to_string()),
             OsString::from("--gas-limit"),
             OsString::from(GAS_LIMIT.to_string()),
+            OsString::from("--fee-asset-id"),
+            OsString::from(hex32(DEVNET_ASSET_ID.as_bytes())),
+            OsString::from("--max-fee"),
+            OsString::from((GAS_LIMIT + 1).to_string()),
+            OsString::from("--fee-treasury-object"),
+            OsString::from(treasury_id.to_string()),
             OsString::from("--request-id"),
             OsString::from(hex32(&[REQUEST_ID_R1_BYTE; 32])),
             OsString::from("--expected-chain-id"),
@@ -368,9 +424,12 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             query_current_account(&verify_client, source_id);
         let (destination_ref_after_cli, destination_after_cli, destination_owner_after_cli, _) =
             query_current_account(&verify_client, destination_id);
+        let (treasury_ref_after_cli, treasury_after_cli, treasury_owner_after_cli, _) =
+            query_current_account(&verify_client, treasury_id);
+        let cli_fee: u64 = treasury_after_cli.balance - treasury_baseline.balance;
         assert_eq!(
             source_after_cli.balance,
-            source_baseline.balance - CLI_TRANSFER_AMOUNT
+            source_baseline.balance - CLI_TRANSFER_AMOUNT - cli_fee
         );
         assert_eq!(
             destination_after_cli.balance,
@@ -380,6 +439,10 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         assert_eq!(
             destination_owner_after_cli,
             Owner::Address(recipient_address)
+        );
+        assert_eq!(
+            treasury_owner_after_cli,
+            Owner::Address(sunrise_edge_client::Address::new([0x7B; 32]))
         );
 
         let cli_receipt = verify_client
@@ -404,11 +467,15 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         // byte-identically once in this boot and once after restart.
         let mut access_manifest = AccessManifest::new();
         access_manifest.push(AccessEntry {
-            object_ref: source_ref_after_cli,
+            object_ref: source_ref_after_cli.clone(),
             mode: AccessMode::Write,
         });
         access_manifest.push(AccessEntry {
-            object_ref: destination_ref_after_cli,
+            object_ref: destination_ref_after_cli.clone(),
+            mode: AccessMode::Write,
+        });
+        access_manifest.push(AccessEntry {
+            object_ref: treasury_ref_after_cli.clone(),
             mode: AccessMode::Write,
         });
         let args =
@@ -423,7 +490,11 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             entrypoint: TRANSFER_ENTRYPOINT.to_string(),
             args,
             gas_limit: GAS_LIMIT,
-            fee_payment: None,
+            fee_payment: Some(FeePayment {
+                asset_id: DEVNET_ASSET_ID,
+                max_fee: Amount::new(GAS_LIMIT + 1),
+                fee_object: source_ref_after_cli.clone(),
+            }),
         };
         let signed_transaction_bytes_r2 = build_signed_transaction(
             &owner_signer,
@@ -453,22 +524,30 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             .payload()
             .expect("accepted transfer should carry execution effects");
         let effects = decode_execution_effects(payload).unwrap();
-        assert!(matches!(
-            effects.status,
-            sunrise_edge_client::ExecutionStatus::Success
-        ));
+        assert!(matches!(effects.status, ExecutionStatus::Success));
+        assert_eq!(effects.events.len(), 1);
+        let transfer_event = decode_transfer_event(&effects.events[0].data).unwrap();
+        assert_eq!(transfer_event.amount, SECOND_TRANSFER_AMOUNT);
+        assert_eq!(
+            transfer_event.source_balance,
+            source_after_cli.balance - SECOND_TRANSFER_AMOUNT
+        );
 
-        let (source_ref_after_r2, source_after_r2, source_owner_after_r2, source_query_bytes) =
+        let (source_ref_after_r2, source_after_r2, source_owner_after_r2, _) =
             query_current_account(&verify_client, source_id);
-        let (
-            destination_ref_after_r2,
-            destination_after_r2,
-            destination_owner_after_r2,
-            destination_query_bytes,
-        ) = query_current_account(&verify_client, destination_id);
+        let (destination_ref_after_r2, destination_after_r2, destination_owner_after_r2, _) =
+            query_current_account(&verify_client, destination_id);
+        let (treasury_ref_after_r2, treasury_after_r2, treasury_owner_after_r2, _) =
+            query_current_account(&verify_client, treasury_id);
+        let r2_fee: u64 = treasury_after_r2.balance - treasury_after_cli.balance;
+        assert_eq!(r2_fee, 1 + effects.gas_used);
         assert_eq!(
             source_after_r2.balance,
-            source_after_cli.balance - SECOND_TRANSFER_AMOUNT
+            source_after_cli.balance - SECOND_TRANSFER_AMOUNT - r2_fee
+        );
+        assert_eq!(
+            source_after_r2.balance,
+            transfer_event.source_balance - r2_fee
         );
         assert_eq!(
             destination_after_r2.balance,
@@ -479,6 +558,135 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             destination_owner_after_r2,
             Owner::Address(recipient_address)
         );
+        assert_eq!(
+            treasury_owner_after_r2,
+            Owner::Address(sunrise_edge_client::Address::new([0x7B; 32]))
+        );
+        assert_eq!(source_after_r2.sequence, source_after_cli.sequence + 2);
+        assert_eq!(
+            source_ref_after_r2.version,
+            source_ref_after_cli.version + 1
+        );
+        assert_eq!(
+            destination_ref_after_r2.version,
+            destination_ref_after_cli.version + 1
+        );
+        assert_eq!(
+            treasury_ref_after_r2.version,
+            treasury_ref_after_cli.version + 1
+        );
+
+        // Property 5: malformed module arguments deterministically trap.
+        // Application effects are discarded, while the normalized
+        // `gas_used == gas_limit` charge commits only source/treasury writes.
+        let nonce_before_trap = verify_client
+            .query_next_nonce(owner_address)
+            .expect("next-nonce before trapped invocation should succeed");
+        let mut trap_manifest = AccessManifest::new();
+        trap_manifest.push(AccessEntry {
+            object_ref: source_ref_after_r2.clone(),
+            mode: AccessMode::Write,
+        });
+        trap_manifest.push(AccessEntry {
+            object_ref: destination_ref_after_r2.clone(),
+            mode: AccessMode::Write,
+        });
+        trap_manifest.push(AccessEntry {
+            object_ref: treasury_ref_after_r2,
+            mode: AccessMode::Write,
+        });
+        let trapped_signed_bytes = build_signed_transaction(
+            &owner_signer,
+            SignatureSchemeId::Ed25519,
+            TransactionRequest {
+                chain_id: context.chain_id().clone(),
+                protocol_version: context.protocol_version(),
+                epoch: context.epoch(),
+                nonce: nonce_before_trap.next_nonce(),
+                access_manifest: trap_manifest,
+                module_ref: module_ref.clone(),
+                entrypoint: TRANSFER_ENTRYPOINT.to_string(),
+                args: vec![0],
+                gas_limit: TRAP_GAS_LIMIT,
+                fee_payment: Some(FeePayment {
+                    asset_id: DEVNET_ASSET_ID,
+                    max_fee: Amount::new(TRAP_GAS_LIMIT + 1),
+                    fee_object: source_ref_after_r2.clone(),
+                }),
+            },
+        )
+        .unwrap();
+        let request_id_r3 = RequestId::new([REQUEST_ID_R3_BYTE; 32]).unwrap();
+        let trapped_result = verify_client
+            .submit_transaction(SubmitTransactionRequest {
+                chain_id: context.chain_id().clone(),
+                protocol_version: context.protocol_version(),
+                epoch: context.epoch(),
+                request_id: request_id_r3,
+                signed_transaction_bytes: trapped_signed_bytes.clone(),
+            })
+            .expect("trapped execution should commit its rejected receipt and fee effects");
+        assert_eq!(trapped_result.responses().len(), 1);
+        assert_eq!(
+            trapped_result.responses()[0].status(),
+            NodeResponseStatus::Rejected
+        );
+        let trapped_effects = decode_execution_effects(
+            trapped_result.responses()[0]
+                .payload()
+                .expect("trapped execution should carry normalized effects"),
+        )
+        .unwrap();
+        assert!(matches!(
+            trapped_effects.status,
+            ExecutionStatus::Failure { .. }
+        ));
+        assert_eq!(trapped_effects.gas_used, TRAP_GAS_LIMIT);
+        assert!(trapped_effects.object_effects.is_empty());
+        let trapped_result_bytes = trapped_result
+            .encode()
+            .expect("trapped submit result should encode canonically");
+
+        let source_before_trap: AssetAccount = source_after_r2;
+        let destination_before_trap: AssetAccount = destination_after_r2;
+        let treasury_before_trap: AssetAccount = treasury_after_r2;
+        let (source_ref_after_r2, source_after_r2, source_owner_after_r2, source_query_bytes) =
+            query_current_account(&verify_client, source_id);
+        let (
+            destination_ref_after_r2,
+            destination_after_r2,
+            destination_owner_after_r2,
+            destination_query_bytes,
+        ) = query_current_account(&verify_client, destination_id);
+        let (
+            treasury_ref_after_r2,
+            treasury_after_r2,
+            treasury_owner_after_r2,
+            treasury_query_bytes,
+        ) = query_current_account(&verify_client, treasury_id);
+        assert_eq!(
+            source_after_r2.balance,
+            source_before_trap.balance - TRAP_GAS_LIMIT - 1
+        );
+        assert_eq!(destination_after_r2, destination_before_trap);
+        assert_eq!(
+            treasury_after_r2.balance,
+            treasury_before_trap.balance + TRAP_GAS_LIMIT + 1
+        );
+        assert_eq!(source_after_r2.sequence, source_before_trap.sequence + 1);
+        assert_eq!(
+            treasury_after_r2.sequence,
+            treasury_before_trap.sequence + 1
+        );
+        assert_eq!(source_owner_after_r2, Owner::Address(owner_address));
+        assert_eq!(
+            destination_owner_after_r2,
+            Owner::Address(recipient_address)
+        );
+        assert_eq!(
+            treasury_owner_after_r2,
+            Owner::Address(sunrise_edge_client::Address::new([0x7B; 32]))
+        );
 
         let second_transfer_receipt = verify_client
             .query_receipt(request_id_r2)
@@ -487,12 +695,22 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             second_transfer_receipt,
             HttpReceiptQueryResult::Present { .. }
         ));
+        let trapped_receipt = verify_client
+            .query_receipt(request_id_r3)
+            .expect("trapped invocation receipt query should succeed");
+        assert!(matches!(
+            trapped_receipt,
+            HttpReceiptQueryResult::Present { .. }
+        ));
         let cli_receipt_bytes = cli_receipt
             .encode()
             .expect("CLI receipt result should encode canonically");
         let second_transfer_receipt_bytes = second_transfer_receipt
             .encode()
             .expect("second receipt result should encode canonically");
+        let trapped_receipt_bytes = trapped_receipt
+            .encode()
+            .expect("trapped receipt result should encode canonically");
         let next_nonce_result = verify_client
             .query_next_nonce(owner_address)
             .expect("next-nonce query should succeed");
@@ -532,6 +750,12 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             destination_owner_after_same_boot_duplicate,
             destination_bytes_after_same_boot_duplicate,
         ) = query_current_account(&verify_client, destination_id);
+        let (
+            treasury_ref_after_same_boot_duplicate,
+            treasury_after_same_boot_duplicate,
+            treasury_owner_after_same_boot_duplicate,
+            treasury_bytes_after_same_boot_duplicate,
+        ) = query_current_account(&verify_client, treasury_id);
         assert_eq!(source_ref_after_same_boot_duplicate, source_ref_after_r2);
         assert_eq!(
             destination_ref_after_same_boot_duplicate,
@@ -540,6 +764,11 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         assert_eq!(source_after_same_boot_duplicate, source_after_r2);
         assert_eq!(destination_after_same_boot_duplicate, destination_after_r2);
         assert_eq!(
+            treasury_ref_after_same_boot_duplicate,
+            treasury_ref_after_r2
+        );
+        assert_eq!(treasury_after_same_boot_duplicate, treasury_after_r2);
+        assert_eq!(
             source_owner_after_same_boot_duplicate,
             Owner::Address(owner_address)
         );
@@ -547,10 +776,18 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             destination_owner_after_same_boot_duplicate,
             Owner::Address(recipient_address)
         );
+        assert_eq!(
+            treasury_owner_after_same_boot_duplicate,
+            Owner::Address(sunrise_edge_client::Address::new([0x7B; 32]))
+        );
         assert_eq!(source_bytes_after_same_boot_duplicate, source_query_bytes);
         assert_eq!(
             destination_bytes_after_same_boot_duplicate,
             destination_query_bytes
+        );
+        assert_eq!(
+            treasury_bytes_after_same_boot_duplicate,
+            treasury_query_bytes
         );
         assert_eq!(
             verify_client
@@ -559,6 +796,14 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
                 .encode()
                 .expect("duplicate receipt result should encode canonically"),
             second_transfer_receipt_bytes
+        );
+        assert_eq!(
+            verify_client
+                .query_receipt(request_id_r3)
+                .expect("trapped receipt query after duplicate should succeed")
+                .encode()
+                .expect("trapped receipt result should encode canonically"),
+            trapped_receipt_bytes
         );
         assert_eq!(
             verify_client
@@ -574,18 +819,27 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             destination_account: destination_after_r2,
             source_ref: source_ref_after_r2,
             destination_ref: destination_ref_after_r2,
+            treasury_account: treasury_after_r2,
+            treasury_ref: treasury_ref_after_r2,
             source_query_bytes,
             destination_query_bytes,
+            treasury_query_bytes,
             cli_receipt,
             cli_receipt_bytes,
             second_transfer_receipt,
             second_transfer_receipt_bytes,
+            trapped_receipt,
+            trapped_receipt_bytes,
             next_nonce: next_nonce_final,
             next_nonce_query_bytes,
             request_id_r2,
             signed_transaction_bytes_r2,
             submit_result_r2,
             submit_result_r2_bytes,
+            request_id_r3,
+            signed_transaction_bytes_r3: trapped_signed_bytes,
+            submit_result_r3: trapped_result,
+            submit_result_r3_bytes: trapped_result_bytes,
         }
     })
     .await
@@ -632,8 +886,8 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         })
     );
 
-    // Reseed both configured owners and require Existing with identical
-    // identities and current references.
+    // Reseed both transfer owners and the distinct treasury owner, requiring
+    // Existing with identical identities and current references.
     let second_protocol_context =
         build_devnet_protocol_context(config.chain_id().clone(), config.epoch()).unwrap();
     let second_module =
@@ -674,8 +928,30 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         recipient_reseed_outcome,
         SeedAssetAccountsOutcome::Existing(_)
     ));
-    verify_seeded_asset_supply(&[reseed_outcome.clone(), recipient_reseed_outcome.clone()])
-        .unwrap();
+    let treasury_reseed_context = DurableOperationContext::new(
+        second_generation,
+        StorageDeadline::new(u64::MAX).unwrap(),
+        StorageCorrelationId::new([0x67; 16]).unwrap(),
+    );
+    let treasury_reseed_outcome = seed_asset_accounts(
+        second_boot.store(),
+        second_module.resolver(),
+        config.epoch(),
+        treasury_dev_owner,
+        second_generation,
+        &treasury_reseed_context,
+    )
+    .unwrap();
+    assert!(matches!(
+        treasury_reseed_outcome,
+        SeedAssetAccountsOutcome::Existing(_)
+    ));
+    verify_seeded_asset_supply(&[
+        reseed_outcome.clone(),
+        recipient_reseed_outcome.clone(),
+        treasury_reseed_outcome.clone(),
+    ])
+    .unwrap();
     // `seed_asset_accounts` reports the *current* head reference on the
     // `Existing` path (not the version-one creation snapshot the `Created`
     // path in `first_accounts` captured), so the account identities (owner,
@@ -710,6 +986,18 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         recipient_reseed_outcome.accounts().destination(),
         &pre_restart.destination_ref
     );
+    assert_eq!(
+        treasury_reseed_outcome.accounts().owner(),
+        treasury_accounts.owner()
+    );
+    assert_eq!(
+        treasury_reseed_outcome.accounts().source(),
+        treasury_accounts.source()
+    );
+    assert_eq!(
+        treasury_reseed_outcome.accounts().destination(),
+        &pre_restart.treasury_ref
+    );
     assert_eq!(second_module.module_ref(), &module_ref);
 
     // --- Recompose on a fresh ephemeral port. ---
@@ -719,7 +1007,8 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         second_module,
         second_generation,
         config.max_concurrent(),
-        config.dev_owners().len(),
+        3,
+        treasury_id,
     )
     .unwrap();
     let second_listener =
@@ -734,6 +1023,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
 
     tokio::task::spawn_blocking(move || {
         let verify_client = make_client(second_address);
+        let request_id_r3 = RequestId::new([REQUEST_ID_R3_BYTE; 32]).unwrap();
 
         // Property 3: balances, sequences, receipts, and next nonce are
         // byte-identical to the values captured immediately before restart.
@@ -745,12 +1035,24 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             destination_owner_after_restart,
             destination_query_bytes_after_restart,
         ) = query_current_account(&verify_client, destination_id);
+        let (
+            treasury_ref_after_restart,
+            treasury_after_restart,
+            treasury_owner_after_restart,
+            treasury_query_bytes_after_restart,
+        ) = query_current_account(&verify_client, treasury_id);
         assert_eq!(source_after_restart, pre_restart.source_account);
         assert_eq!(destination_after_restart, pre_restart.destination_account);
+        assert_eq!(treasury_after_restart, pre_restart.treasury_account);
+        assert_eq!(treasury_ref_after_restart, pre_restart.treasury_ref);
         assert_eq!(source_owner_after_restart, Owner::Address(owner_address));
         assert_eq!(
             destination_owner_after_restart,
             Owner::Address(recipient_address)
+        );
+        assert_eq!(
+            treasury_owner_after_restart,
+            Owner::Address(sunrise_edge_client::Address::new([0x7B; 32]))
         );
         assert_eq!(
             source_query_bytes_after_restart,
@@ -759,6 +1061,10 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         assert_eq!(
             destination_query_bytes_after_restart,
             pre_restart.destination_query_bytes
+        );
+        assert_eq!(
+            treasury_query_bytes_after_restart,
+            pre_restart.treasury_query_bytes
         );
 
         let cli_receipt_after_restart = verify_client
@@ -784,6 +1090,17 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
                 .encode()
                 .expect("second receipt result should encode canonically after restart"),
             pre_restart.second_transfer_receipt_bytes
+        );
+
+        let trapped_receipt_after_restart = verify_client
+            .query_receipt(request_id_r3)
+            .expect("trapped receipt query should succeed after restart");
+        assert_eq!(trapped_receipt_after_restart, pre_restart.trapped_receipt);
+        assert_eq!(
+            trapped_receipt_after_restart
+                .encode()
+                .expect("trapped receipt should encode canonically after restart"),
+            pre_restart.trapped_receipt_bytes
         );
 
         let next_nonce_result_after_restart = verify_client
@@ -821,6 +1138,23 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             pre_restart.submit_result_r2_bytes
         );
 
+        let trapped_duplicate_result = verify_client
+            .submit_transaction(SubmitTransactionRequest {
+                chain_id: context.chain_id().clone(),
+                protocol_version: context.protocol_version(),
+                epoch: context.epoch(),
+                request_id: pre_restart.request_id_r3,
+                signed_transaction_bytes: pre_restart.signed_transaction_bytes_r3.clone(),
+            })
+            .expect("the trapped invocation must reconcile without a second fee debit");
+        assert_eq!(trapped_duplicate_result, pre_restart.submit_result_r3);
+        assert_eq!(
+            trapped_duplicate_result
+                .encode()
+                .expect("trapped duplicate should encode canonically after restart"),
+            pre_restart.submit_result_r3_bytes
+        );
+
         let (_, source_after_duplicate, source_owner_after_duplicate, source_query_bytes_after_duplicate) =
             query_current_account(&verify_client, source_id);
         let (
@@ -829,12 +1163,23 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             destination_owner_after_duplicate,
             destination_query_bytes_after_duplicate,
         ) = query_current_account(&verify_client, destination_id);
+        let (
+            _,
+            treasury_after_duplicate,
+            treasury_owner_after_duplicate,
+            treasury_query_bytes_after_duplicate,
+        ) = query_current_account(&verify_client, treasury_id);
         assert_eq!(source_after_duplicate, pre_restart.source_account);
         assert_eq!(destination_after_duplicate, pre_restart.destination_account);
+        assert_eq!(treasury_after_duplicate, pre_restart.treasury_account);
         assert_eq!(source_owner_after_duplicate, Owner::Address(owner_address));
         assert_eq!(
             destination_owner_after_duplicate,
             Owner::Address(recipient_address)
+        );
+        assert_eq!(
+            treasury_owner_after_duplicate,
+            Owner::Address(sunrise_edge_client::Address::new([0x7B; 32]))
         );
         assert_eq!(
             source_query_bytes_after_duplicate,
@@ -845,12 +1190,24 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             pre_restart.destination_query_bytes
         );
         assert_eq!(
+            treasury_query_bytes_after_duplicate,
+            pre_restart.treasury_query_bytes
+        );
+        assert_eq!(
             verify_client
                 .query_receipt(pre_restart.request_id_r2)
                 .expect("receipt query after duplicate should succeed")
                 .encode()
                 .expect("receipt result after duplicate should encode canonically"),
             pre_restart.second_transfer_receipt_bytes
+        );
+        assert_eq!(
+            verify_client
+                .query_receipt(request_id_r3)
+                .expect("trapped receipt query after duplicate should succeed")
+                .encode()
+                .expect("trapped receipt after duplicate should encode canonically"),
+            pre_restart.trapped_receipt_bytes
         );
         let next_nonce_result_after_duplicate = verify_client
             .query_next_nonce(owner_address)
@@ -894,11 +1251,18 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             destination_owner_after_reuse_attempt,
             destination_query_bytes_after_reuse_attempt,
         ) = query_current_account(&verify_client, destination_id);
+        let (
+            _,
+            treasury_after_reuse_attempt,
+            treasury_owner_after_reuse_attempt,
+            treasury_query_bytes_after_reuse_attempt,
+        ) = query_current_account(&verify_client, treasury_id);
         assert_eq!(source_after_reuse_attempt, pre_restart.source_account);
         assert_eq!(
             destination_after_reuse_attempt,
             pre_restart.destination_account
         );
+        assert_eq!(treasury_after_reuse_attempt, pre_restart.treasury_account);
         assert_eq!(
             source_owner_after_reuse_attempt,
             Owner::Address(owner_address)
@@ -908,12 +1272,20 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             Owner::Address(recipient_address)
         );
         assert_eq!(
+            treasury_owner_after_reuse_attempt,
+            Owner::Address(sunrise_edge_client::Address::new([0x7B; 32]))
+        );
+        assert_eq!(
             source_query_bytes_after_reuse_attempt,
             pre_restart.source_query_bytes
         );
         assert_eq!(
             destination_query_bytes_after_reuse_attempt,
             pre_restart.destination_query_bytes
+        );
+        assert_eq!(
+            treasury_query_bytes_after_reuse_attempt,
+            pre_restart.treasury_query_bytes
         );
         assert_eq!(
             verify_client
@@ -930,6 +1302,14 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
                 .encode()
                 .expect("second receipt should encode canonically after rejected reuse"),
             pre_restart.second_transfer_receipt_bytes
+        );
+        assert_eq!(
+            verify_client
+                .query_receipt(request_id_r3)
+                .expect("trapped receipt query should succeed after rejected reuse")
+                .encode()
+                .expect("trapped receipt should encode after rejected reuse"),
+            pre_restart.trapped_receipt_bytes
         );
         let next_nonce_result_after_reuse_attempt = verify_client
             .query_next_nonce(owner_address)

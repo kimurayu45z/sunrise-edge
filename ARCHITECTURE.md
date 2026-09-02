@@ -424,15 +424,18 @@ Bond assets and bond lifecycle are deferred.
 Slashing is deferred, but the architecture already separates message families for future equivocation evidence signatures.
 
 ## 18. Stablecoin fee lifecycle
-Stablecoin fee accounting is deferred. DR-0081 ratifies the governing
-constraint ahead of that implementation: a fee asset is an ordinary
+The S3 local-devnet fee slice is implemented As-Is by DR-0087; validator/
+certificate distribution and production stablecoin economics remain deferred.
+A fee asset is an ordinary
 `fees::AssetId`-tagged asset account using the same single account/transfer
 path as every other asset, never a privileged native coin or a second
 balance/transfer implementation. Fee-asset selection (which `AssetId`(s) may
 pay fees, at what rate) is protocol policy layered over ordinary asset
-accounts, and any future fee-debit effect must reuse the same declared object
-access, exact-head assertions, and atomic object-effect commit as every other
-transfer.
+accounts. The implemented preinstalled-WASM path reuses the sender-owned
+declared fee-object access, exact-head assertions, and atomic object-effect
+commit as every other transfer, and appends one trusted ordinary treasury
+access that the module cannot observe. Settlement uses the committed receipt's
+actual `gas_used`; it never charges `gas_limit` after a successful execution.
 
 ## 19. Governance lifecycle
 Governance is the mechanism by which the active validator set and protocol
@@ -1452,7 +1455,9 @@ protocol behavior:
   unchanged.
 - **Seeded asset accounts.** Startup seeds exactly two ordinary
   `sunrise.devnet.asset_account.v1` objects (`Owner::Address`) per configured
-  development owner. Both accounts carry the same fixed, non-placeholder
+  development owner and per required distinct fee-treasury owner. At most 63
+  transfer owners may be configured, reserving the 64th bounded seed slot for
+  that treasury owner. All accounts carry the same fixed, non-placeholder
   `fees::AssetId`; one starts funded and the other starts empty. A transfer may
   pair one configured owner's source with another configured owner's existing
   destination under the exact committed S2 policy. Their object IDs remain
@@ -1483,12 +1488,30 @@ protocol behavior:
   `sunrise.devnet.asset_account.transferred.v1`. The event and both effects
   enter the same durable receipt and an exact duplicate replays that receipt
   without applying either effect again.
+- **Uniform post-execution fee composition.** Protocol version 3 commits a
+  base fee of 1, an execution price of 1 per actual `gas_used`, zero prices for
+  unmetered categories, and exactly one enabled `DEVNET_ASSET_ID` quoted 1:1.
+  A fee-bearing transaction declares its sender-owned source as `fee_object`
+  and appends the trusted treasury owner's ordinary destination account as the
+  final `Write`. Node-core hides that final access from WASM, settles only
+  after execution, and asks the pure devnet `AssetAccountFeeComposer` to debit
+  payer and credit treasury using the same strict `0xF001` codec. A successful
+  source update merges application and fee bodies into one durable object
+  version advance (the asset-account body sequence advances once per logical
+  application/fee mutation). A normalized trap discards application effects,
+  consumes full declared gas, and commits only payer/treasury fee effects with
+  a rejected receipt. Exact replay reconciles before object I/O or composition.
+  The transfer event remains module output: its `source_balance` is post-
+  transfer but pre-fee; clients obtain the post-fee balance from the committed
+  object and compute the charge from receipt `gas_used` plus the committed
+  schedule.
 - **Canonical catalog declarations.** The dev profile also reserves local
   declaration type IDs `0xF010` for the asset-account schema declaration and
   `0xF011` for its execution-semantics declaration. The schema declaration
   remains encoding version 1. The historical same-sender semantics declaration
-  remains pinned at encoding version 1, while the S2 cross-owner declaration
-  uses encoding version 2. These declarations are complete `CanonicalStruct`
+  remains pinned at encoding version 1, the S2 cross-owner declaration remains
+  pinned at version 2, and the active S3 declaration uses version 3 while
+  preserving the exact WAT/WASM and canonical code hash. These declarations are complete `CanonicalStruct`
   frames and are hashed
   under the existing `SystemModule` purpose when deriving the preinstalled
   catalog commitments. They describe the `0xF001` body, `0xF002` arguments,
@@ -1545,8 +1568,9 @@ no other `clients/*`/`apps/*` path from DR-0081 exists yet. Known current
 limitations that
 must stay visible at devnet startup and in documentation once implemented:
 single validator; owned-object only (Create, Shared/System ownership, and
-blob bodies remain fail-closed); fee-free (`fee_payment: None`, empty fee
-registry); only the exact policy-bounded existing Address-owned destination
+blob bodies remain fail-closed); one fixed ordinary fee asset and one ordinary
+treasury without validator/certificate distribution, gas categories other
+than base/execution pricing, or production economics; only the exact policy-bounded existing Address-owned destination
 may differ from the sender, while literal owner reassignment/gifting remains
 fail-closed; local SQLite only; the four bounded query routes are an
 unauthenticated public-read API (any caller can read any object/receipt/
@@ -3209,6 +3233,15 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   `0xF003` event stay at schema version 1 and the WASM bytes are unchanged.
   This profile selection is not a claim that general upgrade activation is
   implemented.
+
+  **DR-0087 amendment (current status).** The empty-registry/fee-free and
+  deferred-fee statements above likewise preserve DR-0081's historical MVP
+  boundary, not current behavior. S3 now uses the same ordinary asset-account
+  path for payer and distinct treasury, settles actual gas after execution,
+  and commits trap fee-only effects as described by DR-0087. The active
+  module/semantics declaration is version 3; historical v1/v2 declarations,
+  the `0xF001`/`0xF002`/`0xF003` schemas, and WAT/WASM/code hash remain pinned.
+  S4 is next; this is still not production or mainnet readiness.
 - DR-0082: Add the bounded canonical Developer MVP query surface described in
   "Bounded Developer MVP query API". Keep query selectors non-authoritative,
   resolve all chain/domain/epoch/storage authority from trusted composition,
@@ -3286,8 +3319,9 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   has passed without making a production-readiness claim. S0 below is also
   implemented As-Is. S1 below is now also implemented and tested As-Is (see
   "S1 implementation status" immediately below), and S2 is implemented and
-  validated As-Is by DR-0086. The current implementation priority is S3.
-  S4-S5 remain ordered successors, and the TypeScript
+  validated As-Is by DR-0086. S3 is implemented and validated As-Is by
+  DR-0087. The current implementation priority is S4. S5 remains its ordered
+  successor, and the TypeScript
   client/explorer/wallet surface remains deferred until the complete
   CLI-First Node Production Gate passes.
 
@@ -3461,13 +3495,13 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   never widens what the TLS layer itself trusts. This is real S1 evidence,
   not a mainnet-readiness or production-certification claim: Phase 16/17's
   production exit criteria and an independent security audit remain
-  required afterward, unchanged, and S2 (cross-owner transfer) is the next
-  ordered slice.
+    required afterward, unchanged, and S2 (cross-owner transfer) was the next
+  ordered slice at that decision point.
 
   **DR-0086 amendment (current status).** The preceding "S2 is next" sentence
   records DR-0085's S1 completion point. S2 is now implemented and validated
   As-Is through the exact committed destination policy, with literal owner
-  reassignment still deferred; S3 is the next ordered slice. S4/S5, Phase
+  reassignment still deferred; S3 is now implemented by DR-0087. S4/S5, Phase
   16/17 exit criteria, and an independent security audit remain outstanding,
   so no production/mainnet readiness is claimed.
 
@@ -3524,8 +3558,9 @@ version 1, and fail closed on zero identity/rule version, empty access, or
     path. The roadmap phrase "object owner changes" means correct handling of
     differing source/destination owner projections; it does not authorize
     literal owner reassignment, which remains fail-closed.
-  - S3: fees and gas metering, completed before the devnet's fee-free posture
-    is exposed to public live ingress.
+  - S3 (implemented As-Is by DR-0087): uniform ordinary-asset fees and actual-
+    gas metering on the local preinstalled-WASM devnet path, including
+    deterministic trap fee-only settlement and restart/replay evidence.
   - S4: a secure signer replacing today's development-only `LocalSigner`, and
     a real dedicated Sunrise Edge Ledger integration (see "Rust client
     external-signer boundary and Developer MVP CLI" and DR-0084; existing
@@ -3610,9 +3645,74 @@ version 1, and fail closed on zero identity/rule version, empty access, or
 
   This implementation preserves established canonical transaction,
   `ObjectEffect`, `Object`, receipt, nonce, and submit-result bytes. S2 is
-  implemented and validated As-Is only: the local devnet remains fee-free,
-  single-validator, SQLite-backed, and non-production. S3 uniform asset fee
-  accounting and gas metering is next. The TypeScript client, explorer, wallet,
+  implemented and validated As-Is only. DR-0087 subsequently replaces the
+  fee-free devnet posture while preserving S2's exact policy and historical
+  vectors. The TypeScript client, explorer, wallet,
   S4 secure signer/Ledger work, and S5 persistence/provider/operations/release
   evidence remain deferred, and Phase 16/17 exit criteria plus an independent
   security audit remain mandatory.
+- DR-0087: Implement S3 as uniform ordinary-asset fee composition on the
+  trusted preinstalled-WASM devnet path, without changing historical wire,
+  WAT/WASM, or storage bytes.
+
+  **Admission and settlement.** The committed protocol configuration uses
+  non-zero base/execution prices and enables exactly `DEVNET_ASSET_ID` at a
+  1:1 quote. A due fee requires signed `FeePayment`; its `max_fee` must cover
+  the worst case at `gas_limit` before engine work begins. The final charge is
+  computed only after execution from canonical `ExecutionEffects.gas_used`.
+  Successful application effects are merged with the fee debit/credit and
+  committed atomically with state, nonce, receipt, and outbox. A deterministic
+  trap is normalized first, discards every application effect/event, charges
+  its normalized full gas through a restricted fee-only mutation, and commits
+  a Rejected receipt. An insufficient payer balance after successful execution
+  rejects the whole transaction, so execution work may be spent without a
+  commit; this bounded devnet limitation is not production admission policy.
+
+  **Ordinary accounts and trusted boundary.** The payer is one sender-owned
+  declared `Write` object and the trusted fee sink is the distinct configured
+  treasury owner's ordinary seeded destination account. The signed manifest
+  names that treasury exactly once as its final `Write`, but node-core removes
+  it before invoking WASM. The module therefore still observes exactly the two
+  source/destination objects and cannot redirect, inspect, or authorize the
+  fee sink. The pure `AssetAccountFeeComposer` receives only opaque effective
+  payer/treasury bodies and a settled amount, uses the existing strict
+  `0xF001` codec, checks matching asset IDs and checked balance/sequence
+  arithmetic, and returns two bodies. Node-core independently freezes identity,
+  owner, type/schema, provenance, and object version; a no-op or malformed
+  trusted composition fails closed. One successful transaction advances each
+  touched durable object version once, while the payer body sequence advances
+  once for the application transfer and once for the fee mutation.
+
+  **Catalog compatibility.** The active module and semantics declaration move
+  to version 3 solely to commit the new host-side fee/treasury/event facts.
+  Historical v1 same-sender and v2 cross-owner declarations remain exact
+  pinned vectors and are not installed. The asset body/args/event encoding
+  remains v1, the WAT/WASM bytes are unchanged, and a fixed-context canonical
+  code-hash test pins the same artifact. The transfer event is deliberately
+  pre-fee module output: `source_balance` is the balance after transfer but
+  before settlement; the durable source object is lower by `base_fee +
+  gas_used * execution_price` under this profile.
+
+  **CLI, startup, and evidence.** Devnet configuration requires a treasury
+  owner distinct from all transfer owners and reserves one of the 64 seed
+  slots for it. Startup seeds/verifies all owners, selects the treasury
+  destination, and wires it with the composer into the native router. CLI
+  `transfer` accepts the all-or-none `--fee-asset-id`/`--max-fee`/
+  `--fee-treasury-object` trio, fixes source as fee object, queries treasury
+  last, and appends its final `Write`; partial input, zero max fee, or treasury
+  collision fails locally. Native HTTP assigns explicit 4xx classifications
+  to caller fee faults and 5xx classifications to trusted policy/composition
+  invariant failures. The real file-backed SQLite E2E proves a successful
+  actual-gas charge, event pre-fee semantics, a trapped fee-only charge,
+  same-boot and orderly close/reopen replay non-reapplication (including the
+  trapped request), writer-generation advancement/fencing, and request-ID
+  reuse conflict with canonical source/destination/treasury query bytes, all
+  three receipts, and nonce unchanged.
+
+  **Limits and next step.** This is single-validator, one fixed fee asset, one
+  serializing treasury, and local SQLite only. It does not implement fee
+  distribution through `FastCertificate`, multiple governed fee assets,
+  production gas calibration, sufficient-balance preflight, treasury sharding,
+  Shared/System/blob objects, or crash/power-loss durability. TypeScript,
+  explorer, and wallet stay deferred. S4 secure signer/Ledger integration is
+  next; S5, Phase 16/17 exit criteria, and independent audit remain mandatory.

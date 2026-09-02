@@ -53,6 +53,8 @@ async fn client_queries_all_four_routes_from_the_real_devnet_router_over_tcp() {
         OsString::from("7"),
         OsString::from("--dev-owner"),
         OsString::from("2222222222222222222222222222222222222222222222222222222222222222"),
+        OsString::from("--fee-treasury-owner"),
+        OsString::from("3333333333333333333333333333333333333333333333333333333333333333"),
         OsString::from("--max-concurrent"),
         OsString::from("4"),
     ])
@@ -68,6 +70,7 @@ async fn client_queries_all_four_routes_from_the_real_devnet_router_over_tcp() {
         generation,
         config.max_concurrent(),
         config.dev_owners().len(),
+        ObjectId::new([0xFE; 32]),
     )
     .unwrap();
 

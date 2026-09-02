@@ -12,6 +12,7 @@ pub mod boot;
 pub mod catalog;
 pub mod composition;
 pub mod config;
+pub mod fee;
 pub mod genesis;
 pub mod identities;
 pub mod machine;
@@ -30,6 +31,7 @@ pub use config::{
     DEVNET_STARTUP_LIMITATIONS_BANNER, DevOwner, DevnetConfig, DevnetConfigError,
     MAX_DEVNET_CONCURRENCY, MAX_DEVNET_OWNERS,
 };
+pub use fee::AssetAccountFeeComposer;
 pub use genesis::{DevnetGenesisError, DevnetProtocolContext, build_devnet_protocol_context};
 pub use identities::DevnetOutboxIdentitySource;
 pub use machine::DevnetMachine;

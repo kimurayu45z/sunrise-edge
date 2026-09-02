@@ -46,12 +46,22 @@ impl VerifiedAuthenticatedObject {
             previous_created_checkpoint,
         }
     }
+
+    /// Returns the verified, loaded object.
+    pub(super) fn object(&self) -> &Object {
+        &self.object
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct LoadedAuthenticatedObjects {
     reads: Vec<DurableObjectHeadRead>,
     verified: Vec<VerifiedAuthenticatedObject>,
+    /// Parallel to `verified`: `false` for the one trusted-composition
+    /// treasury entry a fee-aware caller asked `load_and_authorize_objects`
+    /// to hide from execution engine inputs (see
+    /// [`Self::push_with_engine_visibility`]); `true` for every other entry.
+    engine_visible: Vec<bool>,
     total_body_bytes: usize,
 }
 
@@ -60,17 +70,26 @@ impl LoadedAuthenticatedObjects {
         Self {
             reads: Vec::with_capacity(capacity),
             verified: Vec::with_capacity(capacity),
+            engine_visible: Vec::with_capacity(capacity),
             total_body_bytes: 0,
         }
     }
 
-    pub(super) fn push(
+    /// Pushes one verified, loaded object, recording whether it should be
+    /// included in [`Self::resolved_objects`]'s execution-engine inputs.
+    /// `engine_visible: false` is used exactly once, for a trusted
+    /// composition's fee treasury access: the entry is still fully verified
+    /// and retained for head-read assertions and effect translation, but is
+    /// hidden from the preinstalled module so it can never observe or
+    /// directly mutate the treasury object.
+    pub(super) fn push_with_engine_visibility(
         &mut self,
         object_id: ObjectId,
         mode: AccessMode,
         head: DurableObjectHead,
         object: Object,
         previous_created_checkpoint: u64,
+        engine_visible: bool,
     ) {
         self.reads
             .push(DurableObjectHeadRead::new(object_id, head.clone()));
@@ -80,19 +99,33 @@ impl LoadedAuthenticatedObjects {
             object,
             previous_created_checkpoint,
         ));
+        self.engine_visible.push(engine_visible);
     }
 
     pub(super) fn verified(&self) -> &[VerifiedAuthenticatedObject] {
         &self.verified
     }
 
+    /// Returns the verified, loaded object matching `object_id`, regardless
+    /// of engine visibility.
+    pub(super) fn object(&self, object_id: ObjectId) -> Option<&Object> {
+        self.verified
+            .iter()
+            .map(VerifiedAuthenticatedObject::object)
+            .find(|object| object.id == object_id)
+    }
+
     pub(super) fn resolved_objects(&self) -> Vec<ResolvedObject> {
         self.verified
             .iter()
-            .map(|verified: &VerifiedAuthenticatedObject| ResolvedObject {
-                object: verified.object.clone(),
-                mode: verified.mode,
-            })
+            .zip(&self.engine_visible)
+            .filter(|(_, visible): &(&VerifiedAuthenticatedObject, &bool)| **visible)
+            .map(
+                |(verified, _): (&VerifiedAuthenticatedObject, &bool)| ResolvedObject {
+                    object: verified.object.clone(),
+                    mode: verified.mode,
+                },
+            )
             .collect()
     }
 
@@ -227,6 +260,122 @@ pub(super) fn translate_authenticated_object_effects(
                 ));
             }
         }
+    }
+
+    if let Some((&object_id, _)) = effects_by_id.first_key_value() {
+        return Err(NodeCoreError::UndeclaredObjectEffect { object_id });
+    }
+    Ok(mutations)
+}
+
+/// Validates a fee-only object mutation for a deterministically trapped
+/// preinstalled-WASM call that still charges a fee.
+///
+/// This is a narrow, distinct relaxation of
+/// [`translate_authenticated_object_effects`]'s exact one-to-one
+/// declared-access/effect matching, used only when
+/// [`crate::TransactionalNodeTransition::rejected_with_fee_only_mutation`]
+/// constructed the transition. Unlike the normal path, a declared `Write`
+/// access outside `{payer, treasury}` is *expected* to have no effect (the
+/// trapped application's own effects were already discarded). Every check
+/// still fails closed:
+///
+/// * an effect for any object id other than `payer` or `treasury` is
+///   rejected as undeclared, even if it is otherwise a validly declared
+///   `Write` access;
+/// * a duplicate effect for the same id is rejected;
+/// * exactly one `Mutated` effect for `payer` and exactly one `Mutated`
+///   effect for `treasury` are required — a subset (only one of the two) or
+///   an empty effect list is rejected, never silently accepted as "nothing
+///   was charged here";
+/// * the verified input matching a supplied effect must be `AccessMode::Write`;
+/// * every matched mutation is independently revalidated through the same
+///   [`translate_update`] the normal path uses — never a loosened copy.
+pub(super) fn translate_fee_only_object_effects(
+    verified: &[VerifiedAuthenticatedObject],
+    effects: &[ObjectEffect],
+    payer: ObjectId,
+    treasury: ObjectId,
+    context: &TrustedObjectMutationContext<'_>,
+    loaded_body_bytes: usize,
+) -> Result<Vec<DurableObjectMutationEntry>, NodeCoreError> {
+    if effects.len() > 2 {
+        return Err(NodeCoreError::TooManyObjectEffects {
+            actual: effects.len(),
+            maximum: 2,
+        });
+    }
+    let mut effects_by_id: BTreeMap<ObjectId, &ObjectEffect> = BTreeMap::new();
+    for effect in effects {
+        let object_id: ObjectId = match effect {
+            ObjectEffect::Created(object) => {
+                return Err(NodeCoreError::ObjectCreationUnsupported {
+                    object_id: object.id,
+                });
+            }
+            ObjectEffect::Mutated { new_object, .. } => new_object.id,
+            ObjectEffect::Deleted { id, .. } => *id,
+        };
+        if object_id != payer && object_id != treasury {
+            return Err(NodeCoreError::UndeclaredObjectEffect { object_id });
+        }
+        if effects_by_id.insert(object_id, effect).is_some() {
+            return Err(NodeCoreError::DuplicateObjectEffect { object_id });
+        }
+    }
+    if !effects_by_id.contains_key(&payer) {
+        return Err(NodeCoreError::ObjectEffectMismatch {
+            object_id: payer,
+            reason: "fee-only mutation requires exactly one mutated effect for the payer",
+        });
+    }
+    if !effects_by_id.contains_key(&treasury) {
+        return Err(NodeCoreError::ObjectEffectMismatch {
+            object_id: treasury,
+            reason: "fee-only mutation requires exactly one mutated effect for the treasury",
+        });
+    }
+
+    let mut mutations: Vec<DurableObjectMutationEntry> = Vec::new();
+    let mut represented_body_bytes: usize = loaded_body_bytes;
+    for input in verified {
+        let object_id: ObjectId = input.object.id;
+        if object_id != payer && object_id != treasury {
+            continue;
+        }
+        let Some(effect) = effects_by_id.remove(&object_id) else {
+            // Already required present above; only reachable if `verified`
+            // named the same allowlisted id twice, which upstream
+            // authorization never produces.
+            return Err(NodeCoreError::ObjectEffectMismatch {
+                object_id,
+                reason: "fee-only mutation requires exactly one mutated effect",
+            });
+        };
+        if input.mode != AccessMode::Write {
+            return Err(NodeCoreError::ObjectEffectMismatch {
+                object_id,
+                reason: "fee-only mutation requires a Write access",
+            });
+        }
+        let ObjectEffect::Mutated {
+            previous_version,
+            new_object,
+        } = effect
+        else {
+            return Err(NodeCoreError::ObjectEffectMismatch {
+                object_id,
+                reason: "fee-only mutation requires exactly one mutated effect",
+            });
+        };
+        let mutation: DurableObjectMutation = translate_update(
+            input,
+            *previous_version,
+            new_object,
+            Some(context),
+            &mut represented_body_bytes,
+        )?;
+        mutations.push(DurableObjectMutationEntry::new(object_id, mutation));
     }
 
     if let Some((&object_id, _)) = effects_by_id.first_key_value() {
@@ -1018,6 +1167,329 @@ mod tests {
                 object_id: ObjectId::new([0x41; 32]),
                 previous_created_checkpoint: 18,
                 attempted_created_checkpoint: 17,
+            })
+        );
+    }
+
+    // ── translate_fee_only_object_effects (S3 fee-only allowlist) ──────────
+
+    fn fee_only_object(id_byte: u8, owner_byte: u8, data: Vec<u8>) -> Object {
+        Object {
+            id: ObjectId::new([id_byte; 32]),
+            version: 1,
+            owner: Owner::Address(Address::new([owner_byte; 32])),
+            type_hash: Digest32::new(HashAlgorithmId::Sha2_256, [0x70; 32]),
+            schema_version: 1,
+            data,
+        }
+    }
+
+    fn fee_only_context<'a>(
+        resolver: &'a HashSuiteResolver,
+        chain_id: &'a ChainId,
+    ) -> TrustedObjectMutationContext<'a> {
+        TrustedObjectMutationContext {
+            resolver,
+            chain_id,
+            protocol_version: ProtocolVersion::new(1),
+            epoch: Epoch::new(0),
+            created_checkpoint: 1,
+        }
+    }
+
+    #[test]
+    fn fee_only_translates_payer_and_treasury_mutations() {
+        let payer = fee_only_object(0x81, 0x82, vec![0x01]);
+        let treasury = fee_only_object(0x83, 0x84, vec![0x02]);
+        let mut payer_next = payer.clone();
+        payer_next.version = 2;
+        payer_next.data = vec![0x11];
+        let mut treasury_next = treasury.clone();
+        treasury_next.version = 2;
+        treasury_next.data = vec![0x22];
+        let resolver = resolver();
+        let chain_id = ChainId::new("sunrise-mvp").unwrap();
+        let context = fee_only_context(&resolver, &chain_id);
+
+        let mutations = translate_fee_only_object_effects(
+            &[
+                verified(AccessMode::Write, payer.clone()),
+                verified(AccessMode::Write, treasury.clone()),
+            ],
+            &[
+                ObjectEffect::Mutated {
+                    previous_version: 1,
+                    new_object: payer_next,
+                },
+                ObjectEffect::Mutated {
+                    previous_version: 1,
+                    new_object: treasury_next,
+                },
+            ],
+            payer.id,
+            treasury.id,
+            &context,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(mutations.len(), 2);
+    }
+
+    #[test]
+    fn fee_only_ignores_non_allowlisted_declared_access_without_effect() {
+        let payer = fee_only_object(0x85, 0x86, vec![0x01]);
+        let treasury = fee_only_object(0x87, 0x88, vec![0x02]);
+        let untouched = fee_only_object(0x89, 0x8A, vec![0x03]);
+        let mut payer_next = payer.clone();
+        payer_next.version = 2;
+        payer_next.data = vec![0x11];
+        let mut treasury_next = treasury.clone();
+        treasury_next.version = 2;
+        treasury_next.data = vec![0x22];
+        let resolver = resolver();
+        let chain_id = ChainId::new("sunrise-mvp").unwrap();
+        let context = fee_only_context(&resolver, &chain_id);
+
+        let mutations = translate_fee_only_object_effects(
+            &[
+                verified(AccessMode::Write, payer.clone()),
+                verified(AccessMode::Write, untouched),
+                verified(AccessMode::Write, treasury.clone()),
+            ],
+            &[
+                ObjectEffect::Mutated {
+                    previous_version: 1,
+                    new_object: payer_next,
+                },
+                ObjectEffect::Mutated {
+                    previous_version: 1,
+                    new_object: treasury_next,
+                },
+            ],
+            payer.id,
+            treasury.id,
+            &context,
+            0,
+        )
+        .unwrap();
+
+        // Both the payer and treasury (the only two ids this mode ever
+        // charges) produced effects; the untouched declared Write access
+        // outside the allowlist is legitimately absent from the result.
+        assert_eq!(mutations.len(), 2);
+    }
+
+    #[test]
+    fn fee_only_rejects_missing_payer_effect() {
+        let payer = fee_only_object(0xA1, 0xA2, vec![0x01]);
+        let treasury = fee_only_object(0xA3, 0xA4, vec![0x02]);
+        let mut treasury_next = treasury.clone();
+        treasury_next.version = 2;
+        treasury_next.data = vec![0x22];
+        let resolver = resolver();
+        let chain_id = ChainId::new("sunrise-mvp").unwrap();
+        let context = fee_only_context(&resolver, &chain_id);
+
+        assert_eq!(
+            translate_fee_only_object_effects(
+                &[
+                    verified(AccessMode::Write, payer.clone()),
+                    verified(AccessMode::Write, treasury.clone()),
+                ],
+                &[ObjectEffect::Mutated {
+                    previous_version: 1,
+                    new_object: treasury_next,
+                }],
+                payer.id,
+                treasury.id,
+                &context,
+                0,
+            ),
+            Err(NodeCoreError::ObjectEffectMismatch {
+                object_id: payer.id,
+                reason: "fee-only mutation requires exactly one mutated effect for the payer",
+            })
+        );
+    }
+
+    #[test]
+    fn fee_only_rejects_missing_treasury_effect() {
+        let payer = fee_only_object(0xA5, 0xA6, vec![0x01]);
+        let treasury = fee_only_object(0xA7, 0xA8, vec![0x02]);
+        let mut payer_next = payer.clone();
+        payer_next.version = 2;
+        payer_next.data = vec![0x11];
+        let resolver = resolver();
+        let chain_id = ChainId::new("sunrise-mvp").unwrap();
+        let context = fee_only_context(&resolver, &chain_id);
+
+        assert_eq!(
+            translate_fee_only_object_effects(
+                &[
+                    verified(AccessMode::Write, payer.clone()),
+                    verified(AccessMode::Write, treasury.clone()),
+                ],
+                &[ObjectEffect::Mutated {
+                    previous_version: 1,
+                    new_object: payer_next,
+                }],
+                payer.id,
+                treasury.id,
+                &context,
+                0,
+            ),
+            Err(NodeCoreError::ObjectEffectMismatch {
+                object_id: treasury.id,
+                reason: "fee-only mutation requires exactly one mutated effect for the treasury",
+            })
+        );
+    }
+
+    #[test]
+    fn fee_only_rejects_empty_effects() {
+        let payer = fee_only_object(0xA9, 0xAA, vec![0x01]);
+        let treasury = fee_only_object(0xAB, 0xAC, vec![0x02]);
+        let resolver = resolver();
+        let chain_id = ChainId::new("sunrise-mvp").unwrap();
+        let context = fee_only_context(&resolver, &chain_id);
+
+        assert_eq!(
+            translate_fee_only_object_effects(
+                &[
+                    verified(AccessMode::Write, payer.clone()),
+                    verified(AccessMode::Write, treasury.clone()),
+                ],
+                &[],
+                payer.id,
+                treasury.id,
+                &context,
+                0,
+            ),
+            Err(NodeCoreError::ObjectEffectMismatch {
+                object_id: payer.id,
+                reason: "fee-only mutation requires exactly one mutated effect for the payer",
+            })
+        );
+    }
+
+    #[test]
+    fn fee_only_rejects_effect_outside_the_two_id_allowlist() {
+        let payer = fee_only_object(0x8B, 0x8C, vec![0x01]);
+        let treasury = fee_only_object(0x8D, 0x8E, vec![0x02]);
+        let outsider = fee_only_object(0x8F, 0x90, vec![0x04]);
+        let mut outsider_next = outsider.clone();
+        outsider_next.version = 2;
+        let resolver = resolver();
+        let chain_id = ChainId::new("sunrise-mvp").unwrap();
+        let context = fee_only_context(&resolver, &chain_id);
+
+        assert!(matches!(
+            translate_fee_only_object_effects(
+                &[verified(AccessMode::Write, outsider.clone())],
+                &[ObjectEffect::Mutated {
+                    previous_version: 1,
+                    new_object: outsider_next,
+                }],
+                payer.id,
+                treasury.id,
+                &context,
+                0,
+            ),
+            Err(NodeCoreError::UndeclaredObjectEffect { object_id }) if object_id == outsider.id
+        ));
+    }
+
+    #[test]
+    fn fee_only_rejects_duplicate_effect_for_the_same_id() {
+        let payer = fee_only_object(0x91, 0x92, vec![0x01]);
+        let treasury = fee_only_object(0x93, 0x94, vec![0x02]);
+        let payer_id = payer.id;
+        let mut payer_next = payer.clone();
+        payer_next.version = 2;
+        let resolver = resolver();
+        let chain_id = ChainId::new("sunrise-mvp").unwrap();
+        let context = fee_only_context(&resolver, &chain_id);
+        let duplicate_effect = ObjectEffect::Mutated {
+            previous_version: 1,
+            new_object: payer_next,
+        };
+
+        assert!(matches!(
+            translate_fee_only_object_effects(
+                &[verified(AccessMode::Write, payer)],
+                &[duplicate_effect.clone(), duplicate_effect],
+                payer_id,
+                treasury.id,
+                &context,
+                0,
+            ),
+            Err(NodeCoreError::DuplicateObjectEffect { .. })
+        ));
+    }
+
+    #[test]
+    fn fee_only_rejects_non_write_verified_access() {
+        let payer = fee_only_object(0x95, 0x96, vec![0x01]);
+        let treasury = fee_only_object(0x97, 0x98, vec![0x02]);
+        let mut payer_next = payer.clone();
+        payer_next.version = 2;
+        let resolver = resolver();
+        let chain_id = ChainId::new("sunrise-mvp").unwrap();
+        let context = fee_only_context(&resolver, &chain_id);
+
+        assert!(matches!(
+            translate_fee_only_object_effects(
+                &[verified(AccessMode::Read, payer.clone())],
+                &[ObjectEffect::Mutated {
+                    previous_version: 1,
+                    new_object: payer_next,
+                }],
+                payer.id,
+                treasury.id,
+                &context,
+                0,
+            ),
+            Err(NodeCoreError::ObjectEffectMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn fee_only_bounds_effect_count_at_two() {
+        let payer = fee_only_object(0x99, 0x9A, vec![0x01]);
+        let treasury = fee_only_object(0x9B, 0x9C, vec![0x02]);
+        let extra = fee_only_object(0x9D, 0x9E, vec![0x03]);
+        let resolver = resolver();
+        let chain_id = ChainId::new("sunrise-mvp").unwrap();
+        let context = fee_only_context(&resolver, &chain_id);
+        let mut extra_next = extra.clone();
+        extra_next.version = 2;
+
+        assert_eq!(
+            translate_fee_only_object_effects(
+                &[],
+                &[
+                    ObjectEffect::Deleted {
+                        id: payer.id,
+                        version: 1
+                    },
+                    ObjectEffect::Deleted {
+                        id: treasury.id,
+                        version: 1
+                    },
+                    ObjectEffect::Mutated {
+                        previous_version: 1,
+                        new_object: extra_next,
+                    },
+                ],
+                payer.id,
+                treasury.id,
+                &context,
+                0,
+            ),
+            Err(NodeCoreError::TooManyObjectEffects {
+                actual: 3,
+                maximum: 2,
             })
         );
     }

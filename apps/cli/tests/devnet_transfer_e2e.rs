@@ -20,10 +20,10 @@ use std::time::Duration;
 use runtime::{Clock, DurableOperationContext, StorageCorrelationId, StorageDeadline, SystemClock};
 use sunrise_edge_client::{Client, LoopbackHttpTransport, ObjectId, decode_object};
 use sunrise_edge_devnet::{
-    ASSET_ACCOUNT_WASM, AssetAccount, DevOwner, DevnetConfig, boot_local_store, build_asset_module,
-    build_devnet_protocol_context, compose_devnet_router, decode_asset_account,
+    ASSET_ACCOUNT_WASM, AssetAccount, DEVNET_ASSET_ID, DevOwner, DevnetConfig, boot_local_store,
+    build_asset_module, build_devnet_protocol_context, compose_devnet_router, decode_asset_account,
     genesis::{DEVNET_DOMAIN_BYTES, DEVNET_PROTOCOL_VERSION},
-    seed_asset_accounts,
+    seed_asset_accounts, verify_seeded_asset_supply,
 };
 
 const INITIAL_SOURCE_BALANCE: u64 = 1_000_000;
@@ -90,19 +90,29 @@ fn hex32(bytes: &[u8; 32]) -> String {
 fn query_asset_account(
     client: &Client<LoopbackHttpTransport>,
     object_id: ObjectId,
-) -> AssetAccount {
+) -> (sunrise_edge_client::ObjectRef, AssetAccount) {
     let result = client
         .query_object(object_id)
         .expect("object query should succeed");
     match result {
         sunrise_edge_client::HttpObjectQueryResult::CurrentInline {
+            object_version,
+            digest,
             canonical_object_bytes,
             ..
         } => {
             let object =
                 decode_object(&canonical_object_bytes).expect("canonical object should decode");
-            decode_asset_account(&object.data)
-                .expect("object body should decode as an asset account")
+            let account = decode_asset_account(&object.data)
+                .expect("object body should decode as an asset account");
+            (
+                sunrise_edge_client::ObjectRef {
+                    id: object_id,
+                    version: object_version.get(),
+                    digest,
+                },
+                account,
+            )
         }
         other => panic!("expected object {object_id} to be CurrentInline, got {other:?}"),
     }
@@ -126,6 +136,8 @@ async fn cli_transfer_command_moves_balance_through_the_real_devnet_router_over_
         OsString::from("11"),
         OsString::from("--dev-owner"),
         OsString::from(owner_address.to_string()),
+        OsString::from("--fee-treasury-owner"),
+        OsString::from("6b".repeat(32)),
         OsString::from("--max-concurrent"),
         OsString::from("4"),
     ])
@@ -152,9 +164,25 @@ async fn cli_transfer_command_moves_balance_through_the_real_devnet_router_over_
         &seed_context,
     )
     .unwrap();
+    let treasury_context = DurableOperationContext::new(
+        boot_generation,
+        seed_deadline,
+        StorageCorrelationId::new([0x78; 16]).unwrap(),
+    );
+    let treasury_outcome = seed_asset_accounts(
+        boot.store(),
+        module.resolver(),
+        config.epoch(),
+        config.fee_treasury_owner(),
+        boot_generation,
+        &treasury_context,
+    )
+    .unwrap();
+    verify_seeded_asset_supply(&[seed_outcome.clone(), treasury_outcome.clone()]).unwrap();
     let accounts = seed_outcome.accounts();
     let source_id = accounts.source().id;
     let destination_id = accounts.destination().id;
+    let treasury_id = treasury_outcome.accounts().destination().id;
     let module_ref = module.module_ref().clone();
 
     let router = compose_devnet_router(
@@ -162,7 +190,8 @@ async fn cli_transfer_command_moves_balance_through_the_real_devnet_router_over_
         module,
         boot_generation,
         config.max_concurrent(),
-        config.dev_owners().len(),
+        2,
+        treasury_id,
     )
     .unwrap();
 
@@ -194,12 +223,17 @@ async fn cli_transfer_command_moves_balance_through_the_real_devnet_router_over_
         .unwrap();
         let verify_client = Client::new(verify_transport);
 
-        let source_before = query_asset_account(&verify_client, source_id);
-        let destination_before = query_asset_account(&verify_client, destination_id);
+        let (source_ref_before, source_before) = query_asset_account(&verify_client, source_id);
+        let (destination_ref_before, destination_before) =
+            query_asset_account(&verify_client, destination_id);
+        let (treasury_ref_before, treasury_before) =
+            query_asset_account(&verify_client, treasury_id);
         assert_eq!(source_before.balance, INITIAL_SOURCE_BALANCE);
         assert_eq!(destination_before.balance, 0);
         assert_eq!(source_before.sequence, 0);
         assert_eq!(destination_before.sequence, 0);
+        assert_eq!(treasury_before.balance, 0);
+        assert_eq!(treasury_before.sequence, 0);
 
         sunrise_edge_cli::run(vec![
             OsString::from("transfer"),
@@ -225,6 +259,12 @@ async fn cli_transfer_command_moves_balance_through_the_real_devnet_router_over_
             OsString::from(TRANSFER_AMOUNT.to_string()),
             OsString::from("--gas-limit"),
             OsString::from("1000000"),
+            OsString::from("--fee-asset-id"),
+            OsString::from(hex32(DEVNET_ASSET_ID.as_bytes())),
+            OsString::from("--max-fee"),
+            OsString::from("1000001"),
+            OsString::from("--fee-treasury-object"),
+            OsString::from(treasury_id.to_string()),
             OsString::from("--request-id"),
             OsString::from("50".repeat(32)),
             OsString::from("--expected-chain-id"),
@@ -262,15 +302,18 @@ async fn cli_transfer_command_moves_balance_through_the_real_devnet_router_over_
         // after the transfer and prove the exact expected balance movement,
         // sequence advancement, and conservation — not merely that the
         // commands above returned success.
-        let source_after = query_asset_account(&verify_client, source_id);
-        let destination_after = query_asset_account(&verify_client, destination_id);
+        let (source_ref_after, source_after) = query_asset_account(&verify_client, source_id);
+        let (destination_ref_after, destination_after) =
+            query_asset_account(&verify_client, destination_id);
+        let (treasury_ref_after, treasury_after) = query_asset_account(&verify_client, treasury_id);
+        let charged_fee = treasury_after.balance - treasury_before.balance;
 
         assert_eq!(source_after.asset_id, source_before.asset_id);
         assert_eq!(destination_after.asset_id, destination_before.asset_id);
         assert_eq!(
             source_after.balance,
-            source_before.balance - TRANSFER_AMOUNT,
-            "source balance should decrease by exactly the transferred amount"
+            source_before.balance - TRANSFER_AMOUNT - charged_fee,
+            "source balance should decrease by the transfer and actual fee"
         );
         assert_eq!(
             destination_after.balance,
@@ -279,8 +322,8 @@ async fn cli_transfer_command_moves_balance_through_the_real_devnet_router_over_
         );
         assert_eq!(
             source_after.sequence,
-            source_before.sequence + 1,
-            "source sequence should advance by exactly one"
+            source_before.sequence + 2,
+            "application transfer and fee composition each advance the source body sequence"
         );
         assert_eq!(
             destination_after.sequence,
@@ -288,9 +331,25 @@ async fn cli_transfer_command_moves_balance_through_the_real_devnet_router_over_
             "destination sequence should advance by exactly one"
         );
         assert_eq!(
-            source_after.balance + destination_after.balance,
-            source_before.balance + destination_before.balance,
-            "combined balance must be conserved across the transfer"
+            treasury_after.sequence,
+            treasury_before.sequence + 1,
+            "treasury sequence should advance by exactly one"
+        );
+        assert_eq!(source_ref_after.version, source_ref_before.version + 1);
+        assert_eq!(
+            destination_ref_after.version,
+            destination_ref_before.version + 1
+        );
+        assert_eq!(treasury_ref_after.version, treasury_ref_before.version + 1);
+        assert!(charged_fee > 1, "execution must add a non-zero metered fee");
+        assert!(
+            charged_fee < 1_000_001,
+            "successful execution must charge actual gas, not the gas limit"
+        );
+        assert_eq!(
+            source_after.balance + destination_after.balance + treasury_after.balance,
+            source_before.balance + destination_before.balance + treasury_before.balance,
+            "the ordinary asset must be conserved across transfer and fee settlement"
         );
     })
     .await

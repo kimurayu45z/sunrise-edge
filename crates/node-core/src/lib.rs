@@ -40,12 +40,14 @@ use std::error::Error;
 use system_modules::{ModuleId, SystemModule, SystemModuleError};
 
 mod authenticated_object_effects;
+pub mod fee_effects;
 mod preinstalled_wasm;
 mod query;
 pub mod transaction_auth;
 
 use authenticated_object_effects::{
     LoadedAuthenticatedObjects, translate_authenticated_object_effects,
+    translate_fee_only_object_effects,
 };
 use preinstalled_wasm::{
     check_preinstalled_module_gas_limit, normalize_trapped_preinstalled_execution,
@@ -53,6 +55,10 @@ use preinstalled_wasm::{
 };
 
 pub use execution::{ObjectEffect, ResolvedObject};
+pub use fee_effects::{
+    CommittedFeePolicy, FeeChargeBodies, FeeChargeRequest, FeeCompositionError, FeeEffectComposer,
+    PreinstalledFeeComposition,
+};
 pub use preinstalled_wasm::{
     MAX_PREINSTALLED_MODULE_GAS_LIMIT, MAX_PREINSTALLED_MODULE_WASM_BYTES,
     MAX_PREINSTALLED_MODULES, MAX_PREINSTALLED_OBJECT_ACCESS_POLICIES,
@@ -605,6 +611,45 @@ pub enum NodeCoreError {
         /// Declared access mode.
         mode: AccessMode,
     },
+    /// The committed schedule requires a non-zero fee at the worst-case
+    /// `gas_limit`, but the transaction declared no `fee_payment`.
+    FeePaymentRequired,
+    /// The transaction declared a `fee_payment` on a fee-aware preinstalled-
+    /// WASM invocation, but the committed schedule's worst-case fee at
+    /// `gas_limit` is zero. Historical fee-free behavior applies only to a
+    /// transaction that declares no `fee_payment` and no treasury access, so
+    /// this is rejected rather than silently settling a zero-amount charge.
+    FeePaymentNotRequired,
+    /// A `fee_payment` was declared on a node-core entrypoint that has no
+    /// fee-charging composition wired.
+    FeePaymentUnsupportedOnPath,
+    /// The declared `fee_payment` failed deterministic settlement against
+    /// the committed schedule and fee-asset registry.
+    FeePaymentRejected(fees::FeeError),
+    /// `fee_payment.fee_object` did not exactly match one declared `Write`
+    /// access.
+    FeeObjectNotDeclaredWrite,
+    /// The fee object's verified owner is not the authenticated sender.
+    FeeObjectNotOwnedBySender,
+    /// `fee_payment.fee_object` named the trusted composition's treasury
+    /// object.
+    FeeObjectIsTreasury,
+    /// The trusted composition's treasury object was not declared exactly
+    /// once, as the final `Write` access, exactly when a fee is due.
+    FeeTreasuryAccessMisdeclared,
+    /// This preinstalled-WASM invocation requires fee composition, but none
+    /// was supplied by trusted node composition.
+    FeeCompositionUnavailable,
+    /// The trusted fee-effect composer rejected the settlement.
+    FeeCompositionFailed(FeeCompositionError),
+    /// The fee-effect composer returned the payer body, the treasury body,
+    /// or both unchanged for a non-zero settled amount. A non-zero charge
+    /// must always change both bodies.
+    FeeCompositionNoOp,
+    /// A fee was admitted as due at the worst-case `gas_limit` but settled to
+    /// exactly zero at the actual `gas_used`, leaving a declared treasury
+    /// `Write` access with no economically justified mutation.
+    FeeAmountZero,
 }
 
 impl fmt::Display for NodeCoreError {
@@ -1008,6 +1053,38 @@ impl fmt::Display for NodeCoreError {
                 f,
                 "preinstalled object-access policy declared unsupported access mode {mode:?}, only Write is authorized"
             ),
+            Self::FeePaymentRequired => f.write_str(
+                "committed fee schedule requires a non-zero worst-case fee, but no fee_payment was declared",
+            ),
+            Self::FeePaymentNotRequired => f.write_str(
+                "fee_payment was declared but the committed worst-case fee at gas_limit is zero",
+            ),
+            Self::FeePaymentUnsupportedOnPath => {
+                f.write_str("fee_payment is not supported on this node-core entrypoint")
+            }
+            Self::FeePaymentRejected(error) => write!(f, "fee payment settlement failed: {error}"),
+            Self::FeeObjectNotDeclaredWrite => f.write_str(
+                "fee_payment.fee_object did not exactly match a declared Write access",
+            ),
+            Self::FeeObjectNotOwnedBySender => {
+                f.write_str("fee object's verified owner is not the authenticated sender")
+            }
+            Self::FeeObjectIsTreasury => {
+                f.write_str("fee_payment.fee_object must not be the trusted composition treasury")
+            }
+            Self::FeeTreasuryAccessMisdeclared => f.write_str(
+                "trusted composition treasury object must be declared exactly once, as the final Write access, exactly when a fee is due",
+            ),
+            Self::FeeCompositionUnavailable => f.write_str(
+                "a fee is due but no trusted fee-effect composition was supplied",
+            ),
+            Self::FeeCompositionFailed(error) => write!(f, "fee composition failed: {error}"),
+            Self::FeeCompositionNoOp => f.write_str(
+                "fee composition returned the payer body, the treasury body, or both unchanged for a non-zero settled amount",
+            ),
+            Self::FeeAmountZero => f.write_str(
+                "fee settled to zero at actual gas_used with a declared treasury access",
+            ),
         }
     }
 }
@@ -1025,6 +1102,8 @@ impl Error for NodeCoreError {
             Self::TransactionAuth(error) => Some(error),
             Self::SystemModules(error) => Some(error),
             Self::Execution(error) => Some(error),
+            Self::FeePaymentRejected(error) => Some(error),
+            Self::FeeCompositionFailed(error) => Some(error),
             _ => None,
         }
     }
@@ -1383,6 +1462,7 @@ pub struct AuthenticatedSubmitTransaction {
     transaction: AuthenticatedTransaction,
     placement: DomainPlacementManifest,
     committed_system_module: Option<SystemModule>,
+    committed_fee_policy: CommittedFeePolicy,
 }
 
 impl AuthenticatedSubmitTransaction {
@@ -1438,12 +1518,17 @@ pub fn authenticate_submit_transaction_event(
         .domain_placement
         .clone()
         .ok_or(ProtocolConfigError::MissingDomainPlacement)?;
+    let committed_fee_policy = CommittedFeePolicy {
+        gas_schedule: protocol_config.gas_schedule.clone(),
+        fee_assets: protocol_config.fee_assets.clone(),
+    };
 
     Ok(AuthenticatedSubmitTransaction {
         event,
         transaction,
         placement,
         committed_system_module,
+        committed_fee_policy,
     })
 }
 
@@ -2332,17 +2417,39 @@ impl NodeStateUpdate {
     }
 }
 
+/// How a [`TransactionalNodeTransition`]'s `object_effects` relate to the
+/// signed manifest's declared `Write`/`Consume` accesses.
+///
+/// [`Self::Exact`] is the default and only publicly constructible mode: an
+/// exact one-to-one match between every declared access and a returned
+/// effect. The other two modes are narrow, `pub(crate)`-only escape hatches
+/// used exclusively by the preinstalled-WASM composition, never by a caller
+/// that is simply missing an effect it should have produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ObjectEffectMatching {
+    /// Every declared `Write`/`Consume` access must have exactly one
+    /// matching effect.
+    Exact,
+    /// A trapped call with no fee due: every declared access must have no
+    /// effect at all, regardless of its mode.
+    RejectedNoMutation,
+    /// A trapped call that still charges a fee: only `payer` and `treasury`
+    /// may have an effect; every other declared access must have none.
+    RejectedFeeOnly {
+        /// The sender-owned object the fee was debited from.
+        payer: ObjectId,
+        /// The trusted composition treasury the fee was credited to.
+        treasury: ObjectId,
+    },
+}
+
 /// Candidate multi-key transition and outputs held until atomic commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransactionalNodeTransition {
     updates: Vec<NodeStateUpdate>,
     object_effects: Vec<ObjectEffect>,
     output: NodeOutput,
-    /// `true` only for [`Self::rejected_with_no_object_mutation`]. Every
-    /// other constructor leaves this `false`, preserving the existing rule
-    /// that a declared `Write`/`Consume` access with no matching effect is a
-    /// fail-closed [`NodeCoreError::ObjectEffectMismatch`].
-    bypass_object_effect_matching: bool,
+    object_effect_matching: ObjectEffectMatching,
 }
 
 impl TransactionalNodeTransition {
@@ -2368,7 +2475,7 @@ impl TransactionalNodeTransition {
             updates,
             object_effects: Vec::new(),
             output,
-            bypass_object_effect_matching: false,
+            object_effect_matching: ObjectEffectMatching::Exact,
         })
     }
 
@@ -2408,7 +2515,7 @@ impl TransactionalNodeTransition {
             updates,
             object_effects,
             output,
-            bypass_object_effect_matching: false,
+            object_effect_matching: ObjectEffectMatching::Exact,
         })
     }
 
@@ -2424,7 +2531,7 @@ impl TransactionalNodeTransition {
             updates: Vec::new(),
             object_effects: Vec::new(),
             output,
-            bypass_object_effect_matching: false,
+            object_effect_matching: ObjectEffectMatching::Exact,
         }
     }
 
@@ -2451,7 +2558,35 @@ impl TransactionalNodeTransition {
             updates: Vec::new(),
             object_effects: Vec::new(),
             output,
-            bypass_object_effect_matching: true,
+            object_effect_matching: ObjectEffectMatching::RejectedNoMutation,
+        }
+    }
+
+    /// Creates a transition for a deterministically rejected (trapped) call
+    /// that still charges a fee.
+    ///
+    /// A distinct, narrower escape hatch than
+    /// [`Self::rejected_with_no_object_mutation`]: exactly `payer` and
+    /// `treasury` may be mutated, and every other declared `Write`/`Consume`
+    /// access must have no effect, matching the trapped application's own
+    /// effects being discarded. Constructed only by `PreinstalledWasmMachine`
+    /// after independently computing the fee from the committed, normalized
+    /// `gas_used` and composing it over the loaded (pre-execution) bodies —
+    /// never by a caller simply missing an effect it should have produced.
+    /// The normal exact-matching path ([`ObjectEffectMatching::Exact`]) is
+    /// completely unaffected by this mode's existence.
+    #[must_use]
+    pub(crate) fn rejected_with_fee_only_mutation(
+        output: NodeOutput,
+        object_effects: Vec<ObjectEffect>,
+        payer: ObjectId,
+        treasury: ObjectId,
+    ) -> Self {
+        Self {
+            updates: Vec::new(),
+            object_effects,
+            output,
+            object_effect_matching: ObjectEffectMatching::RejectedFeeOnly { payer, treasury },
         }
     }
 
@@ -2474,10 +2609,11 @@ impl TransactionalNodeTransition {
         &self.object_effects
     }
 
-    /// Returns `true` only for [`Self::rejected_with_no_object_mutation`].
+    /// Returns how this transition's `object_effects` relate to the signed
+    /// manifest's declared accesses.
     #[must_use]
-    const fn bypasses_object_effect_matching(&self) -> bool {
-        self.bypass_object_effect_matching
+    const fn effect_matching(&self) -> &ObjectEffectMatching {
+        &self.object_effect_matching
     }
 }
 
@@ -3073,7 +3209,21 @@ struct PreinstalledWasmMachine<'a> {
     registered_module: Option<&'a SystemModule>,
     catalog: &'a PreinstalledModuleCatalog,
     engine: &'a WasmExecutionEngine,
+    /// Committed `GasSchedule`/`FeeAssetRegistry`, captured at authentication
+    /// time from the same committed `ProtocolConfig` as `registered_module`.
+    fee_policy: &'a CommittedFeePolicy,
+    /// Trusted node composition's fee-charging capability, if this
+    /// deployment wires one. `None` preserves byte-identical historical
+    /// behavior: no admission check, no engine-input exclusion, no charge.
+    fee_composition: Option<PreinstalledFeeComposition<'a>>,
     resolved_module: std::cell::OnceCell<&'a PreinstalledModuleCatalogEntry>,
+    /// The verified, loaded treasury object, populated by the durable
+    /// handler (never by this machine) immediately after object load and
+    /// strictly before `transition` runs, so `transition` can compose and
+    /// merge a fee charge over a body the execution engine itself never
+    /// receives (see `load_and_authorize_objects`'s engine-visibility
+    /// exclusion).
+    treasury_object: std::cell::OnceCell<Object>,
 }
 
 impl<'a> PreinstalledWasmMachine<'a> {
@@ -3099,6 +3249,302 @@ impl<'a> PreinstalledWasmMachine<'a> {
             NodeCoreError::PersistenceInvariant("preinstalled module resolved twice")
         })?;
         Ok(module)
+    }
+
+    /// Deterministic worst-case fee at `gas_limit` under the committed
+    /// schedule. Monotonic in `execution_units`, so a settlement that
+    /// succeeds here always bounds the actual post-execution charge.
+    fn worst_case_fee_units(&self) -> Result<fees::Amount, NodeCoreError> {
+        fees::calculate_fee(
+            &fees::FeeUsage {
+                execution_units: self.transaction.gas_limit,
+                ..Default::default()
+            },
+            &self.fee_policy.gas_schedule,
+        )
+        .map_err(NodeCoreError::FeePaymentRejected)
+    }
+
+    /// Pre-execution, fail-closed, zero-I/O-beyond-already-loaded admission.
+    ///
+    /// Returns `None` when this deployment wires no fee composition and the
+    /// committed schedule's worst-case fee at `gas_limit` is zero and the
+    /// transaction declares no `fee_payment`, or when a fee composition is
+    /// wired but the worst-case fee is zero and the transaction declares no
+    /// treasury access and no `fee_payment` — both byte-identical to
+    /// historical fee-free behavior. A declared `fee_payment` against a zero
+    /// worst-case fee is rejected ([`NodeCoreError::FeePaymentNotRequired`])
+    /// rather than silently ignored, and — when this deployment wires no fee
+    /// composition at all — a declared `fee_payment` is rejected
+    /// ([`NodeCoreError::FeePaymentUnsupportedOnPath`]) while a non-zero
+    /// committed worst-case fee with no declared `fee_payment` is rejected
+    /// ([`NodeCoreError::FeeCompositionUnavailable`]): this call is only
+    /// reached once `transition` actually runs a non-replayed invocation, so
+    /// neither check ever affects exact-replay short-circuiting. Otherwise
+    /// returns the exact declared `fee_payment`, the verified sender-owned
+    /// fee object id, and the trusted treasury id, after enforcing every
+    /// invariant in `ARCHITECTURE.md`'s fee lifecycle section: the treasury
+    /// is the final declared `Write` access, present exactly when a fee is
+    /// due; the fee object is a distinct declared `Write` access owned by
+    /// the sender; and the worst-case settlement (at `gas_limit`) succeeds
+    /// against the signed `max_fee`, so a later post-execution settlement at
+    /// the lower actual `gas_used` can never fail from insufficient
+    /// authorization.
+    fn admit_fee(
+        &self,
+        state: &NodeStateSnapshot,
+    ) -> Result<Option<(&'a fees::FeePayment, ObjectId, ObjectId)>, NodeCoreError> {
+        let Some(composition) = &self.fee_composition else {
+            // No fee-charging composition is wired for this deployment. A
+            // declared `fee_payment` can never be settled without one, and a
+            // committed non-zero worst-case fee can never be collected
+            // without one either — both must fail closed rather than
+            // silently admitting the transaction as fee-free. Historical
+            // fee-free behavior is preserved only for the zero-schedule,
+            // no-`fee_payment` case.
+            if self.transaction.fee_payment.is_some() {
+                return Err(NodeCoreError::FeePaymentUnsupportedOnPath);
+            }
+            if self.worst_case_fee_units()?.get() > 0 {
+                return Err(NodeCoreError::FeeCompositionUnavailable);
+            }
+            return Ok(None);
+        };
+        let treasury_id = composition.treasury_object_id;
+        let entries = &self.transaction.access_manifest.entries;
+        let treasury_declared_anywhere = entries
+            .iter()
+            .any(|entry| entry.object_ref.id == treasury_id);
+        let fee_required = self.worst_case_fee_units()?.get() > 0;
+
+        if !fee_required {
+            if treasury_declared_anywhere {
+                return Err(NodeCoreError::FeeTreasuryAccessMisdeclared);
+            }
+            // Historical fee-free behavior (`Ok(None)`, no admission check,
+            // no engine-input exclusion, no charge) is preserved only when
+            // the transaction also declares no `fee_payment`: a declared
+            // `fee_payment` against a zero worst-case fee can never be
+            // legitimately settled, so it must fail closed here rather than
+            // being silently ignored.
+            if self.transaction.fee_payment.is_some() {
+                return Err(NodeCoreError::FeePaymentNotRequired);
+            }
+            return Ok(None);
+        }
+
+        let fee_payment = self
+            .transaction
+            .fee_payment
+            .as_ref()
+            .ok_or(NodeCoreError::FeePaymentRequired)?;
+        let treasury_is_final_write = entries.last().is_some_and(|entry| {
+            entry.object_ref.id == treasury_id && entry.mode == AccessMode::Write
+        });
+        if !treasury_is_final_write {
+            return Err(NodeCoreError::FeeTreasuryAccessMisdeclared);
+        }
+        if fee_payment.fee_object.id == treasury_id {
+            return Err(NodeCoreError::FeeObjectIsTreasury);
+        }
+        let fee_object_id = entries
+            .iter()
+            .find(|entry| {
+                entry.object_ref == fee_payment.fee_object && entry.mode == AccessMode::Write
+            })
+            .map(|entry| entry.object_ref.id)
+            .ok_or(NodeCoreError::FeeObjectNotDeclaredWrite)?;
+        let fee_object = state
+            .resolved_objects()
+            .iter()
+            .find(|resolved| resolved.object.id == fee_object_id)
+            .map(|resolved| resolved.object.owner.clone())
+            .ok_or(NodeCoreError::FeeObjectNotDeclaredWrite)?;
+        if fee_object != Owner::Address(self.transaction.sender) {
+            return Err(NodeCoreError::FeeObjectNotOwnedBySender);
+        }
+        let worst_case = self.worst_case_fee_units()?;
+        fees::settle_fee_payment(&self.fee_policy.fee_assets, fee_payment, worst_case)
+            .map_err(NodeCoreError::FeePaymentRejected)?;
+
+        Ok(Some((fee_payment, fee_object_id, treasury_id)))
+    }
+
+    /// Deterministic post-execution fee at the exact committed `gas_used`.
+    fn settle_actual_fee(
+        &self,
+        fee_payment: &fees::FeePayment,
+        gas_used: u64,
+    ) -> Result<fees::Amount, NodeCoreError> {
+        let fee_units = fees::calculate_fee(
+            &fees::FeeUsage {
+                execution_units: gas_used,
+                ..Default::default()
+            },
+            &self.fee_policy.gas_schedule,
+        )
+        .map_err(NodeCoreError::FeePaymentRejected)?;
+        fees::settle_fee_payment(&self.fee_policy.fee_assets, fee_payment, fee_units)
+            .map_err(NodeCoreError::FeePaymentRejected)
+    }
+
+    /// Composes and merges one settled fee charge into `application_effects`.
+    ///
+    /// Node-core, not the composer, builds every returned
+    /// [`ObjectEffect::Mutated`]: identity, version (+1 from the verified
+    /// loaded object), owner, type, and schema come from node-core's own
+    /// verified state, never from the composer's opaque bytes. When
+    /// `application_effects` already contains a `Mutated` effect for
+    /// `fee_object_id` (the success path, `fee_object` may equal an
+    /// application-mutated object), its `.data` is overwritten in place —
+    /// one effect, one version bump — instead of inserting a second effect
+    /// for the same id. The treasury never appears in
+    /// `application_effects` (the module never sees it), so it always gets a
+    /// fresh effect. At most one `application_effects` entry may name
+    /// `fee_object_id`, and it must be `Mutated`
+    /// ([`NodeCoreError::DuplicateObjectEffect`] /
+    /// [`NodeCoreError::ObjectCreationUnsupported`] /
+    /// [`NodeCoreError::ObjectEffectMismatch`] otherwise), and the composer's
+    /// returned bodies must both differ from their effective inputs
+    /// ([`NodeCoreError::FeeCompositionNoOp`] otherwise): a non-zero charge
+    /// always changes both the payer and the treasury.
+    fn charge_fee(
+        &self,
+        state: &NodeStateSnapshot,
+        fee_payment: &fees::FeePayment,
+        fee_object_id: ObjectId,
+        treasury_id: ObjectId,
+        amount: fees::Amount,
+        application_effects: Vec<ObjectEffect>,
+    ) -> Result<Vec<ObjectEffect>, NodeCoreError> {
+        let composition = self
+            .fee_composition
+            .as_ref()
+            .ok_or(NodeCoreError::FeeCompositionUnavailable)?;
+        let payer_loaded: Object = state
+            .resolved_objects()
+            .iter()
+            .find(|resolved| resolved.object.id == fee_object_id)
+            .map(|resolved| resolved.object.clone())
+            .ok_or(NodeCoreError::FeeObjectNotDeclaredWrite)?;
+        let treasury_loaded: &Object = self
+            .treasury_object
+            .get()
+            .ok_or(NodeCoreError::FeeCompositionUnavailable)?;
+
+        // At most one application effect may name the fee object, and if
+        // present it must be exactly `Mutated`: a duplicate effect, or a
+        // `Created`/`Deleted` effect for the same id, is exactly what
+        // `translate_authenticated_object_effects`'s exact one-to-one
+        // matching would reject for a declared `Write` access, so charging
+        // must reject it too rather than silently masking it by filtering
+        // every same-id effect out during merge.
+        let payer_effect_count = application_effects
+            .iter()
+            .filter(|effect| fee_effect_object_id(effect) == fee_object_id)
+            .count();
+        if payer_effect_count > 1 {
+            return Err(NodeCoreError::DuplicateObjectEffect {
+                object_id: fee_object_id,
+            });
+        }
+        let existing_payer_effect: Option<ObjectEffect> = match application_effects
+            .iter()
+            .find(|effect| fee_effect_object_id(effect) == fee_object_id)
+        {
+            None => None,
+            Some(effect @ ObjectEffect::Mutated { .. }) => Some(effect.clone()),
+            Some(ObjectEffect::Created(object)) => {
+                return Err(NodeCoreError::ObjectCreationUnsupported {
+                    object_id: object.id,
+                });
+            }
+            Some(ObjectEffect::Deleted { .. }) => {
+                return Err(NodeCoreError::ObjectEffectMismatch {
+                    object_id: fee_object_id,
+                    reason: "fee object write access requires exactly one mutated effect",
+                });
+            }
+        };
+        let payer_effective_body: Vec<u8> = match &existing_payer_effect {
+            Some(ObjectEffect::Mutated { new_object, .. }) => new_object.data.clone(),
+            _ => payer_loaded.data.clone(),
+        };
+
+        let request = FeeChargeRequest {
+            asset_id: fee_payment.asset_id,
+            amount,
+            payer_body: &payer_effective_body,
+            treasury_body: &treasury_loaded.data,
+        };
+        let bodies = composition
+            .composer
+            .compose_fee_charge(&request)
+            .map_err(NodeCoreError::FeeCompositionFailed)?;
+        // A non-zero charge must change both the payer and treasury bodies:
+        // either one coming back unchanged means the composer did not
+        // actually settle the charge it was asked for.
+        if bodies.payer_body == payer_effective_body || bodies.treasury_body == treasury_loaded.data
+        {
+            return Err(NodeCoreError::FeeCompositionNoOp);
+        }
+
+        let payer_effect = match existing_payer_effect {
+            Some(ObjectEffect::Mutated {
+                previous_version,
+                mut new_object,
+            }) => {
+                new_object.data = bodies.payer_body;
+                ObjectEffect::Mutated {
+                    previous_version,
+                    new_object,
+                }
+            }
+            _ => {
+                let next_version = payer_loaded.version.checked_add(1).ok_or(
+                    NodeCoreError::ObjectVersionOverflow {
+                        object_id: fee_object_id,
+                    },
+                )?;
+                let mut new_object = payer_loaded.clone();
+                new_object.version = next_version;
+                new_object.data = bodies.payer_body;
+                ObjectEffect::Mutated {
+                    previous_version: payer_loaded.version,
+                    new_object,
+                }
+            }
+        };
+        let treasury_next_version =
+            treasury_loaded
+                .version
+                .checked_add(1)
+                .ok_or(NodeCoreError::ObjectVersionOverflow {
+                    object_id: treasury_id,
+                })?;
+        let mut treasury_new_object = treasury_loaded.clone();
+        treasury_new_object.version = treasury_next_version;
+        treasury_new_object.data = bodies.treasury_body;
+        let treasury_effect = ObjectEffect::Mutated {
+            previous_version: treasury_loaded.version,
+            new_object: treasury_new_object,
+        };
+
+        let mut merged: Vec<ObjectEffect> = application_effects
+            .into_iter()
+            .filter(|effect| fee_effect_object_id(effect) != fee_object_id)
+            .collect();
+        merged.push(payer_effect);
+        merged.push(treasury_effect);
+        Ok(merged)
+    }
+}
+
+fn fee_effect_object_id(effect: &ObjectEffect) -> ObjectId {
+    match effect {
+        ObjectEffect::Created(object) => object.id,
+        ObjectEffect::Mutated { new_object, .. } => new_object.id,
+        ObjectEffect::Deleted { id, .. } => *id,
     }
 }
 
@@ -3127,6 +3573,12 @@ impl TransactionalNodeStateMachine for PreinstalledWasmMachine<'_> {
             });
         }
         check_preinstalled_module_gas_limit(self.transaction.gas_limit)?;
+
+        // Fee admission runs before the engine ever executes: an
+        // insufficient `max_fee` at the worst-case `gas_limit` is rejected
+        // here, so a request that cannot possibly pay never spends engine
+        // work.
+        let fee_admission = self.admit_fee(state)?;
 
         let tx_hash = hash_transaction(self.transaction, self.resolver)?;
         let effects = self.engine.execute(
@@ -3157,24 +3609,66 @@ impl TransactionalNodeStateMachine for PreinstalledWasmMachine<'_> {
         let response_payload: Vec<u8> = encode_execution_effects(&effects)?;
         let response = NodeResponse::new(event.request_id(), status, Some(response_payload))?;
         let output = NodeOutput::new(vec![response], Vec::new())?;
+        let gas_used = effects.gas_used;
 
         match effects.status {
             // `WasmExecutionEngine` discards every candidate object effect on
             // a trap (see `execution::wasm_engine`), so a declared
-            // `Write`/`Consume` access can never be matched here; commit the
-            // deterministic rejection with no object mutation instead of
-            // failing the whole invocation.
-            ExecutionStatus::Failure { .. } => {
-                Ok(TransactionalNodeTransition::rejected_with_no_object_mutation(output))
-            }
-            ExecutionStatus::Success if !effects.object_effects.is_empty() => {
-                TransactionalNodeTransition::with_object_effects(
-                    Vec::new(),
-                    effects.object_effects,
-                    output,
-                )
-            }
-            ExecutionStatus::Success => Ok(TransactionalNodeTransition::read_only(output)),
+            // `Write`/`Consume` access can never be matched here.
+            ExecutionStatus::Failure { .. } => match fee_admission {
+                None => Ok(TransactionalNodeTransition::rejected_with_no_object_mutation(output)),
+                Some((fee_payment, fee_object_id, treasury_id)) => {
+                    let amount = self.settle_actual_fee(fee_payment, gas_used)?;
+                    if amount.get() == 0 {
+                        Ok(TransactionalNodeTransition::rejected_with_no_object_mutation(output))
+                    } else {
+                        // Trap discards every application effect, so both
+                        // bodies charged here are exactly the loaded
+                        // (pre-execution) bodies.
+                        let charged = self.charge_fee(
+                            state,
+                            fee_payment,
+                            fee_object_id,
+                            treasury_id,
+                            amount,
+                            Vec::new(),
+                        )?;
+                        Ok(
+                            TransactionalNodeTransition::rejected_with_fee_only_mutation(
+                                output,
+                                charged,
+                                fee_object_id,
+                                treasury_id,
+                            ),
+                        )
+                    }
+                }
+            },
+            ExecutionStatus::Success => match fee_admission {
+                None if !effects.object_effects.is_empty() => {
+                    TransactionalNodeTransition::with_object_effects(
+                        Vec::new(),
+                        effects.object_effects,
+                        output,
+                    )
+                }
+                None => Ok(TransactionalNodeTransition::read_only(output)),
+                Some((fee_payment, fee_object_id, treasury_id)) => {
+                    let amount = self.settle_actual_fee(fee_payment, gas_used)?;
+                    if amount.get() == 0 {
+                        return Err(NodeCoreError::FeeAmountZero);
+                    }
+                    let merged = self.charge_fee(
+                        state,
+                        fee_payment,
+                        fee_object_id,
+                        treasury_id,
+                        amount,
+                        effects.object_effects,
+                    )?;
+                    TransactionalNodeTransition::with_object_effects(Vec::new(), merged, output)
+                }
+            },
         }
     }
 }
@@ -3211,7 +3705,9 @@ struct ResolvedPreinstalledAuthorization<'a> {
 /// `Transaction.gas_limit` is rejected before the WASM engine ever runs if it
 /// exceeds the conservative pre-activation [`MAX_PREINSTALLED_MODULE_GAS_LIMIT`]
 /// ceiling (see [`NodeCoreError::PreinstalledModuleGasLimitExceedsCeiling`]);
-/// this is not a production fee-weighted gas schedule, which remains
+/// that ceiling remains an independent safety bound, not a price. S3's
+/// committed base/execution schedule now settles the exact post-execution
+/// `gas_used` As-Is; production gas calibration and broader economics remain
 /// deferred.
 ///
 /// A deterministically trapped/rejected execution still commits: it produces
@@ -3220,7 +3716,11 @@ struct ResolvedPreinstalledAuthorization<'a> {
 /// `gas_limit` charge, empty effects/events — see
 /// `preinstalled_wasm::normalize_trapped_preinstalled_execution`), and,
 /// because [`ExecutionStatus::Failure`] discards every object effect before
-/// this function ever sees them, no object mutation. Exact request replay is
+/// this function ever sees them, no application object effect. Under a
+/// configured non-zero fee policy, the normalized full-gas charge still
+/// commits the restricted fee-only payer/treasury mutations atomically with
+/// the rejected receipt; without a due fee there is no object mutation. Exact
+/// request replay is
 /// reconciled from the persisted receipt before any module resolution,
 /// object load, or execution, identical to every other structured durable
 /// entrypoint. The module's committed semantics envelope is independently
@@ -3238,9 +3738,11 @@ struct ResolvedPreinstalledAuthorization<'a> {
 /// An additive `native_http::preinstalled_wasm_structured_durable_router`
 /// wires this entrypoint over HTTP (see `ARCHITECTURE.md` DR-0080);
 /// `native_http::structured_durable_router` remains on the read-only
-/// entrypoint. Create, Shared/System ownership, blob bodies, and production
-/// gas metering remain unimplemented and fail closed or are simply not
-/// reachable from this MVP slice.
+/// entrypoint. Create, Shared/System ownership, blob bodies, validator/
+/// certificate fee distribution, production gas calibration, and production
+/// economics remain unimplemented and fail closed or are simply not reachable
+/// from this MVP slice.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution<
     S,
 >(
@@ -3251,6 +3753,7 @@ pub fn handle_authenticated_resolved_durable_submit_transaction_with_preinstalle
     engine: &WasmExecutionEngine,
     submission: AuthenticatedSubmitTransaction,
     created_checkpoint: u64,
+    fee_composition: Option<PreinstalledFeeComposition<'_>>,
 ) -> Result<ResolvedNodeOutput, NodeCoreError>
 where
     S: StructuredDurableDomainStateStore,
@@ -3279,6 +3782,7 @@ where
         transaction,
         placement: _,
         committed_system_module,
+        committed_fee_policy,
     } = submission;
     let machine = PreinstalledWasmMachine {
         transaction: transaction.transaction(),
@@ -3286,7 +3790,10 @@ where
         registered_module: committed_system_module.as_ref(),
         catalog,
         engine,
+        fee_policy: &committed_fee_policy,
+        fee_composition,
         resolved_module: std::cell::OnceCell::new(),
+        treasury_object: std::cell::OnceCell::new(),
     };
     let plan = machine.access_plan(&event)?;
     let output = handle_durable_idempotent_event_with_plan(
@@ -3318,6 +3825,13 @@ where
     S: StructuredDurableDomainStateStore,
     M: TransactionalNodeStateMachine,
 {
+    // This shared read-only/generic-owned-effects entrypoint has no fee
+    // composition to charge from: reject a declared `fee_payment` before any
+    // receipt, nonce, or object I/O rather than silently ignoring it. Only
+    // the preinstalled-WASM entrypoint is fee-aware.
+    if submission.transaction.transaction().fee_payment.is_some() {
+        return Err(NodeCoreError::FeePaymentUnsupportedOnPath);
+    }
     let created_checkpoint: Option<u64> = match object_policy {
         AuthenticatedObjectPolicy::ReadOnly => None,
         AuthenticatedObjectPolicy::OwnedMutations { created_checkpoint } => {
@@ -3339,6 +3853,7 @@ where
         transaction: _authenticated_transaction,
         placement: _,
         committed_system_module: _,
+        committed_fee_policy: _,
     } = submission;
     let output = handle_durable_idempotent_event_with_plan(
         store,
@@ -3480,6 +3995,15 @@ where
             None => None,
         };
 
+    // Trusted fee-charging composition, if the preinstalled machine has one.
+    // Its treasury object id is composition, never request input; passing it
+    // to the loader lets it authorize the treasury independent of ownership
+    // and hide it from execution-engine inputs (see
+    // `load_and_authorize_objects` and `fee_effects::PreinstalledFeeComposition`).
+    let treasury_object_id: Option<ObjectId> = preinstalled_machine
+        .and_then(|machine| machine.fee_composition.as_ref())
+        .map(|composition| composition.treasury_object_id);
+
     // Object reads happen only after the receipt and nonce checks above, so a
     // stale or replayed request never spends the fan-out cost of the
     // per-entry head/version storage round-trips. Only this authenticated
@@ -3493,9 +4017,22 @@ where
             event.chain_id(),
             dispatch,
             preinstalled_authorization.as_ref(),
+            treasury_object_id,
         )?,
         None => LoadedAuthenticatedObjects::default(),
     };
+    // Give the preinstalled machine its verified, loaded treasury object (if
+    // one was declared and authorized above) through a request-local cell it
+    // alone can populate, so `transition` can compose and merge a fee charge
+    // over a body the execution engine itself never receives.
+    let treasury_object: Option<&Object> = preinstalled_machine
+        .zip(treasury_object_id)
+        .and_then(|(_, treasury_object_id)| loaded_objects.object(treasury_object_id));
+    if let (Some(machine), Some(object)) = (preinstalled_machine, treasury_object) {
+        machine.treasury_object.set(object.clone()).map_err(|_| {
+            NodeCoreError::PersistenceInvariant("preinstalled treasury object resolved twice")
+        })?;
+    }
     let mut values = BTreeMap::new();
     for access in plan.accesses() {
         let observed = store.get_versioned_durable(context, domain, access.key())?;
@@ -3520,22 +4057,31 @@ where
                 created_checkpoint,
             }
         });
-    // `bypasses_object_effect_matching` is only set by
-    // `TransactionalNodeTransition::rejected_with_no_object_mutation`, which
-    // also always returns empty `object_effects()`; every other transition
-    // still requires an exact declared-access/effect match.
-    let object_mutations: Vec<DurableObjectMutationEntry> =
-        if transition.bypasses_object_effect_matching() {
+    let object_mutations: Vec<DurableObjectMutationEntry> = match transition.effect_matching() {
+        ObjectEffectMatching::Exact => translate_authenticated_object_effects(
+            loaded_objects.verified(),
+            transition.object_effects(),
+            mutation_context.as_ref(),
+            loaded_objects.total_body_bytes(),
+        )?,
+        ObjectEffectMatching::RejectedNoMutation => {
             debug_assert!(transition.object_effects().is_empty());
             Vec::new()
-        } else {
-            translate_authenticated_object_effects(
+        }
+        ObjectEffectMatching::RejectedFeeOnly { payer, treasury } => {
+            let context = mutation_context
+                .as_ref()
+                .ok_or(NodeCoreError::ObjectMutationContextMissing { object_id: *payer })?;
+            translate_fee_only_object_effects(
                 loaded_objects.verified(),
                 transition.object_effects(),
-                mutation_context.as_ref(),
+                *payer,
+                *treasury,
+                context,
                 loaded_objects.total_body_bytes(),
             )?
-        };
+        }
+    };
 
     let dedup_record = NodeDedupRecord::new(
         event.request_id(),
@@ -3629,6 +4175,7 @@ fn load_and_authorize_objects<S>(
     chain_id: &ChainId,
     dispatch: &AuthenticatedObjectDispatch,
     preinstalled_authorization: Option<&ResolvedPreinstalledAuthorization<'_>>,
+    treasury_object_id: Option<ObjectId>,
 ) -> Result<LoadedAuthenticatedObjects, NodeCoreError>
 where
     S: StructuredDurableDomainStateStore,
@@ -3753,9 +4300,22 @@ where
             return Err(NodeCoreError::ObjectRecordMismatch { object_id });
         }
 
+        // The trusted composition's fee treasury is authorized independent
+        // of who owns it, but only for the exact final declared `Write`
+        // access naming its exact id: the sender's signed manifest can never
+        // redirect the fee, because `treasury_object_id` is composition,
+        // never request input. See `fee_effects::PreinstalledFeeComposition`
+        // and `PreinstalledWasmMachine::admit_fee`.
+        let is_final_access: bool = access_index + 1 == dispatch.accesses.len();
+        let is_treasury_access: bool = is_final_access
+            && access.mode == AccessMode::Write
+            && treasury_object_id == Some(object_id);
+
         match &object.owner {
             Owner::Address(owner_address) => {
-                if *owner_address != dispatch.authority {
+                if is_treasury_access {
+                    // Trusted-composition exception: any Address owner.
+                } else if *owner_address != dispatch.authority {
                     let access_index: u32 = u32::try_from(access_index).map_err(|_| {
                         NodeCoreError::PersistenceInvariant(
                             "bounded authenticated object index did not fit u32",
@@ -3788,12 +4348,13 @@ where
             }
         }
 
-        loaded.push(
+        loaded.push_with_engine_visibility(
             object_id,
             access.mode,
             head,
             object.clone(),
             record.created_checkpoint(),
+            !is_treasury_access,
         );
     }
     loaded.set_total_body_bytes(total_body_bytes);
@@ -8541,6 +9102,7 @@ mod tests {
             &ChainId::new("sunrise-test").unwrap(),
             &dispatch,
             Some(&authorization),
+            None,
         )
     }
 
@@ -8609,6 +9171,7 @@ mod tests {
             &engine,
             submission,
             9,
+            None,
         )
         .unwrap();
 
@@ -8751,6 +9314,7 @@ mod tests {
             &WasmExecutionEngine,
             submission,
             10,
+            None,
         )
         .unwrap();
 
@@ -8946,6 +9510,7 @@ mod tests {
             &engine,
             submission,
             9,
+            None,
         )
         .unwrap();
         // An empty catalog and a different composition-trusted checkpoint on
@@ -8961,6 +9526,7 @@ mod tests {
             &engine,
             replay_submission,
             999,
+            None,
         )
         .unwrap();
 
@@ -9050,6 +9616,7 @@ mod tests {
                 &engine,
                 submission,
                 9,
+                None,
             )
             .unwrap_err();
             (error, store.commits.lock().unwrap().len())
@@ -9176,6 +9743,7 @@ mod tests {
                 &engine,
                 submission,
                 9,
+                None,
             )
             .unwrap_err();
             (error, store.commits.lock().unwrap().len())
@@ -9364,6 +9932,7 @@ mod tests {
             &engine,
             submission,
             9,
+            None,
         )
         .unwrap_err();
 
@@ -9446,6 +10015,7 @@ mod tests {
             &engine,
             submission,
             9,
+            None,
         )
         .unwrap();
 
@@ -9544,6 +10114,7 @@ mod tests {
             &engine,
             submission,
             9,
+            None,
         )
         .unwrap_err();
 
@@ -9616,6 +10187,7 @@ mod tests {
             &engine,
             submission,
             9,
+            None,
         )
         .unwrap();
 
@@ -9687,6 +10259,7 @@ mod tests {
             &engine,
             submission,
             9,
+            None,
         )
         .unwrap_err();
 
@@ -9756,6 +10329,7 @@ mod tests {
             &engine,
             submission,
             9,
+            None,
         )
         .unwrap_err();
 
@@ -9826,6 +10400,7 @@ mod tests {
             &engine,
             over_submission,
             9,
+            None,
         )
         .unwrap_err();
 
@@ -9898,6 +10473,7 @@ mod tests {
             &engine,
             submission,
             9,
+            None,
         )
         .unwrap();
 
@@ -9974,6 +10550,7 @@ mod tests {
             &engine,
             submission,
             9,
+            None,
         )
         .unwrap_err();
 
@@ -10065,6 +10642,7 @@ mod tests {
             &engine,
             submission,
             9,
+            None,
         )
         .unwrap();
 
@@ -12150,5 +12728,2512 @@ mod tests {
         let error = query_request_receipt(&store, &context, domain(0x74), req).unwrap_err();
 
         assert!(matches!(error, NodeCoreError::PersistenceInvariant(_)));
+    }
+
+    // ── S3 fee lifecycle ─────────────────────────────────────────────────
+
+    fn fee_asset_id() -> fees::AssetId {
+        fees::AssetId::new([0xF3; 32])
+    }
+
+    fn fee_gas_schedule() -> fees::GasSchedule {
+        fees::GasSchedule {
+            base_fee: 1,
+            execution_price: 1,
+            read_price: 0,
+            write_price: 0,
+            storage_price: 0,
+            system_module_price: 0,
+        }
+    }
+
+    fn fee_asset_registry() -> fees::FeeAssetRegistry {
+        let mut registry = fees::FeeAssetRegistry::new();
+        registry
+            .add_asset(fees::FeeAsset {
+                asset_id: fee_asset_id(),
+                fee_units_per_asset_unit: 1,
+                enabled: true,
+            })
+            .unwrap();
+        registry
+    }
+
+    /// Committed protocol configuration with a non-zero fee schedule and one
+    /// enabled fee asset, otherwise identical to [`active_protocol_config`].
+    fn fee_active_protocol_config(byte: u8) -> ProtocolConfig {
+        let mut protocol_config = active_protocol_config(byte);
+        protocol_config.gas_schedule = fee_gas_schedule();
+        protocol_config.fee_assets = fee_asset_registry();
+        protocol_config
+    }
+
+    /// Deterministically appends a fixed debit/credit tag to each body and
+    /// records the exact settled amount it was asked to charge, so tests can
+    /// assert both the merged bytes and the amount without needing real
+    /// balance semantics.
+    #[derive(Debug)]
+    struct RecordingFeeComposer {
+        charged_amount: Mutex<Option<u64>>,
+    }
+
+    impl RecordingFeeComposer {
+        fn new() -> Self {
+            Self {
+                charged_amount: Mutex::new(None),
+            }
+        }
+    }
+
+    impl FeeEffectComposer for RecordingFeeComposer {
+        fn compose_fee_charge(
+            &self,
+            request: &FeeChargeRequest<'_>,
+        ) -> Result<FeeChargeBodies, FeeCompositionError> {
+            *self.charged_amount.lock().unwrap() = Some(request.amount.get());
+            let mut payer_body = request.payer_body.to_vec();
+            payer_body.push(0xF0);
+            let mut treasury_body = request.treasury_body.to_vec();
+            treasury_body.push(0xF1);
+            Ok(FeeChargeBodies {
+                payer_body,
+                treasury_body,
+            })
+        }
+    }
+
+    /// Returns both bodies unchanged, deterministically triggering
+    /// [`NodeCoreError::FeeCompositionNoOp`] whenever a non-zero amount is
+    /// charged.
+    #[derive(Debug)]
+    struct EchoFeeComposer;
+
+    impl FeeEffectComposer for EchoFeeComposer {
+        fn compose_fee_charge(
+            &self,
+            request: &FeeChargeRequest<'_>,
+        ) -> Result<FeeChargeBodies, FeeCompositionError> {
+            Ok(FeeChargeBodies {
+                payer_body: request.payer_body.to_vec(),
+                treasury_body: request.treasury_body.to_vec(),
+            })
+        }
+    }
+
+    /// Changes only the payer body, leaving the treasury body byte-identical
+    /// to its effective input — deterministically triggering
+    /// [`NodeCoreError::FeeCompositionNoOp`]: a non-zero charge must move
+    /// value on both sides, not just debit the payer.
+    #[derive(Debug)]
+    struct PayerOnlyChangeFeeComposer;
+
+    impl FeeEffectComposer for PayerOnlyChangeFeeComposer {
+        fn compose_fee_charge(
+            &self,
+            request: &FeeChargeRequest<'_>,
+        ) -> Result<FeeChargeBodies, FeeCompositionError> {
+            let mut payer_body = request.payer_body.to_vec();
+            payer_body.push(0xF2);
+            Ok(FeeChargeBodies {
+                payer_body,
+                treasury_body: request.treasury_body.to_vec(),
+            })
+        }
+    }
+
+    /// Changes only the treasury body, leaving the payer body byte-identical
+    /// to its effective input — deterministically triggering
+    /// [`NodeCoreError::FeeCompositionNoOp`]: a non-zero charge must move
+    /// value on both sides, not just credit the treasury.
+    #[derive(Debug)]
+    struct TreasuryOnlyChangeFeeComposer;
+
+    impl FeeEffectComposer for TreasuryOnlyChangeFeeComposer {
+        fn compose_fee_charge(
+            &self,
+            request: &FeeChargeRequest<'_>,
+        ) -> Result<FeeChargeBodies, FeeCompositionError> {
+            let mut treasury_body = request.treasury_body.to_vec();
+            treasury_body.push(0xF3);
+            Ok(FeeChargeBodies {
+                payer_body: request.payer_body.to_vec(),
+                treasury_body,
+            })
+        }
+    }
+
+    /// Always rejects with a fixed, caller-chosen error.
+    #[derive(Debug)]
+    struct RejectingFeeComposer(FeeCompositionError);
+
+    impl FeeEffectComposer for RejectingFeeComposer {
+        fn compose_fee_charge(
+            &self,
+            _request: &FeeChargeRequest<'_>,
+        ) -> Result<FeeChargeBodies, FeeCompositionError> {
+            Err(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn preinstalled_wasm_fee_charges_actual_gas_used_not_gas_limit() {
+        let store: MemoryDurableStateStore =
+            MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0xD0);
+        let signing_key: SigningKey = dev_signing_key(0xD0);
+        let sender: Address = dev_sender_address(&signing_key);
+        let context: DurableOperationContext = durable_context();
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let object_domain: AtomicityDomainId = domain(0xD0);
+        let module_id = ModuleId::new([0xD0; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_noop_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+
+        let payer_id: ObjectId = ObjectId::new([0xD1; 32]);
+        let mut payer_object = test_object(payer_id, 1, Owner::Address(sender), 0xD1);
+        payer_object.data = vec![0x10];
+        let payer_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            payer_object,
+            "sunrise-test",
+            9,
+            0xD2,
+        );
+        let treasury_owner: Address = Address::new([0xD3; 32]);
+        let treasury_id: ObjectId = ObjectId::new([0xD4; 32]);
+        let mut treasury_object = test_object(treasury_id, 1, Owner::Address(treasury_owner), 0xD4);
+        treasury_object.data = vec![0x00];
+        let treasury_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            treasury_object,
+            "sunrise-test",
+            9,
+            0xD5,
+        );
+
+        let manifest: AccessManifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: payer_ref.clone(),
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: treasury_ref,
+                mode: AccessMode::Write,
+            },
+        ]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            Vec::new(),
+        );
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(2_000_000),
+            fee_object: payer_ref,
+        });
+        let submission: AuthenticatedSubmitTransaction = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xD6),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+        let composer = RecordingFeeComposer::new();
+        let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+
+        let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &context,
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            Some(fee_composition),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.output().responses()[0].status(),
+            NodeResponseStatus::Accepted
+        );
+        let payload = resolved.output().responses()[0].payload().unwrap();
+        let effects = execution::decode_execution_effects(payload).unwrap();
+        assert!(effects.gas_used < 1_000_000);
+
+        let charged = composer.charged_amount.lock().unwrap().unwrap();
+        assert_eq!(charged, 1 + effects.gas_used);
+
+        let payer_v2 = store
+            .get_object_version(
+                &context,
+                object_domain,
+                payer_id,
+                DurableObjectVersion::new(2).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            payer_v2.payload().inline().unwrap().object().data,
+            vec![0x10, 0xF0]
+        );
+        let treasury_v2 = store
+            .get_object_version(
+                &context,
+                object_domain,
+                treasury_id,
+                DurableObjectVersion::new(2).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            treasury_v2.payload().inline().unwrap().object().data,
+            vec![0x00, 0xF1]
+        );
+    }
+
+    #[test]
+    fn preinstalled_wasm_fee_merges_into_application_mutated_payer_object() {
+        let store: MemoryDurableStateStore =
+            MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0xD7);
+        let signing_key: SigningKey = dev_signing_key(0xD7);
+        let sender: Address = dev_sender_address(&signing_key);
+        let context: DurableOperationContext = durable_context();
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let object_domain: AtomicityDomainId = domain(0xD7);
+        let module_id = ModuleId::new([0xD7; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+
+        let payer_id: ObjectId = ObjectId::new([0xD8; 32]);
+        let mut payer_object = test_object(payer_id, 1, Owner::Address(sender), 0xD8);
+        payer_object.data = vec![0x10];
+        let payer_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            payer_object,
+            "sunrise-test",
+            9,
+            0xD9,
+        );
+        let treasury_owner: Address = Address::new([0xDA; 32]);
+        let treasury_id: ObjectId = ObjectId::new([0xDB; 32]);
+        let mut treasury_object = test_object(treasury_id, 1, Owner::Address(treasury_owner), 0xDB);
+        treasury_object.data = vec![0x00];
+        let treasury_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            treasury_object,
+            "sunrise-test",
+            9,
+            0xDC,
+        );
+
+        let manifest: AccessManifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: payer_ref.clone(),
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: treasury_ref,
+                mode: AccessMode::Write,
+            },
+        ]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(2_000_000),
+            fee_object: payer_ref,
+        });
+        let submission: AuthenticatedSubmitTransaction = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xDD),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+        let composer = RecordingFeeComposer::new();
+        let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+
+        let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &context,
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            Some(fee_composition),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.output().responses()[0].status(),
+            NodeResponseStatus::Accepted
+        );
+
+        // Exactly one Mutated effect for the payer: version bumps by one,
+        // not two, even though both the application and the fee charge
+        // touched it (requirement 6).
+        let payer_head: DurableObjectHead = store
+            .get_object_head(&context, object_domain, payer_id)
+            .unwrap();
+        assert_eq!(payer_head.object_version(), DurableObjectVersion::new(2));
+        let payer_v2 = store
+            .get_object_version(
+                &context,
+                object_domain,
+                payer_id,
+                DurableObjectVersion::new(2).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            payer_v2.payload().inline().unwrap().object().data,
+            vec![0xCA, 0xFE, 0xF0]
+        );
+        let treasury_v2 = store
+            .get_object_version(
+                &context,
+                object_domain,
+                treasury_id,
+                DurableObjectVersion::new(2).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            treasury_v2.payload().inline().unwrap().object().data,
+            vec![0x00, 0xF1]
+        );
+    }
+
+    #[test]
+    fn preinstalled_wasm_trapped_call_still_charges_fee_and_credits_treasury() {
+        let store: MemoryDurableStateStore =
+            MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0xDE);
+        let signing_key: SigningKey = dev_signing_key(0xDE);
+        let sender: Address = dev_sender_address(&signing_key);
+        let context: DurableOperationContext = durable_context();
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let object_domain: AtomicityDomainId = domain(0xDE);
+        let module_id = ModuleId::new([0xDE; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_trap_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+
+        let payer_id: ObjectId = ObjectId::new([0xDF; 32]);
+        let mut payer_object = test_object(payer_id, 1, Owner::Address(sender), 0xDF);
+        payer_object.data = vec![0x10];
+        let payer_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            payer_object,
+            "sunrise-test",
+            9,
+            0xE1,
+        );
+        let treasury_owner: Address = Address::new([0xE2; 32]);
+        let treasury_id: ObjectId = ObjectId::new([0xE3; 32]);
+        let mut treasury_object = test_object(treasury_id, 1, Owner::Address(treasury_owner), 0xE3);
+        treasury_object.data = vec![0x00];
+        let treasury_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            treasury_object,
+            "sunrise-test",
+            9,
+            0xE4,
+        );
+
+        let manifest: AccessManifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: payer_ref.clone(),
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: treasury_ref,
+                mode: AccessMode::Write,
+            },
+        ]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(2_000_000),
+            fee_object: payer_ref,
+        });
+        let submission: AuthenticatedSubmitTransaction = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xE5),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+        let composer = RecordingFeeComposer::new();
+        let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+
+        let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &context,
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            Some(fee_composition),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.output().responses()[0].status(),
+            NodeResponseStatus::Rejected
+        );
+        let payload = resolved.output().responses()[0].payload().unwrap();
+        let effects = execution::decode_execution_effects(payload).unwrap();
+        assert!(effects.object_effects.is_empty());
+        assert_eq!(effects.gas_used, 1_000_000);
+
+        let charged = composer.charged_amount.lock().unwrap().unwrap();
+        assert_eq!(charged, 1 + 1_000_000);
+
+        // The application never ran (trap), so the committed payer body is
+        // exactly its loaded data with only the fee tag appended.
+        let payer_v2 = store
+            .get_object_version(
+                &context,
+                object_domain,
+                payer_id,
+                DurableObjectVersion::new(2).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            payer_v2.payload().inline().unwrap().object().data,
+            vec![0x10, 0xF0]
+        );
+        let treasury_v2 = store
+            .get_object_version(
+                &context,
+                object_domain,
+                treasury_id,
+                DurableObjectVersion::new(2).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            treasury_v2.payload().inline().unwrap().object().data,
+            vec![0x00, 0xF1]
+        );
+        let nonce_key: Vec<u8> =
+            sender_nonce_key_for("sunrise-test", *sender.as_bytes(), Epoch::new(7));
+        let persisted_nonce: VersionedStateValue = store
+            .get_versioned_durable(&context, object_domain, &nonce_key)
+            .unwrap();
+        let nonce_record: SenderNonceRecord =
+            SenderNonceRecord::decode(persisted_nonce.value().unwrap()).unwrap();
+        assert_eq!(nonce_record.next_nonce, 1);
+    }
+
+    #[test]
+    fn preinstalled_wasm_trap_with_zero_schedule_and_fee_composition_present_commits_no_mutation() {
+        let store: MemoryDurableStateStore =
+            MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = active_protocol_config(0xFB);
+        let signing_key: SigningKey = dev_signing_key(0xFB);
+        let sender: Address = dev_sender_address(&signing_key);
+        let context: DurableOperationContext = durable_context();
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let object_domain: AtomicityDomainId = domain(0xFB);
+        let module_id = ModuleId::new([0xFB; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_trap_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let payer_id: ObjectId = ObjectId::new([0xFC; 32]);
+        let payer_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            test_object(payer_id, 1, Owner::Address(sender), 0xFC),
+            "sunrise-test",
+            9,
+            0xFD,
+        );
+        let treasury_id: ObjectId = ObjectId::new([0xFE; 32]);
+
+        let manifest: AccessManifest = manifest_with(vec![AccessEntry {
+            object_ref: payer_ref,
+            mode: AccessMode::Write,
+        }]);
+        let tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        let submission: AuthenticatedSubmitTransaction = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xFF),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+        let composer = EchoFeeComposer;
+        let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+
+        let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &context,
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            Some(fee_composition),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.output().responses()[0].status(),
+            NodeResponseStatus::Rejected
+        );
+        let payer_head: DurableObjectHead = store
+            .get_object_head(&context, object_domain, payer_id)
+            .unwrap();
+        assert_eq!(payer_head.object_version(), DurableObjectVersion::new(1));
+    }
+
+    #[test]
+    fn preinstalled_wasm_fee_treasury_is_hidden_from_engine_object_count() {
+        let store: MemoryDurableStateStore =
+            MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0x60);
+        let signing_key: SigningKey = dev_signing_key(0x60);
+        let sender: Address = dev_sender_address(&signing_key);
+        let context: DurableOperationContext = durable_context();
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let object_domain: AtomicityDomainId = domain(0x60);
+        let module_id = ModuleId::new([0x60; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_write_two_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+
+        let payer_id: ObjectId = ObjectId::new([0x61; 32]);
+        let mut payer_object = test_object(payer_id, 1, Owner::Address(sender), 0x61);
+        payer_object.data = vec![0x00, 0x00];
+        let payer_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            payer_object,
+            "sunrise-test",
+            9,
+            0x62,
+        );
+        let treasury_owner: Address = Address::new([0x63; 32]);
+        let treasury_id: ObjectId = ObjectId::new([0x64; 32]);
+        let mut treasury_object = test_object(treasury_id, 1, Owner::Address(treasury_owner), 0x64);
+        treasury_object.data = vec![0x00];
+        let treasury_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            treasury_object,
+            "sunrise-test",
+            9,
+            0x65,
+        );
+
+        let manifest: AccessManifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: payer_ref.clone(),
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: treasury_ref,
+                mode: AccessMode::Write,
+            },
+        ]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(2_000_000),
+            fee_object: payer_ref,
+        });
+        let submission: AuthenticatedSubmitTransaction = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0x66),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+        let composer = RecordingFeeComposer::new();
+        let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+
+        let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &context,
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            Some(fee_composition),
+        )
+        .unwrap();
+
+        // The module attempts to write declared indices 0 and 1, but with
+        // the treasury excluded from engine inputs the engine holds exactly
+        // one object; the out-of-range write to index 1 silently no-ops (see
+        // `execution::wasm_engine::write_object_data`), so only the payer
+        // carries the application's write, fee-tagged on top.
+        assert_eq!(
+            resolved.output().responses()[0].status(),
+            NodeResponseStatus::Accepted
+        );
+        let payer_v2 = store
+            .get_object_version(
+                &context,
+                object_domain,
+                payer_id,
+                DurableObjectVersion::new(2).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            payer_v2.payload().inline().unwrap().object().data,
+            vec![0xCA, 0xFE, 0xF0]
+        );
+        let treasury_v2 = store
+            .get_object_version(
+                &context,
+                object_domain,
+                treasury_id,
+                DurableObjectVersion::new(2).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            treasury_v2.payload().inline().unwrap().object().data,
+            vec![0x00, 0xF1]
+        );
+    }
+
+    #[test]
+    fn generic_read_only_entrypoint_rejects_fee_payment() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let protocol_config: ProtocolConfig = active_protocol_config(0xE6);
+        let signing_key: SigningKey = dev_signing_key(0xE6);
+        let sender: Address = dev_sender_address(&signing_key);
+        let mut tx = unsigned_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+        );
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(1),
+            fee_object: sample_object_ref(0xE7),
+        });
+        let submission: AuthenticatedSubmitTransaction = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xE7),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let machine = OwnedObjectEffectMachine {
+            expected_inputs: Vec::new(),
+            replacement_byte: 0,
+            calls: AtomicUsize::new(0),
+        };
+
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &machine,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::FeePaymentUnsupportedOnPath);
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn generic_owned_effects_entrypoint_rejects_fee_payment() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let protocol_config: ProtocolConfig = active_protocol_config(0xE8);
+        let signing_key: SigningKey = dev_signing_key(0xE8);
+        let sender: Address = dev_sender_address(&signing_key);
+        let mut tx = unsigned_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+        );
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(1),
+            fee_object: sample_object_ref(0xE9),
+        });
+        let submission: AuthenticatedSubmitTransaction = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xEA),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let machine = OwnedObjectEffectMachine {
+            expected_inputs: Vec::new(),
+            replacement_byte: 0,
+            calls: AtomicUsize::new(0),
+        };
+
+        let error =
+            handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+                &store,
+                &durable_context(),
+                &resolver("sunrise-test"),
+                submission,
+                9,
+                &machine,
+            )
+            .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::FeePaymentUnsupportedOnPath);
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn preinstalled_wasm_nonzero_schedule_requires_fee_payment() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0xEB);
+        let signing_key: SigningKey = dev_signing_key(0xEB);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0xEB; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (payer_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0xEC; 32]),
+            Owner::Address(sender),
+            0xEC,
+        );
+        let treasury_owner = Address::new([0xED; 32]);
+        let treasury_id = ObjectId::new([0xEE; 32]);
+        let (treasury_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            treasury_id,
+            Owner::Address(treasury_owner),
+            0xEE,
+        );
+        let manifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: payer_ref,
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: treasury_ref,
+                mode: AccessMode::Write,
+            },
+        ]);
+        let tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xEF),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+        let composer = EchoFeeComposer;
+        let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            Some(fee_composition),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::FeePaymentRequired);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    /// A declared `fee_payment` must never be silently ignored just because
+    /// the committed schedule's worst-case fee at `gas_limit` happens to be
+    /// zero: node-core has no way to charge it and must fail closed instead
+    /// of admitting the transaction as though it were fee-free.
+    #[test]
+    fn preinstalled_wasm_fee_payment_declared_against_zero_worst_case_fee_is_rejected() {
+        let node_config: NodeConfig = config("sunrise-test");
+        // Deliberately not `fee_active_protocol_config`: the default,
+        // genesis-derived `gas_schedule` prices every unit at zero, so the
+        // committed worst-case fee at any `gas_limit` is zero.
+        let mut protocol_config: ProtocolConfig = active_protocol_config(0x64);
+        let signing_key: SigningKey = dev_signing_key(0x64);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0x64; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (payer_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0x65; 32]),
+            Owner::Address(sender),
+            0x65,
+        );
+        let treasury_id = ObjectId::new([0x66; 32]);
+        // No treasury access is declared: only the `fee_payment` itself is
+        // misdeclared here.
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref: payer_ref.clone(),
+            mode: AccessMode::Write,
+        }]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(2_000_000),
+            fee_object: payer_ref,
+        });
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0x67),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+        let composer = EchoFeeComposer;
+        let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            Some(fee_composition),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::FeePaymentNotRequired);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    /// No fee-charging composition is wired for this deployment (`None`
+    /// passed to the handler), yet the transaction declares a
+    /// `fee_payment`. It must never be silently ignored — that would admit
+    /// the transaction as fee-free while dropping the sender's declared
+    /// payment.
+    #[test]
+    fn preinstalled_wasm_fee_payment_declared_with_no_fee_composition_is_rejected() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = active_protocol_config(0x68);
+        let signing_key: SigningKey = dev_signing_key(0x68);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0x68; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (payer_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0x69; 32]),
+            Owner::Address(sender),
+            0x69,
+        );
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref: payer_ref.clone(),
+            mode: AccessMode::Write,
+        }]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(2_000_000),
+            fee_object: payer_ref,
+        });
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0x6A),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::FeePaymentUnsupportedOnPath);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    /// No fee-charging composition is wired, and the transaction declares no
+    /// `fee_payment` either, but the committed schedule's worst-case fee at
+    /// `gas_limit` is non-zero. Historical fee-free behavior must not
+    /// silently apply here: with a committed non-zero price and nothing to
+    /// charge it against, the deployment is misconfigured and must fail
+    /// closed rather than let the transaction execute for free.
+    #[test]
+    fn preinstalled_wasm_nonzero_schedule_with_no_fee_composition_is_rejected() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0x6B);
+        let signing_key: SigningKey = dev_signing_key(0x6B);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0x6B; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (payer_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0x6C; 32]),
+            Owner::Address(sender),
+            0x6C,
+        );
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref: payer_ref,
+            mode: AccessMode::Write,
+        }]);
+        let tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0x6D),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::FeeCompositionUnavailable);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn preinstalled_wasm_fee_object_not_declared_write_is_rejected_before_execution() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0x6C);
+        let signing_key: SigningKey = dev_signing_key(0x6C);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0x6C; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (payer_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0x6D; 32]),
+            Owner::Address(sender),
+            0x6D,
+        );
+        let treasury_owner = Address::new([0x6E; 32]);
+        let treasury_id = ObjectId::new([0x6F; 32]);
+        let (treasury_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            treasury_id,
+            Owner::Address(treasury_owner),
+            0x6F,
+        );
+        let manifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: payer_ref,
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: treasury_ref,
+                mode: AccessMode::Write,
+            },
+        ]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(2_000_000),
+            // Not declared anywhere in the manifest.
+            fee_object: sample_object_ref(0x70),
+        });
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0x71),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+        let composer = EchoFeeComposer;
+        let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            Some(fee_composition),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::FeeObjectNotDeclaredWrite);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn preinstalled_wasm_fee_object_not_owned_by_sender_is_rejected_before_execution() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0x72);
+        let signing_key: SigningKey = dev_signing_key(0x72);
+        let sender: Address = dev_sender_address(&signing_key);
+        let recipient: Address = Address::new([0x73; 32]);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0x72; 32]);
+        let destination_byte: u8 = 0x22;
+        let policy: PreinstalledObjectAccessPolicy = PreinstalledObjectAccessPolicy::new(
+            1,
+            "run".to_string(),
+            AccessMode::Write,
+            Digest32::new(
+                HashAlgorithmId::Sha2_256,
+                [destination_byte.wrapping_add(1); 32],
+            ),
+            u32::from(destination_byte),
+        )
+        .unwrap();
+        let envelope: PreinstalledModuleSemanticsEnvelope =
+            PreinstalledModuleSemanticsEnvelope::new(b"fee-owner-test".to_vec(), vec![policy])
+                .unwrap();
+        let (registry, catalog, module_ref) = preinstalled_module_fixture_with_envelope(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_write_two_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+            envelope,
+        );
+        protocol_config.system_modules = registry;
+
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (source_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0x74; 32]),
+            Owner::Address(sender),
+            0x21,
+        );
+        let (destination_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0x75; 32]),
+            Owner::Address(recipient),
+            destination_byte,
+        );
+        let treasury_owner = Address::new([0x76; 32]);
+        let treasury_id = ObjectId::new([0x77; 32]);
+        let (treasury_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            treasury_id,
+            Owner::Address(treasury_owner),
+            0x77,
+        );
+
+        let manifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: source_ref,
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: destination_ref.clone(),
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: treasury_ref,
+                mode: AccessMode::Write,
+            },
+        ]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(2_000_000),
+            // Authorized for cross-owner Write by the committed policy, but
+            // never owned by the sender: the fee lifecycle requires more
+            // than mere authorization.
+            fee_object: destination_ref,
+        });
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0x78),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+        let composer = EchoFeeComposer;
+        let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            Some(fee_composition),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::FeeObjectNotOwnedBySender);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn preinstalled_wasm_fee_object_equal_to_treasury_is_rejected() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0x79);
+        let signing_key: SigningKey = dev_signing_key(0x79);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0x79; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (payer_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0x7A; 32]),
+            Owner::Address(sender),
+            0x7A,
+        );
+        let treasury_owner = Address::new([0x7B; 32]);
+        let treasury_id = ObjectId::new([0x7C; 32]);
+        let (treasury_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            treasury_id,
+            Owner::Address(treasury_owner),
+            0x7C,
+        );
+        let manifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: payer_ref,
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: treasury_ref.clone(),
+                mode: AccessMode::Write,
+            },
+        ]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(2_000_000),
+            fee_object: treasury_ref,
+        });
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0x7D),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+        let composer = EchoFeeComposer;
+        let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            Some(fee_composition),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::FeeObjectIsTreasury);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn preinstalled_wasm_treasury_declared_at_non_final_index_is_misdeclared() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0x7E);
+        let signing_key: SigningKey = dev_signing_key(0x7E);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0x7E; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        // A sender-owned stand-in for the treasury id, so object loading
+        // succeeds under the ordinary same-owner rule: this test isolates
+        // manifest-structure validation from ownership authorization.
+        let treasury_id = ObjectId::new([0x7F; 32]);
+        let (treasury_stand_in_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            treasury_id,
+            Owner::Address(sender),
+            0x7F,
+        );
+        let (payer_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0x80; 32]),
+            Owner::Address(sender),
+            0x80,
+        );
+        let manifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: treasury_stand_in_ref,
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: payer_ref.clone(),
+                mode: AccessMode::Write,
+            },
+        ]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(2_000_000),
+            fee_object: payer_ref,
+        });
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0x81),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+        let composer = EchoFeeComposer;
+        let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            Some(fee_composition),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::FeeTreasuryAccessMisdeclared);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn preinstalled_wasm_sender_substituted_object_as_treasury_is_rejected() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0x82);
+        let signing_key: SigningKey = dev_signing_key(0x82);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0x82; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (payer_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0x83; 32]),
+            Owner::Address(sender),
+            0x83,
+        );
+        // Sender's own object, declared final -- an attempt to redirect the
+        // fee credit to an address the sender controls. The real trusted
+        // treasury id (below) never appears in this manifest at all.
+        let (substituted_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0x84; 32]),
+            Owner::Address(sender),
+            0x84,
+        );
+        let treasury_id = ObjectId::new([0x85; 32]);
+        let manifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: payer_ref.clone(),
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: substituted_ref,
+                mode: AccessMode::Write,
+            },
+        ]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(2_000_000),
+            fee_object: payer_ref,
+        });
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0x86),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+        let composer = EchoFeeComposer;
+        let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            Some(fee_composition),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::FeeTreasuryAccessMisdeclared);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn preinstalled_wasm_max_fee_below_worst_case_is_rejected_before_execution() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0x87);
+        let signing_key: SigningKey = dev_signing_key(0x87);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0x87; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (payer_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0x88; 32]),
+            Owner::Address(sender),
+            0x88,
+        );
+        let treasury_owner = Address::new([0x89; 32]);
+        let treasury_id = ObjectId::new([0x8A; 32]);
+        let (treasury_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            treasury_id,
+            Owner::Address(treasury_owner),
+            0x8A,
+        );
+        let manifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: payer_ref.clone(),
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: treasury_ref,
+                mode: AccessMode::Write,
+            },
+        ]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        // gas_limit is 1_000_000 (see `preinstalled_transaction`), so the
+        // worst-case fee is 1 + 1_000_000 = 1_000_001; `max_fee` of 1 can
+        // never cover it.
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(1),
+            fee_object: payer_ref,
+        });
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0x8B),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+        let composer = EchoFeeComposer;
+        let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            Some(fee_composition),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NodeCoreError::FeePaymentRejected(fees::FeeError::MaxFeeExceeded { .. })
+        ));
+        // The engine never ran: no commit was ever attempted.
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn preinstalled_wasm_fee_composer_insufficient_balance_rejects_whole_request() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0x8C);
+        let signing_key: SigningKey = dev_signing_key(0x8C);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0x8C; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_noop_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (payer_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0x8D; 32]),
+            Owner::Address(sender),
+            0x8D,
+        );
+        let treasury_owner = Address::new([0x8E; 32]);
+        let treasury_id = ObjectId::new([0x8F; 32]);
+        let (treasury_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            treasury_id,
+            Owner::Address(treasury_owner),
+            0x8F,
+        );
+        let manifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: payer_ref.clone(),
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: treasury_ref,
+                mode: AccessMode::Write,
+            },
+        ]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            Vec::new(),
+        );
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(2_000_000),
+            fee_object: payer_ref,
+        });
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0x90),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+        let composer = RejectingFeeComposer(FeeCompositionError::InsufficientBalance);
+        let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            Some(fee_composition),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::FeeCompositionFailed(FeeCompositionError::InsufficientBalance)
+        );
+        // No commit at all: no nonce burn, no receipt, no object mutation.
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn preinstalled_wasm_fee_composer_no_op_is_rejected() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0x91);
+        let signing_key: SigningKey = dev_signing_key(0x91);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0x91; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_noop_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (payer_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0x92; 32]),
+            Owner::Address(sender),
+            0x92,
+        );
+        let treasury_owner = Address::new([0x93; 32]);
+        let treasury_id = ObjectId::new([0x94; 32]);
+        let (treasury_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            treasury_id,
+            Owner::Address(treasury_owner),
+            0x94,
+        );
+        let manifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: payer_ref.clone(),
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: treasury_ref,
+                mode: AccessMode::Write,
+            },
+        ]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            Vec::new(),
+        );
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(2_000_000),
+            fee_object: payer_ref,
+        });
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0x95),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+        let composer = EchoFeeComposer;
+        let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            Some(fee_composition),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::FeeCompositionNoOp);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    /// A composer that debits the payer but leaves the treasury body
+    /// byte-identical is not a valid non-zero settlement: value must move on
+    /// both sides, never just off the payer.
+    #[test]
+    fn preinstalled_wasm_fee_composer_payer_only_change_is_rejected() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0xA0);
+        let signing_key: SigningKey = dev_signing_key(0xA0);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0xA0; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_noop_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (payer_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0xA1; 32]),
+            Owner::Address(sender),
+            0xA1,
+        );
+        let treasury_owner = Address::new([0xA2; 32]);
+        let treasury_id = ObjectId::new([0xA3; 32]);
+        let (treasury_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            treasury_id,
+            Owner::Address(treasury_owner),
+            0xA3,
+        );
+        let manifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: payer_ref.clone(),
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: treasury_ref,
+                mode: AccessMode::Write,
+            },
+        ]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            Vec::new(),
+        );
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(2_000_000),
+            fee_object: payer_ref,
+        });
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xA4),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+        let composer = PayerOnlyChangeFeeComposer;
+        let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            Some(fee_composition),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::FeeCompositionNoOp);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    /// A composer that credits the treasury but leaves the payer body
+    /// byte-identical is not a valid non-zero settlement: value must move on
+    /// both sides, never just onto the treasury.
+    #[test]
+    fn preinstalled_wasm_fee_composer_treasury_only_change_is_rejected() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0xA5);
+        let signing_key: SigningKey = dev_signing_key(0xA5);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0xA5; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_noop_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (payer_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0xA6; 32]),
+            Owner::Address(sender),
+            0xA6,
+        );
+        let treasury_owner = Address::new([0xA7; 32]);
+        let treasury_id = ObjectId::new([0xA8; 32]);
+        let (treasury_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            treasury_id,
+            Owner::Address(treasury_owner),
+            0xA8,
+        );
+        let manifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: payer_ref.clone(),
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: treasury_ref,
+                mode: AccessMode::Write,
+            },
+        ]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            Vec::new(),
+        );
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(2_000_000),
+            fee_object: payer_ref,
+        });
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xA9),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+        let composer = TreasuryOnlyChangeFeeComposer;
+        let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            Some(fee_composition),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::FeeCompositionNoOp);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    /// Owned fixture state for the `charge_fee` adversarial tests below.
+    /// `charge_fee` never reads `self.transaction`, `self.resolver`,
+    /// `self.catalog`, `self.engine`, or `self.fee_policy`, so their exact
+    /// contents are immaterial; only `payer`, `treasury`, and `fee_payment`
+    /// matter to the assertions.
+    fn charge_fee_test_state() -> (
+        Transaction,
+        HashSuiteResolver,
+        PreinstalledModuleCatalog,
+        WasmExecutionEngine,
+        CommittedFeePolicy,
+        Object,
+        Object,
+        fees::FeePayment,
+    ) {
+        let signing_key = dev_signing_key(0xB0);
+        let sender = dev_sender_address(&signing_key);
+        let resolver = resolver("sunrise-test");
+        let catalog = PreinstalledModuleCatalog::new(Vec::new()).unwrap();
+        let engine = WasmExecutionEngine;
+        let fee_policy = CommittedFeePolicy {
+            gas_schedule: fee_gas_schedule(),
+            fee_assets: fee_asset_registry(),
+        };
+        let payer = test_object(ObjectId::new([0xB1; 32]), 1, Owner::Address(sender), 0xB1);
+        let treasury_owner = Address::new([0xB2; 32]);
+        let treasury = test_object(
+            ObjectId::new([0xB3; 32]),
+            1,
+            Owner::Address(treasury_owner),
+            0xB3,
+        );
+        let fee_object_ref = ObjectRef {
+            id: payer.id,
+            version: payer.version,
+            digest: Digest32::new(HashAlgorithmId::Sha2_256, [0xB4; 32]),
+        };
+        let fee_payment = fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(2_000_000),
+            fee_object: fee_object_ref.clone(),
+        };
+        let manifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: fee_object_ref,
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: ObjectRef {
+                    id: treasury.id,
+                    version: treasury.version,
+                    digest: Digest32::new(HashAlgorithmId::Sha2_256, [0xB5; 32]),
+                },
+                mode: AccessMode::Write,
+            },
+        ]);
+        let module_ref = ObjectRef {
+            id: ObjectId::new([0xB6; 32]),
+            version: 1,
+            digest: Digest32::new(HashAlgorithmId::Sha2_256, [0xB7; 32]),
+        };
+        let tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            Vec::new(),
+        );
+        (
+            tx,
+            resolver,
+            catalog,
+            engine,
+            fee_policy,
+            payer,
+            treasury,
+            fee_payment,
+        )
+    }
+
+    /// `charge_fee` finds at most one application effect naming the fee
+    /// object; two effects for the same id must be rejected as a duplicate,
+    /// never silently coalesced into one merged mutation. This scenario is
+    /// unreachable through the real WASM engine (the fee object is always a
+    /// single declared `Write` access, so the engine can produce at most one
+    /// effect for it), so `charge_fee` is exercised directly.
+    #[test]
+    fn preinstalled_wasm_charge_fee_rejects_duplicate_payer_effect() {
+        let (tx, resolver, catalog, engine, fee_policy, payer, treasury, fee_payment) =
+            charge_fee_test_state();
+        let composer = RecordingFeeComposer::new();
+        let fee_composition = PreinstalledFeeComposition::new(treasury.id, &composer);
+        let machine = PreinstalledWasmMachine {
+            transaction: &tx,
+            resolver: &resolver,
+            registered_module: None,
+            catalog: &catalog,
+            engine: &engine,
+            fee_policy: &fee_policy,
+            fee_composition: Some(fee_composition),
+            resolved_module: std::cell::OnceCell::new(),
+            treasury_object: std::cell::OnceCell::new(),
+        };
+        machine.treasury_object.set(treasury.clone()).unwrap();
+        let snapshot = NodeStateSnapshot {
+            values: BTreeMap::new(),
+            resolved_objects: vec![ResolvedObject {
+                object: payer.clone(),
+                mode: AccessMode::Write,
+            }],
+        };
+        let mut payer_next = payer.clone();
+        payer_next.version = payer.version + 1;
+        payer_next.data = vec![0x01];
+        let duplicate_effect = ObjectEffect::Mutated {
+            previous_version: payer.version,
+            new_object: payer_next,
+        };
+
+        let error = machine
+            .charge_fee(
+                &snapshot,
+                &fee_payment,
+                payer.id,
+                treasury.id,
+                fees::Amount::new(5),
+                vec![duplicate_effect.clone(), duplicate_effect],
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::DuplicateObjectEffect {
+                object_id: payer.id
+            }
+        );
+    }
+
+    /// A `Created` application effect for the fee object id is exactly what
+    /// `translate_authenticated_object_effects` would reject for a declared
+    /// `Write` access; `charge_fee` must reject it too rather than treating
+    /// it as "no existing effect" and silently overwriting it with a fresh
+    /// mutation.
+    #[test]
+    fn preinstalled_wasm_charge_fee_rejects_created_payer_effect() {
+        let (tx, resolver, catalog, engine, fee_policy, payer, treasury, fee_payment) =
+            charge_fee_test_state();
+        let composer = RecordingFeeComposer::new();
+        let fee_composition = PreinstalledFeeComposition::new(treasury.id, &composer);
+        let machine = PreinstalledWasmMachine {
+            transaction: &tx,
+            resolver: &resolver,
+            registered_module: None,
+            catalog: &catalog,
+            engine: &engine,
+            fee_policy: &fee_policy,
+            fee_composition: Some(fee_composition),
+            resolved_module: std::cell::OnceCell::new(),
+            treasury_object: std::cell::OnceCell::new(),
+        };
+        machine.treasury_object.set(treasury.clone()).unwrap();
+        let snapshot = NodeStateSnapshot {
+            values: BTreeMap::new(),
+            resolved_objects: vec![ResolvedObject {
+                object: payer.clone(),
+                mode: AccessMode::Write,
+            }],
+        };
+        let created = test_object(payer.id, 1, payer.owner.clone(), 0xB9);
+
+        let error = machine
+            .charge_fee(
+                &snapshot,
+                &fee_payment,
+                payer.id,
+                treasury.id,
+                fees::Amount::new(5),
+                vec![ObjectEffect::Created(created)],
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::ObjectCreationUnsupported {
+                object_id: payer.id
+            }
+        );
+    }
+
+    /// A `Deleted` application effect for the fee object id disagrees with
+    /// its required `Write` access exactly like
+    /// `translate_authenticated_object_effects` would reject it;
+    /// `charge_fee` must reject it too instead of masking it by filtering
+    /// every same-id effect out during merge and inserting a fresh mutation.
+    #[test]
+    fn preinstalled_wasm_charge_fee_rejects_deleted_payer_effect() {
+        let (tx, resolver, catalog, engine, fee_policy, payer, treasury, fee_payment) =
+            charge_fee_test_state();
+        let composer = RecordingFeeComposer::new();
+        let fee_composition = PreinstalledFeeComposition::new(treasury.id, &composer);
+        let machine = PreinstalledWasmMachine {
+            transaction: &tx,
+            resolver: &resolver,
+            registered_module: None,
+            catalog: &catalog,
+            engine: &engine,
+            fee_policy: &fee_policy,
+            fee_composition: Some(fee_composition),
+            resolved_module: std::cell::OnceCell::new(),
+            treasury_object: std::cell::OnceCell::new(),
+        };
+        machine.treasury_object.set(treasury.clone()).unwrap();
+        let snapshot = NodeStateSnapshot {
+            values: BTreeMap::new(),
+            resolved_objects: vec![ResolvedObject {
+                object: payer.clone(),
+                mode: AccessMode::Write,
+            }],
+        };
+
+        let error = machine
+            .charge_fee(
+                &snapshot,
+                &fee_payment,
+                payer.id,
+                treasury.id,
+                fees::Amount::new(5),
+                vec![ObjectEffect::Deleted {
+                    id: payer.id,
+                    version: payer.version,
+                }],
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::ObjectEffectMismatch {
+                object_id: payer.id,
+                reason: "fee object write access requires exactly one mutated effect",
+            }
+        );
+    }
+
+    #[test]
+    fn preinstalled_wasm_fee_paying_exact_replay_does_not_recharge() {
+        let store: MemoryDurableStateStore =
+            MemoryDurableStateStore::new(WriterFenceGeneration::new(1).unwrap());
+        store.set_time(100);
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0xF4);
+        let signing_key: SigningKey = dev_signing_key(0xF4);
+        let sender: Address = dev_sender_address(&signing_key);
+        let context: DurableOperationContext = durable_context();
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let object_domain: AtomicityDomainId = domain(0xF4);
+        let module_id = ModuleId::new([0xF4; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_noop_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+
+        let payer_id: ObjectId = ObjectId::new([0xF5; 32]);
+        let mut payer_object = test_object(payer_id, 1, Owner::Address(sender), 0xF5);
+        payer_object.data = vec![0x10];
+        let payer_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            payer_object,
+            "sunrise-test",
+            9,
+            0xF6,
+        );
+        let treasury_owner: Address = Address::new([0xF7; 32]);
+        let treasury_id: ObjectId = ObjectId::new([0xF8; 32]);
+        let mut treasury_object = test_object(treasury_id, 1, Owner::Address(treasury_owner), 0xF8);
+        treasury_object.data = vec![0x00];
+        let treasury_ref: ObjectRef = commit_memory_inline_object(
+            &store,
+            &context,
+            object_domain,
+            treasury_object,
+            "sunrise-test",
+            9,
+            0xF9,
+        );
+
+        let manifest: AccessManifest = manifest_with(vec![
+            AccessEntry {
+                object_ref: payer_ref.clone(),
+                mode: AccessMode::Write,
+            },
+            AccessEntry {
+                object_ref: treasury_ref,
+                mode: AccessMode::Write,
+            },
+        ]);
+        let mut tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            Vec::new(),
+        );
+        tx.fee_payment = Some(fees::FeePayment {
+            asset_id: fee_asset_id(),
+            max_fee: fees::Amount::new(2_000_000),
+            fee_object: payer_ref,
+        });
+        let submission: AuthenticatedSubmitTransaction = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0xFA),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let replay_submission: AuthenticatedSubmitTransaction = submission.clone();
+        let engine = WasmExecutionEngine;
+        let composer = RecordingFeeComposer::new();
+        let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+
+        let first = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &context,
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            Some(fee_composition),
+        )
+        .unwrap();
+
+        // An empty catalog and no fee composition at all on replay prove
+        // that the persisted receipt short-circuits before module
+        // resolution, fee admission, or execution -- the fee is not
+        // reapplied.
+        let empty_catalog: PreinstalledModuleCatalog =
+            PreinstalledModuleCatalog::new(Vec::new()).unwrap();
+        let replay = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &context,
+            &hash_resolver,
+            &empty_catalog,
+            &engine,
+            replay_submission,
+            999,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(first, replay);
+        let payer_head: DurableObjectHead = store
+            .get_object_head(&context, object_domain, payer_id)
+            .unwrap();
+        assert_eq!(payer_head.object_version(), DurableObjectVersion::new(2));
+        let treasury_head: DurableObjectHead = store
+            .get_object_head(&context, object_domain, treasury_id)
+            .unwrap();
+        assert_eq!(treasury_head.object_version(), DurableObjectVersion::new(2));
     }
 }

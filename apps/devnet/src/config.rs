@@ -13,8 +13,12 @@ use std::{
 
 /// Hard admission ceiling for the local-only devnet.
 pub const MAX_DEVNET_CONCURRENCY: usize = 1_024;
-/// Maximum development owners seeded by one local process boot.
+/// Maximum total ordinary asset-account owners seeded by one local process
+/// boot, including the distinct fee-treasury owner.
 pub const MAX_DEVNET_OWNERS: usize = 64;
+/// Maximum caller-configured transfer owners, reserving one seed slot for the
+/// required distinct fee-treasury owner.
+const MAX_CONFIGURED_DEV_OWNERS: usize = MAX_DEVNET_OWNERS - 1;
 
 /// Known-limitations banner printed once at every devnet startup.
 ///
@@ -27,7 +31,7 @@ pub const MAX_DEVNET_OWNERS: usize = 64;
 /// authorization), and query and submission share one admission budget
 /// (the single `NativeBlockingExecutor` constructed by the native router), so
 /// a burst of one can starve the other.
-pub const DEVNET_STARTUP_LIMITATIONS_BANNER: &str = "single-validator,owned-objects-only,policy-bounded-cross-owner-destination,literal-owner-reassignment-fail-closed,fee-free,local-sqlite,unauthenticated-bounded-public-read-query-api,shared-query-submission-admission-budget,non-production";
+pub const DEVNET_STARTUP_LIMITATIONS_BANNER: &str = "single-validator,owned-objects-only,policy-bounded-cross-owner-destination,literal-owner-reassignment-fail-closed,single-ordinary-fee-asset,ordinary-treasury-not-certificate-distributed,local-sqlite,unauthenticated-bounded-public-read-query-api,shared-query-submission-admission-budget,non-production";
 
 /// One browser/client-controlled development owner address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -64,6 +68,7 @@ pub struct DevnetConfig {
     chain_id: ChainId,
     epoch: Epoch,
     dev_owners: Vec<DevOwner>,
+    fee_treasury_owner: DevOwner,
     max_concurrent: usize,
 }
 
@@ -72,7 +77,11 @@ impl DevnetConfig {
     ///
     /// Every scalar flag is required exactly once. `--dev-owner` is required
     /// at least once and may be repeated with distinct, exact 32-byte lowercase
-    /// or uppercase hexadecimal values. Binding is restricted to loopback.
+    /// or uppercase hexadecimal values. `--fee-treasury-owner` is required
+    /// exactly once, parsed with the same strict hexadecimal rule, and must
+    /// not equal any `--dev-owner`: the fee sink is seeded and queried as an
+    /// ordinary owner distinct from every transfer participant. Binding is
+    /// restricted to loopback.
     pub fn parse_from<I, S>(args: I) -> Result<Self, DevnetConfigError>
     where
         I: IntoIterator<Item = S>,
@@ -83,6 +92,7 @@ impl DevnetConfig {
         let mut chain_id: Option<ChainId> = None;
         let mut epoch: Option<Epoch> = None;
         let mut dev_owners: Vec<DevOwner> = Vec::new();
+        let mut fee_treasury_owner: Option<DevOwner> = None;
         let mut max_concurrent: Option<usize> = None;
         let mut iterator = args.into_iter().map(Into::into);
 
@@ -138,9 +148,9 @@ impl DevnetConfig {
                     epoch = Some(Epoch::new(parsed));
                 }
                 "--dev-owner" => {
-                    if dev_owners.len() >= MAX_DEVNET_OWNERS {
+                    if dev_owners.len() >= MAX_CONFIGURED_DEV_OWNERS {
                         return Err(DevnetConfigError::TooManyDevOwners {
-                            maximum: MAX_DEVNET_OWNERS,
+                            maximum: MAX_CONFIGURED_DEV_OWNERS,
                         });
                     }
                     let value: String = required_utf8_value(&mut iterator, "--dev-owner")?;
@@ -149,6 +159,13 @@ impl DevnetConfig {
                         return Err(DevnetConfigError::DuplicateDevOwner(owner));
                     }
                     dev_owners.push(owner);
+                }
+                "--fee-treasury-owner" => {
+                    ensure_absent("--fee-treasury-owner", &fee_treasury_owner)?;
+                    let value: String = required_utf8_value(&mut iterator, "--fee-treasury-owner")?;
+                    let bytes: [u8; 32] = parse_hex_owner(&value)
+                        .ok_or_else(|| DevnetConfigError::InvalidFeeTreasuryOwner(value.clone()))?;
+                    fee_treasury_owner = Some(DevOwner::new(bytes));
                 }
                 "--max-concurrent" => {
                     ensure_absent("--max-concurrent", &max_concurrent)?;
@@ -172,12 +189,20 @@ impl DevnetConfig {
         if dev_owners.is_empty() {
             return Err(DevnetConfigError::MissingDevOwner);
         }
+        let fee_treasury_owner: DevOwner =
+            fee_treasury_owner.ok_or(DevnetConfigError::MissingFlag("--fee-treasury-owner"))?;
+        if dev_owners.contains(&fee_treasury_owner) {
+            return Err(DevnetConfigError::FeeTreasuryOwnerDuplicatesDevOwner(
+                fee_treasury_owner,
+            ));
+        }
         Ok(Self {
             data_dir: data_dir.ok_or(DevnetConfigError::MissingFlag("--data-dir"))?,
             listen: listen.ok_or(DevnetConfigError::MissingFlag("--listen"))?,
             chain_id: chain_id.ok_or(DevnetConfigError::MissingFlag("--chain-id"))?,
             epoch: epoch.ok_or(DevnetConfigError::MissingFlag("--epoch"))?,
             dev_owners,
+            fee_treasury_owner,
             max_concurrent: max_concurrent
                 .ok_or(DevnetConfigError::MissingFlag("--max-concurrent"))?,
         })
@@ -213,6 +238,12 @@ impl DevnetConfig {
         &self.dev_owners
     }
 
+    /// Returns the fee-treasury owner, distinct from every `--dev-owner`.
+    #[must_use]
+    pub const fn fee_treasury_owner(&self) -> DevOwner {
+        self.fee_treasury_owner
+    }
+
     /// Returns the bounded synchronous admission limit.
     #[must_use]
     pub const fn max_concurrent(&self) -> usize {
@@ -246,8 +277,14 @@ where
 }
 
 fn parse_dev_owner(value: &str) -> Result<DevOwner, DevnetConfigError> {
+    parse_hex_owner(value)
+        .map(DevOwner::new)
+        .ok_or_else(|| DevnetConfigError::InvalidDevOwner(value.to_owned()))
+}
+
+fn parse_hex_owner(value: &str) -> Option<[u8; 32]> {
     if value.len() != 64 || !value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
-        return Err(DevnetConfigError::InvalidDevOwner(value.to_owned()));
+        return None;
     }
     let mut bytes: [u8; 32] = [0; 32];
     for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
@@ -255,7 +292,7 @@ fn parse_dev_owner(value: &str) -> Result<DevOwner, DevnetConfigError> {
         let low: u8 = decode_hex_nibble(pair[1]);
         bytes[index] = (high << 4) | low;
     }
-    Ok(DevOwner::new(bytes))
+    Some(bytes)
 }
 
 const fn decode_hex_nibble(value: u8) -> u8 {
@@ -324,6 +361,10 @@ pub enum DevnetConfigError {
     InvalidDevOwner(String),
     /// A development owner appeared more than once.
     DuplicateDevOwner(DevOwner),
+    /// The fee-treasury owner was not exactly 32 bytes of hexadecimal.
+    InvalidFeeTreasuryOwner(String),
+    /// The fee-treasury owner equaled a `--dev-owner`.
+    FeeTreasuryOwnerDuplicatesDevOwner(DevOwner),
 }
 
 impl fmt::Display for DevnetConfigError {
@@ -363,6 +404,14 @@ impl fmt::Display for DevnetConfigError {
             Self::DuplicateDevOwner(owner) => {
                 write!(f, "--dev-owner must be unique, duplicate {owner}")
             }
+            Self::InvalidFeeTreasuryOwner(value) => write!(
+                f,
+                "--fee-treasury-owner must be exactly 64 hexadecimal characters, got {value:?}"
+            ),
+            Self::FeeTreasuryOwnerDuplicatesDevOwner(owner) => write!(
+                f,
+                "--fee-treasury-owner must be distinct from every --dev-owner, got {owner}"
+            ),
         }
     }
 }
@@ -395,6 +444,8 @@ mod tests {
             "1111111111111111111111111111111111111111111111111111111111111111".into(),
             "--max-concurrent".into(),
             "16".into(),
+            "--fee-treasury-owner".into(),
+            "2222222222222222222222222222222222222222222222222222222222222222".into(),
         ]
     }
 
@@ -406,6 +457,41 @@ mod tests {
         assert_eq!(config.epoch(), Epoch::new(7));
         assert_eq!(config.dev_owners(), &[DevOwner::new([0x11; 32])]);
         assert_eq!(config.max_concurrent(), 16);
+        assert_eq!(config.fee_treasury_owner(), DevOwner::new([0x22; 32]));
+    }
+
+    #[test]
+    fn requires_fee_treasury_owner_and_rejects_malformed_or_duplicate_value() {
+        let mut without_treasury = valid_args();
+        without_treasury.drain(12..14);
+        assert!(matches!(
+            DevnetConfig::parse_from(without_treasury),
+            Err(DevnetConfigError::MissingFlag("--fee-treasury-owner"))
+        ));
+
+        let mut malformed = valid_args();
+        malformed[13] = "22".into();
+        assert!(matches!(
+            DevnetConfig::parse_from(malformed),
+            Err(DevnetConfigError::InvalidFeeTreasuryOwner(_))
+        ));
+
+        let mut duplicated_flag = valid_args();
+        duplicated_flag.extend([
+            "--fee-treasury-owner".into(),
+            "3333333333333333333333333333333333333333333333333333333333333333".into(),
+        ]);
+        assert!(matches!(
+            DevnetConfig::parse_from(duplicated_flag),
+            Err(DevnetConfigError::DuplicateFlag("--fee-treasury-owner"))
+        ));
+
+        let mut collides_with_dev_owner = valid_args();
+        collides_with_dev_owner[13] = collides_with_dev_owner[9].clone();
+        assert!(matches!(
+            DevnetConfig::parse_from(collides_with_dev_owner),
+            Err(DevnetConfigError::FeeTreasuryOwnerDuplicatesDevOwner(_))
+        ));
     }
 
     #[test]
@@ -465,7 +551,7 @@ mod tests {
         let mut args: Vec<OsString> = valid_args();
         args.drain(8..10);
         let max_concurrent: Vec<OsString> = args.split_off(8);
-        for value in 1..=(MAX_DEVNET_OWNERS + 1) {
+        for value in 1..=MAX_DEVNET_OWNERS {
             args.push(OsString::from("--dev-owner"));
             args.push(OsString::from(format!("{value:064x}")));
         }
@@ -474,9 +560,26 @@ mod tests {
         assert!(matches!(
             DevnetConfig::parse_from(args),
             Err(DevnetConfigError::TooManyDevOwners {
-                maximum: MAX_DEVNET_OWNERS
+                maximum: MAX_CONFIGURED_DEV_OWNERS
             })
         ));
+    }
+
+    #[test]
+    fn exact_owner_boundary_reserves_one_seed_slot_for_treasury() {
+        let mut args: Vec<OsString> = valid_args();
+        args.drain(8..10);
+        let suffix: Vec<OsString> = args.split_off(8);
+        for value in 1..=MAX_CONFIGURED_DEV_OWNERS {
+            args.push(OsString::from("--dev-owner"));
+            args.push(OsString::from(format!("{value:064x}")));
+        }
+        args.extend(suffix);
+
+        let config: DevnetConfig = DevnetConfig::parse_from(args)
+            .expect("the exact transfer-owner boundary must remain valid");
+        assert_eq!(config.dev_owners().len(), MAX_DEVNET_OWNERS - 1);
+        assert_eq!(config.dev_owners().len() + 1, MAX_DEVNET_OWNERS);
     }
 
     #[test]
@@ -523,6 +626,12 @@ mod tests {
         assert!(
             DEVNET_STARTUP_LIMITATIONS_BANNER.contains("shared-query-submission-admission-budget")
         );
+        assert!(DEVNET_STARTUP_LIMITATIONS_BANNER.contains("single-ordinary-fee-asset"));
+        assert!(
+            DEVNET_STARTUP_LIMITATIONS_BANNER
+                .contains("ordinary-treasury-not-certificate-distributed")
+        );
+        assert!(!DEVNET_STARTUP_LIMITATIONS_BANNER.contains("fee-free"));
         assert!(
             DEVNET_STARTUP_LIMITATIONS_BANNER
                 .split(',')
