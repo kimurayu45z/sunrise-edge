@@ -9,6 +9,7 @@ abi.workspace = true
 canonical-encoding.workspace = true
 crypto.workspace = true
 execution.workspace = true
+fees.workspace = true
 hashing.workspace = true
 objects.workspace = true
 protocol-config.workspace = true

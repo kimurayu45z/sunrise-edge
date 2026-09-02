@@ -1,11 +1,12 @@
 #![forbid(unsafe_code)]
 
 use native_http::serve;
+use objects::ObjectId;
 use runtime::{Clock, DurableOperationContext, StorageCorrelationId, StorageDeadline, SystemClock};
 use std::{error::Error, process::ExitCode, sync::Arc};
 use sunrise_edge_devnet::{
     ASSET_ACCOUNT_WASM, DEVNET_ASSET_ID, DEVNET_DATABASE_FILE, DEVNET_STARTUP_LIMITATIONS_BANNER,
-    DevnetConfig, SeedAssetAccountsOutcome, asset_account_type_hash, boot_local_store,
+    DevOwner, DevnetConfig, SeedAssetAccountsOutcome, asset_account_type_hash, boot_local_store,
     build_asset_module, build_devnet_protocol_context, compose_devnet_router, seed_asset_accounts,
     verify_seeded_asset_supply,
 };
@@ -21,9 +22,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
         build_devnet_protocol_context(config.chain_id().clone(), config.epoch())?;
     let asset_module = build_asset_module(protocol_context, ASSET_ACCOUNT_WASM.to_vec())?;
     let module_ref = asset_module.module_ref().clone();
-    let mut seed_outcomes: Vec<SeedAssetAccountsOutcome> =
-        Vec::with_capacity(config.dev_owners().len());
-    for (index, owner) in config.dev_owners().iter().copied().enumerate() {
+    let seed_owners: Vec<DevOwner> = config
+        .dev_owners()
+        .iter()
+        .copied()
+        .chain(std::iter::once(config.fee_treasury_owner()))
+        .collect();
+    let mut seed_outcomes: Vec<SeedAssetAccountsOutcome> = Vec::with_capacity(seed_owners.len());
+    for (index, owner) in seed_owners.iter().copied().enumerate() {
         let now_unix_millis: u64 = SystemClock.now_unix_millis()?;
         let seed_deadline_unix_millis: u64 = now_unix_millis
             .checked_add(SEED_OPERATION_TIMEOUT_MILLIS)
@@ -52,9 +58,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
             SeedAssetAccountsOutcome::Created(_) => "created",
             SeedAssetAccountsOutcome::Existing(_) => "verified-existing",
         };
+        let role: &str = if owner == config.fee_treasury_owner() {
+            "fee-treasury"
+        } else {
+            "dev-owner"
+        };
         println!(
-            "owner={} seed_status={} source={} destination={}",
+            "owner={} role={} seed_status={} source={} destination={}",
             owner,
+            role,
             seed_status,
             outcome.accounts().source().id,
             outcome.accounts().destination().id
@@ -62,6 +74,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
         seed_outcomes.push(outcome);
     }
     verify_seeded_asset_supply(&seed_outcomes)?;
+    let fee_treasury_object_id: ObjectId = seed_outcomes
+        .last()
+        .ok_or("missing fee-treasury seed outcome")?
+        .accounts()
+        .destination()
+        .id;
 
     let store = Arc::new(boot.into_store());
     let router = compose_devnet_router(
@@ -69,7 +87,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         asset_module,
         boot_generation,
         config.max_concurrent(),
-        config.dev_owners().len(),
+        seed_owners.len(),
+        fee_treasury_object_id,
     )?;
     let listener = tokio::net::TcpListener::bind(config.listen()).await?;
 
@@ -89,6 +108,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         module_ref.digest
     );
     println!("dev_owners={}", config.dev_owners().len());
+    println!("fee_treasury_owner={}", config.fee_treasury_owner());
+    println!("fee_treasury_object={fee_treasury_object_id}");
     println!("max_concurrent={}", config.max_concurrent());
     println!("limitations={DEVNET_STARTUP_LIMITATIONS_BANNER}");
     println!("Press Ctrl-C to stop.");

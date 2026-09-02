@@ -426,9 +426,10 @@ cross-provider ingress milestones implemented through Phase 17:
   owned-effects path that validates signed Address-object Update/Delete
   effects and, through a separate additive preinstalled-WASM entrypoint,
   deterministic bounded WASM execution against an exact-committed module
-  catalog; Create, Shared/System ownership, blob transfer verification,
-  native binary/devnet startup composition, and fee/gas metering remain
-  deferred.
+  catalog. Local native devnet startup composition and S3's bounded actual-gas
+  AssetAccount fee settlement are implemented As-Is; Create, Shared/System
+  ownership, blob transfer verification, arbitrary module upload, and
+  production deployment and economics remain deferred.
 - An additive indexed durable-outbox repository contract that claims at most
   one due message in stable availability/request order, installs a bounded
   restart-safe lease atomically, and makes same-lease claim and acknowledgement
@@ -522,16 +523,17 @@ rehearsal for one snapshot cycle, not a production backup/restore
 capability, and DR-0075 is a bounded local rehearsal, not provider-managed
 pooler service certification),
 portable system-module execution, cryptographic slashing proof verification,
-fee-object debiting,
+validator/certificate fee distribution, production gas calibration and broader
+fee economics,
 provider persistence bindings, runtime adapters, networking/RPC surfaces, and
 independent security review.
 
 The [CLI Developer MVP Gate](TODO.md#cli-developer-mvp-gate) is satisfied
 As-Is: a real Rust client and CLI exercise the local end-to-end product,
 including orderly restart and duplicate-request evidence. Under the CLI-first
-production-strategy pivot (see `ARCHITECTURE.md` DR-0085), S2 of the
+production-strategy pivot (see `ARCHITECTURE.md` DR-0085), S3 of the
 [CLI-First Node Production Gate](TODO.md#cli-first-node-production-gate) is
-now implemented As-Is, and the current milestone is S3 — S0-S2 are real
+now implemented As-Is, and the current milestone is S4 — S0-S3 are real
 node/persistence/operations gate slices defined by reference to the existing,
 unchanged Phase 15 production exit criteria, the Post-MVP persistence
 implementation order, and the cross-phase release gate. S1 has two separate
@@ -577,8 +579,15 @@ destination owner remains unchanged. Literal ownership reassignment/gifting,
 `Consume`, wrong position/mode/type/schema/entrypoint/module, and Shared/
 System/Immutable owners remain fail-closed. The TypeScript-client/explorer/
 wallet criteria remain unchanged but are deferred until the CLI-First Node
-Production Gate passes. Passing S2 is explicitly not mainnet readiness; S3
-through S5, the Phase 16/17 production exit criteria, and an independent
+Production Gate passes. S3 adds uniform fee accounting over the same ordinary
+asset-account model: a committed non-zero base/execution gas schedule, one
+enabled `DEVNET_ASSET_ID`, a sender-owned source fee object, and one distinct
+ordinary treasury account supplied only by trusted devnet composition. The
+module still sees only source/destination; node-core settles exact receipt
+`gas_used` after execution and atomically merges fee effects. Traps discard
+application effects but commit a normalized fee-only charge. Passing S3 is
+explicitly not mainnet readiness; S4 and S5, the Phase 16/17 production exit
+criteria, and an independent
 security audit remain required afterward. The owned-object Write/Consume
 durable composition and an additive trusted preinstalled-WASM node-core
 entrypoint are
@@ -627,17 +636,22 @@ privileged native coin or special-cased balance/transfer/fee path. It enforces
 conservation and fails closed on zero amount, underflow, overflow, and
 asset-ID mismatch.
 The module name and its `0xF001` body, `0xF002` arguments, and `0xF003` event
-schemas remain version 1, but the installed preinstalled module version is 2:
-its `0xF011` version-2 semantics declaration commits the S2 policy. Historical
-module/semantics version 1 bytes remain pinned for compatibility and are not
-installed by this dev profile; the WASM bytes are unchanged. This is a bounded
+schemas remain version 1, but the installed preinstalled module version is 3:
+its `0xF011` version-3 semantics declaration commits S2's destination policy
+plus S3's post-execution fee/treasury/event semantics. Historical
+module/semantics version 1 and 2 bytes remain pinned for compatibility and are
+not installed by this dev profile; the WAT/WASM bytes and canonical code hash
+are unchanged. This is a bounded
 dev-profile selection, not a general module-upgrade activation architecture.
 The trusted devnet catalog may authorize an existing destination owned by a
 different configured address while leaving both object owners unchanged;
-literal object-owner reassignment remains fail-closed. The devnet's fee
-registry stays empty and every transaction commits with `fee_payment: None`.
-The MVP remains single-validator, owned-object only, fee-free, local-SQLite,
-and explicitly non-production.
+literal object-owner reassignment remains fail-closed. The devnet commits one
+enabled ordinary fee asset (`DEVNET_ASSET_ID`, 1 fee unit per asset unit), a
+base fee of 1, and an execution price of 1 per actual `gas_used`. The fee
+treasury is the distinct configured treasury owner's ordinary destination
+account. The MVP remains single-validator, owned-object only, single-fee-asset,
+local-SQLite, and explicitly non-production; validator/certificate fee
+distribution and production economics remain deferred.
 
 `apps/devnet` now composes strict loopback-only CLI configuration, durable
 SQLite writer-fence advancement on every boot, restart-safe bounded outbox
@@ -739,8 +753,12 @@ response, for the next-nonce/both-object queries, transaction construction,
 signing, and submission that follow; a mismatch on any field stops the
 command immediately after that one context request. It requires the source
 owner to equal the signer and the destination owner to equal the explicit
-expected address, then builds the exact two-`Write` access manifest in source/
-destination order, signs and submits
+expected address, then builds the exact source/destination `Write` accesses.
+When the all-or-none `--fee-asset-id`/`--max-fee`/
+`--fee-treasury-object` trio is present, it queries and appends the treasury
+as the final `Write`, while the source is the signed `fee_object`. Partial fee
+configuration, zero max fee, and treasury collision with either transfer leg
+fail locally before dispatch. It signs and submits
 through `clients/rust`, and can optionally wait for a receipt under
 caller-supplied, finite poll bounds (`--wait` requires all four `--wait-*`
 bounds together; no hidden default). Output is deterministic `key=value`
@@ -766,24 +784,27 @@ the file is genuinely closed first), verifies the writer generation advances
 and the same seeded accounts reconcile, and proves a real cross-owner transfer
 leaves the recipient destination owner unchanged while the canonical object,
 receipt, next-nonce, and submit-result bytes survive restart exactly. The
-same signed request is replayed both within one boot and after restart without
-re-applying its effects; reusing a committed request id for a
-different transaction is a typed fail-closed HTTP conflict with both objects,
-both relevant receipts, and the sender nonce unchanged, and the
+same successful signed request is replayed within one boot and after restart,
+and a trapped fee-only request is also replayed after restart, without
+re-applying transfer or fee effects; reusing a committed request id for a
+different transaction is a typed fail-closed HTTP conflict with source,
+destination, treasury, all three relevant receipts, and sender nonce
+unchanged, and the
 pre-restart writer generation is fenced on the reopened store. This proves
 only orderly stop/reopen — not `kill -9`, power loss, torn writes, load,
 concurrency, or SQLite's production suitability.
 
 The Phase 15-17 production exit criteria and accepted persistence designs are
-preserved. The CLI Developer MVP Gate and S0-S2 of the CLI-First Node
+preserved. The CLI Developer MVP Gate and S0-S3 of the CLI-First Node
 Production Gate are satisfied As-Is: S1's expected-protocol-context
 verification slice and its remote TLS transport slice are both now
 implemented and tested, so S1 as a whole is complete; S2's committed
 cross-owner destination policy and restart/replay evidence are also complete
-As-Is, and the current milestone is S3, uniform asset fee accounting and gas
-metering. This is real node/persistence/operations and remote-CLI
+As-Is. S3's uniform asset fee accounting and actual-gas settlement are now
+implemented and validated As-Is; the current milestone is S4 secure signer.
+This is real node/persistence/operations and remote-CLI
 evidence, not a mainnet-readiness or production-certification claim: passing
-S2 does not authorize skipping directly to later production claims.
+S3 does not authorize skipping directly to later production claims.
 Additional capacity/load/soak evidence, PITR, HA/failover, and provider-managed
 certification remain frozen until S5's certification work or an explicit SLO
 requires them. The
@@ -859,7 +880,8 @@ workspace has already been built once (`cargo build --workspace`). The devnet
 binds loopback only, is single-validator, and must never be used to custody
 real assets or exposed beyond your own machine.
 
-1. In terminal A, choose explicit paths and create sender and recipient
+1. In terminal A, choose explicit paths and create sender, recipient, and
+   distinct fee-treasury
    development seed files: private, non-keystore development secrets each
    consisting of exactly 64 hexadecimal characters, with permission
    `0600` and never a symlink (`apps/cli`'s `address`/`transfer` commands
@@ -868,26 +890,31 @@ real assets or exposed beyond your own machine.
    ```bash
    SENDER_SEED_FILE=/tmp/sunrise-edge-sender-seed
    RECIPIENT_SEED_FILE=/tmp/sunrise-edge-recipient-seed
+   TREASURY_SEED_FILE=/tmp/sunrise-edge-treasury-seed
    DEVNET_DATA_DIR=/tmp/sunrise-edge-devnet
    umask 077
    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$SENDER_SEED_FILE"
    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$RECIPIENT_SEED_FILE"
-   chmod 600 "$SENDER_SEED_FILE" "$RECIPIENT_SEED_FILE"
+   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$TREASURY_SEED_FILE"
+   chmod 600 "$SENDER_SEED_FILE" "$RECIPIENT_SEED_FILE" "$TREASURY_SEED_FILE"
    ```
 
-2. Derive both addresses. Each command prints exactly one
+2. Derive all three distinct addresses. Each command prints exactly one
    `address=<64-hex-character address>` line (the values depend on the random
    seeds above, so they are not written out here):
 
    ```bash
    SENDER_ADDRESS_LINE="$(cargo run -p sunrise-edge-cli -- address --seed-file "$SENDER_SEED_FILE")"
    RECIPIENT_ADDRESS_LINE="$(cargo run -p sunrise-edge-cli -- address --seed-file "$RECIPIENT_SEED_FILE")"
+   TREASURY_ADDRESS_LINE="$(cargo run -p sunrise-edge-cli -- address --seed-file "$TREASURY_SEED_FILE")"
    SENDER_OWNER="${SENDER_ADDRESS_LINE#address=}"
    RECIPIENT_OWNER="${RECIPIENT_ADDRESS_LINE#address=}"
-   printf 'SENDER_OWNER=%s\nRECIPIENT_OWNER=%s\n' "$SENDER_OWNER" "$RECIPIENT_OWNER"
+   TREASURY_OWNER="${TREASURY_ADDRESS_LINE#address=}"
+   printf 'SENDER_OWNER=%s\nRECIPIENT_OWNER=%s\nTREASURY_OWNER=%s\n' \
+     "$SENDER_OWNER" "$RECIPIENT_OWNER" "$TREASURY_OWNER"
    ```
 
-3. Start the local devnet in its own terminal with both addresses configured:
+3. Start the local devnet in its own terminal with all addresses configured:
 
    ```bash
    cargo run -p sunrise-edge-devnet -- \
@@ -897,15 +924,17 @@ real assets or exposed beyond your own machine.
      --epoch 0 \
      --dev-owner "$SENDER_OWNER" \
      --dev-owner "$RECIPIENT_OWNER" \
+     --fee-treasury-owner "$TREASURY_OWNER" \
      --max-concurrent 16
    ```
 
-   Startup prints one line per `--dev-owner`:
-   `owner=<owner> seed_status=<created|verified-existing> source=<object id> destination=<object id>`,
+   Startup prints one line per seeded owner (including the treasury):
+   `owner=<owner> role=<dev-owner|fee-treasury> seed_status=<created|verified-existing> source=<object id> destination=<object id>`,
    and one line with the preinstalled module identity:
    `asset_id=<...> asset_account_type=<...> module_id=<...> module_version=<...> module_digest=<algorithm-label>:<hex digest>`.
-   Copy the sender owner's `source`, the recipient owner's `destination`, and
-   `module_id`/`module_version` from these printed lines for step 5.
+   Copy the sender owner's `source`, recipient owner's `destination`, treasury
+   owner's `destination`, `asset_id`, and `module_id`/`module_version` from
+   these printed lines for step 5.
    `module_digest` prints as
    `<algorithm-label>:<hex>` (currently always `sha2-256:<hex>`, the only
    implemented digest algorithm, whose committed numeric `HashAlgorithmId` is
@@ -921,8 +950,11 @@ real assets or exposed beyond your own machine.
    SENDER_SEED_FILE=/tmp/sunrise-edge-sender-seed
    SENDER_OWNER="PASTE_SENDER_ADDRESS_PRINTED_IN_STEP_2"
    RECIPIENT_OWNER="PASTE_RECIPIENT_ADDRESS_PRINTED_IN_STEP_2"
+   TREASURY_OWNER="PASTE_TREASURY_ADDRESS_PRINTED_IN_STEP_2"
    SOURCE_OBJECT_ID="PASTE_SENDER_SOURCE_OBJECT_ID_PRINTED_IN_STEP_3"
    DESTINATION_OBJECT_ID="PASTE_RECIPIENT_DESTINATION_OBJECT_ID_PRINTED_IN_STEP_3"
+   TREASURY_OBJECT_ID="PASTE_TREASURY_DESTINATION_OBJECT_ID_PRINTED_IN_STEP_3"
+   FEE_ASSET_ID="PASTE_ASSET_ID_PRINTED_IN_STEP_3"
    MODULE_ID="PASTE_MODULE_ID_PRINTED_IN_STEP_3"
    MODULE_VERSION="PASTE_MODULE_VERSION_PRINTED_IN_STEP_3"
    MODULE_DIGEST_HEX="PASTE_HEX_AFTER_THE_MODULE_DIGEST_COLON"
@@ -967,6 +999,9 @@ real assets or exposed beyond your own machine.
      --destination-owner "$RECIPIENT_OWNER" \
      --amount 250 \
      --gas-limit 1000000 \
+     --fee-asset-id "$FEE_ASSET_ID" \
+     --max-fee 1000001 \
+     --fee-treasury-object "$TREASURY_OBJECT_ID" \
      --request-id "$REQUEST_ID" \
      --expected-chain-id "$EXPECTED_CHAIN_ID" \
      --expected-protocol-version "$EXPECTED_PROTOCOL_VERSION" \
@@ -980,8 +1015,10 @@ real assets or exposed beyond your own machine.
      --wait-max-elapsed-ms 5000
    ```
 
-   `transfer` requires `--destination-owner` and the five `--expected-*`
-   flags above. It rejects a missing or malformed destination address and a
+   `transfer` requires `--destination-owner`, the five `--expected-*` flags,
+   and, for this non-zero-fee devnet, the complete three fee flags above. It
+   rejects partial fee flags, zero max fee, a treasury equal to source or
+   destination, a missing or malformed destination address, and a
    missing, zero, or malformed expected-context value before any network
    dispatch. Before any
    nonce/object query or signing, it also requires the queried `/v1/context`
@@ -994,7 +1031,7 @@ real assets or exposed beyond your own machine.
    non-zero-exit error even with `--wait`; it never reports a rejected or
    failed transaction as success.
 
-6. Independently capture the post-transfer receipt, both updated objects, and
+6. Independently capture the post-transfer receipt, all three updated objects, and
    next nonce, using the exact identifiers chosen above. These deterministic
    CLI outputs are the pre-restart observations used in step 7:
 
@@ -1006,13 +1043,15 @@ real assets or exposed beyond your own machine.
      --object-id "$SOURCE_OBJECT_ID" > "$OBSERVATION_PREFIX.source"
    cargo run -p sunrise-edge-cli -- object --endpoint 127.0.0.1:7400 \
      --object-id "$DESTINATION_OBJECT_ID" > "$OBSERVATION_PREFIX.destination"
+   cargo run -p sunrise-edge-cli -- object --endpoint 127.0.0.1:7400 \
+     --object-id "$TREASURY_OBJECT_ID" > "$OBSERVATION_PREFIX.treasury"
    cargo run -p sunrise-edge-cli -- next-nonce --endpoint 127.0.0.1:7400 \
      --sender "$SENDER_OWNER" > "$OBSERVATION_PREFIX.nonce"
    ```
 
 7. Stop the devnet in terminal A with `Ctrl-C`, rerun the exact command from
-   step 3 with the same data directory, chain id, and both owners, and wait for
-   both `seed_status=verified-existing` lines. In terminal B, compare fresh queries with
+   step 3 with the same data directory, chain id, and all three owners, and wait for
+   all three `seed_status=verified-existing` lines. In terminal B, compare fresh queries with
    the pre-restart outputs; every `diff` must exit successfully with no output:
 
    ```bash
@@ -1028,6 +1067,10 @@ real assets or exposed beyond your own machine.
      cargo run -p sunrise-edge-cli -- object --endpoint 127.0.0.1:7400 \
        --object-id "$DESTINATION_OBJECT_ID"
    )
+   diff -u "$OBSERVATION_PREFIX.treasury" <(
+     cargo run -p sunrise-edge-cli -- object --endpoint 127.0.0.1:7400 \
+       --object-id "$TREASURY_OBJECT_ID"
+   )
    diff -u "$OBSERVATION_PREFIX.nonce" <(
      cargo run -p sunrise-edge-cli -- next-nonce --endpoint 127.0.0.1:7400 \
        --sender "$SENDER_OWNER"
@@ -1039,7 +1082,7 @@ output or caller-generated values; this README does not assert any specific
 address, object id, module id, or digest, since each one depends on the random
 seed generated in step 1 and the exact devnet database state at boot time.
 Step 7 reopens the same SQLite database under a new writer generation and
-checks the post-transfer receipt, both current objects, and next nonce are
+checks the post-transfer receipt, all three current objects, and next nonce are
 identical across the orderly restart (see "Local devnet architecture" in
 `ARCHITECTURE.md` and `apps/cli/tests/devnet_restart_duplicate_e2e.rs`). The
 manual commands demonstrate start, transfer, receipt lookup, orderly restart,

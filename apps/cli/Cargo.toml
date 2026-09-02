@@ -18,6 +18,7 @@ sunrise-edge-client.workspace = true
 [dev-dependencies]
 execution.workspace = true
 native-http.workspace = true
+node-core.workspace = true
 objects.workspace = true
 rcgen.workspace = true
 runtime.workspace = true

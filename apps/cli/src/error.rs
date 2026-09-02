@@ -80,6 +80,18 @@ pub enum CliError {
     ZeroGasLimit,
     /// `--source-object` and `--destination-object` named the same object.
     SameSourceAndDestination,
+    /// Exactly one of the paired `--fee-asset-id`/`--max-fee`/
+    /// `--fee-treasury-object` flags was supplied; all three or none are
+    /// required, and this is reported before any network dispatch.
+    PartialFeeConfiguration {
+        /// A flag that must also be supplied to complete the trio.
+        missing: &'static str,
+    },
+    /// `--max-fee` was zero.
+    ZeroMaxFee,
+    /// `--fee-treasury-object` named the same object as `--source-object` or
+    /// `--destination-object`.
+    FeeTreasuryConflictsWithTransfer,
     /// A `--wait-*` bound flag was supplied without `--wait`.
     WaitBoundWithoutWait(&'static str),
     /// `--wait` was supplied without one of its required bound flags.
@@ -205,6 +217,14 @@ impl fmt::Display for CliError {
             Self::SameSourceAndDestination => {
                 f.write_str("--source-object and --destination-object must name distinct objects")
             }
+            Self::PartialFeeConfiguration { missing } => write!(
+                f,
+                "--fee-asset-id, --max-fee, and --fee-treasury-object must all be supplied together; missing {missing}"
+            ),
+            Self::ZeroMaxFee => f.write_str("--max-fee must be non-zero"),
+            Self::FeeTreasuryConflictsWithTransfer => f.write_str(
+                "--fee-treasury-object must be distinct from --source-object and --destination-object",
+            ),
             Self::WaitBoundWithoutWait(flag) => {
                 write!(f, "{flag} requires --wait to also be supplied")
             }

@@ -173,6 +173,8 @@ mod tests {
             OsString::from("2222222222222222222222222222222222222222222222222222222222222222"),
             OsString::from("--max-concurrent"),
             OsString::from("4"),
+            OsString::from("--fee-treasury-owner"),
+            OsString::from("3333333333333333333333333333333333333333333333333333333333333333"),
         ])
         .unwrap()
     }

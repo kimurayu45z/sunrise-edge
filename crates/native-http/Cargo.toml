@@ -8,6 +8,7 @@ license.workspace = true
 axum.workspace = true
 canonical-encoding.workspace = true
 execution.workspace = true
+fees.workspace = true
 hashing.workspace = true
 node-core.workspace = true
 node-wire.workspace = true

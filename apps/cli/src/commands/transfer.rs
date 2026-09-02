@@ -31,8 +31,9 @@
 //! address, while the destination owner must exactly match the caller's
 //! required `--destination-owner` address. These are defense-in-depth checks
 //! alongside the server's committed module policy (see `ARCHITECTURE.md`
-//! DR-0086). It then builds the
-//! exact two-`Write` access manifest in source/destination order, builds and
+//! DR-0086). It then builds the source/destination `Write` accesses and, when
+//! the all-or-none fee flags are present, appends the treasury as the final
+//! `Write` while naming source as `fee_object`; it builds and
 //! signs the transaction through `clients/rust`, and submits it with an
 //! explicit non-zero request id. Waiting for a receipt is optional and, when
 //! requested, bounded by caller-supplied, finite poll parameters.
@@ -42,13 +43,13 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use sunrise_edge_client::{
-    AccessEntry, AccessManifest, AccessMode, Address, AtomicityDomainId, CanonicalStruct, ChainId,
-    Client, Digest32, ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+    AccessEntry, AccessManifest, AccessMode, Address, Amount, AssetId, AtomicityDomainId,
+    CanonicalStruct, ChainId, Client, Digest32, ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
     ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID, Epoch, ExecutionEffects, ExecutionStatus,
-    ExpectedProtocolContext, HashAlgorithmId, HashSuiteId, LocalSigner, NodeResponseStatus,
-    ObjectEffect, ObjectId, ObjectRef, Owner, ProtocolVersion, ReceiptPollBounds, RequestId,
-    SignatureSchemeId, SubmitTransactionRequest, TransactionRequest, Transport,
-    build_signed_transaction, decode_object,
+    ExpectedProtocolContext, FeePayment, HashAlgorithmId, HashSuiteId, LocalSigner,
+    NodeResponseStatus, ObjectEffect, ObjectId, ObjectRef, Owner, ProtocolVersion,
+    ReceiptPollBounds, RequestId, SignatureSchemeId, SubmitTransactionRequest, TransactionRequest,
+    Transport, build_signed_transaction, decode_object,
 };
 
 use crate::args::{ParsedArgs, parse_flags, scalar, switch};
@@ -70,6 +71,9 @@ const DESTINATION_OBJECT: &str = "--destination-object";
 const DESTINATION_OWNER: &str = "--destination-owner";
 const AMOUNT: &str = "--amount";
 const GAS_LIMIT: &str = "--gas-limit";
+const FEE_ASSET_ID: &str = "--fee-asset-id";
+const MAX_FEE: &str = "--max-fee";
+const FEE_TREASURY_OBJECT: &str = "--fee-treasury-object";
 const REQUEST_ID: &str = "--request-id";
 const EXPECTED_CHAIN_ID: &str = "--expected-chain-id";
 const EXPECTED_PROTOCOL_VERSION: &str = "--expected-protocol-version";
@@ -101,6 +105,21 @@ struct TransferInputs {
     request_id: RequestId,
     expected_context: ExpectedProtocolContext,
     wait_bounds: Option<ReceiptPollBounds>,
+    fee: Option<FeeInputs>,
+}
+
+/// Fully parsed, strongly typed fee inputs, present only when all three
+/// `--fee-asset-id`/`--max-fee`/`--fee-treasury-object` flags were supplied.
+///
+/// There is no separate `--fee-object` flag: the fee payer is always the
+/// already-queried source object (see `execute`), matching the devnet's
+/// uniform-asset model where the sender pays fees from the same account it
+/// transfers from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FeeInputs {
+    asset_id: AssetId,
+    max_fee: Amount,
+    treasury_object_id: ObjectId,
 }
 
 /// Runs the `transfer` subcommand.
@@ -136,6 +155,9 @@ fn transfer_flag_specs() -> Vec<crate::args::FlagSpec> {
         scalar(DESTINATION_OWNER),
         scalar(AMOUNT),
         scalar(GAS_LIMIT),
+        scalar(FEE_ASSET_ID),
+        scalar(MAX_FEE),
+        scalar(FEE_TREASURY_OBJECT),
         scalar(REQUEST_ID),
         scalar(EXPECTED_CHAIN_ID),
         scalar(EXPECTED_PROTOCOL_VERSION),
@@ -175,6 +197,7 @@ fn parse_inputs(parsed: &ParsedArgs) -> Result<TransferInputs, CliError> {
     if gas_limit == 0 {
         return Err(CliError::ZeroGasLimit);
     }
+    let fee = parse_fee_inputs(parsed, source_id, destination_id)?;
     let request_id = RequestId::new(decode_hex_32(REQUEST_ID, parsed.require(REQUEST_ID)?)?)?;
     let expected_context = parse_expected_context(parsed)?;
     let wait_bounds = parse_wait_bounds(parsed)?;
@@ -189,7 +212,59 @@ fn parse_inputs(parsed: &ParsedArgs) -> Result<TransferInputs, CliError> {
         request_id,
         expected_context,
         wait_bounds,
+        fee,
     })
+}
+
+/// Parses the all-or-none `--fee-asset-id`/`--max-fee`/
+/// `--fee-treasury-object` trio before any network dispatch.
+///
+/// With none of the three flags supplied, this returns `Ok(None)` and stays
+/// byte-for-byte compatible with a fee-free devnet profile (unchanged
+/// `fee_payment: None`). With exactly one or two supplied, this returns a
+/// typed [`CliError::PartialFeeConfiguration`] rather than silently treating
+/// the transfer as fee-free. `--fee-treasury-object` is also required to
+/// differ from both `source_id` and `destination_id`: it is a distinct
+/// declared access, not a redirection of an existing transfer leg.
+fn parse_fee_inputs(
+    parsed: &ParsedArgs,
+    source_id: ObjectId,
+    destination_id: ObjectId,
+) -> Result<Option<FeeInputs>, CliError> {
+    const FEE_FLAGS: [&str; 3] = [FEE_ASSET_ID, MAX_FEE, FEE_TREASURY_OBJECT];
+    let present: [bool; 3] = FEE_FLAGS.map(|flag| parsed.is_present(flag));
+    if present == [false, false, false] {
+        return Ok(None);
+    }
+    if present != [true, true, true] {
+        let missing: &'static str = if !present[0] {
+            FEE_ASSET_ID
+        } else if !present[1] {
+            MAX_FEE
+        } else {
+            FEE_TREASURY_OBJECT
+        };
+        return Err(CliError::PartialFeeConfiguration { missing });
+    }
+
+    let asset_id = AssetId::new(decode_hex_32(FEE_ASSET_ID, parsed.require(FEE_ASSET_ID)?)?);
+    let max_fee = parse_u64(MAX_FEE, parsed.require(MAX_FEE)?)?;
+    if max_fee == 0 {
+        return Err(CliError::ZeroMaxFee);
+    }
+    let treasury_object_id = ObjectId::new(decode_hex_32(
+        FEE_TREASURY_OBJECT,
+        parsed.require(FEE_TREASURY_OBJECT)?,
+    )?);
+    if treasury_object_id == source_id || treasury_object_id == destination_id {
+        return Err(CliError::FeeTreasuryConflictsWithTransfer);
+    }
+
+    Ok(Some(FeeInputs {
+        asset_id,
+        max_fee: Amount::new(max_fee),
+        treasury_object_id,
+    }))
 }
 
 /// Parses the required `--expected-*` flags into a locally trusted
@@ -256,13 +331,30 @@ where
 
     let mut access_manifest = AccessManifest::new();
     access_manifest.push(AccessEntry {
-        object_ref: source_ref,
+        object_ref: source_ref.clone(),
         mode: AccessMode::Write,
     });
     access_manifest.push(AccessEntry {
         object_ref: destination_ref,
         mode: AccessMode::Write,
     });
+
+    let fee_payment = match inputs.fee {
+        None => None,
+        Some(fee) => {
+            let treasury_ref =
+                require_current_inline(client, FEE_TREASURY_OBJECT, fee.treasury_object_id)?;
+            access_manifest.push(AccessEntry {
+                object_ref: treasury_ref,
+                mode: AccessMode::Write,
+            });
+            Some(FeePayment {
+                asset_id: fee.asset_id,
+                max_fee: fee.max_fee,
+                fee_object: source_ref,
+            })
+        }
+    };
 
     let mut args_frame =
         CanonicalStruct::new(TRANSFER_ARGS_TYPE_ID, TRANSFER_ARGS_ENCODING_VERSION);
@@ -279,7 +371,7 @@ where
         entrypoint: TRANSFER_ENTRYPOINT.to_string(),
         args,
         gas_limit: inputs.gas_limit,
-        fee_payment: None,
+        fee_payment,
     };
     let signed_bytes = build_signed_transaction(signer, SignatureSchemeId::Ed25519, request)?;
 
@@ -446,6 +538,39 @@ where
             object_id: object_id.to_string(),
             expected_owner: expected_owner.to_string(),
             owner: owner_label(owner),
+        }),
+    }
+}
+
+/// Queries `object_id` and requires it to be `CurrentInline`, returning its
+/// exact `ObjectRef` without decoding or checking ownership.
+///
+/// Used only for the fee treasury: unlike the source/destination legs, the
+/// treasury's owner is trusted node composition, not a caller-controlled
+/// address, so there is nothing local for this client to compare it against.
+fn require_current_inline<T>(
+    client: &Client<T>,
+    flag: &'static str,
+    object_id: ObjectId,
+) -> Result<ObjectRef, CliError>
+where
+    T: Transport,
+{
+    let result = client.query_object(object_id)?;
+    match &result {
+        sunrise_edge_client::HttpObjectQueryResult::CurrentInline {
+            object_version,
+            digest,
+            ..
+        } => Ok(ObjectRef {
+            id: object_id,
+            version: object_version.get(),
+            digest: *digest,
+        }),
+        other => Err(CliError::ObjectNotCurrentlyInline {
+            flag,
+            object_id: object_id.to_string(),
+            status: object_query_status_label(other),
         }),
     }
 }
@@ -630,6 +755,7 @@ mod tests {
             request_id: RequestId::new([0x30; 32]).unwrap(),
             expected_context: sample_expected_context(),
             wait_bounds: None,
+            fee: None,
         }
     }
 
@@ -708,6 +834,99 @@ mod tests {
         assert_eq!(requests.len(), 5);
         assert_eq!(requests[0].path, "/v1/context");
         assert_eq!(requests[4].method, sunrise_edge_client::Method::Post);
+    }
+
+    #[test]
+    fn execute_succeeds_with_fee_enabled_queries_treasury_last_and_sets_fee_payment() {
+        let signer = sample_signer();
+        let mut inputs = sample_inputs();
+        let treasury_id = ObjectId::new([0x40; 32]);
+        inputs.fee = Some(FeeInputs {
+            asset_id: AssetId::new([0x50; 32]),
+            max_fee: Amount::new(10),
+            treasury_object_id: treasury_id,
+        });
+        let context = sample_context();
+        let nonce = HttpNextNonceQueryResult::new(signer.address(), Epoch::new(5), 3);
+        let source = current_inline_owned_by(inputs.source_id, 1, signer.address());
+        let destination =
+            current_inline_owned_by(inputs.destination_id, 1, inputs.destination_owner);
+        let treasury = current_inline_with_owner(treasury_id, 1, Owner::System);
+        let accepted =
+            NodeResponse::new(inputs.request_id, NodeResponseStatus::Accepted, None).unwrap();
+        let submit = HttpNodeResult::new(inputs.request_id, vec![accepted]).unwrap();
+
+        let transport = FakeTransport::new(vec![
+            query_ok(context.encode().unwrap()),
+            query_ok(nonce.encode().unwrap()),
+            query_ok(source.encode().unwrap()),
+            query_ok(destination.encode().unwrap()),
+            query_ok(treasury.encode().unwrap()),
+            node_result_ok(submit.encode().unwrap()),
+        ]);
+        let client = Client::new(transport);
+
+        execute(&client, &signer, inputs).unwrap();
+
+        let requests = client.transport().requests();
+        assert_eq!(requests.len(), 6);
+        assert_eq!(requests[0].path, "/v1/context");
+        // The treasury is queried last among the four object/nonce/context
+        // reads, strictly after source and destination, and strictly before
+        // the POST submission.
+        assert_eq!(requests[4].path, format!("/v1/objects/{treasury_id}"));
+        assert_eq!(requests[5].method, sunrise_edge_client::Method::Post);
+        let submitted_event = node_core::NodeEvent::decode(&requests[5].body).unwrap();
+        let transaction = execution::decode_transaction(submitted_event.payload()).unwrap();
+        assert_eq!(transaction.access_manifest.entries.len(), 3);
+        let final_access = &transaction.access_manifest.entries[2];
+        assert_eq!(final_access.object_ref.id, treasury_id);
+        assert_eq!(final_access.mode, AccessMode::Write);
+        let payment = transaction
+            .fee_payment
+            .expect("all fee flags must produce a signed fee payment");
+        assert_eq!(payment.asset_id, AssetId::new([0x50; 32]));
+        assert_eq!(payment.max_fee, Amount::new(10));
+        assert_eq!(payment.fee_object.id, ObjectId::new([0x10; 32]));
+    }
+
+    #[test]
+    fn execute_rejects_a_fee_treasury_that_is_not_currently_inline() {
+        let signer = sample_signer();
+        let mut inputs = sample_inputs();
+        let treasury_id = ObjectId::new([0x40; 32]);
+        inputs.fee = Some(FeeInputs {
+            asset_id: AssetId::new([0x50; 32]),
+            max_fee: Amount::new(10),
+            treasury_object_id: treasury_id,
+        });
+        let context = sample_context();
+        let nonce = HttpNextNonceQueryResult::new(signer.address(), Epoch::new(5), 3);
+        let source = current_inline_owned_by(inputs.source_id, 1, signer.address());
+        let destination =
+            current_inline_owned_by(inputs.destination_id, 1, inputs.destination_owner);
+        let absent_treasury = HttpObjectQueryResult::Absent {
+            object_id: treasury_id,
+        };
+
+        let transport = FakeTransport::new(vec![
+            query_ok(context.encode().unwrap()),
+            query_ok(nonce.encode().unwrap()),
+            query_ok(source.encode().unwrap()),
+            query_ok(destination.encode().unwrap()),
+            query_ok(absent_treasury.encode().unwrap()),
+        ]);
+        let client = Client::new(transport);
+
+        let error = execute(&client, &signer, inputs).unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::ObjectNotCurrentlyInline {
+                flag: FEE_TREASURY_OBJECT,
+                status: "absent",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1220,6 +1439,54 @@ mod tests {
         let parsed = parse_flags(to_os(&args), &transfer_specs()).unwrap();
 
         assert!(matches!(parse_inputs(&parsed), Err(CliError::NodeCore(_))));
+    }
+
+    #[test]
+    fn parse_inputs_accepts_no_fee_flags_and_rejects_every_partial_fee_trio() {
+        let base = base_flag_values();
+        let parsed = parse_flags(to_os(&base), &transfer_specs()).unwrap();
+        assert!(parse_inputs(&parsed).unwrap().fee.is_none());
+
+        let fee_values: [(&'static str, String); 3] = [
+            (FEE_ASSET_ID, "50".repeat(32)),
+            (MAX_FEE, "1001".to_string()),
+            (FEE_TREASURY_OBJECT, "40".repeat(32)),
+        ];
+        for mask in 1_u8..=6_u8 {
+            let mut values = base.clone();
+            for (index, (flag, value)) in fee_values.iter().enumerate() {
+                if mask & (1_u8 << index) != 0 {
+                    values.insert(*flag, value.clone());
+                }
+            }
+            let parsed = parse_flags(to_os(&values), &transfer_specs()).unwrap();
+            assert!(matches!(
+                parse_inputs(&parsed),
+                Err(CliError::PartialFeeConfiguration { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn parse_inputs_rejects_zero_max_fee_and_treasury_transfer_collisions() {
+        let mut zero = base_flag_values();
+        zero.insert(FEE_ASSET_ID, "50".repeat(32));
+        zero.insert(MAX_FEE, "0".to_string());
+        zero.insert(FEE_TREASURY_OBJECT, "40".repeat(32));
+        let parsed = parse_flags(to_os(&zero), &transfer_specs()).unwrap();
+        assert!(matches!(parse_inputs(&parsed), Err(CliError::ZeroMaxFee)));
+
+        for conflicting_object in ["10".repeat(32), "20".repeat(32)] {
+            let mut values = base_flag_values();
+            values.insert(FEE_ASSET_ID, "50".repeat(32));
+            values.insert(MAX_FEE, "1001".to_string());
+            values.insert(FEE_TREASURY_OBJECT, conflicting_object);
+            let parsed = parse_flags(to_os(&values), &transfer_specs()).unwrap();
+            assert!(matches!(
+                parse_inputs(&parsed),
+                Err(CliError::FeeTreasuryConflictsWithTransfer)
+            ));
+        }
     }
 
     #[test]

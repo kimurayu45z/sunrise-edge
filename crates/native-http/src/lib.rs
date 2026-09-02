@@ -17,13 +17,13 @@ use core::fmt;
 use execution::{ExecutionError, WasmExecutionEngine};
 use hashing::HashSuiteResolver;
 use node_core::{
-    AuthenticatedSubmitTransaction, MAX_NODE_OUTPUT_ITEMS, MAX_NODE_PAYLOAD_BYTES, NodeConfig,
-    NodeCoreError, NodeEvent, NodeEventKind, NodeOutboxBatch, NodeOutboxDelivery, OutboxClaim,
-    OutboxLeaseId, PreinstalledModuleCatalog, RequestId, TransactionAuthError,
-    TransactionalNodeStateMachine, acknowledge_outbox_message,
-    acknowledge_outbox_message_in_domain, authenticate_submit_transaction_event,
-    claim_next_outbox_message, claim_next_outbox_message_in_domain,
-    handle_authenticated_resolved_durable_submit_transaction,
+    AuthenticatedSubmitTransaction, FeeEffectComposer, MAX_NODE_OUTPUT_ITEMS,
+    MAX_NODE_PAYLOAD_BYTES, NodeConfig, NodeCoreError, NodeEvent, NodeEventKind, NodeOutboxBatch,
+    NodeOutboxDelivery, OutboxClaim, OutboxLeaseId, PreinstalledFeeComposition,
+    PreinstalledModuleCatalog, RequestId, TransactionAuthError, TransactionalNodeStateMachine,
+    acknowledge_outbox_message, acknowledge_outbox_message_in_domain,
+    authenticate_submit_transaction_event, claim_next_outbox_message,
+    claim_next_outbox_message_in_domain, handle_authenticated_resolved_durable_submit_transaction,
     handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution,
     handle_idempotent_event, handle_resolved_durable_idempotent_event,
     handle_resolved_idempotent_event, query_object, query_request_receipt, query_sender_next_nonce,
@@ -214,6 +214,30 @@ impl<S, T, C, I> StructuredDurableNativeComponents<S, T, C, I> {
     }
 }
 
+/// Trusted node composition's fee-charging capability, owned so it can be
+/// stored inside [`PreinstalledWasmComposition`] and cloned across requests.
+///
+/// `treasury_object_id` and `composer` never come from HTTP request bytes,
+/// exactly like `catalog`/`engine`/`created_checkpoint`. Each request builds
+/// the borrowed [`node_core::PreinstalledFeeComposition`] this crate's
+/// entrypoint call needs from this owned value.
+#[derive(Clone, Debug)]
+pub struct PreinstalledFeeCompositionConfig {
+    treasury_object_id: ObjectId,
+    composer: Arc<dyn FeeEffectComposer>,
+}
+
+impl PreinstalledFeeCompositionConfig {
+    /// Creates a trusted fee-charging capability.
+    #[must_use]
+    pub fn new(treasury_object_id: ObjectId, composer: Arc<dyn FeeEffectComposer>) -> Self {
+        Self {
+            treasury_object_id,
+            composer,
+        }
+    }
+}
+
 /// Trusted preinstalled-WASM composition input for
 /// [`preinstalled_wasm_structured_durable_router`].
 ///
@@ -223,16 +247,24 @@ impl<S, T, C, I> StructuredDurableNativeComponents<S, T, C, I> {
 /// `created_checkpoint` never comes from request bytes or wall-clock time. It
 /// is the caller's already-validated chain-progress value, identical in
 /// origin and trust level to the `created_checkpoint` accepted by that
-/// function.
+/// function. `fee` is optional only as a composition capability: `None`
+/// preserves byte-identical historical behavior exclusively when the
+/// committed schedule's worst-case fee is zero and the transaction declares
+/// neither `fee_payment` nor a treasury access. A non-zero committed schedule
+/// or a declared payment fails closed when this capability is absent.
 #[derive(Clone, Debug)]
 pub struct PreinstalledWasmComposition {
     catalog: Arc<PreinstalledModuleCatalog>,
     engine: WasmExecutionEngine,
     created_checkpoint: u64,
+    fee: Option<PreinstalledFeeCompositionConfig>,
 }
 
 impl PreinstalledWasmComposition {
-    /// Creates a trusted preinstalled-WASM composition input.
+    /// Creates a trusted preinstalled-WASM composition input with no fee
+    /// composition wired. This is executable only under a committed zero-fee
+    /// schedule with no declared `fee_payment`; fee-bearing requests fail
+    /// closed until [`Self::with_fee_composition`] is applied.
     ///
     /// `created_checkpoint` must be non-decreasing across process restarts
     /// for every object this composition may mutate: node-core rejects a
@@ -254,7 +286,16 @@ impl PreinstalledWasmComposition {
             catalog,
             engine,
             created_checkpoint,
+            fee: None,
         }
+    }
+
+    /// Returns an equivalent composition with a trusted fee-charging
+    /// capability wired in.
+    #[must_use]
+    pub fn with_fee_composition(mut self, fee: PreinstalledFeeCompositionConfig) -> Self {
+        self.fee = Some(fee);
+        self
     }
 }
 
@@ -2233,6 +2274,7 @@ enum StructuredDurableAuthenticatedExecution<'a> {
         catalog: &'a PreinstalledModuleCatalog,
         engine: WasmExecutionEngine,
         created_checkpoint: u64,
+        fee_composition: Option<PreinstalledFeeComposition<'a>>,
     },
 }
 
@@ -2281,6 +2323,9 @@ where
             catalog: state.preinstalled_wasm.catalog.as_ref(),
             engine: state.preinstalled_wasm.engine,
             created_checkpoint: state.preinstalled_wasm.created_checkpoint,
+            fee_composition: state.preinstalled_wasm.fee.as_ref().map(|fee| {
+                PreinstalledFeeComposition::new(fee.treasury_object_id, fee.composer.as_ref())
+            }),
         },
         body,
     )
@@ -2372,6 +2417,7 @@ where
                 catalog,
                 engine,
                 created_checkpoint,
+                fee_composition,
             },
         ) => handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
             components.store.as_ref(),
@@ -2381,6 +2427,7 @@ where
             &engine,
             *submission,
             created_checkpoint,
+            fee_composition,
         ),
         (PreparedStructuredEvent::Generic(event), _) => handle_resolved_durable_idempotent_event(
             components.store.as_ref(),
@@ -2911,6 +2958,85 @@ fn node_error_response(error: &NodeCoreError) -> Response {
         NodeCoreError::PreinstalledModuleZeroObjectAccess => (
             StatusCode::BAD_REQUEST,
             "preinstalled-module-zero-object-access",
+        ),
+        NodeCoreError::FeePaymentRequired => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "fee-payment-required",
+        ),
+        NodeCoreError::FeePaymentNotRequired => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "fee-payment-not-required",
+        ),
+        NodeCoreError::FeePaymentUnsupportedOnPath => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "fee-payment-unsupported-on-path",
+        ),
+        NodeCoreError::FeePaymentRejected(
+            fees::FeeError::UnknownAsset(_)
+            | fees::FeeError::AssetDisabled(_)
+            | fees::FeeError::MaxFeeExceeded { .. },
+        ) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "fee-payment-rejected",
+        ),
+        NodeCoreError::FeePaymentRejected(fees::FeeError::ArithmeticOverflow) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "fee-settlement-overflow",
+        ),
+        NodeCoreError::FeePaymentRejected(
+            fees::FeeError::InvalidAssetIdLength(_)
+            | fees::FeeError::ZeroFeeUnitsPerAssetUnit
+            | fees::FeeError::RegistryTooLarge(_)
+            | fees::FeeError::TooManySigners(_)
+            | fees::FeeError::DuplicateAsset(_)
+            | fees::FeeError::EmptySignerSet
+            | fees::FeeError::DuplicateSigner(_)
+            | fees::FeeError::CanonicalEncoding(_)
+            | fees::FeeError::CanonicalDecoding(_)
+            | fees::FeeError::Object(_),
+        ) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "fee-policy-invalid",
+        ),
+        NodeCoreError::FeeObjectNotDeclaredWrite => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "fee-object-not-declared-write",
+        ),
+        NodeCoreError::FeeObjectNotOwnedBySender => (
+            StatusCode::FORBIDDEN,
+            "fee-object-owner-mismatch",
+        ),
+        NodeCoreError::FeeObjectIsTreasury => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "fee-object-is-treasury",
+        ),
+        NodeCoreError::FeeTreasuryAccessMisdeclared => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "fee-treasury-access-misdeclared",
+        ),
+        NodeCoreError::FeeCompositionFailed(node_core::FeeCompositionError::InsufficientBalance) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "fee-balance-insufficient",
+        ),
+        NodeCoreError::FeeCompositionFailed(
+            node_core::FeeCompositionError::MalformedBody
+            | node_core::FeeCompositionError::AssetMismatch
+            | node_core::FeeCompositionError::Overflow,
+        ) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "fee-composition-invalid",
+        ),
+        NodeCoreError::FeeCompositionUnavailable => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "fee-composition-unavailable",
+        ),
+        NodeCoreError::FeeCompositionNoOp => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "fee-composition-no-op",
+        ),
+        NodeCoreError::FeeAmountZero => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "fee-settlement-zero",
         ),
         // Catalog/commitment mismatch: the composition-trusted catalog
         // disagrees with the governance-committed registry, which is a host
@@ -4824,6 +4950,100 @@ mod tests {
             to_bytes(overflow.into_body(), 128).await.unwrap(),
             "sender-nonce-overflow"
         );
+    }
+
+    #[tokio::test]
+    async fn native_error_mapping_classifies_fee_request_and_composition_failures() {
+        let asset_id = fees::AssetId::new([0x56; 32]);
+        let cases: Vec<(NodeCoreError, StatusCode, &'static str)> = vec![
+            (
+                NodeCoreError::FeePaymentRequired,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "fee-payment-required",
+            ),
+            (
+                NodeCoreError::FeePaymentNotRequired,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "fee-payment-not-required",
+            ),
+            (
+                NodeCoreError::FeePaymentUnsupportedOnPath,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "fee-payment-unsupported-on-path",
+            ),
+            (
+                NodeCoreError::FeePaymentRejected(fees::FeeError::UnknownAsset(asset_id)),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "fee-payment-rejected",
+            ),
+            (
+                NodeCoreError::FeePaymentRejected(fees::FeeError::ArithmeticOverflow),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "fee-settlement-overflow",
+            ),
+            (
+                NodeCoreError::FeePaymentRejected(fees::FeeError::ZeroFeeUnitsPerAssetUnit),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "fee-policy-invalid",
+            ),
+            (
+                NodeCoreError::FeeObjectNotDeclaredWrite,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "fee-object-not-declared-write",
+            ),
+            (
+                NodeCoreError::FeeObjectNotOwnedBySender,
+                StatusCode::FORBIDDEN,
+                "fee-object-owner-mismatch",
+            ),
+            (
+                NodeCoreError::FeeObjectIsTreasury,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "fee-object-is-treasury",
+            ),
+            (
+                NodeCoreError::FeeTreasuryAccessMisdeclared,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "fee-treasury-access-misdeclared",
+            ),
+            (
+                NodeCoreError::FeeCompositionFailed(
+                    node_core::FeeCompositionError::InsufficientBalance,
+                ),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "fee-balance-insufficient",
+            ),
+            (
+                NodeCoreError::FeeCompositionFailed(node_core::FeeCompositionError::MalformedBody),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "fee-composition-invalid",
+            ),
+            (
+                NodeCoreError::FeeCompositionUnavailable,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "fee-composition-unavailable",
+            ),
+            (
+                NodeCoreError::FeeCompositionNoOp,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "fee-composition-no-op",
+            ),
+            (
+                NodeCoreError::FeeAmountZero,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "fee-settlement-zero",
+            ),
+        ];
+
+        for (error, expected_status, expected_code) in cases {
+            let response = node_error_response(&error);
+            assert_eq!(response.status(), expected_status, "error: {error:?}");
+            assert_eq!(
+                to_bytes(response.into_body(), 128).await.unwrap(),
+                expected_code,
+                "error: {error:?}"
+            );
+        }
     }
 
     #[tokio::test]

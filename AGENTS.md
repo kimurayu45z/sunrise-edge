@@ -210,13 +210,18 @@ criterion after context compaction. Re-check `main`, the open stacked PR chain,
 and `TODO.md` before starting because repository state may have advanced. The
 explicit `CLI Developer MVP Gate` (`TODO.md`; renamed and narrowed from the
 earlier `Developer MVP Gate` to node/client/CLI capability criteria 1-6/10/11)
-and S0-S1 of the production sequence are satisfied As-Is. The current
-priority is S2 of the `CLI-First Node Production Gate` (`TODO.md`) — a real
+and S0-S3 of the production sequence are satisfied As-Is. The current
+priority is S4 secure signer/Ledger of the `CLI-First Node Production Gate`
+(`TODO.md`) — a real
 node/persistence/operations gate defined entirely by reference to existing,
 unchanged Phase 15 To-Be exit criteria, the Post-MVP persistence
 implementation order, and the cross-phase release gate; passing it is
 explicitly not mainnet readiness (see ARCHITECTURE.md DR-0085 for the full
-rationale and the S0-S5 ordered slices). S1 implements remote TLS transport
+rationale and the S0-S5 ordered slices). S2's exact cross-owner destination
+policy is implemented by DR-0086. S3's uniform ordinary-asset fee composition,
+actual-gas settlement, trap fee-only charge, and restart/replay evidence are
+implemented by DR-0087 without changing historical WAT/WASM or canonical wire
+bytes. S1 implements remote TLS transport
 plus a separate locally configured expected protocol-context check before
 signing; these are two independent slices, and as of 2026-09-01 both are
 implemented and tested As-Is, so S1 as a whole is complete. The
@@ -362,15 +367,17 @@ completed or deleted) until the new `CLI-First Node Production Gate`
 (`TODO.md`) passes. This replaces DR-0080's earlier `clients/typescript`/`demo/counter`
 pairing; no `demo/counter` directory is created. The devnet's own
 demonstration contract is `sunrise.devnet.asset_account.v1`
-(`transfer`), moving balance only between two ordinary, same-sender-owned
-asset accounts under the uniform fungible asset model (one `AssetId`/account/
-transfer path for every asset, no privileged native coin or special fee path)
-ratified in DR-0081; cross-owner transfer authorization stays fail-closed, so
-this demonstrates same-sender movement only, and the devnet fee registry
-stays empty with every transaction committing `fee_payment: None`. Create,
-Shared/System ownership, blob transfer, arbitrary module upload, fee
-charging/gas metering, fast certificates, and production object migrations
-remain deferred. The opaque SQLite table and prefix scanner remain local
+(`transfer`), moving balance between two ordinary asset accounts under the
+uniform fungible asset model (one `AssetId`/account/transfer/fee path for every
+asset, no privileged native coin or special balance path) ratified in DR-0081.
+DR-0086 permits only its exact existing cross-owner destination policy while
+preserving both owners. DR-0087 activates module/semantics v3 with unchanged
+WAT/WASM and v1/v2 vectors, requires the sender source as fee object, and
+settles actual gas into the distinct treasury owner's ordinary destination.
+Create, Shared/System ownership, blob transfer, arbitrary module upload, fee
+distribution/FastCertificate settlement, production gas calibration, secure
+signer/Ledger integration (S4), and production object migrations remain
+deferred. The opaque SQLite table and prefix scanner remain local
 compatibility/reference paths, not production schema. Started blocking work
 remains uncancellable and its configured admission limit is not
 a validated capacity budget.

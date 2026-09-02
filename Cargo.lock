@@ -872,6 +872,7 @@ dependencies = [
  "crypto",
  "ed25519-zebra",
  "execution",
+ "fees",
  "hashing",
  "node-core",
  "node-wire",
@@ -895,6 +896,7 @@ dependencies = [
  "crypto",
  "ed25519-zebra",
  "execution",
+ "fees",
  "hashing",
  "objects",
  "protocol-config",
@@ -1549,6 +1551,7 @@ version = "0.1.0"
 dependencies = [
  "execution",
  "native-http",
+ "node-core",
  "objects",
  "rcgen",
  "runtime",
