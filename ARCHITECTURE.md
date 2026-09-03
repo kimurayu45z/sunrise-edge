@@ -356,12 +356,13 @@ now wires it up (see DR-0080). Arbitrary uploads, JIT/AOT, and production
 metering remain deferred.
 
 Protocol version 3 MUST NOT be activated on any live chain until shared-object
-ordering, FastVote/FastCertificate, certificate publication, every externally
-accepted event family's authenticated/authorized ingress, and the CLI-First
-Node Production Gate's remaining S4/S5 and independent security/release gates
-are implemented and atomically composed with the authenticated transaction.
-The bounded S3 uniform ordinary-asset fee composition (DR-0087) and the
-additive owned-effects/preinstalled-WASM module-object effects entrypoints
+ordering, FastVote/FastCertificate, certificate publication, and every
+externally accepted event family's authenticated/authorized ingress are
+implemented and atomically composed with the authenticated transaction where
+protocol semantics require it; independently, the CLI-First Node Production
+Gate's remaining S4/S5 and the independent security/release gates must also be
+completed. The bounded S3 uniform ordinary-asset fee composition (DR-0087) and
+the additive owned-effects/preinstalled-WASM module-object effects entrypoints
 are implemented As-Is, but implementing them alone does not satisfy this
 constraint. The structured durable
 path now derives read-only object authority only from the authenticated inner
@@ -799,9 +800,12 @@ derives the private sender-nonce reservation. Exact next-nonce equality and its
 checked increment now commit atomically with the structured invocation. Signed
 read-only object manifests are loaded from exact heads and immutable inline
 versions, authorized against the verified sender, and asserted in that same
-invocation. Fee debit, module loading, mutating/consuming object effects,
-shared-object ordering, fast-path certificates, and authorization for every
-other externally accepted event family remain mandatory before live activation.
+invocation. The bounded S3 uniform ordinary-asset fee composition (DR-0087)
+and additive owned-effects/preinstalled-WASM module-object effects
+entrypoints are implemented As-Is; shared-object ordering, fast-path
+certificates/publication, authorization for every other externally accepted
+event family, S4/S5, and the independent security/release gates remain
+mandatory before live activation.
 
 The outbox delivery cursor (`0xE005`) advances one message at a time. A caller
 supplies a non-zero lease ID, an observed time, and a duration bounded to five
@@ -3522,8 +3526,14 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   rehearsal evidence, and real Cloudflare Durable Object/AWS provider
   certification); the cross-phase production release gate; the existing hard
   activation constraint that protocol version 3's live activation stays
-  prohibited until fee, module/object-effect, and `FastCertificate` atomic
-  composition is complete; and the existing hard activation constraint that
+  prohibited until shared-object ordering, FastVote/`FastCertificate`,
+  certificate publication, and every externally accepted event family's
+  authorization are implemented and atomically composed where protocol
+  semantics require it, and, independently, until S4/S5 and the independent
+  security/release gates are completed — the bounded S3 uniform ordinary-asset
+  fee composition (DR-0087) and additive owned-effects/preinstalled-WASM
+  module-object effects entrypoints are implemented As-Is, but on their own do
+  not satisfy this constraint; and the existing hard activation constraint that
   every externally accepted node-event family other than `SubmitTransaction`
   (especially certificate, protocol-upgrade, and validator-set-change events)
   needs its own authenticated/authorized ingress boundary before live

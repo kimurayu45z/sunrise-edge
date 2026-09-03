@@ -2767,8 +2767,14 @@ Phase 15 As-Is scope:
   invalid signature、inner/outer chain/version/epoch mismatch、missing profile、
   trailing/non-canonical bytesはmachine/identity/clock/storage/sendのcall count
   zeroで失敗するtestを持つ。transaction wire field/encoding versionは追加して
-  いない。protocol version 3のlive activationはfee/module/object effect/
-  FastCertificateのatomic compositionが完成するまで禁止する。
+  いない。protocol version 3のlive activationはshared-object ordering、
+  FastVote/FastCertificate、certificate publication、他event familyの
+  authorized ingressがprotocol semanticsの要求する箇所でauthenticated
+  transactionとatomically composeされ、かつ独立してS4/S5と独立
+  security/release gateが完了するまで禁止する。fee（S3のbounded uniform
+  ordinary-asset fee composition、DR-0087）とmodule/object effect（additive
+  owned-effects entrypointおよびpreinstalled-WASM entrypoint）はimplemented
+  As-Isだが、単独ではこのconstraintを満たさない。
   **Hard activation constraint:** `SubmitTransaction`以外の
   externally acceptedなnode-event family(特にcertificate、protocol upgrade、
   validator-set change)も、live activationの前に同等のauthenticated/authorized
@@ -2802,9 +2808,14 @@ Phase 15 As-Is scope:
   tombstone revisionを持つabsenceはexpected zeroへresetせずpersistence invariant
   でfail closedする。DB schema generationとTransaction wire/schema versionは
   不変。epoch pruningのproduction policyはdeferredであり、fee debitとbounded
-  retentionがない間はnew senderによるstate growthがeconomic meteringされない。
-  このAs-Is routeをlive transaction ingressとして公開してはならない。
-  fee/object/effect/FastCertificateおよび他event
+  retentionがない間はnew senderによるstate growthがeconomic meteringされない
+  ——これはfee/object-effect compositionを持たないこのgeneric structured
+  durable route（nonce-onlyの`SubmitTransaction` path）に限定した記述である。
+  additive owned-effects entrypointとpreinstalled-WASM entrypointは別途fee
+  （S3のbounded uniform ordinary-asset fee composition、DR-0087）とmodule/
+  object effectsをimplemented As-Isであり、本項の対象外である。このgeneric
+  As-Is routeをlive transaction ingressとして公開してはならない。
+  FastCertificateおよび他event
   familyのauthenticated/authorized ingressが残るためlive activationは引き続き
   禁止する（runtime/node-core/native implemented As-Is）。
 - request pathのcommit直後deliveryはdomain-wide `claim_due_outbox`を流用しない。同じdomainのolder due workを
