@@ -59,11 +59,17 @@ pub use client::{Client, ReceiptPollBounds, SubmitTransactionRequest};
 pub use context::{ExpectedProtocolContext, ExpectedProtocolContextError, ProtocolContextMismatch};
 pub use error::ClientError;
 pub use key::LocalSigner;
+pub use signing_view::{
+    ClearSigningPolicy, ClearSigningPolicyError, ClearSigningView, DEVNET_ASSET_TRANSFER_POLICY,
+    DeviceSigningProfile, SigningViewError,
+};
 pub use support::{
     ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID, ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
     current_inline_object_ref,
 };
-pub use transaction::{PreparedTransaction, TransactionRequest, build_signed_transaction};
+pub use transaction::{
+    ExternalSigner, PreparedTransaction, TransactionRequest, build_signed_transaction,
+};
 pub use transport::{
     LoopbackHttpTransport, MAX_CA_CERTIFICATE_DER_BYTES, Method, RemoteTlsHttpTransport, Transport,
     TransportError, WireRequest, WireResponse,

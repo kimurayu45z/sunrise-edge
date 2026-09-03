@@ -1959,10 +1959,12 @@ rejection (Unix); a fake-`Transport` unit test per query command plus
 non-current-inline-object adversarial paths; and two real loopback-TCP tests
 against a composed local devnet router — one exercising `context`/
 `next-nonce`/`object`, and one exercising a complete signed `transfer`
-against freshly seeded accounts through to a waited, present receipt. The
-Ledger device application, APDU/host transport, on-device clear signing, and
-hardware-in-the-loop tests described above remain entirely unimplemented and
-are not claimed by `PreparedTransaction`'s readiness for that boundary.
+against freshly seeded accounts through to a waited, present receipt.
+DR-0088 subsequently implements S4a's strict host-side profile, exact
+signed-byte clear-signing fixture, and external-signer preflight. The Ledger
+device application, APDU/host transport, on-device implementation, and
+hardware-in-the-loop tests remain entirely unimplemented and are not claimed
+by that host boundary.
 
 **Development-only residual: no memory zeroization.** `load_dev_seed`'s read
 buffer and decoded `[u8; 32]` seed, and `LocalSigner`'s in-memory signing
@@ -1979,6 +1981,57 @@ architecture" above). Under the CLI-first production-strategy pivot (DR-0085),
 `clients/typescript`, `apps/explorer`, and `apps/wallet` remain deferred until
 the CLI-First Node Production Gate passes (see
 `TODO.md#cli-developer-mvp-gate` and `TODO.md#cli-first-node-production-gate`).
+
+## 46. Hardware Signing Profile v1 and external-signer preflight
+
+S4 is split into four ordered boundaries so a host library cannot become a
+surrogate for device-side authorization. S4a is the implemented As-Is boundary
+in this repository; S4b is a separate dedicated Ledger application repository;
+S4c adds host APDU/USB and CLI selection; S4d is the Speculos, physical-device,
+and release-evidence gate. S4 is not complete until S4d passes and the CLI has
+an actual production signing path replacing its development-only seed flow.
+
+`crypto::decode_signature_frame` is the strict counterpart to the established
+`frame_signature_message` encoder. It accepts only canonical type `0x2001`,
+encoding version 1, and exact fields 1-6, and changes no existing bytes.
+The new dependency-light `signing-view` crate independently decodes the
+signable Transaction v1 shape without depending on `execution`/`wasmi`, applies
+Hardware Signing Profile v1's fixed 4 KiB frame and tighter nested bounds, and
+re-encodes every accepted value to require byte identity. A dev-only
+differential test proves this independent encoder agrees with `execution`.
+
+Clear signing is exact-policy-only. The first policy recognizes only the
+reference `sunrise-local-devnet`, protocol 3, epoch 0 asset-account transfer's
+exact module id/version/SHA-256 code digest, `transfer` entrypoint, non-zero
+`0xF002` v1 amount, three distinct ordered `Write` references, and fee object
+equal to source index 0. Unknown module, digest algorithm or bytes, version,
+entrypoint, argument schema, access shape, or fee shape is a typed rejection.
+There is no raw-argument, blind-signing, or expert-mode fallback. Every
+rendered line comes only from the signed frame: `request_id`, destination
+owner, transferred-asset symbol/id, module display name, and other queried
+metadata are excluded because Transaction v1 does not bind them. Fee asset id
+is signed and is displayed.
+
+`PreparedTransaction::clear_signing_view` derives the view only from
+`signable_frame`. The additive `ExternalSigner` boundary and
+`sign_and_finalize_external` compare the signer's reported scheme and address
+to the prepared transaction before invocation, validate the exact frame under
+the fixed profile/policy, then pass that same frame to the signer. Existing
+`finalize` still independently checks length and Ed25519 validity against the
+sender. The host view is only preflight/conformance evidence: the eventual
+device app must independently parse and display the received frame.
+
+`SIGNING.md` is normative for the fixed profile bounds, stable display fixture,
+provisional explicitly unregistered development derivation path, and the
+future bounded APDU state machine/status words. The dedicated device app must
+live in a separate `sunrise-edge-ledger-app` repository because its custom
+targets, Rust SDK/C bindings, Speculos workflow, device matrix, and Ledger
+release lifecycle cannot pass or be hidden from this workspace's host-target
+gate. S4c will place vendor host dependencies in a new `clients/ledger` crate,
+never a protocol crate or `clients/rust`, and will explicitly amend the CLI's
+current one-runtime-dependency invariant. No device app, APDU transport,
+USB/HID dependency, Speculos evidence, physical-device evidence, registered
+SLIP-0044 allocation, or release artifact exists in S4a.
 
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
@@ -3250,7 +3303,8 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   and commits trap fee-only effects as described by DR-0087. The active
   module/semantics declaration is version 3; historical v1/v2 declarations,
   the `0xF001`/`0xF002`/`0xF003` schemas, and WAT/WASM/code hash remain pinned.
-  S4 is next; this is still not production or mainnet readiness.
+  DR-0088 subsequently implements only S4a's hardware-signing profile/host
+  preflight. S4b is next; this is still not production or mainnet readiness.
 - DR-0082: Add the bounded canonical Developer MVP query surface described in
   "Bounded Developer MVP query API". Keep query selectors non-authoritative,
   resolve all chain/domain/epoch/storage authority from trusted composition,
@@ -3323,13 +3377,15 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   Production Gate below passes (see the "Amendment: gate renamed and
   resequenced by DR-0085" note on DR-0081's "Developer MVP order" above).
 
-  **Current implementation status (2026-09-01).** The CLI Developer MVP Gate's
+  **Current implementation status (2026-09-04).** The CLI Developer MVP Gate's
   criteria 1-6, 10, and 11 are implemented and validated As-Is, so that gate
   has passed without making a production-readiness claim. S0 below is also
   implemented As-Is. S1 below is now also implemented and tested As-Is (see
   "S1 implementation status" immediately below), and S2 is implemented and
   validated As-Is by DR-0086. S3 is implemented and validated As-Is by
-  DR-0087. The current implementation priority is S4. S5 remains its ordered
+  DR-0087. S4a is implemented and validated As-Is by DR-0088; S4 remains
+  incomplete and the current implementation priority is S4b's separate
+  dedicated Ledger application/Speculos evidence. S5 remains its ordered
   successor, and the TypeScript
   client/explorer/wallet surface remains deferred until the complete
   CLI-First Node Production Gate passes.
@@ -3751,5 +3807,50 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   distribution through `FastCertificate`, multiple governed fee assets,
   production gas calibration, sufficient-balance preflight, treasury sharding,
   Shared/System/blob objects, or crash/power-loss durability. TypeScript,
-  explorer, and wallet stay deferred. S4 secure signer/Ledger integration is
-  next; S5, Phase 16/17 exit criteria, and independent audit remain mandatory.
+  explorer, and wallet stay deferred. DR-0088 subsequently implements only
+  S4a's hardware profile/host preflight; S4b dedicated device application and
+  Speculos evidence are next. S5, Phase 16/17 exit criteria, and independent
+  audit remain mandatory.
+- DR-0088: Implement only S4a's hardware-signing profile and host preflight in
+  this repository, with the dedicated Ledger application isolated in a
+  separate repository and S4 completion reserved for physical evidence.
+
+  **Exact signed source.** Hardware Signing Profile v1 interprets only the
+  established `0x2001` v1 signature frame and its `0x6001` v1 Transaction
+  signable payload. `crypto` adds a strict decoder but changes no encoder,
+  canonical identifier, signature domain, transaction byte, or stable
+  historical vector. `signing-view` applies immutable device-sized bounds,
+  independently decodes and byte-identically re-encodes the transaction shape
+  without an `execution`/`wasmi` runtime dependency, and emits bounded ASCII
+  lines only after the complete signed value matches one exact policy.
+
+  **No blind signing.** The first policy is limited to the fixed README
+  reference devnet module id/version/code digest, transfer argument schema,
+  three ordered `Write` entries, and source-bound fee authorization. Any
+  unknown module/digest/entrypoint/arguments/access/fee shape is a typed
+  rejection. Unsigned `request_id`, destination owner, transferred asset
+  metadata, module names, or host labels never enter the view. The stable
+  fixture pins both the exact frame and display lines for the future device
+  repository.
+
+  **Host seam and repository boundary.** `clients/rust` adds no USB/HID or
+  Ledger dependency. Its external-signer seam verifies reported scheme and
+  address, performs exact-frame clear-signing preflight, invokes the signer on
+  that same frame, and retains `PreparedTransaction::finalize` as independent
+  signature verification. The dedicated Rust device application belongs in a
+  separate `sunrise-edge-ledger-app` repository so custom Ledger targets,
+  bindings, Speculos, device workflows, and release artifacts cannot be hidden
+  from this workspace gate. Later S4c vendor transport code belongs in a
+  separate `clients/ledger` crate and requires an explicit amendment to the
+  CLI's one-runtime-dependency decision.
+
+  **Completion boundary.** `SIGNING.md` fixes the future APDU state machine,
+  status words, bounds, clear-signing fields, and a provisional explicitly
+  unregistered devnet-only derivation path. S4a has no device app, APDU I/O,
+  USB/HID, Speculos, physical-device, registered coin-type, or release evidence;
+  `LocalSigner` remains development-only and unchanged. S4b implements and
+  emulates the dedicated app, S4c integrates the host/CLI, and S4d requires
+  Speculos CI, physical HIL for each claimed model, verified address and user
+  confirmation, a pinned app/firmware matrix, reproducible build hash, and
+  release/submission evidence. S4 remains incomplete until those criteria and
+  the real CLI production signer replacement are satisfied.

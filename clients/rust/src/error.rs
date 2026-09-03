@@ -53,6 +53,27 @@ pub enum ClientError {
     Execution(execution::ExecutionError),
     /// Signing or signature-domain framing failed.
     Crypto(crypto::CryptoError),
+    /// The exact signed frame could not be converted into an approved,
+    /// bounded clear-signing view.
+    SigningView(signing_view::SigningViewError),
+    /// An external signer reported a different signature scheme than the
+    /// prepared transaction.
+    ExternalSignerSchemeMismatch {
+        /// Scheme fixed by the prepared transaction.
+        expected: SignatureSchemeId,
+        /// Scheme reported by the external signer.
+        actual: SignatureSchemeId,
+    },
+    /// An external signer reported a different address than the prepared
+    /// transaction sender.
+    ExternalSignerAddressMismatch {
+        /// Sender fixed by the prepared transaction.
+        expected: Address,
+        /// Address reported by the external signer.
+        actual: Address,
+    },
+    /// The external signer failed before returning signature bytes.
+    ExternalSigner(Box<dyn Error + Send + Sync>),
     /// The decoded submit result was bound to a request id other than the
     /// one the caller supplied, so it was rejected before being returned.
     SubmitResponseRequestIdMismatch {
@@ -130,6 +151,18 @@ impl fmt::Display for ClientError {
             Self::NodeCore(error) => write!(f, "node-core validation error: {error}"),
             Self::Execution(error) => write!(f, "transaction codec error: {error}"),
             Self::Crypto(error) => write!(f, "cryptography error: {error}"),
+            Self::SigningView(error) => write!(f, "clear-signing error: {error}"),
+            Self::ExternalSignerSchemeMismatch { expected, actual } => write!(
+                f,
+                "external signer scheme {} disagrees with prepared scheme {}",
+                actual.as_u16(),
+                expected.as_u16()
+            ),
+            Self::ExternalSignerAddressMismatch { expected, actual } => write!(
+                f,
+                "external signer address {actual} disagrees with prepared sender {expected}"
+            ),
+            Self::ExternalSigner(error) => write!(f, "external signer failed: {error}"),
             Self::SubmitResponseRequestIdMismatch { expected, actual } => write!(
                 f,
                 "submit result request id {actual} disagrees with submitted request id {expected}"
@@ -174,6 +207,8 @@ impl Error for ClientError {
             Self::NodeCore(error) => Some(error),
             Self::Execution(error) => Some(error),
             Self::Crypto(error) => Some(error),
+            Self::SigningView(error) => Some(error),
+            Self::ExternalSigner(error) => Some(error.as_ref()),
             Self::UnexpectedStatus { .. }
             | Self::UnexpectedContentType { .. }
             | Self::SubmitResponseRequestIdMismatch { .. }
@@ -183,6 +218,8 @@ impl Error for ClientError {
             | Self::ReceiptPollExhausted { .. }
             | Self::ReceiptPollDeadlineOverflow
             | Self::UnsupportedSignatureScheme(_)
+            | Self::ExternalSignerSchemeMismatch { .. }
+            | Self::ExternalSignerAddressMismatch { .. }
             | Self::ExternalSignatureInvalid { .. } => None,
         }
     }
@@ -227,5 +264,11 @@ impl From<execution::ExecutionError> for ClientError {
 impl From<crypto::CryptoError> for ClientError {
     fn from(value: crypto::CryptoError) -> Self {
         Self::Crypto(value)
+    }
+}
+
+impl From<signing_view::SigningViewError> for ClientError {
+    fn from(value: signing_view::SigningViewError) -> Self {
+        Self::SigningView(value)
     }
 }
