@@ -3668,6 +3668,24 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   rejects the whole transaction, so execution work may be spent without a
   commit; this bounded devnet limitation is not production admission policy.
 
+  **Schedule-shape invariant.** S3 only ever measures `execution_units`:
+  every `fees::FeeUsage` the preinstalled-WASM machine builds leaves
+  `state_read_units`, `state_write_units`, `storage_units`, and
+  `system_module_units` at their default zero. Before fee admission or the
+  engine ever runs, it independently validates the committed `GasSchedule`'s
+  shape (`fee_effects::validate_gas_schedule_shape`): a non-zero
+  `read_price`/`write_price`/`storage_price`/`system_module_price` is
+  rejected as `NodeCoreError::UnsupportedGasScheduleShape` rather than
+  silently multiplied by zero usage and dropped from the total by
+  `fees::calculate_fee`, and a non-zero `execution_price` paired with a zero
+  `base_fee` is rejected the same way, because a legitimate zero-`gas_used`
+  success could otherwise settle a zero fee even though worst-case admission
+  at `gas_limit` already required a treasury `Write`. The genesis all-zero
+  schedule and the current devnet `base_fee`/`execution_price`-only schedule
+  both pass unchanged. This is a trusted committed-configuration fault, never
+  a caller-supplied one; native HTTP maps it to an opaque `500
+  fee-schedule-unsupported`, distinct from every caller-facing 4xx fee code.
+
   **Ordinary accounts and trusted boundary.** The payer is one sender-owned
   declared `Write` object and the trusted fee sink is the distinct configured
   treasury owner's ordinary seeded destination account. The signed manifest
@@ -3703,11 +3721,15 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   collision fails locally. Native HTTP assigns explicit 4xx classifications
   to caller fee faults and 5xx classifications to trusted policy/composition
   invariant failures. The real file-backed SQLite E2E proves a successful
-  actual-gas charge, event pre-fee semantics, a trapped fee-only charge,
-  same-boot and orderly close/reopen replay non-reapplication (including the
-  trapped request), writer-generation advancement/fencing, and request-ID
-  reuse conflict with canonical source/destination/treasury query bytes, all
-  three receipts, and nonce unchanged.
+  actual-gas charge, event pre-fee semantics, and a trapped fee-only charge,
+  then replays both the successful and the trapped request once in the same
+  boot and once after an orderly close/reopen: every replay returns
+  byte-identical canonical submit-result bytes and mutates neither the
+  canonical source/destination/treasury query bytes, the second-transfer or
+  trapped receipt, nor the sender's next nonce. It also proves
+  writer-generation advancement/fencing and request-ID reuse conflict with
+  the same canonical source/destination/treasury query bytes, all three
+  receipts, and nonce unchanged.
 
   **Limits and next step.** This is single-validator, one fixed fee asset, one
   serializing treasury, and local SQLite only. It does not implement fee

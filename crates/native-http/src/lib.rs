@@ -3038,6 +3038,14 @@ fn node_error_response(error: &NodeCoreError) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
             "fee-settlement-zero",
         ),
+        // The committed `GasSchedule` itself is malformed for this path
+        // (see `node_core::GasScheduleShapeFault`): trusted configuration,
+        // never anything the caller controls, so it is opaque to the caller
+        // beyond a generic server-fault code.
+        NodeCoreError::UnsupportedGasScheduleShape(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "fee-schedule-unsupported",
+        ),
         // Catalog/commitment mismatch: the composition-trusted catalog
         // disagrees with the governance-committed registry, which is a host
         // misconfiguration rather than anything the caller controls.
@@ -5032,6 +5040,20 @@ mod tests {
                 NodeCoreError::FeeAmountZero,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "fee-settlement-zero",
+            ),
+            (
+                NodeCoreError::UnsupportedGasScheduleShape(
+                    node_core::GasScheduleShapeFault::UnmeasuredCategoryPriced,
+                ),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "fee-schedule-unsupported",
+            ),
+            (
+                NodeCoreError::UnsupportedGasScheduleShape(
+                    node_core::GasScheduleShapeFault::ZeroBaseFeeWithExecutionPrice,
+                ),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "fee-schedule-unsupported",
             ),
         ];
 

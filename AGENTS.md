@@ -221,7 +221,13 @@ rationale and the S0-S5 ordered slices). S2's exact cross-owner destination
 policy is implemented by DR-0086. S3's uniform ordinary-asset fee composition,
 actual-gas settlement, trap fee-only charge, and restart/replay evidence are
 implemented by DR-0087 without changing historical WAT/WASM or canonical wire
-bytes. S1 implements remote TLS transport
+bytes. The preinstalled-WASM fee-aware path accepts only an all-zero or a
+base/execution-only committed `GasSchedule` shape, rejecting any priced
+S3-unmeasured category and a zero `base_fee` paired with a non-zero
+`execution_price` before engine work with a typed, opaque HTTP 500 mapping,
+and the real file-backed SQLite E2E proves both the successful and trapped
+invocation replay exactly, in the same boot and after reopen, without
+reapplication. S1 implements remote TLS transport
 plus a separate locally configured expected protocol-context check before
 signing; these are two independent slices, and as of 2026-09-01 both are
 implemented and tested As-Is, so S1 as a whole is complete. The

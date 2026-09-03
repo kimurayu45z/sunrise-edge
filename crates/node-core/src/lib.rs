@@ -57,7 +57,7 @@ use preinstalled_wasm::{
 pub use execution::{ObjectEffect, ResolvedObject};
 pub use fee_effects::{
     CommittedFeePolicy, FeeChargeBodies, FeeChargeRequest, FeeCompositionError, FeeEffectComposer,
-    PreinstalledFeeComposition,
+    GasScheduleShapeFault, PreinstalledFeeComposition, validate_gas_schedule_shape,
 };
 pub use preinstalled_wasm::{
     MAX_PREINSTALLED_MODULE_GAS_LIMIT, MAX_PREINSTALLED_MODULE_WASM_BYTES,
@@ -650,6 +650,11 @@ pub enum NodeCoreError {
     /// exactly zero at the actual `gas_used`, leaving a declared treasury
     /// `Write` access with no economically justified mutation.
     FeeAmountZero,
+    /// The committed `GasSchedule` has a shape the preinstalled-WASM
+    /// fee-aware path cannot safely charge; see
+    /// [`fee_effects::GasScheduleShapeFault`]. A trusted committed
+    /// configuration fault, never a caller-supplied one.
+    UnsupportedGasScheduleShape(GasScheduleShapeFault),
 }
 
 impl fmt::Display for NodeCoreError {
@@ -1085,6 +1090,9 @@ impl fmt::Display for NodeCoreError {
             Self::FeeAmountZero => f.write_str(
                 "fee settled to zero at actual gas_used with a declared treasury access",
             ),
+            Self::UnsupportedGasScheduleShape(fault) => {
+                write!(f, "committed gas schedule shape is unsupported: {fault}")
+            }
         }
     }
 }
@@ -1104,6 +1112,7 @@ impl Error for NodeCoreError {
             Self::Execution(error) => Some(error),
             Self::FeePaymentRejected(error) => Some(error),
             Self::FeeCompositionFailed(error) => Some(error),
+            Self::UnsupportedGasScheduleShape(error) => Some(error),
             _ => None,
         }
     }
@@ -3573,6 +3582,14 @@ impl TransactionalNodeStateMachine for PreinstalledWasmMachine<'_> {
             });
         }
         check_preinstalled_module_gas_limit(self.transaction.gas_limit)?;
+
+        // The committed schedule's shape is validated before fee admission
+        // or the engine ever runs: it is a trusted configuration fact, never
+        // request-dependent, so it must fail closed identically for every
+        // invocation rather than only when this particular transaction
+        // happens to owe a fee.
+        validate_gas_schedule_shape(&self.fee_policy.gas_schedule)
+            .map_err(NodeCoreError::UnsupportedGasScheduleShape)?;
 
         // Fee admission runs before the engine ever executes: an
         // insufficient `max_fee` at the worst-case `gas_limit` is rejected
@@ -13925,6 +13942,161 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, NodeCoreError::FeeCompositionUnavailable);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    /// A committed schedule that prices a category this path never measures
+    /// (`read_price`, `write_price`, `storage_price`, or
+    /// `system_module_price`) must fail closed before the engine ever runs,
+    /// rather than let `fees::calculate_fee` silently multiply that price by
+    /// the always-zero usage this path reports and drop it from the total.
+    #[test]
+    fn preinstalled_wasm_schedule_pricing_an_unmeasured_category_is_rejected_before_execution() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0x91);
+        protocol_config.gas_schedule.storage_price = 1;
+        let signing_key: SigningKey = dev_signing_key(0x91);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0x91; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (payer_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0x92; 32]),
+            Owner::Address(sender),
+            0x92,
+        );
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref: payer_ref,
+            mode: AccessMode::Write,
+        }]);
+        let tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0x93),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::UnsupportedGasScheduleShape(
+                GasScheduleShapeFault::UnmeasuredCategoryPriced
+            )
+        );
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    /// A committed schedule with a zero `base_fee` but a non-zero
+    /// `execution_price` lets a legitimate zero-`gas_used` success settle a
+    /// zero fee even though worst-case admission at `gas_limit` already
+    /// required a treasury `Write`. This must fail closed before the engine
+    /// ever runs rather than depend on whichever `gas_used` a specific
+    /// invocation happens to report.
+    #[test]
+    fn preinstalled_wasm_zero_base_fee_with_nonzero_execution_price_is_rejected_before_execution() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = fee_active_protocol_config(0x94);
+        protocol_config.gas_schedule.base_fee = 0;
+        let signing_key: SigningKey = dev_signing_key(0x94);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id = ModuleId::new([0x94; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let (payer_ref, _) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0x95; 32]),
+            Owner::Address(sender),
+            0x95,
+        );
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref: payer_ref,
+            mode: AccessMode::Write,
+        }]);
+        let tx = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+        let submission = authenticated_submission_from_transaction(
+            "sunrise-test",
+            request(0x96),
+            &signing_key,
+            Epoch::new(7),
+            tx,
+            &node_config,
+            &protocol_config,
+        );
+        let engine = WasmExecutionEngine;
+
+        let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &store,
+            &durable_context(),
+            &hash_resolver,
+            &catalog,
+            &engine,
+            submission,
+            9,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::UnsupportedGasScheduleShape(
+                GasScheduleShapeFault::ZeroBaseFeeWithExecutionPrice
+            )
+        );
         assert!(store.commits.lock().unwrap().is_empty());
     }
 
