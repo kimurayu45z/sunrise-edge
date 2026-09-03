@@ -542,8 +542,20 @@ including orderly restart and duplicate-request evidence. Under the CLI-first
 production-strategy pivot (see `ARCHITECTURE.md` DR-0085), S3 of the
 [CLI-First Node Production Gate](TODO.md#cli-first-node-production-gate) is
 now implemented As-Is, and S4a's hardware-signing profile/host preflight is
-also implemented As-Is; the current milestone is S4b's separate dedicated
-Ledger device app and Speculos evidence. S0-S3 are real
+also implemented As-Is. `ARCHITECTURE.md` DR-0089 subsequently makes eight
+S4b device-contract clarifications in [`SIGNING.md`](SIGNING.md) (derivation
+algorithm, public key encoding, status-word ownership, device-side sender
+comparison, pinned device policy, and duplicate-`ObjectId` rejection), plus
+one correction to DR-0088's explicit blanket 230-byte whole-APDU data cap for
+`sign transaction`, raising FIRST's maximum command data from 230 to 255
+bytes and its first chunk from 205 to 230 bytes (CONTINUE/LAST chunks stay
+capped at 230, unchanged). This is a documentation-only clarification and
+correction — it changes no canonical transaction/signature byte or
+implementation code, since S4b has none yet; no device
+app, APDU transport, USB/HID dependency, or Speculos/physical-device
+evidence exists in this or any other repository, so S4 remains incomplete
+and the current milestone is still S4b's separate dedicated Ledger device
+app and Speculos evidence. S0-S3 are real
 node/persistence/operations gate slices defined by reference to the existing,
 unchanged Phase 15 production exit criteria, the Post-MVP persistence
 implementation order, and the cross-phase release gate. S1 has two separate
@@ -817,8 +829,15 @@ implemented and tested, so S1 as a whole is complete; S2's committed
 cross-owner destination policy and restart/replay evidence are also complete
 As-Is. S3's uniform asset fee accounting and actual-gas settlement are now
 implemented and validated As-Is. S4a's strict hardware profile, signed-byte-
-only display, and host preflight are also implemented As-Is; the current
-milestone is S4b's separate dedicated Ledger device app and Speculos evidence.
+only display, and host preflight are also implemented As-Is; DR-0089 has
+since clarified the S4b device contract and corrected DR-0088's blanket
+230-byte whole-APDU data cap (FIRST 230→255 bytes, first chunk 205→230
+bytes, CONTINUE/LAST unchanged at 230) in `SIGNING.md` (documentation
+only, changing no canonical transaction/signature byte or implementation
+code), but no device app, APDU transport, or Speculos/physical-device evidence
+exists yet, so S4 remains incomplete and the current milestone is still S4b's
+separate dedicated Ledger device app and Speculos evidence; the TypeScript
+client, explorer, wallet, and S5 remain deferred until then.
 This is real node/persistence/operations and remote-CLI
 evidence, not a mainnet-readiness or production-certification claim: passing
 S3 does not authorize skipping directly to later production claims.

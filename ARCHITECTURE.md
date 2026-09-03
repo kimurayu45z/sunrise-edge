@@ -3383,10 +3383,14 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   implemented As-Is. S1 below is now also implemented and tested As-Is (see
   "S1 implementation status" immediately below), and S2 is implemented and
   validated As-Is by DR-0086. S3 is implemented and validated As-Is by
-  DR-0087. S4a is implemented and validated As-Is by DR-0088; S4 remains
-  incomplete and the current implementation priority is S4b's separate
-  dedicated Ledger application/Speculos evidence. S5 remains its ordered
-  successor, and the TypeScript
+  DR-0087. S4a is implemented and validated As-Is by DR-0088, and DR-0089
+  subsequently makes eight S4b device-contract clarifications in `SIGNING.md`
+  and one correction to DR-0088's blanket 230-byte whole-APDU data cap (FIRST rises
+  230→255 bytes, first chunk 205→230 bytes, CONTINUE/LAST unchanged at
+  230), without adding any device app or Speculos/physical-device
+  evidence; S4 remains incomplete and the current implementation priority is S4b's
+  separate dedicated Ledger application/Speculos evidence. S5 remains its
+  ordered successor, and the TypeScript
   client/explorer/wallet surface remains deferred until the complete
   CLI-First Node Production Gate passes.
 
@@ -3854,3 +3858,100 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   confirmation, a pinned app/firmware matrix, reproducible build hash, and
   release/submission evidence. S4 remains incomplete until those criteria and
   the real CLI production signer replacement are satisfied.
+- DR-0089: Make eight S4b Ledger device-contract clarifications for details
+  `SIGNING.md` left implicit after DR-0088's freeze, and one correction to DR-0088's explicit
+  blanket 230-byte whole-APDU data cap for `sign transaction`: FIRST's
+  maximum command data rises from 230 to 255 bytes and its first chunk from
+  205 to 230 bytes, while CONTINUE/LAST chunks remain capped at 230 bytes,
+  unchanged. Neither the clarifications nor this correction change a
+  Sunrise canonical transaction/signature byte, encoder, canonical
+  identifier, or the `0x2001`/`0x6001` frame shapes DR-0088 already fixed,
+  and no implementation code changes because S4b has no implementation in
+  this or any other repository yet.
+
+  **Scope.** This is a documentation-only clarification and correction of
+  the future S4b APDU/derivation contract in `SIGNING.md`. It changes no
+  code, canonical byte, encoder, or historical vector in this repository,
+  and it is not itself S4b device-app or Speculos/physical-device evidence.
+
+  **Clarifications and correction.** (1) Pins the provisional devnet derivation path to
+  SLIP-0010 Ed25519 exactly, not only the five-component hardened path
+  shape DR-0088 already froze. (2) Defines the returned public key as the
+  standard RFC 8032 compressed Ed25519 encoding and distinguishes two Ledger
+  SDK paths to it, not treating every Ledger SDK output as raw or manual
+  conversion as universally required: starting from
+  `ECPrivateKey::public_key`'s raw, uncompressed `04 || X || Y` point, app
+  code must convert it (`Y` from the SDK's big-endian byte order to
+  little-endian, sign bit from `X`'s parity); using the current Ledger SDK's
+  `cx_edwards_compress_point_no_throw` helper, its `pubkey[1..33]` output is
+  already the compressed RFC 8032 bytes and must be used as-is, with no
+  second reversal or sign-bit transformation. It requires the separate S4b
+  repository to add a deterministic test vector (fixed seed/path in, fixed
+  32-byte compressed public key out) for whichever path it implements
+  before S4b can be considered complete, and, if both paths are
+  implemented, to show they agree; no such vector is fabricated in this
+  repository, since one written here could not be verified against a real
+  device or SDK. (3) Fixes `get configuration` success data at exactly six bytes
+  (`profile` `u16`, pinned to `1` for Hardware Signing Profile v1; semver
+  `major`/`minor`/`patch` `u8` each; `flags` `u8`), states every currently
+  defined flags bit is `0`, defines an unknown flag as any set flag bit
+  that either the host's own supported version or the responding device's
+  version does not define, and requires a future host to reject a response
+  with an unknown flag set rather than ignore it. (4) Separates the app's own `E0`-CLA status-word table
+  from Ledger SDK/OS-level statuses it does not own or define — `6E03`
+  (the SDK I/O layer's malformed-APDU-length rejection, distinct from the
+  app's own `6A80`), `5515` (Ledger OS locked-device status), and `E000`
+  (an unhandled panic/exception caught by Ledger's own fault handling) —
+  and documents that Ledger's common CLA `B0` is intercepted by the
+  platform before reaching this app's dispatcher, while `E0` remains this
+  app's own CLA for every command in its table. (5) Requires the device to
+  derive the public key from the path supplied on FIRST and compare it
+  byte-for-byte against the parsed Transaction v1 `sender` before
+  rendering any review screen, returning `6A80` and wiping the buffered
+  frame/derivation state on mismatch, so a wrong-key session can never
+  reach a display page. (6) Pins the device policy's chain id, protocol
+  version, and epoch (`sunrise-local-devnet`, `3`, `0`, the same README
+  reference context DR-0088 already used) together with the exact devnet
+  fee `AssetId`
+  (`ccad27f687338b99953183728647bc1177388eb45a37afd9812c0d286b433ea8`, the
+  normative value `crates/signing-view/src/policy.rs`'s
+  `DEVNET_ASSET_TRANSFER_POLICY.fee_asset_id` field fixes, which
+  `crates/signing-view/tests/fixtures.rs` exercises only as fixture
+  evidence) as one policy, rejecting any other combination rather than
+  matching fields independently. (7) Requires a typed rejection when any two of the three
+  `Write` access entries (source/destination/treasury) share an
+  `ObjectId`, even when mode and position are otherwise well-formed;
+  DR-0088's "three ordered `Write` entries" language did not previously
+  state this explicitly. (8) **Correction, not clarification:** supersedes
+  DR-0088's explicit blanket 230-byte whole-APDU data cap for
+  `sign transaction`. The 230-byte figure now names the chunk-payload
+  bound specifically (not the whole APDU), and CONTINUE/LAST chunks stay
+  capped at 230 bytes, unchanged. FIRST's total command data rises from
+  230 to 255 bytes: `total_length` (4 bytes) plus the fixed depth-five
+  path (21 bytes) plus up to 230 bytes of first chunk — so FIRST's own
+  chunk allowance rises from 205 to 230 bytes. This is a normative change
+  to the future APDU wire contract, not a restatement of an existing
+  implicit bound; it changes no canonical transaction/signature byte and
+  no implementation code, since S4b has no implementation to change.
+  (9) States FIRST/CONTINUE success responses carry empty data (only LAST
+  carries the 64-byte signature), and that the returned public key equals
+  the Sunrise address only because the chain's committed
+  `protocol_config::TransactionAuthProfile` — which Hardware Signing
+  Profile v1 relies on rather than itself commits — selects
+  `AddressIsPublicKey`, not as a general equivalence.
+
+  **Evidence boundary unchanged; byte bound corrected.** DR-0088's S4
+  evidence/completion criteria are unchanged by this clarification and
+  correction: S4a remains implemented and validated As-Is; S4b still has
+  no device application, APDU transport, USB/HID dependency, or
+  Speculos/physical-device evidence in this or any other repository,
+  S4d's Speculos CI/physical-HIL/reproducible-build gate is untouched, and
+  S4 remains incomplete. What DR-0089 does change, per (8) above, is
+  DR-0088's explicit blanket 230-byte whole-APDU data cap for
+  `sign transaction`: this document corrects — not merely clarifies — it
+  to a 255-byte FIRST maximum and a 230-byte first-chunk maximum
+  (CONTINUE/LAST unchanged at 230). That correction is confined to the
+  future wire contract: no canonical transaction/signature byte, encoder,
+  canonical identifier, or implementation code changes, since none exists
+  yet for S4b. TypeScript client, explorer, wallet, and S5 remain
+  deferred, unaffected by this clarification.
