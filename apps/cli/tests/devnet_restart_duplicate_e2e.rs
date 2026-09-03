@@ -23,7 +23,10 @@
 //!    byte-identically both before and after restart: the canonical response
 //!    bytes are identical and neither duplicate re-applies its effects.
 //! 5. A trapped invocation discards its application transfer but charges the
-//!    normalized actual gas through fee-only source/treasury writes.
+//!    normalized actual gas through fee-only source/treasury writes, and
+//!    that exact trapped request replays byte-identically both in the same
+//!    boot and after restart, mutating neither source, destination,
+//!    treasury, the second-transfer or trapped receipts, nor next nonce.
 //! 6. Reusing an already-committed request id for a different transaction is
 //!    a typed, nonzero, fail-closed HTTP conflict with no state change.
 //! 7. The pre-restart writer generation is fenced on the reopened store.
@@ -809,6 +812,113 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             verify_client
                 .query_next_nonce(owner_address)
                 .expect("next-nonce query after duplicate should succeed")
+                .encode()
+                .expect("next-nonce result should encode canonically"),
+            next_nonce_query_bytes
+        );
+
+        // Same-boot duplicate evidence for the trapped fee-only request:
+        // replay it before the restart and prove both the canonical
+        // response and every persisted observation -- source, destination,
+        // treasury, the second-transfer and trapped receipts, and next
+        // nonce -- remain byte-identical, exactly like the successful R2
+        // replay above.
+        let trapped_duplicate_before_restart = verify_client
+            .submit_transaction(SubmitTransactionRequest {
+                chain_id: context.chain_id().clone(),
+                protocol_version: context.protocol_version(),
+                epoch: context.epoch(),
+                request_id: request_id_r3,
+                signed_transaction_bytes: trapped_signed_bytes.clone(),
+            })
+            .expect("the exact same-boot trapped duplicate should reconcile");
+        assert_eq!(
+            trapped_duplicate_before_restart
+                .encode()
+                .expect("trapped duplicate submit result should encode canonically"),
+            trapped_result_bytes
+        );
+
+        let (
+            source_ref_after_same_boot_trap_duplicate,
+            source_after_same_boot_trap_duplicate,
+            source_owner_after_same_boot_trap_duplicate,
+            source_bytes_after_same_boot_trap_duplicate,
+        ) = query_current_account(&verify_client, source_id);
+        let (
+            destination_ref_after_same_boot_trap_duplicate,
+            destination_after_same_boot_trap_duplicate,
+            destination_owner_after_same_boot_trap_duplicate,
+            destination_bytes_after_same_boot_trap_duplicate,
+        ) = query_current_account(&verify_client, destination_id);
+        let (
+            treasury_ref_after_same_boot_trap_duplicate,
+            treasury_after_same_boot_trap_duplicate,
+            treasury_owner_after_same_boot_trap_duplicate,
+            treasury_bytes_after_same_boot_trap_duplicate,
+        ) = query_current_account(&verify_client, treasury_id);
+        assert_eq!(
+            source_ref_after_same_boot_trap_duplicate,
+            source_ref_after_r2
+        );
+        assert_eq!(
+            destination_ref_after_same_boot_trap_duplicate,
+            destination_ref_after_r2
+        );
+        assert_eq!(source_after_same_boot_trap_duplicate, source_after_r2);
+        assert_eq!(
+            destination_after_same_boot_trap_duplicate,
+            destination_after_r2
+        );
+        assert_eq!(
+            treasury_ref_after_same_boot_trap_duplicate,
+            treasury_ref_after_r2
+        );
+        assert_eq!(treasury_after_same_boot_trap_duplicate, treasury_after_r2);
+        assert_eq!(
+            source_owner_after_same_boot_trap_duplicate,
+            Owner::Address(owner_address)
+        );
+        assert_eq!(
+            destination_owner_after_same_boot_trap_duplicate,
+            Owner::Address(recipient_address)
+        );
+        assert_eq!(
+            treasury_owner_after_same_boot_trap_duplicate,
+            Owner::Address(sunrise_edge_client::Address::new([0x7B; 32]))
+        );
+        assert_eq!(
+            source_bytes_after_same_boot_trap_duplicate,
+            source_query_bytes
+        );
+        assert_eq!(
+            destination_bytes_after_same_boot_trap_duplicate,
+            destination_query_bytes
+        );
+        assert_eq!(
+            treasury_bytes_after_same_boot_trap_duplicate,
+            treasury_query_bytes
+        );
+        assert_eq!(
+            verify_client
+                .query_receipt(request_id_r2)
+                .expect("second-transfer receipt query after trapped duplicate should succeed")
+                .encode()
+                .expect("second-transfer receipt result should encode canonically"),
+            second_transfer_receipt_bytes
+        );
+        assert_eq!(
+            verify_client
+                .query_receipt(request_id_r3)
+                .expect("trapped receipt query after trapped duplicate should succeed")
+                .encode()
+                .expect("trapped receipt result should encode canonically"),
+            trapped_receipt_bytes
+        );
+        assert_eq!(
+            verify_client
+                .query_next_nonce(owner_address)
+                .expect("next-nonce query after trapped duplicate should succeed")
                 .encode()
                 .expect("next-nonce result should encode canonically"),
             next_nonce_query_bytes

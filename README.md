@@ -155,9 +155,12 @@ cross-provider ingress milestones implemented through Phase 17:
   entrypoint instead, so a signed owned Write/Consume can execute a governed
   deterministic contract over HTTP; both routers share the same request-scoped
   outbox claim/send/ack path and admission/cancellation bounds. Shared/system
-  ownership, blob bodies, arbitrary module upload, fee debit, FastVote/FastCertificate,
+  ownership, blob bodies, arbitrary module upload, FastVote/FastCertificate,
   and certificate publication also remain unimplemented, so the owned fast
-  path is not yet safe to activate on a live chain. The other externally
+  path is not yet safe to activate on a live chain. S3's uniform ordinary-
+  asset fee debit (see `ARCHITECTURE.md` DR-0087) is implemented on the
+  preinstalled-WASM entrypoint only; the generic owned-effects entrypoint
+  above still has no fee-charging composition wired. The other externally
   accepted node-event families, especially certificate, protocol-upgrade, and
   validator-set-change events, still need their own authenticated and
   authorized ingress boundaries before any live activation. The outer
@@ -204,8 +207,10 @@ cross-provider ingress milestones implemented through Phase 17:
   outbox acknowledgement stays idempotent after reopen, and a bounded
   contention test proving a short deadline does not wait the fixed default.
   It exists so the preinstalled-WASM native routers can use one local durable
-  structured store; it is not provider-hardened, and native binary/devnet
-  startup wiring around it remains unimplemented.
+  structured store; it is not provider-hardened. The local devnet binary
+  (`apps/devnet`) now wires startup, seeded accounts, and the bounded query
+  API around it (see "Local devnet architecture" in `ARCHITECTURE.md` and
+  DR-0081/DR-0087).
 - An accepted [production persistence architecture](PERSISTENCE.md) that makes
   validator-local atomicity domains, complete read-set validation, normalized
   object/receipt/outbox data, indexed recovery, writer fencing, migration, and

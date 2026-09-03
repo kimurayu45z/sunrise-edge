@@ -2193,11 +2193,16 @@ criteriaを変更せず参照するだけである。
   と第三者security auditの重大指摘解消、mainnet genesis前のrelease
   artifact/dependency/compiler/build provenance固定とreproducible build/upgrade
   rehearsal）。
-- protocol version 3のfee/module-object-effect/FastCertificateのatomic
-  compositionが完成するまでlive activationを禁止する既存のhard activation
-  constraint（後述の「Phase 15 As-Is scope」参照。fee debit、module/object
-  effect、FastCertificateはこのgateでも引き続き未実装の前提であり、このgate単独で
-  protocol version 3を有効化してよいことにはならない）。
+- protocol version 3のFastCertificate/certificate publicationのatomic
+  composition、`SubmitTransaction`以外の外部event familyのauthenticated/
+  authorized ingress、S4/S5、および独立したsecurity/release gateが完了する
+  までlive activationを禁止する既存のhard activation constraint（後述の
+  「Phase 15 As-Is scope」参照）。fee（S3のbounded uniform ordinary-asset fee
+  composition、DR-0087）とmodule/object effect（additive owned-effects
+  entrypointおよびpreinstalled-WASM entrypoint）はimplemented As-Isだが、
+  FastCertificate、certificate publication、他event familyのauthorized
+  ingress、S4/S5、独立security/release gateは引き続き未実装の前提であり、この
+  gate単独でprotocol version 3を有効化してよいことにはならない。
 - `SubmitTransaction`以外の外部から受理されるnode-event family（特にcertificate、
   protocol upgrade、validator-set change）について、live activation前に
   `SubmitTransaction`と同等のauthenticated/authorized ingressを要求する既存の
@@ -2630,7 +2635,8 @@ Phase 15 As-Is scope:
   exact replayはmodule resolve/object read/execution前にreceiptから返る。additive preinstalled-WASM native router
   （`preinstalled_wasm_structured_durable_router`/`_with_executor`）はこのentrypointへwiring済みである一方、
   generic structured durable routerはread-only entrypointのままである。Shared/System owner、blob body、
-  devnet/startup composition、arbitrary provider wiring、fee debit、owned fast path certificateは未実装である。
+  arbitrary provider wiring、owned fast path certificateは未実装である。devnet/startup composition
+  （`apps/devnet`）とfee debit（S3のuniform ordinary-asset fee slice、DR-0087）はimplemented As-Isである。
   node-core additive handlerはmanifest domainをI/O前にresolveし、typed receipt replayをstate readより先に行い、
   read-only assertionを含むstate/receipt/outboxをこのenvelopeへ構築する。definite commitまたはexact replay以外では
   outputを返さない。single-lock memoryとnormalized PostgreSQL conformance storeでatomic publication、object lifecycle/ABA、
@@ -2684,8 +2690,11 @@ Phase 15 As-Is scope:
   `curve25519-dalek` 4.1.3で再確認済み）。strict transaction authentication
   とproduction-oriented structured durable native routeの接続もimplemented
   As-Is（下記bullet）。persistent sender nonceもimplemented As-Is（下記bullet）。
-  ただしfee、module/object effects、FastCertificateは引き続き未実装であり、protocol
-  version 3のlive activationは禁止する。
+  fee（S3のuniform asset fee slice、DR-0087）とmodule/object effects（additive
+  owned-effects entrypointおよびpreinstalled-WASM entrypoint）は現在implemented
+  As-Isだが、FastCertificateとCLI-First Node Production GateのS4/S5・independent
+  security reviewは引き続き未実装であり、protocol version 3のlive activationは
+  禁止したままである。
 - `execution::decode_transaction`はexecution::Transaction v1の厳密な
   standalone canonical decoderを追加した：type id/encoding version 1を要求し、
   field 1-10と12を必須、field 11（`fee_payment`）のみoptionalとして
@@ -2758,8 +2767,14 @@ Phase 15 As-Is scope:
   invalid signature、inner/outer chain/version/epoch mismatch、missing profile、
   trailing/non-canonical bytesはmachine/identity/clock/storage/sendのcall count
   zeroで失敗するtestを持つ。transaction wire field/encoding versionは追加して
-  いない。protocol version 3のlive activationはfee/module/object effect/
-  FastCertificateのatomic compositionが完成するまで禁止する。
+  いない。protocol version 3のlive activationはshared-object ordering、
+  FastVote/FastCertificate、certificate publication、他event familyの
+  authorized ingressがprotocol semanticsの要求する箇所でauthenticated
+  transactionとatomically composeされ、かつ独立してS4/S5と独立
+  security/release gateが完了するまで禁止する。fee（S3のbounded uniform
+  ordinary-asset fee composition、DR-0087）とmodule/object effect（additive
+  owned-effects entrypointおよびpreinstalled-WASM entrypoint）はimplemented
+  As-Isだが、単独ではこのconstraintを満たさない。
   **Hard activation constraint:** `SubmitTransaction`以外の
   externally acceptedなnode-event family(特にcertificate、protocol upgrade、
   validator-set change)も、live activationの前に同等のauthenticated/authorized
@@ -2793,9 +2808,14 @@ Phase 15 As-Is scope:
   tombstone revisionを持つabsenceはexpected zeroへresetせずpersistence invariant
   でfail closedする。DB schema generationとTransaction wire/schema versionは
   不変。epoch pruningのproduction policyはdeferredであり、fee debitとbounded
-  retentionがない間はnew senderによるstate growthがeconomic meteringされない。
-  このAs-Is routeをlive transaction ingressとして公開してはならない。
-  fee/object/effect/FastCertificateおよび他event
+  retentionがない間はnew senderによるstate growthがeconomic meteringされない
+  ——これはfee/object-effect compositionを持たないこのgeneric structured
+  durable route（nonce-onlyの`SubmitTransaction` path）に限定した記述である。
+  additive owned-effects entrypointとpreinstalled-WASM entrypointは別途fee
+  （S3のbounded uniform ordinary-asset fee composition、DR-0087）とmodule/
+  object effectsをimplemented As-Isであり、本項の対象外である。このgeneric
+  As-Is routeをlive transaction ingressとして公開してはならない。
+  FastCertificateおよび他event
   familyのauthenticated/authorized ingressが残るためlive activationは引き続き
   禁止する（runtime/node-core/native implemented As-Is）。
 - request pathのcommit直後deliveryはdomain-wide `claim_due_outbox`を流用しない。同じdomainのolder due workを
@@ -3068,8 +3088,10 @@ Post-MVP Production Hardening: Phase 15 persistence implementation order（To-Be
 restart safety、fail-closed behaviorを直接満たすために必要な既存contract修正は先行して
 よいものとしていた。CLI Developer MVP Gateは現在通過済みであり、以下の項目は
 ["CLI-First Node Production Gate"](#cli-first-node-production-gate)のS5が参照する
-production persistence作業そのものである。現在はS3がpriorityであり、capacity/PITR/HA等の
-S5 certification項目はS5または明示的なSLOがtriggerするまで引き続き凍結する。
+production persistence作業そのものである。S3は実装・検証済み（DR-0087）であり、現在の
+implementation priorityはS4 secure signer/Ledgerである。S5は順序を飛ばさず後続する。
+capacity/PITR/HA等のS5 certification項目はS5または明示的なSLOがtriggerするまで
+引き続き凍結する。
 
 1. SQLite既存dataを暗黙migrationせず、writer fence、deadline、typed conflict/indeterminate failureを持つ
    durable domain adapter boundaryを定義する（implemented As-Is; composition/provider implementation pending）。
