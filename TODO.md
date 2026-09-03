@@ -2374,8 +2374,11 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
     blind-signing fallbackはない。`request_id`、destination owner、transferred asset metadata、
     module nameはsigned contentとして表示しない。
   - **S4b: device contract clarified（2026-09-04、DR-0089）、実装はnext。** `SIGNING.md`が
-    SLIP-0010 Ed25519 derivation、Ledger SDK `04||X||Y`からRFC 8032 compressed公開鍵への
-    変換とdeterministic test vector要求、`get configuration`の6-byte success layout、
+    SLIP-0010 Ed25519 derivation、RFC 8032 compressed公開鍵への到達経路を2種
+    （`ECPrivateKey::public_key`の生`04||X||Y`はapp側でY反転・sign bit変換が必要、
+    `cx_edwards_compress_point_no_throw`の`pubkey[1..33]`は既にcompressed済みで
+    再変換禁止）に区別した上でのdeterministic test vector要求（両経路実装時はagreement要求）、
+    `get configuration`の6-byte success layout、
     app SW/Ledger SDK・OS status（`6E03`/`5515`/`E000`/CLA `B0`）の分離、device-side
     sender比較と`6A80`、chain/protocol/epoch/fee assetのdevice policy pin、三access間の
     duplicate `ObjectId` rejection、chunk/FIRST APDU size boundを明記する。これはdocument-only

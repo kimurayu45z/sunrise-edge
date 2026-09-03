@@ -119,19 +119,30 @@ The public key returned by `verify public key` and used internally for the
 device-side sender check below is the standard
 [RFC 8032](https://www.rfc-editor.org/rfc/rfc8032) compressed Ed25519
 encoding: 32 little-endian bytes of the point's `Y` coordinate with the sign
-bit of `X` packed into the most-significant bit of the last byte. Ledger
-SDKs commonly expose SLIP-0010 Ed25519 results as an uncompressed
-`04 || X || Y` point (65 bytes, `X`/`Y` each 32 bytes in the SDK's own
-big-endian byte order), not this compressed form. Producing the exact
-32-byte contract used throughout this document therefore requires
-converting the SDK's `Y` from big-endian to little-endian and setting the
-compressed sign bit from `X`'s parity (an odd `X` sets the bit); this
-conversion is app logic, not something the SDK performs automatically, and
-getting the byte order or sign bit wrong silently produces a different,
-wrong public key/address rather than a decode error. **S4b is not complete
-until the separate device-app repository adds a pinned, deterministic test
-vector exercising exactly this SDK-representation-to-RFC-8032 conversion**
-(fixed seed/path in, fixed 32-byte compressed public key out); this document
+bit of `X` packed into the most-significant bit of the last byte. Whether app
+code must convert to reach that encoding depends on which Ledger SDK
+primitive derived the key, and the two paths must not both be applied to the
+same value:
+
+- Starting from `ECPrivateKey::public_key`'s raw, uncompressed output (a
+  65-byte `04 || X || Y` point, `X`/`Y` each 32 bytes in the SDK's own
+  big-endian byte order): this is not the compressed form, and app code must
+  convert it by reversing `Y` from big-endian to little-endian and setting
+  the compressed sign bit from `X`'s parity (an odd `X` sets the bit).
+- Using the current Ledger SDK's `cx_edwards_compress_point_no_throw` helper:
+  it already writes the compressed RFC 8032 bytes into `pubkey[1..33]`. This
+  output must be used as-is; a second reversal or sign-bit transformation on
+  top of it is not permitted and would silently produce a different, wrong
+  public key/address rather than a decode error.
+
+Getting the byte order or sign bit wrong on the first path, or re-transforming
+the second path's already-compressed output, both silently produce a
+different, wrong public key/address rather than a decode error. **S4b is not
+complete until the separate device-app repository adds a pinned,
+deterministic test vector** (fixed seed/path in, fixed 32-byte compressed
+public key out) **exercising whichever of the two paths above the device app
+implements; if the device app implements both, the vector must additionally
+show they agree on the same output for the same input.** This document
 intentionally does not assert such a vector's bytes, since fabricating one
 here would not be verified against a real device or SDK.
 

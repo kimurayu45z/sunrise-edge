@@ -3869,14 +3869,21 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   **Clarifications.** (1) Pins the provisional devnet derivation path to
   SLIP-0010 Ed25519 exactly, not only the five-component hardened path
   shape DR-0088 already froze. (2) Defines the returned public key as the
-  standard RFC 8032 compressed Ed25519 encoding, states explicitly that a
-  Ledger SDK's uncompressed `04 || X || Y` point must be converted (`Y`
-  from the SDK's big-endian byte order to little-endian, sign bit from
-  `X`'s parity) rather than returned as-is, and requires the separate S4b
-  repository to add a deterministic conversion test vector before S4b can
-  be considered complete; no such vector is fabricated in this repository,
-  since one written here could not be verified against a real device or
-  SDK. (3) Fixes `get configuration` success data at exactly six bytes
+  standard RFC 8032 compressed Ed25519 encoding and distinguishes two Ledger
+  SDK paths to it, not treating every Ledger SDK output as raw or manual
+  conversion as universally required: starting from
+  `ECPrivateKey::public_key`'s raw, uncompressed `04 || X || Y` point, app
+  code must convert it (`Y` from the SDK's big-endian byte order to
+  little-endian, sign bit from `X`'s parity); using the current Ledger SDK's
+  `cx_edwards_compress_point_no_throw` helper, its `pubkey[1..33]` output is
+  already the compressed RFC 8032 bytes and must be used as-is, with no
+  second reversal or sign-bit transformation. It requires the separate S4b
+  repository to add a deterministic test vector (fixed seed/path in, fixed
+  32-byte compressed public key out) for whichever path it implements
+  before S4b can be considered complete, and, if both paths are
+  implemented, to show they agree; no such vector is fabricated in this
+  repository, since one written here could not be verified against a real
+  device or SDK. (3) Fixes `get configuration` success data at exactly six bytes
   (`profile` `u16`, semver `major`/`minor`/`patch` `u8` each, `flags`
   `u8`), states every currently defined flags bit is `0`, and requires a
   future host to reject a response with an unrecognized bit set rather
