@@ -83,9 +83,9 @@ Profile v1 recognizes only the exact local reference transfer identified by:
 - a present fee payment whose fee object is byte-for-byte the source
   reference at access index 0, and whose fee `AssetId` is byte-for-byte the
   exact devnet fee asset
-  `ccad27f687338b99953183728647bc1177388eb45a37afd9812c0d286b433ea8`
-  (`DEVNET_ASSET_ID`, the same value used by
-  `crates/signing-view/tests/fixtures.rs`).
+  `ccad27f687338b99953183728647bc1177388eb45a37afd9812c0d286b433ea8` — the
+  normative value is `crates/signing-view/src/policy.rs`'s
+  `DEVNET_ASSET_TRANSFER_POLICY.fee_asset_id` field; `crates/signing-view/tests/fixtures.rs` exercises the same bytes only as fixture evidence.
 
 The view displays chain, protocol version, epoch, message type, scheme,
 sender, nonce, exact module reference, entrypoint, amount, gas limit, every
@@ -160,17 +160,19 @@ transaction integers inside the opaque chunk stream.
 
 | Name | CLA | INS | P1 | P2 | Command data | Success data |
 | --- | ---: | ---: | ---: | ---: | --- | --- |
-| get configuration | `E0` | `00` | `00` | `00` | empty | exactly 6 bytes: profile `u16`, semver `major`/`minor`/`patch` `u8` each, flags `u8` |
-| verify public key | `E0` | `02` | `01` | `00` | derivation path | exact 32-byte Ed25519 public key/address |
+| get configuration | `E0` | `00` | `00` | `00` | empty | exactly 6 bytes: profile `u16` (`1`), semver `major`/`minor`/`patch` `u8` each, flags `u8` |
+| verify public key | `E0` | `02` | `01` | `00` | derivation path | exact 32-byte Ed25519 public key |
 | sign transaction | `E0` | `04` | see below | `00` | header/chunk or chunk | exact 64-byte Ed25519 signature on final approval |
 | reset signing | `E0` | `06` | `00` | `00` | empty | empty |
 
-`get configuration`'s six success bytes are, in order: `profile` (`u16`),
-`major`/`minor`/`patch` (one `u8` each), then `flags` (`u8`). Every flags bit
-defined by this document is currently `0`; there is no defined non-zero bit.
-A future host that recognizes a flags bit its own supported version does not
-define must reject the response as an unsupported configuration rather than
-silently ignore the unknown bit.
+`get configuration`'s six success bytes are, in order: `profile` (`u16`,
+pinned to exactly `1` for Hardware Signing Profile v1), `major`/`minor`/
+`patch` (one `u8` each), then `flags` (`u8`). Every flags bit defined by
+this document is currently `0`; there is no defined non-zero bit. An
+unknown flag is any set flag bit that either the host's own supported
+version or the responding device's version does not define. A future host
+that receives a response with an unknown flag set must reject it as an
+unsupported configuration rather than silently ignore the bit.
 
 The path encoding is one depth byte followed by exactly that many big-endian
 `u32` hardened components. Profile v1 requires depth five and the provisional
@@ -179,9 +181,10 @@ path above, i.e. exactly 21 bytes (1 depth byte + 5 × 4-byte components).
 invalid. The host must compare the returned key with the prepared
 transaction sender before sending any signing chunk. The returned 32-byte
 value is the raw Ed25519 public key; it is also usable directly as the
-Sunrise on-chain address only because Profile v1's committed
-`TransactionAuthProfile` selects the `AddressIsPublicKey` address binding
-(see `ARCHITECTURE.md`). This document does not claim public key and address
+Sunrise on-chain address only because the chain's committed
+`protocol_config::TransactionAuthProfile` — which Hardware Signing Profile
+v1 relies on rather than itself commits — selects the `AddressIsPublicKey`
+address binding (see `ARCHITECTURE.md`). This document does not claim public key and address
 are equal in general — a future signature scheme or address binding would
 require an explicit amendment rather than reusing "public key/address" as
 one value.

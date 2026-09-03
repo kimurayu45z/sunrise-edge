@@ -1754,8 +1754,11 @@ S2のcross-owner destination policyはDR-0086、S3のuniform ordinary-asset fee
 composition・actual-gas/trap settlement・real restart/replay E2EはDR-0087のとおり
 implemented As-Isである。S4a hardware-signing profile/host preflightもDR-0088のとおり
 implemented As-Isであり、DR-0089はS4b device contract（`SIGNING.md`のSLIP-0010 derivation・
-public key encoding・APDU byte layout・status word分離・device-side sender比較・device
-policy pin・duplicate ObjectId rejectionなど）をclarifyしたのみで、device app・APDU
+public key encoding・status word分離・device-side sender比較・device policy pin・
+duplicate ObjectId rejectionなど）をclarifyし、加えてDR-0088のsign transaction全体
+230-byte APDU capをFIRST最大255-byte・first chunk最大230-byteへ訂正した
+（continuation chunkは230-byteのまま不変。Sunrise canonical transaction/signature
+bytesや実装コードの変更はない）。device app・APDU
 transport・Speculos evidenceはこのrepositoryにも別repositoryにも存在せず、S4は引き続き
 incompleteである。現在のimplementation priorityはseparate repositoryで行うS4b dedicated
 Ledger device application/Speculosである。TypeScript client/explorer/walletとS5は引き続き
@@ -1907,9 +1910,10 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    treasury ownerのordinary destinationへactual `gas_used`由来feeをatomic settlementする。
    active module/semanticsはv3、historical v1/v2 bytesとWAT/WASM/code hashは不変である。
    S4a hardware-signing profile/host preflightはDR-0088で後続実装済み。DR-0089はS4b device
-   contractを`SIGNING.md`上でclarifyしたのみで、device app・APDU transport・Speculos evidence
-   はまだ存在しない。次はS4b dedicated Ledger device application/Speculosであり、TypeScript
-   client/explorer/walletとS5は引き続きdeferredである。
+   contractを`SIGNING.md`上でclarifyし、DR-0088のAPDU 230-byte capをFIRST最大255-byte・
+   first chunk最大230-byteへ訂正した（continuationは230-byteで不変）。device app・APDU
+   transport・Speculos evidenceはまだ存在しない。次はS4b dedicated Ledger device
+   application/Speculosであり、TypeScript client/explorer/walletとS5は引き続きdeferredである。
    production/mainnet readinessは未達である。
    前提として、`runtime-sqlite`へ`StructuredDurableDomainStateStore`/`IndexedOutboxRepository`を
    実装するadditive、local-only、non-productionな`SqliteDurableStore`を追加済み
@@ -2373,16 +2377,20 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
     digest algorithm/digest/entrypoint/args/access/fee shapeはtyped rejectionで、raw args/
     blind-signing fallbackはない。`request_id`、destination owner、transferred asset metadata、
     module nameはsigned contentとして表示しない。
-  - **S4b: device contract clarified（2026-09-04、DR-0089）、実装はnext。** `SIGNING.md`が
+  - **S4b: device contract clarified・一部訂正（2026-09-04、DR-0089）、実装はnext。**
+    `SIGNING.md`が
     SLIP-0010 Ed25519 derivation、RFC 8032 compressed公開鍵への到達経路を2種
     （`ECPrivateKey::public_key`の生`04||X||Y`はapp側でY反転・sign bit変換が必要、
     `cx_edwards_compress_point_no_throw`の`pubkey[1..33]`は既にcompressed済みで
     再変換禁止）に区別した上でのdeterministic test vector要求（両経路実装時はagreement要求）、
-    `get configuration`の6-byte success layout、
+    `get configuration`の6-byte success layout（`profile`は`1`に固定）、
     app SW/Ledger SDK・OS status（`6E03`/`5515`/`E000`/CLA `B0`）の分離、device-side
-    sender比較と`6A80`、chain/protocol/epoch/fee assetのdevice policy pin、三access間の
-    duplicate `ObjectId` rejection、chunk/FIRST APDU size boundを明記する。これはdocument-only
-    clarificationであり、**device app・APDU transport・Speculos evidenceはこのrepositoryにも
+    sender比較と`6A80`、chain/protocol/epoch/fee assetのdevice policy pinをclarifyし、
+    三access間のduplicate `ObjectId` rejectionを新たに要求し、DR-0088のsign transaction
+    全体230-byte APDU capをFIRST最大255-byte（`total_length` 4 + path 21 + first chunk
+    230）・first chunk最大230-byte（旧205-byteから訂正）へ訂正する（continuation chunkは
+    230-byteのまま不変）。この訂正もSunrise canonical transaction/signature bytesや実装
+    コードを変更しない。**device app・APDU transport・Speculos evidenceはこのrepositoryにも
     別repositoryにも存在しない。** separate `sunrise-edge-ledger-app` repositoryでdedicated
     Rust Ledger application、exact APDU state machine、independent canonical parse/clear
     signing、address confirmation、Speculos fixture/UX testを実装するのが引き続きnextであり、
@@ -3132,7 +3140,8 @@ restart safety、fail-closed behaviorを直接満たすために必要な既存c
 ["CLI-First Node Production Gate"](#cli-first-node-production-gate)のS5が参照する
 production persistence作業そのものである。S3は実装・検証済み（DR-0087）、S4aは
 hardware-signing profile/host preflightとして実装・検証済み（DR-0088）である。
-DR-0089はS4b device contractをdocument上でclarifyしただけでdevice app・Speculos
+DR-0089はS4b device contractをdocument上でclarifyし、DR-0088のAPDU 230-byte capを
+FIRST最大255-byte・first chunk最大230-byteへ訂正しただけでdevice app・Speculos
 evidenceを追加しておらず、現在のimplementation priorityはS4b dedicated Ledger device
 application/Speculosである。S5は
 順序を飛ばさず後続する。
