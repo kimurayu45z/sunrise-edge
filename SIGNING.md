@@ -62,20 +62,30 @@ hex.
 
 Profile v1 recognizes only the exact local reference transfer identified by:
 
+- the device policy pins exactly chain id `sunrise-local-devnet`, protocol
+  version `3`, and epoch `0` (the README reference context) — any other
+  outer/inner value is a typed rejection, not a best-effort match;
 - module object id
   `0d5dd10aec2c315b1dc564c694439e46bac4b61426d22e0d7ddb764c49197fe7`;
 - module version `3`;
 - SHA-256 code digest
   `01534128f12eb4cf469bfa29677bbced1344879de2870315847cbb7faec21619`,
-  for the README reference context `sunrise-local-devnet`, protocol 3,
-  epoch 0, and the committed asset-account WASM;
+  for the committed asset-account WASM under that pinned chain/protocol/
+  epoch;
 - entrypoint `transfer`;
 - argument `CanonicalStruct(0xF002, v1)` with exactly field 1, a non-zero
   little-endian `u64` amount;
-- exactly three distinct ordered `Write` references: source, destination,
-  and the trusted-composition treasury access;
+- exactly three ordered `Write` references — source, destination, and the
+  trusted-composition treasury access — whose three `ObjectId`s the device
+  must also check are pairwise distinct; a typed rejection applies if any
+  two of the three access entries reference the same `ObjectId`, even when
+  every mode/position is otherwise well-formed;
 - a present fee payment whose fee object is byte-for-byte the source
-  reference at access index 0.
+  reference at access index 0, and whose fee `AssetId` is byte-for-byte the
+  exact devnet fee asset
+  `ccad27f687338b99953183728647bc1177388eb45a37afd9812c0d286b433ea8`
+  (`DEVNET_ASSET_ID`, the same value used by
+  `crates/signing-view/tests/fixtures.rs`).
 
 The view displays chain, protocol version, epoch, message type, scheme,
 sender, nonce, exact module reference, entrypoint, amount, gas limit, every
@@ -98,7 +108,32 @@ Profile v1 reserves the development-only path
 `account` is a caller-selected non-hardened value encoded with the hardened
 bit on the wire. `21333` is an explicitly unregistered provisional marker,
 not a claim on that SLIP-0044 number. The device must reject another depth,
-prefix, unhardened component, change, or address index.
+prefix, unhardened component, change, or address index. For the provisional
+devnet path, key derivation itself is pinned to
+[SLIP-0010](https://github.com/satoshilabs/slips/blob/master/slip-0010.md)
+Ed25519 (all components hardened, matching SLIP-0010's Ed25519 requirement)
+exactly as specified there; this pins the derivation algorithm, not only the
+path shape above.
+
+The public key returned by `verify public key` and used internally for the
+device-side sender check below is the standard
+[RFC 8032](https://www.rfc-editor.org/rfc/rfc8032) compressed Ed25519
+encoding: 32 little-endian bytes of the point's `Y` coordinate with the sign
+bit of `X` packed into the most-significant bit of the last byte. Ledger
+SDKs commonly expose SLIP-0010 Ed25519 results as an uncompressed
+`04 || X || Y` point (65 bytes, `X`/`Y` each 32 bytes in the SDK's own
+big-endian byte order), not this compressed form. Producing the exact
+32-byte contract used throughout this document therefore requires
+converting the SDK's `Y` from big-endian to little-endian and setting the
+compressed sign bit from `X`'s parity (an odd `X` sets the bit); this
+conversion is app logic, not something the SDK performs automatically, and
+getting the byte order or sign bit wrong silently produces a different,
+wrong public key/address rather than a decode error. **S4b is not complete
+until the separate device-app repository adds a pinned, deterministic test
+vector exercising exactly this SDK-representation-to-RFC-8032 conversion**
+(fixed seed/path in, fixed 32-byte compressed public key out); this document
+intentionally does not assert such a vector's bytes, since fabricating one
+here would not be verified against a real device or SDK.
 
 This provisional path may be used only by devnet/Speculos builds. A Ledger
 submission or mainnet claim requires a later decision record that pins the
@@ -114,33 +149,63 @@ transaction integers inside the opaque chunk stream.
 
 | Name | CLA | INS | P1 | P2 | Command data | Success data |
 | --- | ---: | ---: | ---: | ---: | --- | --- |
-| get configuration | `E0` | `00` | `00` | `00` | empty | profile `u16`, app semver bytes, flags `u8` |
+| get configuration | `E0` | `00` | `00` | `00` | empty | exactly 6 bytes: profile `u16`, semver `major`/`minor`/`patch` `u8` each, flags `u8` |
 | verify public key | `E0` | `02` | `01` | `00` | derivation path | exact 32-byte Ed25519 public key/address |
 | sign transaction | `E0` | `04` | see below | `00` | header/chunk or chunk | exact 64-byte Ed25519 signature on final approval |
 | reset signing | `E0` | `06` | `00` | `00` | empty | empty |
 
+`get configuration`'s six success bytes are, in order: `profile` (`u16`),
+`major`/`minor`/`patch` (one `u8` each), then `flags` (`u8`). Every flags bit
+defined by this document is currently `0`; there is no defined non-zero bit.
+A future host that recognizes a flags bit its own supported version does not
+define must reject the response as an unsupported configuration rather than
+silently ignore the unknown bit.
+
 The path encoding is one depth byte followed by exactly that many big-endian
 `u32` hardened components. Profile v1 requires depth five and the provisional
-path above. `verify public key` always requires on-device confirmation; P1
-`00` is invalid. The host must compare the returned key with the prepared
-transaction sender before sending any signing chunk.
+path above, i.e. exactly 21 bytes (1 depth byte + 5 × 4-byte components).
+`verify public key` always requires on-device confirmation; P1 `00` is
+invalid. The host must compare the returned key with the prepared
+transaction sender before sending any signing chunk. The returned 32-byte
+value is the raw Ed25519 public key; it is also usable directly as the
+Sunrise on-chain address only because Profile v1's committed
+`TransactionAuthProfile` selects the `AddressIsPublicKey` address binding
+(see `ARCHITECTURE.md`). This document does not claim public key and address
+are equal in general — a future signature scheme or address binding would
+require an explicit amendment rather than reusing "public key/address" as
+one value.
 
-Each APDU carries at most 230 data bytes. `sign transaction` uses explicit
-P1 states:
+Each frame chunk carries at most 230 bytes of signed-frame payload.
+`sign transaction` uses explicit P1 states:
 
-- `00` FIRST: valid only while idle; data is `total_length: u32`, the path,
-  then the first non-empty frame chunk.
-- `01` CONTINUE: valid only while collecting; data is one non-empty chunk.
-- `02` LAST: valid only while collecting; data is the final non-empty chunk.
+- `00` FIRST: valid only while idle; data is `total_length: u32` (4 bytes),
+  the 21-byte path, then the first non-empty frame chunk (at most 230
+  bytes). FIRST's total command data is therefore at most 255 bytes
+  (4 + 21 + 230); the device rejects a FIRST APDU whose data exceeds that
+  bound.
+- `01` CONTINUE: valid only while collecting; data is one non-empty chunk of
+  at most 230 bytes.
+- `02` LAST: valid only while collecting; data is the final non-empty chunk
+  of at most 230 bytes.
 
-FIRST declares a non-zero total no larger than 4096. The application tracks
-the exact received count with checked arithmetic. LAST succeeds only when the
-count equals the declaration, the complete frame and clear-signing policy
-validate, and the user explicitly approves every display page. FIRST during
-collection, CONTINUE/LAST while idle, empty chunks, overflow, excess bytes,
-premature LAST, USB reset, timeout, rejection, parse error, and any status
-other than success wipe the buffered frame and derivation state. `reset
-signing` is idempotent and also wipes them. No state survives app restart.
+FIRST and CONTINUE, on success, return `9000` with empty response data —
+no partial signature, echo, or progress indicator; only LAST's success
+response carries the 64-byte signature. FIRST declares a non-zero total no
+larger than 4096. The application tracks the exact received count with
+checked arithmetic. Before rendering any review screen, LAST must derive the
+32-byte public key from the path supplied on FIRST (SLIP-0010 Ed25519, RFC
+8032 compressed encoding, as above) and compare it byte-for-byte against the
+parsed Transaction v1 `sender` field; on any mismatch LAST returns `6A80`
+and wipes the buffered frame and derivation state without displaying any
+review page. LAST otherwise succeeds only when the count equals the FIRST
+declaration, the complete frame and clear-signing policy validate — including
+the duplicate-`ObjectId` check in "Clear-signing policy" above — and the user
+explicitly approves
+every display page. FIRST during collection, CONTINUE/LAST while idle, empty
+chunks, overflow, excess bytes, premature LAST, USB reset, timeout,
+rejection, parse error, and any status other than success wipe the buffered
+frame and derivation state. `reset signing` is idempotent and also wipes
+them. No state survives app restart.
 
 Status words are exact:
 
@@ -159,6 +224,29 @@ Status words are exact:
 Unknown status words are typed host errors, never success or user rejection.
 The device application owns this explicit state machine; the host, USB link,
 and scheduler are untrusted.
+
+The table above is the app's own status-word contract for its `E0` CLA only.
+It is explicitly separate from status words and behavior owned by the Ledger
+SDK/OS layer beneath the app, which this document does not define and which
+the separate S4b repository must re-verify against current Ledger platform
+documentation rather than assume from this table:
+
+- `6E03`: the Ledger I/O framework's own malformed-APDU-length rejection —
+  a raw `Lc`/received-length mismatch caught by the SDK's transport layer
+  before app dispatch — distinct from the app's own `6A80`, which is only
+  returned after the app has received and parsed well-framed data it judges
+  invalid/unrecognized.
+- `5515`: the Ledger OS's standard locked-device status, returned when the
+  device is PIN-locked and therefore unreachable by any CLA, including `E0`.
+- `E000`: an unhandled panic/exception caught by the Ledger SDK's own fault
+  handling, not a status this app returns deliberately; it indicates the
+  app's own state machine did not run to a normal typed outcome.
+- CLA `B0`: Ledger's common/dashboard CLA, used for device/app/firmware
+  discovery and other platform-level requests per Ledger's own integration
+  guidelines. Ledger devices intercept CLA `B0` before it reaches this
+  application's dispatcher; the Sunrise app never receives, handles, or
+  redefines CLA `B0` behavior. `E0` remains this app's own CLA for every
+  command in the table above, unaffected by CLA `B0` interception.
 
 ## Delivery sequence
 

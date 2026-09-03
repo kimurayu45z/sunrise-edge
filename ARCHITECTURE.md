@@ -3383,10 +3383,12 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   implemented As-Is. S1 below is now also implemented and tested As-Is (see
   "S1 implementation status" immediately below), and S2 is implemented and
   validated As-Is by DR-0086. S3 is implemented and validated As-Is by
-  DR-0087. S4a is implemented and validated As-Is by DR-0088; S4 remains
-  incomplete and the current implementation priority is S4b's separate
-  dedicated Ledger application/Speculos evidence. S5 remains its ordered
-  successor, and the TypeScript
+  DR-0087. S4a is implemented and validated As-Is by DR-0088, and DR-0089
+  subsequently clarifies nine S4b device-contract details in `SIGNING.md`
+  without adding any device app or Speculos/physical-device evidence; S4
+  remains incomplete and the current implementation priority is S4b's
+  separate dedicated Ledger application/Speculos evidence. S5 remains its
+  ordered successor, and the TypeScript
   client/explorer/wallet surface remains deferred until the complete
   CLI-First Node Production Gate passes.
 
@@ -3854,3 +3856,66 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   confirmation, a pinned app/firmware matrix, reproducible build hash, and
   release/submission evidence. S4 remains incomplete until those criteria and
   the real CLI production signer replacement are satisfied.
+- DR-0089: Clarify nine S4b Ledger device-contract details `SIGNING.md` left
+  implicit after DR-0088's freeze, changing no Sunrise canonical transaction/
+  signature byte, encoder, canonical identifier, or the `0x2001`/`0x6001`
+  frame shapes DR-0088 already fixed.
+
+  **Scope.** This is a documentation-only clarification of the future S4b
+  APDU/derivation contract in `SIGNING.md`. It changes no code, canonical
+  byte, encoder, or historical vector in this repository, and it is not
+  itself S4b device-app or Speculos/physical-device evidence.
+
+  **Clarifications.** (1) Pins the provisional devnet derivation path to
+  SLIP-0010 Ed25519 exactly, not only the five-component hardened path
+  shape DR-0088 already froze. (2) Defines the returned public key as the
+  standard RFC 8032 compressed Ed25519 encoding, states explicitly that a
+  Ledger SDK's uncompressed `04 || X || Y` point must be converted (`Y`
+  from the SDK's big-endian byte order to little-endian, sign bit from
+  `X`'s parity) rather than returned as-is, and requires the separate S4b
+  repository to add a deterministic conversion test vector before S4b can
+  be considered complete; no such vector is fabricated in this repository,
+  since one written here could not be verified against a real device or
+  SDK. (3) Fixes `get configuration` success data at exactly six bytes
+  (`profile` `u16`, semver `major`/`minor`/`patch` `u8` each, `flags`
+  `u8`), states every currently defined flags bit is `0`, and requires a
+  future host to reject a response with an unrecognized bit set rather
+  than ignore it. (4) Separates the app's own `E0`-CLA status-word table
+  from Ledger SDK/OS-level statuses it does not own or define — `6E03`
+  (the SDK I/O layer's malformed-APDU-length rejection, distinct from the
+  app's own `6A80`), `5515` (Ledger OS locked-device status), and `E000`
+  (an unhandled panic/exception caught by Ledger's own fault handling) —
+  and documents that Ledger's common CLA `B0` is intercepted by the
+  platform before reaching this app's dispatcher, while `E0` remains this
+  app's own CLA for every command in its table. (5) Requires the device to
+  derive the public key from the path supplied on FIRST and compare it
+  byte-for-byte against the parsed Transaction v1 `sender` before
+  rendering any review screen, returning `6A80` and wiping the buffered
+  frame/derivation state on mismatch, so a wrong-key session can never
+  reach a display page. (6) Pins the device policy's chain id, protocol
+  version, and epoch (`sunrise-local-devnet`, `3`, `0`, the same README
+  reference context DR-0088 already used) together with the exact devnet
+  fee `AssetId` (`DEVNET_ASSET_ID`,
+  `ccad27f687338b99953183728647bc1177388eb45a37afd9812c0d286b433ea8`, the
+  same value `crates/signing-view/tests/fixtures.rs` already fixes) as one
+  policy, rejecting any other combination rather than matching fields
+  independently. (7) Requires a typed rejection when any two of the three
+  `Write` access entries (source/destination/treasury) share an
+  `ObjectId`, even when mode and position are otherwise well-formed;
+  DR-0088's "three ordered `Write` entries" language did not previously
+  state this explicitly. (8) States the existing 230-byte bound applies to
+  chunk payload specifically (not the whole APDU), and that FIRST's total
+  command data is bounded at 255 bytes: `total_length` (4 bytes) plus the
+  fixed depth-five path (21 bytes) plus up to 230 bytes of first chunk.
+  (9) States FIRST/CONTINUE success responses carry empty data (only LAST
+  carries the 64-byte signature), and that the returned public key equals
+  the Sunrise address only because Profile v1's committed
+  `TransactionAuthProfile` selects `AddressIsPublicKey`, not as a general
+  equivalence.
+
+  **Evidence boundary unchanged.** DR-0088's completion boundary is
+  unchanged by this clarification. S4a remains implemented and validated
+  As-Is; S4b still has no device application, APDU transport, USB/HID
+  dependency, or Speculos/physical-device evidence in this or any other
+  repository, and S4 remains incomplete. TypeScript client, explorer,
+  wallet, and S5 remain deferred, unaffected by this clarification.

@@ -1753,9 +1753,13 @@ protocol-context validationの両方。詳細は
 S2のcross-owner destination policyはDR-0086、S3のuniform ordinary-asset fee
 composition・actual-gas/trap settlement・real restart/replay E2EはDR-0087のとおり
 implemented As-Isである。S4a hardware-signing profile/host preflightもDR-0088のとおり
-implemented As-Isであり、現在のimplementation priorityはseparate repositoryで行うS4b
-dedicated Ledger device application/Speculosである。
-S5は順序を飛ばさず後続する。
+implemented As-Isであり、DR-0089はS4b device contract（`SIGNING.md`のSLIP-0010 derivation・
+public key encoding・APDU byte layout・status word分離・device-side sender比較・device
+policy pin・duplicate ObjectId rejectionなど）をclarifyしたのみで、device app・APDU
+transport・Speculos evidenceはこのrepositoryにも別repositoryにも存在せず、S4は引き続き
+incompleteである。現在のimplementation priorityはseparate repositoryで行うS4b dedicated
+Ledger device application/Speculosである。TypeScript client/explorer/walletとS5は引き続き
+deferredであり、S5は順序を飛ばさず後続する。
 
 CLI Developer MVP completion criteria（capability criteria 2-3を満たしながら、product
 surfaceはARCHITECTURE.md DR-0081の順序に従う: local devnet、bounded query API、Rust
@@ -1902,8 +1906,10 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    S3は同じordinary `AssetAccount`/`DEVNET_ASSET_ID`をfee object/assetとして使い、distinct
    treasury ownerのordinary destinationへactual `gas_used`由来feeをatomic settlementする。
    active module/semanticsはv3、historical v1/v2 bytesとWAT/WASM/code hashは不変である。
-   S4a hardware-signing profile/host preflightはDR-0088で後続実装済み。次はS4b
-   dedicated Ledger device application/Speculosである。
+   S4a hardware-signing profile/host preflightはDR-0088で後続実装済み。DR-0089はS4b device
+   contractを`SIGNING.md`上でclarifyしたのみで、device app・APDU transport・Speculos evidence
+   はまだ存在しない。次はS4b dedicated Ledger device application/Speculosであり、TypeScript
+   client/explorer/walletとS5は引き続きdeferredである。
    production/mainnet readinessは未達である。
    前提として、`runtime-sqlite`へ`StructuredDurableDomainStateStore`/`IndexedOutboxRepository`を
    実装するadditive、local-only、non-productionな`SqliteDurableStore`を追加済み
@@ -2367,10 +2373,17 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
     digest algorithm/digest/entrypoint/args/access/fee shapeはtyped rejectionで、raw args/
     blind-signing fallbackはない。`request_id`、destination owner、transferred asset metadata、
     module nameはsigned contentとして表示しない。
-  - **S4b: next.** separate `sunrise-edge-ledger-app` repositoryでdedicated Rust
-    Ledger application、exact APDU state machine、independent canonical parse/clear signing、
-    address confirmation、Speculos fixture/UX testを実装する。このrepositoryにnested appや
-    workspace `exclude`は作らない。
+  - **S4b: device contract clarified（2026-09-04、DR-0089）、実装はnext。** `SIGNING.md`が
+    SLIP-0010 Ed25519 derivation、Ledger SDK `04||X||Y`からRFC 8032 compressed公開鍵への
+    変換とdeterministic test vector要求、`get configuration`の6-byte success layout、
+    app SW/Ledger SDK・OS status（`6E03`/`5515`/`E000`/CLA `B0`）の分離、device-side
+    sender比較と`6A80`、chain/protocol/epoch/fee assetのdevice policy pin、三access間の
+    duplicate `ObjectId` rejection、chunk/FIRST APDU size boundを明記する。これはdocument-only
+    clarificationであり、**device app・APDU transport・Speculos evidenceはこのrepositoryにも
+    別repositoryにも存在しない。** separate `sunrise-edge-ledger-app` repositoryでdedicated
+    Rust Ledger application、exact APDU state machine、independent canonical parse/clear
+    signing、address confirmation、Speculos fixture/UX testを実装するのが引き続きnextであり、
+    このrepositoryにnested appやworkspace `exclude`は作らない。
   - **S4c:** this repositoryのseparate `clients/ledger` crateにhost APDU/USB transportを置き、
     CLIへall-or-none signer selection、device/app/firmware/profile/address検証を追加する。
     vendor dependencyはprotocol crate/`clients/rust`へ入れず、CLIのone-runtime-dependency
@@ -3115,8 +3128,10 @@ restart safety、fail-closed behaviorを直接満たすために必要な既存c
 よいものとしていた。CLI Developer MVP Gateは現在通過済みであり、以下の項目は
 ["CLI-First Node Production Gate"](#cli-first-node-production-gate)のS5が参照する
 production persistence作業そのものである。S3は実装・検証済み（DR-0087）、S4aは
-hardware-signing profile/host preflightとして実装・検証済み（DR-0088）であり、現在の
-implementation priorityはS4b dedicated Ledger device application/Speculosである。S5は
+hardware-signing profile/host preflightとして実装・検証済み（DR-0088）である。
+DR-0089はS4b device contractをdocument上でclarifyしただけでdevice app・Speculos
+evidenceを追加しておらず、現在のimplementation priorityはS4b dedicated Ledger device
+application/Speculosである。S5は
 順序を飛ばさず後続する。
 capacity/PITR/HA等のS5 certification項目はS5または明示的なSLOがtriggerするまで
 引き続き凍結する。
