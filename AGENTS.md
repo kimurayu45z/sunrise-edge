@@ -147,6 +147,9 @@ policy. Do not edit an old vector and call the change compatible.
   test adapters.
 - `protocol-config`: the canonical commitment point for active protocol
   parameters.
+- `signing-view`: dependency-light hardware profile decoding and exact
+  signed-byte clear-signing policy; it must not depend on `execution`, a
+  runtime, or any Ledger/USB/HID vendor crate.
 
 Keep foundational crates low in the dependency graph. Avoid cycles and avoid
 making protocol primitives depend on execution engines, runtimes, or adapters.
@@ -210,8 +213,11 @@ criterion after context compaction. Re-check `main`, the open stacked PR chain,
 and `TODO.md` before starting because repository state may have advanced. The
 explicit `CLI Developer MVP Gate` (`TODO.md`; renamed and narrowed from the
 earlier `Developer MVP Gate` to node/client/CLI capability criteria 1-6/10/11)
-and S0-S3 of the production sequence are satisfied As-Is. The current
-priority is S4 secure signer/Ledger of the `CLI-First Node Production Gate`
+and S0-S3 of the production sequence are satisfied As-Is. S4a's strict
+hardware-signing profile, signed-byte-only clear-signing fixture, and host
+external-signer preflight are implemented As-Is by DR-0088; S4 is not complete.
+The current priority is S4b's separate dedicated Ledger device application and
+Speculos evidence of the `CLI-First Node Production Gate`
 (`TODO.md`) — a real
 node/persistence/operations gate defined entirely by reference to existing,
 unchanged Phase 15 To-Be exit criteria, the Post-MVP persistence
@@ -381,9 +387,9 @@ preserving both owners. DR-0087 activates module/semantics v3 with unchanged
 WAT/WASM and v1/v2 vectors, requires the sender source as fee object, and
 settles actual gas into the distinct treasury owner's ordinary destination.
 Create, Shared/System ownership, blob transfer, arbitrary module upload, fee
-distribution/FastCertificate settlement, production gas calibration, secure
-signer/Ledger integration (S4), and production object migrations remain
-deferred. The opaque SQLite table and prefix scanner remain local
+distribution/FastCertificate settlement, production gas calibration, S4b-S4d
+device/host/HIL completion, and production object migrations remain deferred.
+The opaque SQLite table and prefix scanner remain local
 compatibility/reference paths, not production schema. Started blocking work
 remains uncancellable and its configured admission limit is not
 a validated capacity budget.

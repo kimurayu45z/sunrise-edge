@@ -24,6 +24,7 @@ members = [
     "crates/node-core",
     "crates/node-wire",
     "crates/native-http",
+    "crates/signing-view",
     "apps/devnet",
     "apps/cli",
     "clients/rust",
@@ -60,6 +61,7 @@ consensus = { path = "crates/consensus" }
 node-core = { path = "crates/node-core" }
 node-wire = { path = "crates/node-wire" }
 native-http = { path = "crates/native-http" }
+signing-view = { path = "crates/signing-view" }
 sunrise-edge-client = { path = "clients/rust" }
 sunrise-edge-devnet = { path = "apps/devnet" }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }

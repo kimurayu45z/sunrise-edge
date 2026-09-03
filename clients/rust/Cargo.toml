@@ -16,6 +16,7 @@ node-wire.workspace = true
 objects.workspace = true
 protocol-types.workspace = true
 rustls.workspace = true
+signing-view.workspace = true
 
 [dev-dependencies]
 native-http.workspace = true

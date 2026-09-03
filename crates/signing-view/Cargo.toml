@@ -1,0 +1,16 @@
+[package]
+name = "signing-view"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+abi.workspace = true
+canonical-encoding.workspace = true
+crypto.workspace = true
+fees.workspace = true
+objects.workspace = true
+protocol-types.workspace = true
+
+[dev-dependencies]
+execution.workspace = true

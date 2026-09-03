@@ -1744,7 +1744,7 @@ developer CLIを実際に構築・検証できるsingle-node CLI Developer MVP�
 HA/failover、provider-managed pooler、real-provider certification、provider deploymentの
 作業はgate通過後の`Post-MVP Production Hardening`へ凍結する。
 
-**Current status (2026-09-02): criteria 1-6・10・11はimplemented and validated
+**Current status (2026-09-04): criteria 1-6・10・11はimplemented and validated
 As-Isであり、CLI Developer MVP Gateは通過済みである。** これはproduction readinessの
 宣言ではない。CLI-First Node Production GateのS0-S3もimplemented and validated
 As-Isであり（S1のremote TLS transportとsigning前の独立したtrusted
@@ -1752,7 +1752,9 @@ protocol-context validationの両方。詳細は
 ["CLI-First Node Production Gate"](#cli-first-node-production-gate)のS1参照）、
 S2のcross-owner destination policyはDR-0086、S3のuniform ordinary-asset fee
 composition・actual-gas/trap settlement・real restart/replay E2EはDR-0087のとおり
-implemented As-Isである。現在のimplementation priorityはS4 secure signer/Ledgerである。
+implemented As-Isである。S4a hardware-signing profile/host preflightもDR-0088のとおり
+implemented As-Isであり、現在のimplementation priorityはseparate repositoryで行うS4b
+dedicated Ledger device application/Speculosである。
 S5は順序を飛ばさず後続する。
 
 CLI Developer MVP completion criteria（capability criteria 2-3を満たしながら、product
@@ -1900,7 +1902,8 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    S3は同じordinary `AssetAccount`/`DEVNET_ASSET_ID`をfee object/assetとして使い、distinct
    treasury ownerのordinary destinationへactual `gas_used`由来feeをatomic settlementする。
    active module/semanticsはv3、historical v1/v2 bytesとWAT/WASM/code hashは不変である。
-   次はS4 secure signer/Ledgerである。
+   S4a hardware-signing profile/host preflightはDR-0088で後続実装済み。次はS4b
+   dedicated Ledger device application/Speculosである。
    production/mainnet readinessは未達である。
    前提として、`runtime-sqlite`へ`StructuredDurableDomainStateStore`/`IndexedOutboxRepository`を
    実装するadditive、local-only、non-productionな`SqliteDurableStore`を追加済み
@@ -2352,8 +2355,31 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
   execution-then-reject、fee distribution/production gas calibrationはdeferred。
 - **S4**: secure signer（`LocalSigner`の development-only in-memory鍵に代わる
   production-oriented signing boundary）と、dedicated Sunrise Edge Ledger device
-  applicationを使った実際のLedger統合（ARCHITECTURE.md DR-0084参照。既存のSolana/
-  Ethereum Ledger appの転用はしない）。
+  applicationを使った実際のLedger統合（ARCHITECTURE.md DR-0084/DR-0088、
+  `SIGNING.md`参照。既存のSolana/Ethereum Ledger appの転用はしない）。以下を順番に
+  完了する。S4cまで通ってもAs-Is host integrationに過ぎず、S4dとCLI replacement前に
+  S4完了とはしない。
+  - **S4a: implemented and validated As-Is（2026-09-04、DR-0088）。** existing
+    `0x2001` signature frameのstrict decoder、fixed 4 KiB hardware profile、
+    `execution`/`wasmi`非依存のstrict Transaction v1 decode/re-encode、exact devnet
+    transfer allowlist、signed bytes onlyのbounded ASCII display fixture、
+    `PreparedTransaction` external-signer preflightを実装する。unknown module/version/
+    digest algorithm/digest/entrypoint/args/access/fee shapeはtyped rejectionで、raw args/
+    blind-signing fallbackはない。`request_id`、destination owner、transferred asset metadata、
+    module nameはsigned contentとして表示しない。
+  - **S4b: next.** separate `sunrise-edge-ledger-app` repositoryでdedicated Rust
+    Ledger application、exact APDU state machine、independent canonical parse/clear signing、
+    address confirmation、Speculos fixture/UX testを実装する。このrepositoryにnested appや
+    workspace `exclude`は作らない。
+  - **S4c:** this repositoryのseparate `clients/ledger` crateにhost APDU/USB transportを置き、
+    CLIへall-or-none signer selection、device/app/firmware/profile/address検証を追加する。
+    vendor dependencyはprotocol crate/`clients/rust`へ入れず、CLIのone-runtime-dependency
+    invariantはDRで明示的に改訂する。
+  - **S4d:** claimed device modelごとのphysical-device HIL、Speculos CI、user rejection/
+    disconnect/reset/adversarial chunk evidence、pinned app/firmware compatibility matrix、
+    reproducible device-app build hash、Ledger release/submission evidenceを揃え、CLIの
+    dev-only `LocalSigner`をactual production pathで置き換える。Sunrise Edgeにはまだ
+    registered BIP44/SLIP-0044 coin typeがなく、S4aのpathはdevnet-only provisionalである。
 - **S5**: production persistence（PERSISTENCE.md/POSTGRES.mdのTo-Be）、
   transactional outbox運用、provider deployment（Cloudflare Durable Object/AWS）、
   operations（observability、runbook）、security（independent audit）、release
@@ -3088,8 +3114,10 @@ Post-MVP Production Hardening: Phase 15 persistence implementation order（To-Be
 restart safety、fail-closed behaviorを直接満たすために必要な既存contract修正は先行して
 よいものとしていた。CLI Developer MVP Gateは現在通過済みであり、以下の項目は
 ["CLI-First Node Production Gate"](#cli-first-node-production-gate)のS5が参照する
-production persistence作業そのものである。S3は実装・検証済み（DR-0087）であり、現在の
-implementation priorityはS4 secure signer/Ledgerである。S5は順序を飛ばさず後続する。
+production persistence作業そのものである。S3は実装・検証済み（DR-0087）、S4aは
+hardware-signing profile/host preflightとして実装・検証済み（DR-0088）であり、現在の
+implementation priorityはS4b dedicated Ledger device application/Speculosである。S5は
+順序を飛ばさず後続する。
 capacity/PITR/HA等のS5 certification項目はS5または明示的なSLOがtriggerするまで
 引き続き凍結する。
 

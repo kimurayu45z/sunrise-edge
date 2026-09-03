@@ -85,7 +85,10 @@ cross-provider ingress milestones implemented through Phase 17:
   declared scheme does not match the signer's/verifier's own scheme before
   any framing or cryptographic operation runs. Only Ed25519 with an
   `AddressIsPublicKey` address binding is implemented today; no production
-  signer exists. `runtime::MemorySigner` is a public in-memory wiring
+  signer is connected to the CLI. S4a now supplies only the strict Hardware
+  Signing Profile v1, signed-byte-only clear-signing view, and external-signer
+  host preflight described in [`SIGNING.md`](SIGNING.md); it does not supply a
+  device application or transport. `runtime::MemorySigner` is a public in-memory wiring
   fixture used to compose test/local runtimes; it is deliberately
   non-cryptographic and must never be used for protocol authentication.
   `protocol-config` only commits and resolves this profile
@@ -538,7 +541,9 @@ As-Is: a real Rust client and CLI exercise the local end-to-end product,
 including orderly restart and duplicate-request evidence. Under the CLI-first
 production-strategy pivot (see `ARCHITECTURE.md` DR-0085), S3 of the
 [CLI-First Node Production Gate](TODO.md#cli-first-node-production-gate) is
-now implemented As-Is, and the current milestone is S4 — S0-S3 are real
+now implemented As-Is, and S4a's hardware-signing profile/host preflight is
+also implemented As-Is; the current milestone is S4b's separate dedicated
+Ledger device app and Speculos evidence. S0-S3 are real
 node/persistence/operations gate slices defined by reference to the existing,
 unchanged Phase 15 production exit criteria, the Post-MVP persistence
 implementation order, and the cross-phase release gate. S1 has two separate
@@ -697,23 +702,28 @@ use real TCP, and all four query methods reach the composed devnet router over
 TCP. A caller deadline bounds the complete exchange, including slow-drip
 responses, rather than resetting on each received byte.
 `clients/rust`'s transaction construction is now also available as a safe,
-additive two-stage external-signer API (`transaction::PreparedTransaction`):
+additive external-signer API (`transaction::PreparedTransaction`):
 `prepare` fixes an immutable transaction from an explicit sender, the active
 signature scheme, and a `TransactionRequest`, rejecting any scheme other than
 the one implemented `Ed25519`/`AddressIsPublicKey` combination before any
 framing; `signable_frame` exposes the exact bytes an external signer must
 sign; and `finalize` produces output only after independently verifying a
 returned signature's exact length and cryptographic validity against the
-sender. `build_signed_transaction` is unchanged in its stable output and is
-now implemented through this same path. This boundary is Ledger-*ready*, not
-a Ledger *integration*: no USB/HID/Ledger dependency exists anywhere in this
-workspace, and a real integration would additionally require a dedicated
-Sunrise Edge Ledger device application, an APDU/host transport, on-device
-clear signing of the exact canonical signature frame, derivation-path policy,
-device/app/version checks, explicit user confirmation, host-side verification
-(already provided), and hardware-in-the-loop tests — existing Solana or
-Ethereum Ledger apps must never be reused for Sunrise signing (see
-`ARCHITECTURE.md` DR-0084).
+sender. S4a adds `clear_signing_view`, `ExternalSigner`, and
+`sign_and_finalize_external`: before invoking an external signer they require
+the signer's exact scheme/address and reject any frame outside the fixed
+device bounds or exact reference-transfer policy. The display is derived only
+from signed bytes and has no raw/blind-signing fallback. `build_signed_transaction`
+is unchanged in its stable output and remains the CLI's development-only path.
+
+This is not a Ledger integration. No USB/HID/Ledger dependency or device app
+exists in this workspace. The dedicated Rust device app belongs in a separate
+`sunrise-edge-ledger-app` repository; later host transport belongs in
+`clients/ledger`. S4 remains incomplete until Speculos plus physical-device
+HIL, address/user-confirmation flows, a pinned app/firmware matrix,
+reproducible build and release evidence exist and the CLI actually replaces
+`LocalSigner`. Existing Solana or Ethereum Ledger apps must never be reused
+for Sunrise signing (see `SIGNING.md`, `ARCHITECTURE.md` DR-0084/DR-0088).
 `clients/rust` also now has a typed, production-oriented expected-protocol-
 context verification boundary (`context::ExpectedProtocolContext`, DR-0085's
 S1a slice): a caller supplies the exact locally trusted `chain_id`,
@@ -806,7 +816,9 @@ verification slice and its remote TLS transport slice are both now
 implemented and tested, so S1 as a whole is complete; S2's committed
 cross-owner destination policy and restart/replay evidence are also complete
 As-Is. S3's uniform asset fee accounting and actual-gas settlement are now
-implemented and validated As-Is; the current milestone is S4 secure signer.
+implemented and validated As-Is. S4a's strict hardware profile, signed-byte-
+only display, and host preflight are also implemented As-Is; the current
+milestone is S4b's separate dedicated Ledger device app and Speculos evidence.
 This is real node/persistence/operations and remote-CLI
 evidence, not a mainnet-readiness or production-certification claim: passing
 S3 does not authorize skipping directly to later production claims.
