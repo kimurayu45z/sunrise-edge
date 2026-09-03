@@ -355,10 +355,15 @@ HTTP activation was still deferred); a later additive `native-http` router
 now wires it up (see DR-0080). Arbitrary uploads, JIT/AOT, and production
 metering remain deferred.
 
-Protocol version 3 MUST NOT be activated on any live chain until fee debit,
-module access, mutating/consuming object effects, shared-object ordering,
-FastVote/FastCertificate, and certificate publication are implemented and
-atomically composed with the authenticated transaction. The structured durable
+Protocol version 3 MUST NOT be activated on any live chain until shared-object
+ordering, FastVote/FastCertificate, certificate publication, every externally
+accepted event family's authenticated/authorized ingress, and the CLI-First
+Node Production Gate's remaining S4/S5 and independent security/release gates
+are implemented and atomically composed with the authenticated transaction.
+The bounded S3 uniform ordinary-asset fee composition (DR-0087) and the
+additive owned-effects/preinstalled-WASM module-object effects entrypoints
+are implemented As-Is, but implementing them alone does not satisfy this
+constraint. The structured durable
 path now derives read-only object authority only from the authenticated inner
 transaction, loads exact heads and immutable inline versions, authorizes typed
 owners, and commits complete head assertions. The generic application machine
