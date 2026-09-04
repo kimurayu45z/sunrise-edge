@@ -174,6 +174,25 @@ pub enum CliError {
     /// The `sunrise-edge-client` library rejected a call. Boxed because
     /// `ClientError` is large relative to this enum's other variants.
     Client(Box<ClientError>),
+    /// No signer was selected: neither `--seed-file` nor both
+    /// `--ledger-hid-path`/`--ledger-account` were supplied.
+    MissingSignerSelection,
+    /// `--seed-file` was combined with either Ledger signer flag; exactly
+    /// one signer must be selected.
+    ConflictingSignerSelection,
+    /// Exactly one of the paired `--ledger-hid-path`/`--ledger-account`
+    /// flags was supplied; both are required together.
+    PartialLedgerSignerConfiguration {
+        /// The flag that must also be supplied to complete the pair.
+        missing: &'static str,
+    },
+    /// Connecting to a Ledger device or verifying its reported
+    /// configuration/public key failed before any transaction was ever
+    /// prepared or signed.
+    LedgerConnect(Box<dyn std::error::Error + Send + Sync>),
+    /// A Ledger signer was selected, but this binary was built without the
+    /// `usb-hid` Cargo feature, so no real USB/HID transport is available.
+    LedgerTransportFeatureDisabled,
 }
 
 impl fmt::Display for CliError {
@@ -282,6 +301,20 @@ impl fmt::Display for CliError {
             Self::NodeCore(error) => write!(f, "{error}"),
             Self::Transport(error) => write!(f, "{error}"),
             Self::Client(error) => write!(f, "{error}"),
+            Self::MissingSignerSelection => f.write_str(
+                "no signer selected; supply --seed-file, or both --ledger-hid-path and --ledger-account",
+            ),
+            Self::ConflictingSignerSelection => f.write_str(
+                "--seed-file cannot be combined with --ledger-hid-path or --ledger-account; select exactly one signer",
+            ),
+            Self::PartialLedgerSignerConfiguration { missing } => write!(
+                f,
+                "--ledger-hid-path and --ledger-account must both be supplied together; missing {missing}"
+            ),
+            Self::LedgerConnect(error) => write!(f, "ledger device connection failed: {error}"),
+            Self::LedgerTransportFeatureDisabled => f.write_str(
+                "a Ledger signer was selected, but this binary was built without the usb-hid feature",
+            ),
         }
     }
 }
@@ -302,6 +335,7 @@ impl std::error::Error for CliError {
             Self::Client(error) => Some(error),
             Self::InvalidExpectedProtocolType(error) => Some(error),
             Self::InvalidExpectedContext(error) => Some(error),
+            Self::LedgerConnect(error) => Some(error.as_ref()),
             _ => None,
         }
     }

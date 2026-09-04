@@ -1,0 +1,28 @@
+[package]
+name = "sunrise-edge-ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "sunrise_edge_ledger"
+path = "src/lib.rs"
+
+[dependencies]
+sunrise-edge-client.workspace = true
+hidapi = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enables the real USB/HID transport (`hid::HidTransport`). Off by default
+# to keep this crate's (and every dependent crate's) default build/test/
+# clippy run free of any native dependency; every other module (the full
+# APDU/chunking/configuration/signer protocol logic) builds and tests with no
+# native dependency regardless of this feature. `hidapi`'s workspace-pinned
+# `linux-native-basic-udev` feature (see the root Cargo.toml) does NOT
+# require the system `libudev` development package that its
+# `linux-static-hidraw`/`linux-static-libusb` alternatives need; it links a
+# pure-Rust `basic-udev` implementation instead, so `--all-features` builds
+# and tests cleanly with no system package installed. See `src/hid.rs` and
+# `SIGNING.md`.
+usb-hid = ["dep:hidapi"]

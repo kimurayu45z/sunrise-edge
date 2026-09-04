@@ -1963,9 +1963,12 @@ against freshly seeded accounts through to a waited, present receipt.
 DR-0088 subsequently implements S4a's strict host-side profile, exact
 signed-byte clear-signing fixture, and external-signer preflight. DR-0091
 records the separate repository's S4b Ledger SDK application and Nano S+
-Speculos evidence As-Is. Host APDU/USB/HID transport, CLI signer selection,
+Speculos evidence As-Is. DR-0092 subsequently implements S4c Phase 1's host
+APDU/USB/HID transport and CLI signer selection in this repository's own
+`clients/ledger` crate — the profile/address checks and USB-descriptor-level
+device recognition only, not the active-app/firmware checks. S4c itself,
 physical-device HIL, and release evidence remain unimplemented and are not
-claimed by either boundary.
+claimed by any of these three boundaries.
 
 **Development-only residual: no memory zeroization.** `load_dev_seed`'s read
 buffer and decoded `[u8; 32]` seed, and `LocalSigner`'s in-memory signing
@@ -1989,8 +1992,12 @@ S4 is split into four ordered boundaries so a host library cannot become a
 surrogate for device-side authorization. S4a is implemented As-Is in this
 repository; S4b's separate dedicated Ledger application and Nano S+ Speculos
 evidence are implemented As-Is in `sunriselayer/sunrise-edge-ledger-app` by
-DR-0091. S4c adds host APDU/USB and CLI selection; S4d completes the remaining
-physical-device, reproducibility, and release-evidence gate. S4 is not complete
+DR-0091. S4c Phase 1's host APDU/USB and CLI signer selection (profile/address checks
+and USB-descriptor-level device recognition) are implemented As-Is in this
+repository by DR-0092, but S4c itself is not complete: it still needs an
+active-app/firmware identity check and real hardware validation. S4d
+completes the remaining physical-device, reproducibility, and
+release-evidence gate. S4 is not complete
 until S4d passes and the CLI has an actual production signing path replacing
 its development-only seed flow.
 
@@ -2030,11 +2037,13 @@ APDU state machine/status words. The dedicated device app lives in the separate
 `sunrise-edge-ledger-app` repository because its custom targets, Rust SDK/C
 bindings, Speculos workflow, device matrix, and Ledger release lifecycle cannot
 pass or be hidden from this workspace's host-target gate. DR-0091 records that
-device-side S4b boundary. S4c will place vendor host dependencies in a new
-`clients/ledger` crate, never a protocol crate or `clients/rust`, and will
-explicitly amend the CLI's current one-runtime-dependency invariant. No host
-APDU/USB/HID dependency, physical-device evidence, registered SLIP-0044
-allocation, or release artifact exists yet.
+device-side S4b boundary. DR-0092 places every vendor host dependency in the
+new `clients/ledger` crate, never a protocol crate or `clients/rust`, and
+explicitly amends the CLI's original one-runtime-dependency invariant
+(DR-0084) to two: `sunrise-edge-client` and `sunrise-edge-ledger`. No
+physical-device evidence, registered SLIP-0044 allocation, or release
+artifact exists yet; `clients/ledger`'s real USB/HID transport is itself
+unvalidated against physical hardware (see DR-0092).
 
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
@@ -3307,9 +3316,11 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   module/semantics declaration is version 3; historical v1/v2 declarations,
   the `0xF001`/`0xF002`/`0xF003` schemas, and WAT/WASM/code hash remain pinned.
   DR-0088 subsequently implements S4a's hardware-signing profile/host
-  preflight, and DR-0091 records S4b's separate device application and Nano S+
-  Speculos evidence As-Is. S4c is next; this is still not production or mainnet
-  readiness.
+  preflight, DR-0091 records S4b's separate device application and Nano S+
+  Speculos evidence As-Is, and DR-0092 implements S4c Phase 1's host
+  APDU/USB/HID and CLI signer selection As-Is (S4c itself remains incomplete,
+  pending an active-app/firmware identity check and real hardware
+  validation); this is still not production or mainnet readiness.
 - DR-0082: Add the bounded canonical Developer MVP query surface described in
   "Bounded Developer MVP query API". Keep query selectors non-authoritative,
   resolve all chain/domain/epoch/storage authority from trusted composition,
@@ -3396,8 +3407,12 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   `sunriselayer/sunrise-edge-ledger-app` repository's earlier host-validated
   `no_std` core milestone. DR-0091 records its merged PR #2 device application,
   five-target builds, and fixed-seed Nano S+ Speculos evidence; S4b is complete
-  As-Is, S4 remains incomplete, and S4c host APDU/USB/HID plus CLI signer
-  selection are next. S5 remains its
+  As-Is. DR-0092 implements S4c Phase 1's host APDU/USB/HID crate and CLI
+  signer selection As-Is (profile/address checks and USB-descriptor-level
+  device recognition); S4c itself is not complete, since it still needs an
+  active-app/firmware identity check and real hardware validation. S4
+  remains incomplete, and both the rest of S4c and S4d's physical-device HIL
+  and release evidence are next. S5 remains its
   ordered successor, and the TypeScript
   client/explorer/wallet surface remains deferred until the complete
   CLI-First Node Production Gate passes.
@@ -3820,8 +3835,10 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   production gas calibration, sufficient-balance preflight, treasury sharding,
   Shared/System/blob objects, or crash/power-loss durability. TypeScript,
   explorer, and wallet stay deferred. DR-0088 implements S4a's hardware
-  profile/host preflight, and DR-0091 records S4b's dedicated device application
-  and Nano S+ Speculos evidence As-Is. S4c host/CLI integration is next. S5,
+  profile/host preflight, DR-0091 records S4b's dedicated device application
+  and Nano S+ Speculos evidence As-Is, and DR-0092 implements S4c Phase 1's
+  host/CLI integration As-Is (S4c itself remains incomplete). The rest of
+  S4c and S4d's physical-device evidence are next. S5,
   Phase 16/17 exit criteria, and independent audit remain mandatory.
 - DR-0088: Implement only S4a's hardware-signing profile and host preflight in
   this repository, with the dedicated Ledger application isolated in a
@@ -4040,3 +4057,171 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   Nano X/Stax/Flex/Apex P are build-validated only, not emulated or physically
   validated. TypeScript client, explorer, wallet, and S5 remain deferred in the
   existing order.
+- DR-0092: Implement S4c Phase 1 As-Is — a separate `clients/ledger` host
+  crate for the frozen device APDU/USB/HID contract, plus explicit,
+  all-or-none CLI Ledger signer selection — without claiming S4c itself,
+  S4, production, mainnet readiness, or physical-hardware validation.
+  **S4c is not complete.** The roadmap's device/app/firmware/profile/address
+  check set is only partly satisfied: this phase implements the profile and
+  address checks in full and adds USB-descriptor-level device-model
+  recognition, but it does not verify the active on-device application's
+  name/version or the device firmware version, and nothing in it has been
+  validated against physical hardware. The next S4c slice must close that
+  gap before S4c itself — not just S4 — can be called complete.
+
+  **New `clients/ledger` crate.** `sunrise-edge-ledger` is the only crate in
+  this workspace that may depend on Ledger/APDU/USB/HID vendor code
+  (`hidapi`, confined to its `hid` module, using the `linux-native-basic-udev`
+  feature so it builds without any system package). It implements the exact
+  `SIGNING.md` "Device APDU contract" against an injectable `apdu::Transport`
+  trait: `device::LedgerDevice` drives `get configuration`, `verify public
+  key`, `sign transaction`, and `reset signing`; `configuration::Configuration`
+  decodes the exact six-byte response and rejects any profile id other than
+  `1` or any flag bit this host does not define (the **profile check**);
+  `path::DerivationPath` encodes the frozen provisional
+  `m/44'/21333'/account'/0'/0'` path (rejecting an `account` value that
+  already carries the hardened bit); and `error::DeviceError` maps every
+  documented status word (`9000`/`6985`/`6986`/`6A80`/`6A84`/`6A86`/`6D00`/
+  `6E00`/`6F00`) to a typed variant, with an unrecognized status word a typed
+  `UnknownStatus`, never success. `sign transaction`'s host-side chunking
+  sends the frame's first ≤230-byte piece as FIRST, every full-size middle
+  piece as CONTINUE, and the final piece as LAST; because `SIGNING.md` states
+  LAST is "valid only while collecting" (never the first APDU) and only
+  LAST's response carries the signature, a frame that would otherwise fit
+  entirely inside FIRST instead reserves its final byte for a dedicated LAST
+  call, so every signing session sends at least one FIRST and one separate
+  LAST; a frame too short to reserve that byte (fewer than two bytes) is a
+  typed `DeviceError::FrameTooSmall`, distinct from `FrameTooLarge` (the
+  frame is too small, not too large) and unreachable for any real
+  Transaction v1 frame. If FIRST was accepted (status `9000`) and any later step in that same
+  call — a further chunk's status, its response length, or the transport
+  itself — then fails, `sign_transaction` attempts a best-effort `reset
+  signing` before returning that original error; the reset's own outcome is
+  always discarded, so it can never mask the primary error or itself surface
+  as the result, and no reset is attempted when FIRST itself is what failed
+  (the device never entered a session to wipe). `signer::LedgerExternalSigner`
+  implements `sunrise_edge_client::ExternalSigner`: `connect` checks `get
+  configuration` and fetches (with mandatory on-device confirmation) the
+  public key/address before returning it to a caller, and `sign_frame`
+  independently repeats both checks immediately before every signature,
+  rather than trusting the connect-time result — the **profile and address**
+  halves of "device-reported configuration/public key/address checks before
+  signing". Every module above `hid` is generic over `Transport`, so
+  `fake::FakeTransport` (a deterministic, pre-scripted, request-recording
+  fake, analogous to `runtime`'s `Memory*` test adapters) exercises the
+  complete protocol — chunking at every documented boundary, exact response
+  lengths, every status word, configuration/flag rejection, public
+  key/address identity and mismatch, mid-sequence disconnect, and the
+  best-effort reset attempt (including when the transport remains usable for
+  the reset call and when it does not) — with no native dependency, in the
+  crate's default-feature and `usb-hid` all-feature unit tests.
+
+  **`hid::HidTransport`: real, device-checked, but not hardware-validated.**
+  This module owns two independent layers. First, USB device identification
+  (the **device** check): `HidTransport::open` resolves the caller's exact
+  path through `HidApi::device_list` and requires `identify_ledger_device`
+  to recognize it — Ledger's USB vendor id `0x2c97`, a product-id family in
+  the exact S4b five-target build list (Nano X, Nano S Plus, Stax, Flex,
+  Apex P — see DR-0091; the plain Nano S is deliberately excluded, since no
+  S4b build target covers it), and exactly the Ledger HID usage page
+  `0xffa0`. Some host libraries, including the independently published
+  Zondax `ledger-go`, also accept a device reporting interface number `0` as
+  an alternative to the usage page (a workaround for platforms that report
+  an empty/zero usage page); this phase does not implement that fallback —
+  without current official primary-source evidence for it and a tested,
+  platform-`cfg`-specific policy for when it is safe, a mismatched usage
+  page is treated as unrecognized. An unrecognized vendor id, product
+  family, or usage page is a typed rejection before `HidApi::open_path` is
+  ever called, and `list_devices` surfaces the same recognized model per
+  path for a caller to present to an operator. This is USB-descriptor-level
+  identity only: it is not, and cannot be over this transport, the active
+  on-device application's name/version or the device firmware version.
+  Those live on two different CLAs depending on device context, neither of
+  which this module sends: the active application's name/version is CLA
+  `B0` `INS 01`; the device firmware version is CLA `E0` `INS 01`, but only
+  while the device is at the dashboard with no application open — a
+  distinct, OS-owned use of the same CLA byte `E0` this workspace's own
+  Sunrise application uses for its own signing commands once it is the
+  active app (see `SIGNING.md`, "Device APDU contract"). Verifying both
+  therefore requires a staged sequence this phase does not implement: probe
+  at the dashboard first, then open (or have the operator open) the Sunrise
+  application and reconnect, then send this crate's own `E0` commands.
+  Verifying the **app** and **firmware** checks is the explicitly
+  unimplemented next S4c slice.
+  Second, the generic USB HID packet framing every Ledger device application
+  uses (fixed 64-byte reports, a `0x0101` channel id, a `0x05` tag, and a
+  big-endian sequence index — one layer below, and independent of, the
+  APDU-level FIRST/CONTINUE/LAST chunking above): every `hid_write` call
+  must report writing the complete packet or the write is a typed
+  `ShortWrite`; reassembly distinguishes a genuinely incomplete response
+  (needs more packets) from a malformed one (wrong channel/tag, an
+  out-of-order sequence index, or a declared length over the bounded
+  short-APDU maximum of 260 bytes — up to 258 response-data bytes plus the
+  2-byte status word) and fails immediately on the latter
+  rather than looping until a timeout; and the complete read is bounded by
+  one wall-clock deadline (30 seconds total, not a per-packet timeout
+  multiplied by a packet-count limit) plus a small secondary packet-count
+  bound. Every arithmetic step in this framing (offsets, remaining lengths,
+  sequence increments) uses checked arithmetic with a typed
+  `FramingBoundsExceeded` fallback in place of a panic or a silent
+  saturating/truncating substitute. Its pure encode/decode functions have
+  self-consistent round-trip unit tests plus independently hand-built byte
+  vectors (not generated by this module's own encoder) matching the
+  documented framing; neither proves agreement with real Ledger firmware,
+  since no physical device or Speculos bridge was available to validate
+  against in this change — real hardware-in-the-loop evidence for
+  `HidTransport`, including whether its USB HID framing and device
+  identification actually match real hardware, remains explicitly deferred.
+  `hidapi`'s `linux-native-basic-udev` feature needs no system package (unlike
+  the `linux-static-hidraw`/`linux-static-libusb` features, which need
+  `libudev`/`libusb-1.0` development headers this environment lacks), so
+  `hid` and the `hidapi` dependency are behind an off-by-default `usb-hid`
+  Cargo feature on both `sunrise-edge-ledger` and `sunrise-edge-cli` purely
+  to keep the default (non-`--all-features`) build/test/clippy gate free of
+  any native dependency; `cargo clippy --workspace --all-targets
+  --all-features` and `cargo test --workspace --all-targets --all-features`
+  both pass in this environment with no system package installed.
+
+  **CLI signer selection amends the one-runtime-dependency invariant.**
+  `apps/cli` now depends on `sunrise-edge-ledger` in addition to
+  `sunrise-edge-client` — DR-0084's original "exactly one non-development/
+  runtime dependency" is revised to exactly these two, both still owning no
+  application-specific (devnet) semantics. A new `apps/cli::signer` module
+  adds `--seed-file`, `--ledger-hid-path`, and `--ledger-account` flags to
+  `address` and `transfer`; `parse_signer_selection` requires exactly
+  `--seed-file` alone or both Ledger flags together, rejecting neither, both
+  groups at once, or exactly one Ledger flag, before any network dispatch or
+  device connection. A Ledger selection resolves and verifies the signer
+  (`signer::connect_ledger_with`, generic over `Transport` and tested with
+  `FakeTransport`) strictly before `transfer` ever constructs a network
+  `Client`, so a Ledger connection failure or on-device rejection is reported
+  before any request reaches the node. Without the `usb-hid` feature, a
+  Ledger selection fails closed with a typed `CliError::LedgerTransportFeatureDisabled`
+  rather than silently falling back to the local signer. `transfer`'s Ledger
+  path builds a `PreparedTransaction` exactly as the local path does, then
+  calls `sign_and_finalize_external` with `DeviceSigningProfile::V1` and
+  `DEVNET_ASSET_TRANSFER_POLICY` — the same host preflight DR-0088 already
+  implements — so canonical transaction/signature bytes and the local-signer
+  path are both completely unchanged.
+
+  **Completion boundary.** This is S4c Phase 1 host integration As-Is only,
+  and S4c itself is not complete. It adds no device application, no
+  active-app/firmware identity check, no physical-device evidence, no
+  registered SLIP-0044 allocation, and no release artifact; `LocalSigner`
+  remains the CLI's only actually-replaceable-in-production signing path,
+  unchanged. The next S4c slice must add the active on-device application
+  name/version check (CLA `B0` `INS 01`) and the device firmware version
+  check (CLA `E0` `INS 01` in dashboard context, staged before the Sunrise
+  application is opened — see the `hid::HidTransport` discussion above),
+  neither of which this app sends today, and real
+  hardware validation boundaries for `HidTransport` (confirming its USB HID
+  framing, device identification, write/read behavior, and best-effort
+  reset actually work against physical devices, not only against
+  `FakeTransport`), before S4c can be considered complete. S4 remains
+  incomplete until S4c finishes, S4d supplies golden/pixel UI evidence,
+  physical-device HIL for every claimed model, broader adversarial
+  session/disconnect evidence, a pinned app/firmware compatibility matrix,
+  two-clean-build reproducibility evidence, Ledger release/submission
+  evidence, and the CLI's default signing path actually replaces
+  `LocalSigner`. TypeScript client, explorer, wallet, and S5 remain deferred
+  in the existing order.

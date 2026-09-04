@@ -1764,8 +1764,13 @@ DR-0091により、そのrepositoryのmerge済みPR #2（`6f6f882`）はLedger S
 actual SLIP-0010 derivation/Ed25519 signing、on-device NBGL review、Nano S+/Nano X/Stax/
 Flex/Apex Pのclean build、fixed-seed Nano S+ Speculos/Ragger key/signature/sender-mismatch/
 reset/rejection evidenceをimplemented and validated As-Isとして提供する。S4bはAs-Isで
-complete、S4全体はincompleteであり、現在のimplementation priorityはS4c host
-APDU/USB/HID transportとCLI signer selectionである。TypeScript client/explorer/walletと
+complete、DR-0092によりS4c Phase 1 host APDU/USB/HID transportとCLI signer
+selection（profile/address check、USB descriptor levelのdevice check）も
+implemented and validated As-Isである。S4cはactive-app/firmware identity check
+（S4c Phase 2）とphysical hardware validationが未実装のためincompleteであり、
+S4全体もincompleteである。現在のimplementation priorityはS4c Phase 2、続いて
+S4d（physical-device HIL、golden/pixel UI evidence、release evidence）である。
+TypeScript client/explorer/walletと
 S5は引き続きdeferredであり、S5は順序を飛ばさず後続する。
 
 CLI Developer MVP completion criteria（capability criteria 2-3を満たしながら、product
@@ -1918,8 +1923,13 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    first chunk最大230-byteへ訂正した（continuationは230-byteで不変）。DR-0090はmerge
    済みseparate `sunrise-edge-ledger-app` repositoryのPR #1 host-core milestoneを記録する。
    DR-0091はmerge済みPR #2のdedicated Ledger SDK app、5 target build、fixed-seed Nano S+
-   Speculos/Ragger evidenceをAs-Isとして記録する。S4bはAs-Isでcomplete、S4全体は
-   incompleteであり、次はS4c host APDU/USB/HIDとCLI signer selectionである。
+   Speculos/Ragger evidenceをAs-Isとして記録する。S4bはAs-Isでcomplete、DR-0092により
+   S4c Phase 1 host `clients/ledger` crate（APDU/USB/HID transport、FakeTransport-testedな
+   protocol、feature-gatedかつphysical-hardware未検証のHidTransport、USB descriptor
+   levelのdevice check）とCLI all-or-none signer selectionはimplemented and validated
+   As-Isである。S4cはactive-app/firmware identity checkとphysical hardware validationが
+   未実装のためincompleteであり、S4全体もincompleteである。次はS4c Phase 2、続いて
+   S4d physical-device HIL/release evidenceである。
    TypeScript client/explorer/walletとS5は引き続き既存の順序でdeferredである。
    production/mainnet readinessは未達である。
    前提として、`runtime-sqlite`へ`StructuredDurableDomainStateStore`/`IndexedOutboxRepository`を
@@ -2401,10 +2411,42 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
     `6901`/CLA `B0`は分離し、Python dependency closure、Docker image、GitHub Actionsをpinする。
     このrepositoryにnested appやworkspace `exclude`は作らず、canonical transaction/
     signature/object/receipt/nonce/submit bytesは変更しない。
-  - **S4c:** this repositoryのseparate `clients/ledger` crateにhost APDU/USB transportを置き、
-    CLIへall-or-none signer selection、device/app/firmware/profile/address検証を追加する。
-    vendor dependencyはprotocol crate/`clients/rust`へ入れず、CLIのone-runtime-dependency
-    invariantはDRで明示的に改訂する。
+  - **S4c: Phase 1 implemented and validated As-Is（2026-09-04、DR-0092）、S4c全体は
+    incomplete。** this repositoryのseparate `clients/ledger`（`sunrise-edge-ledger`）
+    crateが`SIGNING.md`のfrozen host APDU/USB/HID contract（FIRST/CONTINUE/LAST
+    chunking、exact status word、`get configuration` profile/flags検証、provisional
+    derivation path encoding、FIRST acceptance後の後続エラーに対するbest-effort
+    reset signing）をinjectable `Transport` traitに対して実装し、
+    `signer::LedgerExternalSigner`が`sunrise_edge_client::ExternalSigner`として
+    device-reported configuration・on-device-confirmed public key/addressをconnect時と
+    sign時の両方でcheckする（roadmapのprofile/address check）。real USB/HID
+    `HidTransport`（`hidapi`、`linux-native-basic-udev` feature、system package不要）は
+    `HidApi::device_list`経由でLedger vendor id・recognized product-model family
+    （既存のS4b five-target build listと一致するNano X/Nano S Plus/Stax/Flex/Apex P。
+    build targetのないplain Nano Sは除外）・exactなLedger usage page `0xFFA0`
+    （interface-number fallbackなし、strict equality）を検証してからのみopenする
+    （roadmapのdevice check、USB descriptor levelのみ）。full HID write検証、
+    incomplete/malformedを即座に区別するread reassembly、bounded total elapsed
+    read time、Ledger short-APDU maximum 260 byte（response data最大258 byte +
+    2-byte status word）へのresponse bound、non-self-referentialな
+    hand-built packet vectorsも実装する。**未実装：** active on-device application
+    name/version検証とdevice firmware version検証（roadmapのapp/firmware check。
+    app name/versionはCLA `B0` `INS 01`、firmware versionはdashboard context限定の
+    CLA `E0` `INS 01`——Sunrise app自体のE0とは別のOS-owned用途——であり、両方には
+    dashboard probe→Sunrise app open/reconnect→Sunrise E0 commandsという staged
+    sequenceが必要。このapp自体はどちらも送らない）、
+    および上記すべて（APDU protocol、USB HID framing、device recognition）のreal
+    physical hardwareに対するvalidation。これらは次のS4c slice（S4c Phase 2）で
+    実装する。off-by-default `usb-hid` feature配下以外の全moduleは`FakeTransport`
+    によりnative dependencyなしでdeterministicにtestされ、`usb-hid`有効時の
+    descriptor/framing testsもall-feature gateで検証する。CLIは`address`/`transfer`へ
+    `--seed-file`または
+    `--ledger-hid-path`+`--ledger-account`のexplicit all-or-none signer selectionを
+    追加し、Ledger選択時はネットワークdispatch前にdevice接続・configuration・
+    public key checkを完了する。vendor dependencyはprotocol crate/`clients/rust`
+    には入らず`clients/ledger`に閉じ、CLIのone-runtime-dependency invariantは
+    `sunrise-edge-client`と`sunrise-edge-ledger`の2つへDR-0092で明示的に改訂された。
+    canonical transaction/signature bytesとlocal-signer pathは不変である。
   - **S4d:** S4bのNano S+ Speculos CIを維持した上で、golden/pixel UI evidence、claimed
     device modelごとのphysical-device HIL、broader user rejection/disconnect/device-reset/
     adversarial session/chunk evidence、pinned app/firmware compatibility matrix、two-clean-build
@@ -3152,10 +3194,14 @@ FIRST最大255-byte・first chunk最大230-byteへ訂正しただけでdevice ap
 evidenceを追加していない。DR-0090はmerge済みseparate `sunrise-edge-ledger-app`
 repositoryのPR #1 host-core milestoneを記録する。DR-0091はmerge済みPR #2
 （`6f6f882`）のdedicated Ledger SDK device app、five-target build、fixed-seed Nano S+
-Speculos/Ragger evidenceをAs-Isとして記録する。S4bはAs-Isでcomplete、S4全体は
-incompleteであり、現在のimplementation priorityはS4c host APDU/USB/HID transportと
-CLI signer selectionである。TypeScript client/explorer/walletとS5は引き続き既存の
-順序でdeferredであり、S5は順序を飛ばさず後続する。
+Speculos/Ragger evidenceをAs-Isとして記録する。S4bはAs-Isでcomplete、DR-0092により
+S4c Phase 1 host APDU/USB/HID transportとCLI signer selection（profile/address check、
+USB descriptor levelのdevice check）はAs-Isで実装・検証済みである。S4cは
+active-app/firmware identity check（S4c Phase 2）とphysical hardware validationが
+未実装のためincompleteであり、S4全体もincompleteである。現在の
+implementation priorityはS4c Phase 2、続いてS4d
+physical-device HIL/release evidenceである。TypeScript client/explorer/walletとS5は
+引き続き既存の順序でdeferredであり、S5は順序を飛ばさず後続する。
 capacity/PITR/HA等のS5 certification項目はS5または明示的なSLOがtriggerするまで
 引き続き凍結する。
 

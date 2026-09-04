@@ -8,10 +8,28 @@ the clear-signing view derived only from the exact signed frame, and the host
 seam. S4b is implemented and validated As-Is in the separate
 [`sunriselayer/sunrise-edge-ledger-app`](https://github.com/sunriselayer/sunrise-edge-ledger-app)
 repository by merged PR #2 (`6f6f882`): the dedicated device application,
-five-target builds, and Nano S+ Speculos evidence. **No host APDU/USB/HID
-dependency, CLI Ledger selection, or physical-device evidence exists in this
-repository. S4 is not complete.** `LocalSigner` remains a development-only,
-non-keystore in-memory key with no zeroization; S4a/S4b do not replace it.
+five-target builds, and Nano S+ Speculos evidence. S4c Phase 1 is implemented
+As-Is in this repository's `clients/ledger` crate: the host APDU/USB/HID
+transport for the exact contract below, USB-descriptor-level device-model
+recognition, and `apps/cli`'s explicit, all-or-none Ledger signer selection.
+**S4c is not complete.** Phase 1 satisfies the profile and address checks
+and adds a device (USB vendor id/model) check, but it does not verify the
+active on-device application's name or version, nor the device firmware
+version. Those live on two different CLAs depending on device context: the
+active application's name/version is CLA `B0` `INS 01`; the device firmware
+version is CLA `E0` `INS 01`, but only while the device is at the dashboard
+with no application open — a different, OS-owned use of the same CLA byte
+`E0` this document's own table below uses once the Sunrise application is
+the active app (see "Device APDU contract" below). This app sends neither
+query today, and correctly querying both requires a staged sequence (probe
+at the dashboard, then open the Sunrise application and reconnect, then
+send this document's own `E0` commands) that a later S4c slice must add.
+**No physical-device evidence
+exists for any of S4a/S4b/S4c; `clients/ledger`'s real USB/HID transport
+(including its device recognition) is itself unvalidated against physical
+hardware, and behind an off-by-default `usb-hid` Cargo feature. S4 is
+not complete.** `LocalSigner` remains a development-only,
+non-keystore in-memory key with no zeroization; S4a/S4b/S4c do not replace it.
 
 ## Signed input and bounds
 
@@ -161,9 +179,12 @@ hardware signing profile rather than silently reinterpreting v1.
 
 ## Device APDU contract
 
-S4a freezes the following byte contract, and the separate
+S4a freezes the following byte contract, the separate
 `sunrise-edge-ledger-app` repository implements its application side under
-S4b. This repository does not implement host transport code.
+S4b, and this repository's `clients/ledger` crate implements its host side
+under S4c Phase 1 (S4c Phase 1 is host integration As-Is; it is neither
+physical-hardware evidence nor active-app/firmware identity verification,
+and S4c itself is not complete — see "Delivery sequence" below).
 All multi-byte APDU integers are big-endian, independently of canonical
 transaction integers inside the opaque chunk stream.
 
@@ -268,12 +289,27 @@ tooling rather than assuming it from this table:
   synchronous confirmation UI is active. It is returned before the app core
   receives the second APDU and therefore cannot be treated as an app-core
   status or proof that the core wiped its pending review state.
-- CLA `B0`: Ledger's common/dashboard CLA, used for device/app/firmware
-  discovery and other platform-level requests per Ledger's own integration
-  guidelines. Ledger devices intercept CLA `B0` before it reaches this
-  application's dispatcher; the Sunrise app never receives, handles, or
-  redefines CLA `B0` behavior. `E0` remains this app's own CLA for every
-  command in the table above, unaffected by CLA `B0` interception.
+- CLA `B0`: Ledger's common CLA for the currently active application's own
+  identity — `INS 01` ("get app and version") returns the running app's
+  name and version — and other platform-level requests per Ledger's own
+  integration guidelines. Ledger devices intercept CLA `B0` before it
+  reaches this application's dispatcher; the Sunrise app never receives,
+  handles, or redefines CLA `B0` behavior.
+- CLA `E0`, dashboard context: while the device is at the dashboard (no
+  application open), `INS 01` ("get version") is the Ledger OS's own
+  firmware-version query — a distinct, OS-owned use of the same CLA byte
+  `E0` the table above uses for the Sunrise application's own commands. It
+  is reachable only before the Sunrise application is opened; once the
+  Sunrise app is the active app, `E0` is this app's own CLA and the
+  dashboard's `INS 01` firmware query is no longer reachable. A host that
+  wants the device model, active app name/version, and firmware version
+  together must stage the query in that order — dashboard first (CLA
+  `B0`/`E0` as above), then open (or have the operator open) the Sunrise
+  application and reconnect, then send this document's own `E0` commands —
+  never assume a single CLA byte means the same thing across that
+  transition. `E0` remains this app's own CLA for every command in the
+  table above once the Sunrise application is active, unaffected by CLA
+  `B0` interception.
 
 ## Delivery sequence
 
@@ -287,16 +323,41 @@ tooling rather than assuming it from this table:
   signature uses the sender-substituted canonical-shape fixture; the
   byte-identical copied source fixture is the sender-mismatch case. Solana and
   Ethereum apps are never reused.
-- **S4c (this repository):** a separate `clients/ledger` host crate for the
-  APDU/USB boundary and an explicit CLI signer choice. Vendor dependencies do
-  not enter protocol crates or `clients/rust`.
+- **S4c Phase 1 (this repository, implemented As-Is by DR-0092):** a
+  separate `clients/ledger` host crate implements the APDU/USB/HID boundary
+  above against an injectable transport (a deterministic `FakeTransport`
+  used by every protocol test, and a real but not yet hardware-validated
+  `HidTransport` behind an off-by-default `usb-hid` Cargo feature), and
+  `apps/cli`'s `address`/`transfer` commands add an explicit, all-or-none
+  Ledger signer selection that checks the device's reported configuration
+  and on-device-confirmed public key/address before every signature. Vendor
+  dependencies (`hidapi`) do not enter protocol crates or `clients/rust`;
+  they are confined to `clients/ledger`, which `apps/cli` now depends on in
+  addition to `clients/rust`. `HidTransport::open` additionally requires the
+  target path to resolve, through USB device enumeration, to Ledger's vendor
+  id, a recognized product-id model family (the exact S4b five-target build
+  list — Nano X, Nano S Plus, Stax, Flex, Apex P), and exactly the Ledger
+  APDU usage page `0xFFA0` (the **device** check; no interface-number
+  fallback) before ever opening it. **S4c is not complete**: this phase does
+  not verify the active on-device application's name/version or the device
+  firmware version (the **app**/**firmware** checks — see "Device APDU
+  contract" above), and none of it — the APDU protocol logic, the USB HID
+  framing, or the device recognition — has been validated against physical
+  hardware.
+- **S4c Phase 2 (not yet started):** add the active on-device application
+  name/version check and the device firmware version check, and real
+  hardware validation for everything Phase 1 built. Only after this phase
+  is S4c itself complete.
 - **S4d (release gate):** preserve the existing Nano S+ Speculos CI and add
-  golden/pixel UI evidence, physical-device HIL for every claimed model,
-  broader reset/disconnect/adversarial session evidence, verified address/
-  confirmation flows, a pinned app and firmware matrix, two-clean-build
-  reproducibility evidence, and release/submission evidence.
+  golden/pixel UI evidence, physical-device HIL for every claimed model
+  (including for `clients/ledger`'s own `HidTransport`, which S4c Phase 1
+  leaves unvalidated against real hardware), broader reset/disconnect/
+  adversarial session evidence, verified address/confirmation flows, a
+  pinned app and firmware matrix, two-clean-build reproducibility evidence,
+  and release/submission evidence.
 
-S4c is only host integration As-Is. S4 is complete only after S4d and after
+S4c Phase 1 is only host integration As-Is, and S4c itself remains
+incomplete pending Phase 2. S4 is complete only after S4c and S4d and after
 the production signing path actually replaces the CLI's dev-only
 `LocalSigner`. Software keystores, OS keychains, PKCS#11, mTLS client keys,
 new signature schemes, and general module registration are outside S4a.

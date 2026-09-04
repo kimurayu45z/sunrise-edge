@@ -47,10 +47,12 @@ use sunrise_edge_client::{
     CanonicalStruct, ChainId, Client, Digest32, ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
     ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID, Epoch, ExecutionEffects, ExecutionStatus,
     ExpectedProtocolContext, FeePayment, HashAlgorithmId, HashSuiteId, LocalSigner,
-    NodeResponseStatus, ObjectEffect, ObjectId, ObjectRef, Owner, ProtocolVersion,
-    ReceiptPollBounds, RequestId, SignatureSchemeId, SubmitTransactionRequest, TransactionRequest,
-    Transport, build_signed_transaction, decode_object,
+    NodeResponseStatus, ObjectEffect, ObjectId, ObjectRef, Owner, PreparedTransaction,
+    ProtocolVersion, ReceiptPollBounds, RequestId, SignatureSchemeId, SubmitTransactionRequest,
+    TransactionRequest, Transport, decode_object,
 };
+#[cfg(feature = "usb-hid")]
+use sunrise_edge_client::{DEVNET_ASSET_TRANSFER_POLICY, DeviceSigningProfile, ExternalSigner};
 
 use crate::args::{ParsedArgs, parse_flags, scalar, switch};
 use crate::error::CliError;
@@ -59,9 +61,9 @@ use crate::net::{connect, tls_flag_specs};
 use crate::output::{bounded_hex_field, sanitize_line};
 use crate::parse::{parse_u16, parse_u32, parse_u64};
 use crate::seed::load_dev_seed;
+use crate::signer::{SignerSelection, parse_signer_selection, signer_flag_specs};
 
 const ENDPOINT: &str = "--endpoint";
-const SEED_FILE: &str = "--seed-file";
 const MODULE_ID: &str = "--module-id";
 const MODULE_VERSION: &str = "--module-version";
 const MODULE_DIGEST_ALGORITHM: &str = "--module-digest-algorithm";
@@ -123,29 +125,85 @@ struct FeeInputs {
 }
 
 /// Runs the `transfer` subcommand.
+///
+/// Signer selection ([`crate::signer::parse_signer_selection`]) and, for a
+/// Ledger selection, the device-reported configuration/public key/address
+/// checks all happen before this function ever constructs a network
+/// [`Client`]: a Ledger connection failure or rejection is reported before
+/// any request reaches the node.
 pub fn run<I>(args: I) -> Result<(), CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
     let mut specs = transfer_flag_specs();
     specs.extend(tls_flag_specs());
+    specs.extend(signer_flag_specs());
     let parsed = parse_flags(args, &specs)?;
 
     let endpoint = parsed.require(ENDPOINT)?;
-    let seed_file = parsed.require(SEED_FILE)?;
     let inputs = parse_inputs(&parsed)?;
 
-    let seed = load_dev_seed(std::path::Path::new(seed_file))?;
-    let signer = LocalSigner::from_seed(seed);
+    match parse_signer_selection(&parsed)? {
+        SignerSelection::Local { seed_file } => {
+            let seed = load_dev_seed(std::path::Path::new(&seed_file))?;
+            let signer = LocalSigner::from_seed(seed);
+            let sender = signer.address();
+            let client = connect(endpoint, &parsed)?;
+            execute(&client, sender, inputs, |prepared| {
+                prepared
+                    .sign_and_finalize_with(&signer)
+                    .map_err(CliError::from)
+            })
+        }
+        SignerSelection::Ledger { hid_path, account } => {
+            run_with_ledger(endpoint, &parsed, &hid_path, account, inputs)
+        }
+    }
+}
 
-    let client = connect(endpoint, &parsed)?;
-    execute(&client, &signer, inputs)
+/// Connects a real Ledger device and completes `transfer` using it as the
+/// external signer (see `SIGNING.md` and `ARCHITECTURE.md`'s Hardware
+/// Signing Profile v1 decision records).
+#[cfg(feature = "usb-hid")]
+fn run_with_ledger(
+    endpoint: &str,
+    parsed: &ParsedArgs,
+    hid_path: &str,
+    account: u32,
+    inputs: TransferInputs,
+) -> Result<(), CliError> {
+    let transport = sunrise_edge_ledger::HidTransport::open(hid_path)
+        .map_err(|error| CliError::LedgerConnect(Box::new(error)))?;
+    let signer = crate::signer::connect_ledger_with(transport, account)?;
+    let sender = signer.address();
+    let client = connect(endpoint, parsed)?;
+    execute(&client, sender, inputs, |prepared| {
+        prepared
+            .sign_and_finalize_external(
+                &signer,
+                &DeviceSigningProfile::V1,
+                &DEVNET_ASSET_TRANSFER_POLICY,
+            )
+            .map_err(CliError::from)
+    })
+}
+
+/// This binary was not built with the `usb-hid` feature: fail closed with
+/// an actionable error before any device connection is even attempted.
+#[cfg(not(feature = "usb-hid"))]
+fn run_with_ledger(
+    _endpoint: &str,
+    _parsed: &ParsedArgs,
+    _hid_path: &str,
+    _account: u32,
+    _inputs: TransferInputs,
+) -> Result<(), CliError> {
+    Err(CliError::LedgerTransportFeatureDisabled)
 }
 
 fn transfer_flag_specs() -> Vec<crate::args::FlagSpec> {
     vec![
         scalar(ENDPOINT),
-        scalar(SEED_FILE),
         scalar(MODULE_ID),
         scalar(MODULE_VERSION),
         scalar(MODULE_DIGEST_ALGORITHM),
@@ -301,16 +359,16 @@ fn parse_expected_context(parsed: &ParsedArgs) -> Result<ExpectedProtocolContext
     )?)
 }
 
-fn execute<T>(
+fn execute<T, F>(
     client: &Client<T>,
-    signer: &LocalSigner,
+    sender: Address,
     inputs: TransferInputs,
+    sign: F,
 ) -> Result<(), CliError>
 where
     T: Transport,
+    F: FnOnce(PreparedTransaction) -> Result<Vec<u8>, CliError>,
 {
-    let sender = signer.address();
-
     let context = client.query_verified_context(&inputs.expected_context)?;
 
     let nonce_result = client.query_next_nonce(sender)?;
@@ -373,7 +431,8 @@ where
         gas_limit: inputs.gas_limit,
         fee_payment,
     };
-    let signed_bytes = build_signed_transaction(signer, SignatureSchemeId::Ed25519, request)?;
+    let prepared = PreparedTransaction::prepare(sender, SignatureSchemeId::Ed25519, request)?;
+    let signed_bytes = sign(prepared)?;
 
     let submit_result = client.submit_transaction(SubmitTransactionRequest {
         chain_id: context.chain_id().clone(),
@@ -726,6 +785,18 @@ mod tests {
         LocalSigner::from_seed([0x77; 32])
     }
 
+    /// The local-signer `sign` closure every `execute` test below passes.
+    fn sign_locally(
+        signer: &LocalSigner,
+    ) -> impl FnOnce(PreparedTransaction) -> Result<Vec<u8>, CliError> {
+        let signer = signer.clone();
+        move |prepared| {
+            prepared
+                .sign_and_finalize_with(&signer)
+                .map_err(CliError::from)
+        }
+    }
+
     fn sample_expected_context() -> ExpectedProtocolContext {
         ExpectedProtocolContext::new(
             ChainId::new("transfer-test-chain").unwrap(),
@@ -828,7 +899,7 @@ mod tests {
         ]);
         let client = Client::new(transport);
 
-        execute(&client, &signer, inputs).unwrap();
+        execute(&client, signer.address(), inputs, sign_locally(&signer)).unwrap();
 
         let requests = client.transport().requests();
         assert_eq!(requests.len(), 5);
@@ -866,7 +937,7 @@ mod tests {
         ]);
         let client = Client::new(transport);
 
-        execute(&client, &signer, inputs).unwrap();
+        execute(&client, signer.address(), inputs, sign_locally(&signer)).unwrap();
 
         let requests = client.transport().requests();
         assert_eq!(requests.len(), 6);
@@ -918,7 +989,7 @@ mod tests {
         ]);
         let client = Client::new(transport);
 
-        let error = execute(&client, &signer, inputs).unwrap_err();
+        let error = execute(&client, signer.address(), inputs, sign_locally(&signer)).unwrap_err();
         assert!(matches!(
             error,
             CliError::ObjectNotCurrentlyInline {
@@ -959,7 +1030,7 @@ mod tests {
         ]);
         let client = Client::new(transport);
 
-        let error = execute(&client, &signer, inputs).unwrap_err();
+        let error = execute(&client, signer.address(), inputs, sign_locally(&signer)).unwrap_err();
         assert!(matches!(error, CliError::TransactionRejected { index: 0 }));
         // Exactly the 5 request/nonce/object/submit calls were made: no 6th
         // (receipt-wait) request was ever issued after the rejection.
@@ -1008,7 +1079,7 @@ mod tests {
         ]);
         let client = Client::new(transport);
 
-        let error = execute(&client, &signer, inputs).unwrap_err();
+        let error = execute(&client, signer.address(), inputs, sign_locally(&signer)).unwrap_err();
         assert!(matches!(
             error,
             CliError::TransactionExecutionFailed { index: 0, reason }
@@ -1037,7 +1108,7 @@ mod tests {
         ]);
         let client = Client::new(transport);
 
-        let error = execute(&client, &signer, inputs).unwrap_err();
+        let error = execute(&client, signer.address(), inputs, sign_locally(&signer)).unwrap_err();
         assert!(matches!(error, CliError::EmptySubmitResponse));
     }
 
@@ -1054,7 +1125,7 @@ mod tests {
         ]);
         let client = Client::new(transport);
 
-        let error = execute(&client, &signer, inputs).unwrap_err();
+        let error = execute(&client, signer.address(), inputs, sign_locally(&signer)).unwrap_err();
         assert!(matches!(
             error,
             CliError::EpochMismatch {
@@ -1084,7 +1155,7 @@ mod tests {
         let transport = FakeTransport::new(vec![query_ok(mismatched_context.encode().unwrap())]);
         let client = Client::new(transport);
 
-        let error = execute(&client, &signer, inputs).unwrap_err();
+        let error = execute(&client, signer.address(), inputs, sign_locally(&signer)).unwrap_err();
         match error {
             CliError::Client(boxed) => match *boxed {
                 ClientError::ProtocolContextMismatch(mismatch) => {
@@ -1275,7 +1346,7 @@ mod tests {
         ]);
         let client = Client::new(transport);
 
-        let error = execute(&client, &signer, inputs).unwrap_err();
+        let error = execute(&client, signer.address(), inputs, sign_locally(&signer)).unwrap_err();
         assert!(matches!(
             error,
             CliError::ObjectOwnerMismatch {
@@ -1305,7 +1376,7 @@ mod tests {
         ]);
         let client = Client::new(transport);
 
-        let error = execute(&client, &signer, inputs).unwrap_err();
+        let error = execute(&client, signer.address(), inputs, sign_locally(&signer)).unwrap_err();
         assert!(matches!(
             error,
             CliError::ObjectOwnerMismatch {
@@ -1339,7 +1410,8 @@ mod tests {
             ]);
             let client = Client::new(transport);
 
-            let error = execute(&client, &signer, inputs).unwrap_err();
+            let error =
+                execute(&client, signer.address(), inputs, sign_locally(&signer)).unwrap_err();
             assert!(
                 matches!(
                     &error,
@@ -1368,7 +1440,7 @@ mod tests {
         ]);
         let client = Client::new(transport);
 
-        let error = execute(&client, &signer, inputs).unwrap_err();
+        let error = execute(&client, signer.address(), inputs, sign_locally(&signer)).unwrap_err();
         assert!(matches!(
             error,
             CliError::ObjectNotCurrentlyInline {
@@ -1669,11 +1741,12 @@ mod tests {
     }
 
     /// The subset of [`transfer_flag_specs`] the parsing-only unit tests
-    /// below exercise (they never supply `--endpoint`/`--seed-file`).
+    /// below exercise (they never supply `--endpoint`, and signer selection
+    /// is exercised separately by `crate::signer`'s own tests).
     fn transfer_specs() -> Vec<crate::args::FlagSpec> {
         transfer_flag_specs()
             .into_iter()
-            .filter(|spec| spec.name != ENDPOINT && spec.name != SEED_FILE)
+            .filter(|spec| spec.name != ENDPOINT)
             .collect()
     }
 

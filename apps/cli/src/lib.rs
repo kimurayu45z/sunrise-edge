@@ -1,22 +1,35 @@
 #![forbid(unsafe_code)]
 
-//! Sunrise Edge Developer MVP Rust CLI (`apps/cli`, ARCHITECTURE.md §44 and
-//! DR-0084).
+//! Sunrise Edge Developer MVP Rust CLI (`apps/cli`, ARCHITECTURE.md §44,
+//! DR-0084, and DR-0092).
 //!
-//! Rust-only, with exactly one non-development/runtime dependency:
-//! `sunrise-edge-client`. (A handful of crates are declared under
-//! `[dev-dependencies]` only, to compose a real local devnet and build test
-//! fixtures directly in this crate's own test suite; none of them are
-//! reachable from `main`, `lib`, or any non-test build.) There is no
-//! Node/browser runtime, no argument-parsing crate, and no independent
-//! canonical encode/decode, signing, or RPC path — every protocol
-//! interaction goes through `sunrise-edge-client`.
+//! Rust-only, with exactly two non-development/runtime dependencies:
+//! `sunrise-edge-client` and, as of S4c (DR-0092, amending DR-0084's
+//! original one-dependency invariant), `sunrise-edge-ledger` — the crate
+//! that owns every Ledger/APDU/USB/HID dependency in this workspace. (A
+//! handful of crates are declared under `[dev-dependencies]` only, to
+//! compose a real local devnet and build test fixtures directly in this
+//! crate's own test suite; none of them are reachable from `main`, `lib`,
+//! or any non-test build.) There is no Node/browser runtime, no
+//! argument-parsing crate, and no independent canonical encode/decode,
+//! signing, or RPC path — every protocol interaction goes through
+//! `sunrise-edge-client`, and every Ledger interaction goes through
+//! `sunrise-edge-ledger`.
 //!
 //! Commands: `address`, `context`, `object`, `receipt`, `next-nonce`, and
 //! `transfer` (the devnet asset transfer with an explicit destination-owner
-//! expectation). Output is
-//! deterministic, line-oriented `key=value` text; every error is typed and
-//! actionable, and every error exits the process non-zero.
+//! expectation). `address` and `transfer` each require an explicit,
+//! all-or-none signer selection (see `signer::parse_signer_selection`):
+//! `--seed-file` (the development-only, non-keystore local signer) or both
+//! `--ledger-hid-path`/`--ledger-account` (a Ledger hardware signer, checked
+//! against its device-reported configuration and on-device-confirmed public
+//! key/address before any signing). The real USB/HID transport
+//! (`--ledger-hid-path`) requires this binary to be built with the
+//! `usb-hid` Cargo feature; without it, a Ledger selection fails closed with
+//! a typed, actionable error rather than silently falling back to the local
+//! signer. Output is deterministic, line-oriented `key=value` text; every
+//! error is typed and actionable, and every error exits the process
+//! non-zero.
 
 mod args;
 mod commands;
@@ -26,6 +39,7 @@ mod net;
 mod output;
 mod parse;
 mod seed;
+mod signer;
 #[cfg(test)]
 mod test_support;
 
@@ -97,12 +111,9 @@ mod tests {
     }
 
     #[test]
-    fn address_command_requires_its_flag() {
+    fn address_command_requires_a_signer_selection() {
         let error = run(vec![OsString::from("address")]).unwrap_err();
-        assert!(matches!(
-            error,
-            CliError::Args(args::ArgsError::MissingFlag("--seed-file"))
-        ));
+        assert!(matches!(error, CliError::MissingSignerSelection));
     }
 
     #[test]

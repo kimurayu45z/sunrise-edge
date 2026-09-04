@@ -14,6 +14,13 @@ path = "src/main.rs"
 
 [dependencies]
 sunrise-edge-client.workspace = true
+sunrise-edge-ledger.workspace = true
+
+[features]
+default = []
+# Enables a real Ledger USB/HID transport for `--ledger-hid-path`. Off by
+# default; see `sunrise-edge-ledger`'s `usb-hid` feature and `src/signer.rs`.
+usb-hid = ["sunrise-edge-ledger/usb-hid"]
 
 [dev-dependencies]
 execution.workspace = true
