@@ -174,22 +174,45 @@ pub enum CliError {
     /// The `sunrise-edge-client` library rejected a call. Boxed because
     /// `ClientError` is large relative to this enum's other variants.
     Client(Box<ClientError>),
-    /// No signer was selected: neither `--seed-file` nor both
-    /// `--ledger-hid-path`/`--ledger-account` were supplied.
+    /// No signer was selected: neither `--seed-file` nor all three of
+    /// `--ledger-hid-path`/`--ledger-account`/
+    /// `--ledger-expected-firmware-version` were supplied.
     MissingSignerSelection,
-    /// `--seed-file` was combined with either Ledger signer flag; exactly
+    /// `--seed-file` was combined with any of `--ledger-hid-path`,
+    /// `--ledger-account`, or `--ledger-expected-firmware-version`; exactly
     /// one signer must be selected.
     ConflictingSignerSelection,
-    /// Exactly one of the paired `--ledger-hid-path`/`--ledger-account`
-    /// flags was supplied; both are required together.
+    /// Exactly one of the paired `--ledger-hid-path`/`--ledger-account`/
+    /// `--ledger-expected-firmware-version` flags was supplied; all three
+    /// are required together.
     PartialLedgerSignerConfiguration {
-        /// The flag that must also be supplied to complete the pair.
+        /// The flag that must also be supplied to complete the trio.
         missing: &'static str,
     },
+    /// `--ledger-expected-firmware-version` was empty, non-ASCII, or too
+    /// long. Reported before any device connection is ever attempted.
+    LedgerExpectedFirmwareVersion(sunrise_edge_ledger::ExpectedFirmwareVersionError),
     /// Connecting to a Ledger device or verifying its reported
     /// configuration/public key failed before any transaction was ever
     /// prepared or signed.
     LedgerConnect(Box<dyn std::error::Error + Send + Sync>),
+    /// Verifying the device's dashboard/firmware identity, opening the
+    /// Sunrise application, or verifying the reconnected active
+    /// application's identity failed (see
+    /// `sunrise_edge_ledger::verify_dashboard_and_open`/
+    /// `verify_active_app`).
+    LedgerIdentity(Box<dyn std::error::Error + Send + Sync>),
+    /// The bounded, same-HID-path reconnect this host attempts after
+    /// `open app` never observed the device reappear before its monotonic
+    /// deadline elapsed.
+    LedgerReconnectTimedOut {
+        /// The HID path this host retried.
+        path: String,
+        /// The bounded deadline, in milliseconds.
+        deadline_ms: u64,
+        /// The most recent reconnect attempt's failure.
+        last_error: String,
+    },
     /// A Ledger signer was selected, but this binary was built without the
     /// `usb-hid` Cargo feature, so no real USB/HID transport is available.
     LedgerTransportFeatureDisabled,
@@ -302,16 +325,30 @@ impl fmt::Display for CliError {
             Self::Transport(error) => write!(f, "{error}"),
             Self::Client(error) => write!(f, "{error}"),
             Self::MissingSignerSelection => f.write_str(
-                "no signer selected; supply --seed-file, or both --ledger-hid-path and --ledger-account",
+                "no signer selected; supply --seed-file, or all of --ledger-hid-path, --ledger-account, and --ledger-expected-firmware-version",
             ),
             Self::ConflictingSignerSelection => f.write_str(
-                "--seed-file cannot be combined with --ledger-hid-path or --ledger-account; select exactly one signer",
+                "--seed-file cannot be combined with --ledger-hid-path, --ledger-account, or --ledger-expected-firmware-version; select exactly one signer",
             ),
             Self::PartialLedgerSignerConfiguration { missing } => write!(
                 f,
-                "--ledger-hid-path and --ledger-account must both be supplied together; missing {missing}"
+                "--ledger-hid-path, --ledger-account, and --ledger-expected-firmware-version must all be supplied together; missing {missing}"
             ),
+            Self::LedgerExpectedFirmwareVersion(error) => {
+                write!(f, "invalid --ledger-expected-firmware-version: {error}")
+            }
             Self::LedgerConnect(error) => write!(f, "ledger device connection failed: {error}"),
+            Self::LedgerIdentity(error) => {
+                write!(f, "ledger device identity verification failed: {error}")
+            }
+            Self::LedgerReconnectTimedOut {
+                path,
+                deadline_ms,
+                last_error,
+            } => write!(
+                f,
+                "timed out after {deadline_ms}ms reconnecting to ledger device at {path:?}: {last_error}"
+            ),
             Self::LedgerTransportFeatureDisabled => f.write_str(
                 "a Ledger signer was selected, but this binary was built without the usb-hid feature",
             ),
@@ -335,7 +372,9 @@ impl std::error::Error for CliError {
             Self::Client(error) => Some(error),
             Self::InvalidExpectedProtocolType(error) => Some(error),
             Self::InvalidExpectedContext(error) => Some(error),
+            Self::LedgerExpectedFirmwareVersion(error) => Some(error),
             Self::LedgerConnect(error) => Some(error.as_ref()),
+            Self::LedgerIdentity(error) => Some(error.as_ref()),
             _ => None,
         }
     }
