@@ -221,15 +221,23 @@ evidence are implemented As-Is by DR-0091; S4 is not complete. DR-0092
 implements S4c Phase 1's host APDU/USB/HID transport and explicit CLI Ledger
 signer selection As-Is, including profile/address checks and strict
 USB-descriptor-level device recognition, but not active-app/firmware identity
-checks or physical-hardware evidence. The current priority is S4c Phase 2's
-staged app/firmware checks and physical validation
-for the `CLI-First Node Production Gate`
-(`TODO.md`) — a real
+checks or physical-hardware evidence. DR-0093 implements S4c Phase 2a's strict
+Ledger OS identity/dashboard parsing and staged dashboard/firmware/open-app/
+reconnect/active-app identity sequence in software As-Is, still without
+physical-hardware validation. As of 2026-09-04 the user has explicitly
+reordered the roadmap: all remaining Ledger work — S4c Phase 2b's
+physical-hardware validation, S4d's golden/pixel UI, HIL, and release
+evidence, and any other Ledger device/host/HIL completion — is deferred, and
+no Ledger code is touched by non-Ledger slices. Non-Ledger S5 prerequisite
+work (see DR-0094 below) may proceed instead, but S4, S5, the
+`CLI-First Node Production Gate`
+(`TODO.md`), production, and mainnet readiness all remain incomplete; passing
+that gate was never mainnet readiness on its own — it is a real
 node/persistence/operations gate defined entirely by reference to existing,
 unchanged Phase 15 To-Be exit criteria, the Post-MVP persistence
-implementation order, and the cross-phase release gate; passing it is
-explicitly not mainnet readiness (see ARCHITECTURE.md DR-0085 for the full
-rationale and the S0-S5 ordered slices). S2's exact cross-owner destination
+implementation order, and the cross-phase release gate (see ARCHITECTURE.md
+DR-0085 for the full rationale and the S0-S5 ordered slices). S2's exact
+cross-owner destination
 policy is implemented by DR-0086. S3's uniform ordinary-asset fee composition,
 actual-gas settlement, trap fee-only charge, and restart/replay evidence are
 implemented by DR-0087 without changing historical WAT/WASM or canonical wire
@@ -327,14 +335,33 @@ assertions, sender nonce, state, receipt, and outbox. `structured_durable_router
 still rejects Write/Consume before storage I/O; a separate additive
 `preinstalled_wasm_structured_durable_router` composes a trusted preinstalled
 catalog/engine/checkpoint and now accepts signed owned Write/Consume through
-the preinstalled-WASM entrypoint instead. Shared/System ownership, blob
-bodies, and arbitrary module upload remain fail-closed on every route. Every
+the preinstalled-WASM entrypoint instead. Shared/System ownership and
+arbitrary module upload remain fail-closed on every route. Every
 immutable object version now
 carries its creating chain/protocol-version provenance (`DurableObjectProvenance`,
 DR-0068), and node-core independently recomputes and verifies each
 authenticated object's digest from that provenance and the stored `Digest32`
 algorithm before authorizing it, under bounded inline-body budgets — node-core
-no longer trusts the storage adapter for object-body integrity. PostgreSQL
+no longer trusts the storage adapter for object-body integrity. DR-0094 wires
+`runtime::BlobStore` into authenticated durable object loading: a
+`BlobReference` payload is now fetched from an explicit `BlobStore` component
+(threaded through `StructuredDurableNativeComponents` and every authenticated
+node-core entrypoint as `B`, never folded into the state store) after
+provenance/receipt/nonce checks and before transition, bounded at the same
+per-object 1 MiB limit and folded into the same pre-activation 8 MiB
+aggregate inline/blob budget before hashing or decode, with its own
+`blob_digest` independently verified against the fetched bytes before
+`objects::decode_object` runs and the existing `record.digest` re-verified
+against the same canonical bytes afterward; a missing blob or a `BlobStore`
+`RuntimeError` are distinct typed errors mapped to an opaque HTTP 503, and a
+digest/decode failure is an opaque 500. Exact replay is unaffected. The fully
+generic, never-dispatching `handle_resolved_durable_idempotent_event` keeps
+its original signature (no `BlobStore` parameter); only the three
+authenticated entrypoints, which always declare a dispatch, require one.
+Blob upload/publication of a new
+version, a durable provider `BlobStore`, and GC/checkpoint manifest work
+remain unimplemented; the bounded query API still returns only blob reference
+metadata and never fetches a body. PostgreSQL
 generation one was redefined in place under schema identity v2
 (bootstrap-only; an old v1 database fails closed) to add the provenance
 columns. A shared memory/PostgreSQL conformance suite now
@@ -392,9 +419,12 @@ DR-0086 permits only its exact existing cross-owner destination policy while
 preserving both owners. DR-0087 activates module/semantics v3 with unchanged
 WAT/WASM and v1/v2 vectors, requires the sender source as fee object, and
 settles actual gas into the distinct treasury owner's ordinary destination.
-Create, Shared/System ownership, blob transfer, arbitrary module upload, fee
-distribution/FastCertificate settlement, production gas calibration, S4c-S4d
-device/host/HIL completion, and production object migrations remain deferred.
+Create, Shared/System ownership, blob upload/publication of a new version, a
+durable provider `BlobStore`, GC/checkpoint manifest work, arbitrary module
+upload, fee distribution/FastCertificate settlement, production gas
+calibration, S4c Phase 2b/S4d Ledger physical-hardware/HIL/release completion
+(deferred by the user's explicit roadmap reorder, not by a technical gap),
+and production object migrations remain deferred.
 The opaque SQLite table and prefix scanner remain local
 compatibility/reference paths, not production schema. Started blocking work
 remains uncancellable and its configured admission limit is not

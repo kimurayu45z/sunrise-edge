@@ -1232,7 +1232,11 @@ decode inline bytes. Inline owner projections are derived from typed `Owner`
 when written, but a head projection is routing metadata, not authorization:
 an execution caller must separately read the exact immutable version, match
 its version/digest to the head, decode the inline Object, and compare its typed
-owner. Blob-backed execution fails closed until fetch and content verification.
+owner. Node-core's authenticated durable entrypoints now fetch a blob-backed
+version's body from an explicit, separately supplied `BlobStore` component and
+independently verify it before authorization (DR-0094); durable provider blob
+storage and blob upload/publication remain unimplemented, so a blob-backed
+version still cannot be created or persisted durably.
 The generation-one SQL `type_id` is the stable
 canonical Object record ID rather than the logical `Object::type_hash` retained
 inside canonical bytes. Memory and PostgreSQL apply object/state/receipt/outbox
@@ -1240,8 +1244,9 @@ sections atomically, preventing an adapter from hiding object writes in generic
 state. Node-core now uses the object section for authenticated read-only
 manifest authorization and exact head assertions, plus an additive
 owned-effects path that commits validated signed Address-object Update/Delete
-mutations; Create, Shared/System ownership, and blob transfer verification
-remain deferred. Indexed outbox
+mutations, both now reading a blob-backed input through an explicit `BlobStore`
+component (DR-0094); Create, Shared/System ownership, and blob upload/
+publication of a new version remain deferred. Indexed outbox
 repositories now refine the structured store trait so one implementation owns
 initial commit and later delivery state. An additive node-core handler now
 resolves the manifest domain before I/O, checks the typed receipt before state
@@ -1576,8 +1581,10 @@ the CLI-First Node Production Gate passes (`TODO.md#cli-first-node-production-ga
 no other `clients/*`/`apps/*` path from DR-0081 exists yet. Known current
 limitations that
 must stay visible at devnet startup and in documentation once implemented:
-single validator; owned-object only (Create, Shared/System ownership, and
-blob bodies remain fail-closed); one fixed ordinary fee asset and one ordinary
+single validator; owned-object only (Create and Shared/System ownership remain
+fail-closed; a blob-backed input is fetched and independently verified through
+an explicit `BlobStore` component (DR-0094), but blob upload/publication of a
+new version is not implemented); one fixed ordinary fee asset and one ordinary
 treasury without validator/certificate distribution, gas categories other
 than base/execution pricing, or production economics; only the exact policy-bounded existing Address-owned destination
 may differ from the sender, while literal owner reassignment/gifting remains
@@ -3161,8 +3168,10 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   ownership and blob-transfer coverage stays at node-core rather than being
   duplicated at the HTTP layer, since neither can succeed on this MVP
   object-access surface — their fail-closed rejections
-  (`ObjectOwnerKindUnsupported`/`ObjectBodyUnavailable`) already originate in
-  shared node-core code, and the native HTTP boundary maps those errors to
+  (`ObjectOwnerKindUnsupported`/the then-existing `ObjectBodyUnavailable`,
+  later removed once blob fetch/verification made it unreachable — see
+  DR-0094) already originate in
+  shared node-core code, and the native HTTP boundary mapped those errors to
   `501`, so duplicating the same
   node-core tests at HTTP would add no discrimination. The two axum handlers (`submit_structured_durable_event`
   and `submit_preinstalled_wasm_structured_durable_event`) no longer duplicate
@@ -4361,3 +4370,131 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   evidence, two-clean-build reproducibility evidence, and Ledger release/
   submission evidence are unaffected and still deferred, as are the
   TypeScript client/explorer/wallet surface and S5.
+
+- DR-0094: Wire the existing `runtime::BlobStore` into authenticated
+  structured durable object loading, including native-http composition, so a
+  `DurableObjectPayload::BlobReference` is fetched and independently verified
+  As-Is, while blob upload/publication, a durable provider `BlobStore`, and
+  GC/checkpoint manifest work remain deferred. This is non-Ledger S5
+  prerequisite work; per the user's explicit roadmap reorder (2026-09-04),
+  all remaining Ledger S4c Phase 2b/S4d physical-hardware/HIL/release work
+  (see DR-0093 above) is deferred while this proceeds, and S4, S5, the
+  `CLI-First Node Production Gate`, production, and mainnet readiness all
+  remain incomplete.
+
+  **Explicit separate component, not a hidden default.** `BlobStore` stays
+  independent from `StateStore`: no adapter is required to implement both.
+  `native-http`'s `StructuredDurableNativeComponents<S, B, T, C, I>` gains an
+  explicit `B` type parameter and a `blob_store: Arc<B>` constructor argument
+  (both `new` and `with_cancellation`), threaded through
+  `structured_durable_router`/`_with_executor` and
+  `preinstalled_wasm_structured_durable_router`/`_with_executor` and every
+  handler generic over the composition. `node-core`'s
+  `handle_authenticated_resolved_durable_submit_transaction` and its
+  `_with_owned_object_effects` and `_with_preinstalled_wasm_execution`
+  siblings — every entrypoint that always declares an authenticated object
+  dispatch — take an explicit `blob_store: &B where B: BlobStore` parameter,
+  a deliberate, exhaustively updated Rust API break across every call site
+  and test, not an additive overload. The fully generic
+  `handle_resolved_durable_idempotent_event` never declares a dispatch and
+  never loads or fetches an object body, so its public signature is
+  unchanged; internally it passes `blob_store: None` into the shared
+  `handle_durable_idempotent_event_with_plan` helper, which takes
+  `Option<&dyn BlobStore>` instead of a generic `B` (object-safe, since only
+  the two simple `BlobStore` methods are ever called through it) and treats
+  `None` alongside a `Some(dispatch)` as an internal composition-invariant
+  failure, never reachable from external input, since every caller that
+  passes `Some(dispatch)` also always passes `Some(blob_store)`. The
+  crate-private `load_and_authorize_objects` takes `blob_store: &dyn
+  BlobStore` for the same reason. `apps/devnet::compose_devnet_router` wires
+  a process-local
+  `runtime::MemoryBlobStore`, since `SqliteDurableStore` has no durable
+  `BlobStore` implementation yet: a blob-backed reference does not survive a
+  devnet restart, and nothing in the devnet composition writes one.
+
+  **Fetch ordering and bounds.** Inside `load_and_authorize_objects`, the
+  version record's stored chain provenance is still checked from the record
+  header alone — before a `BlobReference` payload is ever fetched, so a
+  cross-chain record rejects without any blob-store I/O (proven by an
+  instrumented `BlobStore` that asserts zero `get_blob` calls). Exact request
+  replay is unaffected: the persisted-receipt short-circuit in
+  `handle_durable_idempotent_event_with_plan` already runs before any object
+  I/O, so a replayed request naming a blob-backed object still returns before
+  `BlobStore` is ever touched (also proven by an instrumented double). Only
+  then is `blob_store.get_blob` called: `Ok(None)` is the new
+  `NodeCoreError::ObjectBlobMissing { object_id, blob_digest }`; `Err(_)` is
+  the existing `NodeCoreError::Runtime`, not a silently downgraded absence.
+  Fetched bytes are bounded at the existing per-object
+  `MAX_AUTHENTICATED_OBJECT_BODY_BYTES` (1 MiB) limit and folded into the same
+  running `MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES` (8 MiB) aggregate an
+  inline body shares, via one `accumulate_authenticated_body_bytes` helper —
+  both bounds run immediately after the fetch, before either digest is
+  verified or the body is decoded, so an oversized-and-also-malformed blob
+  rejects as `ObjectBodyTooLarge` without ever hashing or decoding it, and a
+  blob that would push the aggregate over budget rejects the same way even if
+  its own bytes are individually well-formed. An inline body's bound/aggregate
+  check keeps its original position (after the record's id/version/schema
+  cross-check, immediately before the shared `record.digest`
+  re-verification below), unaffected by the blob-only reordering, and neither
+  path double-counts. The payload's own
+  `blob_digest` is then independently verified against the exact fetched
+  bytes with `hashing::verify_digest` (`HashPurpose::Object`, the record's own
+  stored chain/protocol-version provenance, self-describing algorithm
+  selection from the digest itself) — a mismatch is the new distinct
+  `NodeCoreError::ObjectBlobDigestMismatch { object_id, blob_digest }`, and an
+  unsupported algorithm still fails closed as the existing
+  `ObjectDigestUnverifiable`. Only after that does `objects::decode_object`
+  run (a decode failure is the existing `DurableInvocationError`/
+  `NodeCoreError::DurableInvocation`, never a panic); the existing object
+  id/version/schema and head-owner-projection cross-checks and the
+  independent `record.digest` re-verification against the same canonical
+  bytes (`ObjectBodyDigestMismatch`) then run exactly as they already did for
+  an inline body. The
+  now-unreachable `NodeCoreError::ObjectBodyUnavailable` variant (a blob
+  payload this slice could not read) is removed rather than left dead.
+
+  **Mutation surface unchanged, read surface widened.** A declared
+  `Write`/`Consume` access on the owned-effects and preinstalled-WASM
+  entrypoints may now read a blob-backed previous version through the
+  identical loader and verification path as a read-only access; every new
+  immutable version either entrypoint commits is still always inline
+  (`authenticated_object_effects::translate_update` never constructs a
+  `DurableObjectPayload::BlobReference`), so blob upload/publication of a new
+  version remains unimplemented by simple absence of a code path. The bounded
+  query API (`node_core::query_object`, §43) is unchanged: it still returns
+  only a `CurrentBlobReference` result's explicit head/version metadata and
+  digests, and still never fetches or verifies a blob body, preserving the
+  documented query/write asymmetry.
+
+  **HTTP mapping stays opaque.** `native-http` maps `ObjectBlobMissing` and
+  the existing `NodeCoreError::Runtime` (a `BlobStore` `RuntimeError`) to an
+  opaque `503`, matching every other transient storage-unavailability
+  variant; `ObjectBlobDigestMismatch` joins the existing opaque `500`
+  corruption group alongside `ObjectBodyDigestMismatch`. No route ever
+  serializes blob bytes or storage details into a response.
+
+  **Tests.** `node-core` adds an `InstrumentedBlobStore` test double (call
+  counting, scriptable `RuntimeError` injection) and unit tests for the
+  happy read-only path, an owned `Write` updating a blob-backed previous
+  version to a new inline version, a `BlobStore` `RuntimeError`, a missing
+  blob, an oversized-before-hashing-or-decode blob, a `blob_digest` mismatch,
+  a malformed/non-canonical decode failure, decoded identity/version/schema
+  mismatches, an independently invalid `record.digest` after a valid
+  `blob_digest`, an unsupported blob-digest algorithm, the provenance-before-
+  fetch and exact-replay-before-fetch orderings, and the shared inline/blob
+  aggregate bound. `native-http` adds a `CountingBlobStore`
+  double and a full HTTP `preinstalled_wasm_structured_durable_router`
+  end-to-end composition test that commits a blob-backed object directly into
+  storage, submits a real signed `Write` `SubmitTransaction` over HTTP, and
+  asserts both the response and the committed inline v2 body, proving the
+  request dispatched through the exact supplied `BlobStore` rather than a
+  hidden default.
+
+  **Completion boundary.** Only blob fetch and verification for an
+  already-existing content-addressed reference are As-Is. Blob
+  upload/publication of a new version, a durable provider `BlobStore`
+  implementation (PostgreSQL/SQLite/Cloudflare/AWS or otherwise),
+  GC/checkpoint manifest work, and Cloudflare/AWS persistence and
+  provider-certification evidence all remain deferred and unimplemented. S4,
+  S5, the `CLI-First Node Production Gate`, production, and mainnet readiness
+  remain incomplete; this DR changes none of their exit criteria.

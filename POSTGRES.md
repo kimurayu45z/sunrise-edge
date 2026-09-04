@@ -83,16 +83,20 @@ the inline bytes. Immutable payloads are read separately. Head owner/routing
 projections are atomically written routing data and must not authorize
 execution by themselves. An execution caller must separately read the linked
 version, verify exact head version/digest, decode an inline Object, and compare
-its typed owner. Blob-backed execution fails closed until blob fetch and
-content verification are implemented. An object version stores exactly one
+its typed owner. Node-core now fetches a blob-backed body from an explicit
+`BlobStore` component and independently verifies it before decode/
+authorization (ARCHITECTURE.md DR-0094); PostgreSQL itself has no durable
+`BlobStore` implementation yet, so a blob-backed reference is not durably
+persisted by this adapter. An object version stores exactly one
 existing canonical `objects::Object` encoding or one self-describing blob
 digest. The SQL `type_id` is the stable canonical Object record identifier,
 not `Object::type_hash`, which remains inside the canonical Object bytes.
 Inline owner projections are derived with `objects::encode_owner` at write
-construction; blob upload, fetch, and digest/content verification remain
-upstream/deferred. Node-core now loads authenticated read-only manifest entries
-from exact heads and immutable inline versions, authorizes the typed owner, and
-commits their complete head assertions. It does not yet dispatch object
+construction; blob upload/publication of a new version and a durable
+provider `BlobStore` remain upstream/deferred. Node-core now loads
+authenticated read-only and owned mutating/consuming manifest entries from
+exact heads and immutable inline (or fetched blob-backed) versions, authorizes
+the typed owner, and commits their complete head assertions and object
 mutations; memory and PostgreSQL consume the typed section directly and never
 hide object writes in generic state.
 

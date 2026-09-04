@@ -120,8 +120,10 @@ cross-provider ingress milestones implemented through Phase 17:
   dashboard context — a different, OS-owned use of the same CLA byte `E0`
   the Sunrise app uses for its own commands once it is open) — but strictly
   in software, against `FakeTransport` only, and none of it has been
-  validated against physical hardware; that physical validation
-  (S4c Phase 2b) is next. The real USB/HID
+  validated against physical hardware. Per the user's explicit roadmap
+  reorder (`ARCHITECTURE.md` DR-0094), that S4c Phase 2b validation, S4d, and
+  all other remaining Ledger work are deferred while non-Ledger S5
+  prerequisite work proceeds instead. The real USB/HID
   transport is behind `sunrise-edge-cli`'s off-by-default `usb-hid` Cargo
   feature — not because it needs an unavailable system package (its
   `linux-native-basic-udev` `hidapi` backend needs none), but to keep the
@@ -201,8 +203,12 @@ cross-provider ingress milestones implemented through Phase 17:
   `WasmExecutionEngine`/`created_checkpoint` and calls the preinstalled-WASM
   entrypoint instead, so a signed owned Write/Consume can execute a governed
   deterministic contract over HTTP; both routers share the same request-scoped
-  outbox claim/send/ack path and admission/cancellation bounds. Shared/system
-  ownership, blob bodies, arbitrary module upload, FastVote/FastCertificate,
+  outbox claim/send/ack path and admission/cancellation bounds. A declared
+  access may read a blob-backed object body, fetched and independently
+  verified through an explicit `BlobStore` component (`ARCHITECTURE.md`
+  DR-0094), but every new version either entrypoint commits is still always
+  inline, so blob upload/publication remains unimplemented. Shared/system
+  ownership, arbitrary module upload, FastVote/FastCertificate,
   and certificate publication also remain unimplemented, so the owned fast
   path is not yet safe to activate on a live chain. S3's uniform ordinary-
   asset fee debit (see `ARCHITECTURE.md` DR-0087) is implemented on the
@@ -277,8 +283,11 @@ cross-provider ingress milestones implemented through Phase 17:
   inline body. Owner/routing head projections are routing data, not execution
   authorization; authorization must separately load the linked immutable
   version, match version/digest, decode an inline Object, and compare its typed
-  owner. Blob-backed execution remains unavailable until fetch and content
-  verification exist. Serialization/deadlock aborts
+  owner. Node-core now fetches and independently verifies a blob-backed
+  version's body through an explicit `BlobStore` component (`ARCHITECTURE.md`
+  DR-0094); PostgreSQL itself still has no durable `BlobStore` implementation,
+  so a blob-backed reference is not yet durably persisted by this adapter.
+  Serialization/deadlock aborts
   retry the unchanged envelope only within an explicit attempt ceiling and
   remaining deadline. Indexed
   exact-request/due claim and acknowledgement now use retained attempt history.
@@ -463,7 +472,9 @@ cross-provider ingress milestones implemented through Phase 17:
   canonical Object or self-describing blob reference and are read separately.
   Head projections alone never authorize execution: a caller must match the
   separately loaded inline version to the head and validate its typed owner;
-  blob-backed execution fails closed while blob verification is deferred.
+  a blob-backed version is now fetched from an explicit `BlobStore` component
+  and independently verified (`ARCHITECTURE.md` DR-0094), while blob
+  upload/publication of a new version remains deferred.
   It bounds total
   represented bytes and rejects domain/request/event-digest drift, so a
   normalized adapter never needs to classify opaque key prefixes. An additive
@@ -479,9 +490,12 @@ cross-provider ingress milestones implemented through Phase 17:
   effects and, through a separate additive preinstalled-WASM entrypoint,
   deterministic bounded WASM execution against an exact-committed module
   catalog. Local native devnet startup composition and S3's bounded actual-gas
-  AssetAccount fee settlement are implemented As-Is; Create, Shared/System
-  ownership, blob transfer verification, arbitrary module upload, and
-  production deployment and economics remain deferred.
+  AssetAccount fee settlement are implemented As-Is; a blob-backed read is now
+  fetched and independently verified through an explicit `BlobStore`
+  component (`ARCHITECTURE.md` DR-0094). Create, Shared/System ownership,
+  blob upload/publication of a new version, a durable provider `BlobStore`,
+  arbitrary module upload, and production deployment and economics remain
+  deferred.
 - An additive indexed durable-outbox repository contract that claims at most
   one due message in stable availability/request order, installs a bounded
   restart-safe lease atomically, and makes same-lease claim and acknowledgement
@@ -855,8 +869,8 @@ USB HID framing and, for Phase 2a, hand-built oversized-but-well-formed
 identity/dashboard fixtures exercising the 258-byte response cap), with no
 native dependency. **Physical-device HIL for all of this — Phase 1's
 protocol/USB HID/device recognition and Phase 2a's identity/dashboard
-sequence alike — remains deferred; that validation is S4c Phase 2b, the
-next slice.**
+sequence alike — remains deferred as part of the explicitly deferred S4c
+Phase 2b/S4d Ledger work.**
 `apps/cli`'s `address` and `transfer` commands now
 require an explicit, all-or-none signer selection (`--seed-file`, or
 `--ledger-hid-path`/`--ledger-account`/`--ledger-expected-firmware-version`
@@ -1011,10 +1025,15 @@ check pinning name `Sunrise Edge`/version `0.1.0` — strictly in software,
 against `FakeTransport` only. **S4c itself remains incomplete** — Phase
 1/2a together cover the profile, address, device, and active-app/firmware
 identity checks, but none of it is physical-device evidence or a CLI
-production signing path — so the next steps are S4c Phase 2b's real
-hardware validation, then S4d's physical/release
-evidence. The TypeScript client, explorer, wallet, and S5
-remain deferred until the complete CLI-First Node Production Gate passes.
+production signing path. As of 2026-09-04 (`ARCHITECTURE.md` DR-0094), the
+user has explicitly reordered the roadmap: all remaining Ledger work — S4c
+Phase 2b's real hardware validation and S4d's physical/release evidence — is
+deferred, and non-Ledger S5 prerequisite work may proceed out of the former
+order instead. This does not change what is complete: S4, S5, the
+CLI-First Node Production Gate, production, and mainnet readiness all remain
+incomplete either way. The TypeScript client, explorer, and wallet remain
+deferred until the complete CLI-First Node Production Gate passes; only
+non-Ledger S5 prerequisite work may proceed before that gate.
 This is real node/persistence/operations and remote-CLI
 evidence, not a mainnet-readiness or production-certification claim: passing
 S3 does not authorize skipping directly to later production claims.

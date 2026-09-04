@@ -17,15 +17,15 @@ use execution::{
     encode_execution_effects, hash_transaction,
 };
 use hashing::{HashSuiteResolver, HashingError};
-use objects::{AccessMode, Address, Object, ObjectId, ObjectRef, Owner};
+use objects::{AccessMode, Address, Object, ObjectId, ObjectRef, Owner, decode_object};
 use protocol_config::{DomainPlacementManifest, ProtocolConfig, ProtocolConfigError};
 use protocol_types::{
     ChainId, Digest32, Epoch, HashAlgorithmId, HashPurpose, ProtocolVersion, TypeError,
 };
 use runtime::{
     AtomicStateMutationSet, AtomicStateReadSet, AtomicStateTransaction, AtomicStateWriteResult,
-    AtomicStateWriteSet, AtomicityDomainId, DomainTransactionalStateStore, DurableCommitOutcome,
-    DurableCommitRejection, DurableInlineObject, DurableInvocationError,
+    AtomicStateWriteSet, AtomicityDomainId, BlobStore, DomainTransactionalStateStore,
+    DurableCommitOutcome, DurableCommitRejection, DurableInlineObject, DurableInvocationError,
     DurableInvocationTransaction, DurableObjectChanges, DurableObjectHead,
     DurableObjectMutationEntry, DurableObjectOwnerProjection, DurableObjectPayload,
     DurableObjectVersion, DurableObjectVersionRecord, DurableOperationContext, DurableOutboxBatch,
@@ -102,14 +102,16 @@ pub const MAX_OUTBOX_LEASE_MILLIS: u64 = 5 * 60 * 1_000;
 /// design note on the `MAX_TRANSACTION_MANIFEST_ENTRIES`/
 /// `MAX_DURABLE_OBJECT_READS` envelope.
 const MAX_AUTHENTICATED_OBJECT_READS: usize = 32;
-/// Per-object inline body bound applied before any hashing work.
+/// Per-object body bound applied before any hashing or decode work, to both
+/// an inline body and a body fetched from a `BlobStore`.
 ///
 /// Pre-activation admission budget, not a measured capacity limit: hashing is
 /// attacker-influenced work over up to `MAX_STATE_VALUE_BYTES` (32 MiB) per
 /// entry times the `MAX_AUTHENTICATED_OBJECT_READS` fan-out. Raising this
 /// bound requires capacity evidence and a decision record.
 pub const MAX_AUTHENTICATED_OBJECT_BODY_BYTES: usize = 1024 * 1024;
-/// Aggregate inline body budget for one authenticated invocation.
+/// Aggregate body budget for one authenticated invocation, shared by every
+/// inline and blob-fetched body loaded in it.
 ///
 /// Pre-activation admission budget: bounds worst-case per-request hashing
 /// work to 8 MiB, below the 16 MiB HTTP body limit already accepted by
@@ -325,10 +327,22 @@ pub enum NodeCoreError {
         /// Object identifier.
         object_id: ObjectId,
     },
-    /// A manifest entry resolved to a blob-backed payload this slice cannot read.
-    ObjectBodyUnavailable {
+    /// A blob-backed payload's content digest was absent from the supplied
+    /// `BlobStore`.
+    ObjectBlobMissing {
         /// Object identifier.
         object_id: ObjectId,
+        /// Content digest that could not be found.
+        blob_digest: Digest32,
+    },
+    /// A blob-backed payload's fetched bytes did not hash to its own
+    /// `blob_digest`, independent of the separate `ObjectBodyDigestMismatch`
+    /// check against the immutable version record's `digest`.
+    ObjectBlobDigestMismatch {
+        /// Object identifier.
+        object_id: ObjectId,
+        /// Content digest the fetched bytes disagreed with.
+        blob_digest: Digest32,
     },
     /// An authenticated transaction declared more object accesses than the
     /// pre-activation resource bound.
@@ -386,13 +400,16 @@ pub enum NodeCoreError {
         /// Object identifier.
         object_id: ObjectId,
     },
-    /// One inline body exceeded the pre-activation verification bound.
+    /// One object body — inline or fetched from a blob store — exceeded the
+    /// pre-activation per-object bound, or the running aggregate total of
+    /// every body (inline and blob-fetched) loaded so far in this invocation
+    /// exceeded the pre-activation aggregate bound.
     ObjectBodyTooLarge {
         /// Object identifier.
         object_id: ObjectId,
-        /// Actual inline body length in bytes.
+        /// Actual body length, or running aggregate total, in bytes.
         actual: usize,
-        /// Maximum accepted inline body length in bytes.
+        /// Maximum accepted per-object or aggregate length in bytes.
         maximum: usize,
     },
     /// Deterministic execution returned two effects for the same object.
@@ -862,9 +879,20 @@ impl fmt::Display for NodeCoreError {
                 f,
                 "object {object_id} owner kind is not supported by this slice"
             ),
-            Self::ObjectBodyUnavailable { object_id } => {
-                write!(f, "object {object_id} payload is not locally available")
-            }
+            Self::ObjectBlobMissing {
+                object_id,
+                blob_digest,
+            } => write!(
+                f,
+                "object {object_id} blob payload {blob_digest} is absent from blob storage"
+            ),
+            Self::ObjectBlobDigestMismatch {
+                object_id,
+                blob_digest,
+            } => write!(
+                f,
+                "object {object_id} fetched blob bytes do not hash to {blob_digest}"
+            ),
             Self::ObjectManifestTooLarge { count, maximum } => write!(
                 f,
                 "authenticated object manifest has {count} entries, maximum is {maximum}"
@@ -909,7 +937,7 @@ impl fmt::Display for NodeCoreError {
                 maximum,
             } => write!(
                 f,
-                "object {object_id} inline body is {actual} bytes, maximum is {maximum}"
+                "object {object_id} body or aggregate body total is {actual} bytes, maximum is {maximum}"
             ),
             Self::DuplicateObjectEffect { object_id } => {
                 write!(
@@ -3110,6 +3138,10 @@ where
 /// transition. New application state, the receipt, and any ordered outbox are
 /// then submitted as one structured invocation. Output is never released for a
 /// rejected or indeterminate commit.
+///
+/// This entrypoint never declares an authenticated object dispatch, so it
+/// never loads or fetches an object body and takes no `BlobStore` component:
+/// only the authenticated entrypoints, which always declare a dispatch, do.
 pub fn handle_resolved_durable_idempotent_event<S, M>(
     store: &S,
     context: &DurableOperationContext,
@@ -3127,7 +3159,7 @@ where
     let plan = machine.access_plan(&event)?;
     let domain = placement.resolve_domain(event.epoch(), plan.accesses().len())?;
     let output = handle_durable_idempotent_event_with_plan(
-        store, context, domain, resolver, event, machine, plan, None, None, None, None,
+        None, store, context, domain, resolver, event, machine, plan, None, None, None, None,
     )?;
     Ok(ResolvedNodeOutput::new(domain, output))
 }
@@ -3147,11 +3179,14 @@ where
 /// must resolve, through its exact current head and immutable version, to a
 /// typed object whose owner is that sender's address or is immutable, and the
 /// resulting head-read assertions commit atomically alongside everything
-/// else. This established entrypoint remains read-only; `Write`/`Consume`,
-/// shared/system owners, and blob payloads fail closed rather than silently
-/// downgrade. Use the explicit owned-effects entrypoint for the bounded MVP
-/// mutation surface.
-pub fn handle_authenticated_resolved_durable_submit_transaction<S, M>(
+/// else. A blob-backed entry is fetched from `blob_store` and independently
+/// verified exactly like [`load_and_authorize_objects`] does for every other
+/// authenticated entrypoint. This established entrypoint remains read-only;
+/// `Write`/`Consume` and shared/system owners fail closed rather than
+/// silently downgrade. Use the explicit owned-effects entrypoint for the
+/// bounded MVP mutation surface.
+pub fn handle_authenticated_resolved_durable_submit_transaction<S, B, M>(
+    blob_store: &B,
     store: &S,
     context: &DurableOperationContext,
     resolver: &HashSuiteResolver,
@@ -3160,9 +3195,11 @@ pub fn handle_authenticated_resolved_durable_submit_transaction<S, M>(
 ) -> Result<ResolvedNodeOutput, NodeCoreError>
 where
     S: StructuredDurableDomainStateStore,
+    B: BlobStore,
     M: TransactionalNodeStateMachine,
 {
     handle_authenticated_submit_transaction_with_policy(
+        blob_store,
         store,
         context,
         resolver,
@@ -3179,9 +3216,14 @@ where
 /// `created_checkpoint` is trusted node composition, never request input. The
 /// caller must derive it from its already-validated chain progress. Node-core
 /// rejects a value lower than the previous immutable object's checkpoint.
-/// Create, shared/system ownership, immutable mutations, and blob bodies remain
-/// unsupported and fail closed.
-pub fn handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects<S, M>(
+/// Create, shared/system ownership, and immutable mutations remain unsupported
+/// and fail closed. A declared `Write`/`Consume` access may read a
+/// blob-backed previous version (fetched and verified through `blob_store`
+/// exactly like the read-only entrypoint), but every new immutable version
+/// this entrypoint commits is always inline: blob upload/publication of a new
+/// version remains unsupported and fail closed.
+pub fn handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects<S, B, M>(
+    blob_store: &B,
     store: &S,
     context: &DurableOperationContext,
     resolver: &HashSuiteResolver,
@@ -3191,9 +3233,11 @@ pub fn handle_authenticated_resolved_durable_submit_transaction_with_owned_objec
 ) -> Result<ResolvedNodeOutput, NodeCoreError>
 where
     S: StructuredDurableDomainStateStore,
+    B: BlobStore,
     M: TransactionalNodeStateMachine,
 {
     handle_authenticated_submit_transaction_with_policy(
+        blob_store,
         store,
         context,
         resolver,
@@ -3755,14 +3799,19 @@ struct ResolvedPreinstalledAuthorization<'a> {
 /// An additive `native_http::preinstalled_wasm_structured_durable_router`
 /// wires this entrypoint over HTTP (see `ARCHITECTURE.md` DR-0080);
 /// `native_http::structured_durable_router` remains on the read-only
-/// entrypoint. Create, Shared/System ownership, blob bodies, validator/
-/// certificate fee distribution, production gas calibration, and production
-/// economics remain unimplemented and fail closed or are simply not reachable
-/// from this MVP slice.
+/// entrypoint. A declared access may read a blob-backed previous version
+/// (fetched and verified through `blob_store`), but every new immutable
+/// version this entrypoint commits is always inline: blob upload/publication
+/// of a new version remains unsupported and fail closed. Create,
+/// Shared/System ownership, validator/certificate fee distribution,
+/// production gas calibration, and production economics remain unimplemented
+/// and fail closed or are simply not reachable from this MVP slice.
 #[allow(clippy::too_many_arguments)]
 pub fn handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution<
     S,
+    B,
 >(
+    blob_store: &B,
     store: &S,
     context: &DurableOperationContext,
     resolver: &HashSuiteResolver,
@@ -3774,6 +3823,7 @@ pub fn handle_authenticated_resolved_durable_submit_transaction_with_preinstalle
 ) -> Result<ResolvedNodeOutput, NodeCoreError>
 where
     S: StructuredDurableDomainStateStore,
+    B: BlobStore,
 {
     let dispatch = AuthenticatedObjectDispatch::from_authenticated_transaction(
         &submission.transaction,
@@ -3814,6 +3864,7 @@ where
     };
     let plan = machine.access_plan(&event)?;
     let output = handle_durable_idempotent_event_with_plan(
+        Some(blob_store),
         store,
         context,
         domain,
@@ -3830,7 +3881,8 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_authenticated_submit_transaction_with_policy<S, M>(
+fn handle_authenticated_submit_transaction_with_policy<S, B, M>(
+    blob_store: &B,
     store: &S,
     context: &DurableOperationContext,
     resolver: &HashSuiteResolver,
@@ -3840,6 +3892,7 @@ fn handle_authenticated_submit_transaction_with_policy<S, M>(
 ) -> Result<ResolvedNodeOutput, NodeCoreError>
 where
     S: StructuredDurableDomainStateStore,
+    B: BlobStore,
     M: TransactionalNodeStateMachine,
 {
     // This shared read-only/generic-owned-effects entrypoint has no fee
@@ -3873,6 +3926,7 @@ where
         committed_fee_policy: _,
     } = submission;
     let output = handle_durable_idempotent_event_with_plan(
+        Some(blob_store),
         store,
         context,
         domain,
@@ -3898,6 +3952,7 @@ struct PendingSenderNonceWrite {
 
 #[allow(clippy::too_many_arguments)]
 fn handle_durable_idempotent_event_with_plan<S, M>(
+    blob_store: Option<&dyn BlobStore>,
     store: &S,
     context: &DurableOperationContext,
     domain: AtomicityDomainId,
@@ -4027,15 +4082,27 @@ where
     // path supplies verified typed object inputs to the pure transition;
     // generic handlers always supply an empty object slice.
     let loaded_objects: LoadedAuthenticatedObjects = match &dispatch {
-        Some(dispatch) => load_and_authorize_objects(
-            store,
-            context,
-            domain,
-            event.chain_id(),
-            dispatch,
-            preinstalled_authorization.as_ref(),
-            treasury_object_id,
-        )?,
+        Some(dispatch) => {
+            // Every caller that ever constructs `Some(dispatch)` also
+            // supplies a blob store (see `handle_authenticated_submit_transaction_with_policy`
+            // and the preinstalled-WASM entrypoint); the fully generic,
+            // never-dispatching idempotent path always passes `dispatch:
+            // None` and therefore never reaches this branch. Absence here is
+            // an internal composition bug, not reachable external input.
+            let blob_store = blob_store.ok_or(NodeCoreError::PersistenceInvariant(
+                "authenticated object dispatch requires a blob store",
+            ))?;
+            load_and_authorize_objects(
+                store,
+                blob_store,
+                context,
+                domain,
+                event.chain_id(),
+                dispatch,
+                preinstalled_authorization.as_ref(),
+                treasury_object_id,
+            )?
+        }
         None => LoadedAuthenticatedObjects::default(),
     };
     // Give the preinstalled machine its verified, loaded treasury object (if
@@ -4162,6 +4229,70 @@ where
     }
 }
 
+/// One object version's canonical body and typed object, either already
+/// inline in the immutable version record or fetched and independently
+/// verified from content-addressed blob storage.
+enum LoadedObjectBody<'a> {
+    /// Existing canonical bytes stored directly in the version row.
+    Inline(&'a DurableInlineObject),
+    /// Canonical bytes fetched from `blob_store` and already independently
+    /// verified against the payload's `blob_digest` before this value is
+    /// constructed.
+    Blob { bytes: Vec<u8>, object: Object },
+}
+
+impl LoadedObjectBody<'_> {
+    fn canonical_bytes(&self) -> &[u8] {
+        match self {
+            Self::Inline(inline) => inline.canonical_bytes(),
+            Self::Blob { bytes, .. } => bytes,
+        }
+    }
+
+    fn object(&self) -> &Object {
+        match self {
+            Self::Inline(inline) => inline.object(),
+            Self::Blob { object, .. } => object,
+        }
+    }
+}
+
+/// Bounds one object body at the per-object limit and folds it into the
+/// running aggregate total, bounding that at the aggregate limit. Shared by
+/// the inline and blob-fetched paths so both budgets are enforced exactly
+/// once per object, at the point each body's bytes first become available —
+/// for a blob body, that is before its own digest is verified or it is
+/// decoded.
+fn accumulate_authenticated_body_bytes(
+    total_body_bytes: usize,
+    object_id: ObjectId,
+    body_length: usize,
+) -> Result<usize, NodeCoreError> {
+    if body_length > MAX_AUTHENTICATED_OBJECT_BODY_BYTES {
+        return Err(NodeCoreError::ObjectBodyTooLarge {
+            object_id,
+            actual: body_length,
+            maximum: MAX_AUTHENTICATED_OBJECT_BODY_BYTES,
+        });
+    }
+    let total_body_bytes =
+        total_body_bytes
+            .checked_add(body_length)
+            .ok_or(NodeCoreError::ObjectBodyTooLarge {
+                object_id,
+                actual: usize::MAX,
+                maximum: MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES,
+            })?;
+    if total_body_bytes > MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES {
+        return Err(NodeCoreError::ObjectBodyTooLarge {
+            object_id,
+            actual: total_body_bytes,
+            maximum: MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES,
+        });
+    }
+    Ok(total_body_bytes)
+}
+
 /// Loads and authorizes every entry in `dispatch.accesses` against
 /// `dispatch.authority`, returning one exact [`runtime::DurableObjectHeadRead`] per
 /// entry in the same signed manifest declaration order. The runtime durable
@@ -4170,23 +4301,38 @@ where
 /// Every check fails closed:
 ///
 /// * an absent or tombstoned head, a version/digest disagreement with the
-///   signed reference, a blob-backed payload, or an unauthorized owner all
-///   reject before any assertion is recorded;
+///   signed reference, or an unauthorized owner all reject before any
+///   assertion is recorded;
 /// * a current head that points at a missing or disagreeing immutable
-///   version record, or an inline object that disagrees with its own version
+///   version record, or a decoded object that disagrees with its own version
 ///   record, is treated as storage corruption distinct from authorization
 ///   failure;
 /// * the record's own stored provenance must name the trusted event `chain_id`
 ///   — a mismatch means a misbound namespace, a cross-chain body transplant,
-///   or adapter corruption, never a legitimate historical object;
+///   or adapter corruption, never a legitimate historical object. This is
+///   checked from the record header alone, before a blob-backed payload is
+///   ever fetched from `blob_store`;
+/// * a blob-backed payload is fetched from `blob_store` only after the
+///   provenance check above; a `None` result is a typed missing-blob error
+///   and a [`RuntimeError`] from the store is a typed runtime/storage error.
+///   Fetched bytes are bounded at the same per-object limit as an inline body
+///   before either digest is verified or the body is decoded. The payload's
+///   own `blob_digest` is independently verified against the exact fetched
+///   bytes with [`hashing::verify_digest`] and the record's stored
+///   chain/protocol-version provenance before [`objects::decode_object`]
+///   ever runs;
 /// * this node independently recomputes the object digest from the record's
 ///   own stored provenance and canonical body using [`hashing::verify_digest`],
 ///   which selects the algorithm recorded self-describingly in the digest
 ///   itself. It never uses the reader's epoch-selected hash suite, which
 ///   would misjudge a legitimate object created under a different suite or
-///   protocol version; inline bodies are bounded before hashing.
+///   protocol version; every body (inline or blob-fetched) is bounded before
+///   hashing, and an unsupported digest algorithm fails closed rather than
+///   silently skipping verification.
+#[allow(clippy::too_many_arguments)]
 fn load_and_authorize_objects<S>(
     store: &S,
+    blob_store: &dyn BlobStore,
     context: &DurableOperationContext,
     domain: AtomicityDomainId,
     chain_id: &ChainId,
@@ -4239,13 +4385,66 @@ where
             return Err(NodeCoreError::ObjectRecordMismatch { object_id });
         }
 
-        let inline: &DurableInlineObject = match record.payload() {
-            DurableObjectPayload::BlobReference(_) => {
-                return Err(NodeCoreError::ObjectBodyUnavailable { object_id });
+        // Objects never migrate chains: the event chain is already validated
+        // trusted input, so a mismatch here means a misbound namespace, a
+        // cross-chain body transplant, or adapter corruption, never a
+        // legitimate object. No equivalent check exists for the recorded
+        // protocol version: a legitimately older object must still verify.
+        // Checked from the record header alone, before any blob-store I/O,
+        // so a misbound namespace never spends a blob fetch.
+        if record.provenance().chain_id() != chain_id {
+            return Err(NodeCoreError::ObjectProvenanceMismatch { object_id });
+        }
+
+        // Loads the canonical object body, either already inline or fetched
+        // and independently verified from content-addressed blob storage.
+        // Bytes are bounded at both the per-object and running-aggregate
+        // limits before either digest is verified or the body is decoded —
+        // for a blob body that bound runs immediately after the fetch, since
+        // hashing and decoding are otherwise the first things that would
+        // touch attacker-influenced bytes.
+        let loaded_body: LoadedObjectBody<'_> = match record.payload() {
+            DurableObjectPayload::Inline(inline) => LoadedObjectBody::Inline(inline),
+            DurableObjectPayload::BlobReference(blob_digest) => {
+                let blob_digest: Digest32 = *blob_digest;
+                let bytes: Vec<u8> = blob_store
+                    .get_blob(&blob_digest)
+                    .map_err(NodeCoreError::Runtime)?
+                    .ok_or(NodeCoreError::ObjectBlobMissing {
+                        object_id,
+                        blob_digest,
+                    })?;
+                total_body_bytes =
+                    accumulate_authenticated_body_bytes(total_body_bytes, object_id, bytes.len())?;
+                let blob_verified: bool = hashing::verify_digest(
+                    &blob_digest,
+                    HashPurpose::Object,
+                    record.provenance().protocol_version(),
+                    record.provenance().chain_id(),
+                    &bytes,
+                )
+                .map_err(|error| match error {
+                    HashingError::UnsupportedAlgorithm(algorithm) => {
+                        NodeCoreError::ObjectDigestUnverifiable {
+                            object_id,
+                            algorithm,
+                        }
+                    }
+                    other => NodeCoreError::Hashing(other),
+                })?;
+                if !blob_verified {
+                    return Err(NodeCoreError::ObjectBlobDigestMismatch {
+                        object_id,
+                        blob_digest,
+                    });
+                }
+                let object: Object = decode_object(&bytes)
+                    .map_err(DurableInvocationError::from)
+                    .map_err(NodeCoreError::from)?;
+                LoadedObjectBody::Blob { bytes, object }
             }
-            DurableObjectPayload::Inline(inline) => inline,
         };
-        let object: &Object = inline.object();
+        let object: &Object = loaded_body.object();
         if object.id != object_id
             || object.version != access.object_ref.version
             || record.schema_version() != object.schema_version
@@ -4253,37 +4452,18 @@ where
             return Err(NodeCoreError::ObjectRecordMismatch { object_id });
         }
 
-        // Objects never migrate chains: the event chain is already validated
-        // trusted input, so a mismatch here means a misbound namespace, a
-        // cross-chain body transplant, or adapter corruption, never a
-        // legitimate object. No equivalent check exists for the recorded
-        // protocol version: a legitimately older object must still verify.
-        if record.provenance().chain_id() != chain_id {
-            return Err(NodeCoreError::ObjectProvenanceMismatch { object_id });
-        }
-
-        let body_length: usize = inline.canonical_bytes().len();
-        if body_length > MAX_AUTHENTICATED_OBJECT_BODY_BYTES {
-            return Err(NodeCoreError::ObjectBodyTooLarge {
+        // A blob body was already bounded and folded into the aggregate
+        // above, before its digest/decode; re-running this here would
+        // double-count it. An inline body's bytes were already available
+        // (no I/O, digest, or decode precedes this point for it), so its
+        // bound/aggregate check keeps its original position, unaffected by
+        // the blob-only reordering above.
+        if matches!(record.payload(), DurableObjectPayload::Inline(_)) {
+            total_body_bytes = accumulate_authenticated_body_bytes(
+                total_body_bytes,
                 object_id,
-                actual: body_length,
-                maximum: MAX_AUTHENTICATED_OBJECT_BODY_BYTES,
-            });
-        }
-        total_body_bytes =
-            total_body_bytes
-                .checked_add(body_length)
-                .ok_or(NodeCoreError::ObjectBodyTooLarge {
-                    object_id,
-                    actual: usize::MAX,
-                    maximum: MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES,
-                })?;
-        if total_body_bytes > MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES {
-            return Err(NodeCoreError::ObjectBodyTooLarge {
-                object_id,
-                actual: total_body_bytes,
-                maximum: MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES,
-            });
+                loaded_body.canonical_bytes().len(),
+            )?;
         }
 
         let verified: bool = hashing::verify_digest(
@@ -4291,7 +4471,7 @@ where
             HashPurpose::Object,
             record.provenance().protocol_version(),
             record.provenance().chain_id(),
-            inline.canonical_bytes(),
+            loaded_body.canonical_bytes(),
         )
         .map_err(|error| match error {
             HashingError::UnsupportedAlgorithm(algorithm) => {
@@ -5040,8 +5220,8 @@ mod tests {
     use protocol_types::{HashSuite, HashSuiteId, HashSuiteSchedule, SignatureSchemeId};
     use runtime::{
         DurableDomainStateStore, DurableObjectProvenance, DurableObjectRoutingProjection,
-        MemoryDurableStateStore, MemoryRuntime, StateRevision, StateStore, StorageCorrelationId,
-        StorageDeadline, TransactionalStateStore, WriterFenceGeneration,
+        MemoryBlobStore, MemoryDurableStateStore, MemoryRuntime, StateRevision, StateStore,
+        StorageCorrelationId, StorageDeadline, TransactionalStateStore, WriterFenceGeneration,
     };
     use std::sync::{
         Arc, Barrier, Mutex,
@@ -5869,6 +6049,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
         let resolved = handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &resolver("sunrise-test"),
@@ -5936,7 +6117,12 @@ mod tests {
             &protocol_config,
         );
         handle_authenticated_resolved_durable_submit_transaction(
-            &store, &context, &resolver, first, &machine,
+            &MemoryBlobStore::default(),
+            &store,
+            &context,
+            &resolver,
+            first,
+            &machine,
         )
         .unwrap();
 
@@ -5950,7 +6136,12 @@ mod tests {
             &protocol_config,
         );
         handle_authenticated_resolved_durable_submit_transaction(
-            &store, &context, &resolver, second, &machine,
+            &MemoryBlobStore::default(),
+            &store,
+            &context,
+            &resolver,
+            second,
+            &machine,
         )
         .unwrap();
 
@@ -5998,7 +6189,12 @@ mod tests {
                 &protocol_config,
             );
             handle_authenticated_resolved_durable_submit_transaction(
-                &store, &context, &resolver, submission, &machine,
+                &MemoryBlobStore::default(),
+                &store,
+                &context,
+                &resolver,
+                submission,
+                &machine,
             )
             .unwrap();
         }
@@ -6057,6 +6253,7 @@ mod tests {
             let resolver = resolver.clone();
             std::thread::spawn(move || {
                 handle_authenticated_resolved_durable_submit_transaction(
+                    &MemoryBlobStore::default(),
                     store.as_ref(),
                     &context,
                     &resolver,
@@ -6070,6 +6267,7 @@ mod tests {
             let machine = Arc::clone(&machine);
             std::thread::spawn(move || {
                 handle_authenticated_resolved_durable_submit_transaction(
+                    &MemoryBlobStore::default(),
                     store.as_ref(),
                     &context,
                     &resolver,
@@ -6170,6 +6368,7 @@ mod tests {
             &protocol_config,
         );
         handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             store.as_ref(),
             &context,
             &resolver,
@@ -6240,6 +6439,7 @@ mod tests {
             &protocol_config,
         );
         let error = handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &resolver("sunrise-test"),
@@ -6288,6 +6488,7 @@ mod tests {
             &protocol_config,
         );
         let first = handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &context,
             &resolver,
@@ -6306,6 +6507,7 @@ mod tests {
             &protocol_config,
         );
         let replay = handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &context,
             &resolver,
@@ -6347,6 +6549,7 @@ mod tests {
             &protocol_config,
         );
         let error = handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &resolver("sunrise-test"),
@@ -6390,6 +6593,7 @@ mod tests {
             &protocol_config,
         );
         let error = handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &resolver("sunrise-test"),
@@ -6431,6 +6635,7 @@ mod tests {
             &protocol_config,
         );
         let error = handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &resolver("sunrise-test"),
@@ -6470,6 +6675,7 @@ mod tests {
         );
 
         let error = handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &resolver("sunrise-test"),
@@ -6515,6 +6721,7 @@ mod tests {
             &protocol_config,
         );
         let error = handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &resolver("sunrise-test"),
@@ -6693,6 +6900,7 @@ mod tests {
             &protocol_config,
         );
         let resolved = handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &context,
             &resolver("sunrise-test"),
@@ -6753,6 +6961,7 @@ mod tests {
             &protocol_config,
         );
         let error = handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &context,
             &resolver,
@@ -6782,7 +6991,12 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
         handle_authenticated_resolved_durable_submit_transaction(
-            &store, &context, &resolver, retry, &machine,
+            &MemoryBlobStore::default(),
+            &store,
+            &context,
+            &resolver,
+            retry,
+            &machine,
         )
         .unwrap();
     }
@@ -6840,6 +7054,7 @@ mod tests {
             &protocol_config,
         );
         let error = handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &resolver("sunrise-test"),
@@ -7303,6 +7518,105 @@ mod tests {
         )
     }
 
+    /// A [`BlobStore`] test double that counts every [`BlobStore::get_blob`]
+    /// call and can be scripted to fail closed with a fixed [`RuntimeError`],
+    /// so tests can prove ordering (a blob fetch never happens before an
+    /// earlier fail-closed check) as well as exact digest-keyed content.
+    #[derive(Clone, Default)]
+    struct InstrumentedBlobStore {
+        blobs: Arc<Mutex<BTreeMap<Digest32, Vec<u8>>>>,
+        get_calls: Arc<AtomicUsize>,
+        fail_with: Arc<Mutex<Option<RuntimeError>>>,
+    }
+
+    impl InstrumentedBlobStore {
+        fn insert(&self, digest: Digest32, bytes: Vec<u8>) {
+            self.blobs.lock().unwrap().insert(digest, bytes);
+        }
+
+        fn fail_with(&self, error: RuntimeError) {
+            *self.fail_with.lock().unwrap() = Some(error);
+        }
+
+        fn get_calls(&self) -> usize {
+            self.get_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl BlobStore for InstrumentedBlobStore {
+        fn put_blob(&self, digest: Digest32, bytes: Vec<u8>) -> Result<(), RuntimeError> {
+            self.insert(digest, bytes);
+            Ok(())
+        }
+
+        fn get_blob(&self, digest: &Digest32) -> Result<Option<Vec<u8>>, RuntimeError> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = self.fail_with.lock().unwrap().clone() {
+                return Err(error);
+            }
+            Ok(self.blobs.lock().unwrap().get(digest).cloned())
+        }
+    }
+
+    /// Preloads a blob-backed current object version: canonical bytes live
+    /// only in `blob_store`, keyed under the returned `blob_digest`, exactly
+    /// like a production content-addressed store. Both the immutable
+    /// version's own `digest` (checked against the head and independently
+    /// re-verified against the fetched bytes) and the payload's separate
+    /// `blob_digest` (independently verified against the same fetched bytes
+    /// first) are computed from the identical canonical bytes, matching the
+    /// non-adversarial case; individual tests overwrite one or the other to
+    /// exercise a specific corruption.
+    fn preload_blob_object(
+        store: &ScriptedDurableStore,
+        blob_store: &InstrumentedBlobStore,
+        chain: &str,
+        object_id: ObjectId,
+        owner: Owner,
+        byte: u8,
+    ) -> (ObjectRef, DurableObjectHead, Digest32) {
+        let object: Object = test_object(object_id, 1, owner.clone(), byte);
+        let canonical_bytes: Vec<u8> = encode_object(&object).unwrap();
+        let chain_id = ChainId::new(chain).unwrap();
+        let protocol_version = ProtocolVersion::new(3);
+        let content_digest = BuiltinHashFunction::new(HashAlgorithmId::Sha2_256)
+            .hash(
+                HashPurpose::Object,
+                protocol_version,
+                &chain_id,
+                &canonical_bytes,
+            )
+            .unwrap();
+        blob_store.insert(content_digest, canonical_bytes);
+        let provenance = DurableObjectProvenance::new(chain_id, protocol_version);
+        let record = DurableObjectVersionRecord::from_blob_reference(
+            object_id,
+            DurableObjectVersion::FIRST,
+            content_digest,
+            object.schema_version,
+            provenance,
+            1,
+            content_digest,
+        );
+        let head = DurableObjectHead::Current {
+            head_revision: runtime::ObjectHeadRevision::FIRST,
+            object_version: DurableObjectVersion::FIRST,
+            digest: content_digest,
+            owner_projection: DurableObjectOwnerProjection::from_owner(owner).unwrap(),
+            routing_projection: DurableObjectRoutingProjection::default(),
+        };
+        store.preload_object(object_id, head.clone(), Some(record));
+        (
+            ObjectRef {
+                id: object_id,
+                version: 1,
+                digest: content_digest,
+            },
+            head,
+            content_digest,
+        )
+    }
+
     fn commit_memory_inline_object(
         store: &MemoryDurableStateStore,
         context: &DurableOperationContext,
@@ -7522,6 +7836,7 @@ mod tests {
         };
 
         handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &resolver("sunrise-test"),
@@ -7909,29 +8224,31 @@ mod tests {
                 false,
             ),
             (
-                "blob body unavailable",
+                "blob payload missing from blob store",
                 Box::new(move || {
                     let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
                     let object_id = ObjectId::new([0x44; 32]);
-                    let blob_digest: Digest32 =
+                    let record_digest: Digest32 =
                         Digest32::new(HashAlgorithmId::Sha2_256, [0x45; 32]);
+                    let blob_digest: Digest32 =
+                        Digest32::new(HashAlgorithmId::Sha3_256, [0x46; 32]);
                     let blob_record: DurableObjectVersionRecord =
                         DurableObjectVersionRecord::from_blob_reference(
                             object_id,
                             DurableObjectVersion::FIRST,
-                            blob_digest,
+                            record_digest,
                             1,
                             DurableObjectProvenance::new(
                                 ChainId::new("sunrise-test").unwrap(),
                                 ProtocolVersion::new(3),
                             ),
                             1,
-                            Digest32::new(HashAlgorithmId::Sha3_256, [0x46; 32]),
+                            blob_digest,
                         );
                     let blob_head: DurableObjectHead = DurableObjectHead::Current {
                         head_revision: runtime::ObjectHeadRevision::FIRST,
                         object_version: DurableObjectVersion::FIRST,
-                        digest: blob_digest,
+                        digest: record_digest,
                         owner_projection: DurableObjectOwnerProjection::default(),
                         routing_projection: DurableObjectRoutingProjection::default(),
                     };
@@ -7940,14 +8257,17 @@ mod tests {
                         object_ref: ObjectRef {
                             id: object_id,
                             version: 1,
-                            digest: blob_digest,
+                            digest: record_digest,
                         },
                         mode: AccessMode::Read,
                     }]);
                     (
                         store,
                         manifest,
-                        NodeCoreError::ObjectBodyUnavailable { object_id },
+                        NodeCoreError::ObjectBlobMissing {
+                            object_id,
+                            blob_digest,
+                        },
                     )
                 }),
                 false,
@@ -8225,6 +8545,7 @@ mod tests {
             };
             let request_byte = 0xD2u8.wrapping_add(u8::try_from(index).unwrap());
             let error = handle_authenticated_resolved_durable_submit_transaction(
+                &MemoryBlobStore::default(),
                 &store,
                 &durable_context(),
                 &resolver("sunrise-test"),
@@ -8252,6 +8573,1028 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A signed read-only access naming a blob-backed object is fetched from
+    /// the supplied `BlobStore`, independently verified, decoded, and
+    /// committed exactly like an inline object.
+    #[test]
+    fn authenticated_read_only_blob_reference_is_fetched_verified_and_commits() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let blob_store = InstrumentedBlobStore::default();
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xB0);
+        let signing_key = dev_signing_key(0xB0);
+        let sender: Address = dev_sender_address(&signing_key);
+        let object_id = ObjectId::new([0x70; 32]);
+        let (object_ref, head, blob_digest) = preload_blob_object(
+            &store,
+            &blob_store,
+            "sunrise-test",
+            object_id,
+            Owner::Address(sender),
+            0x70,
+        );
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref,
+            mode: AccessMode::Read,
+        }]);
+        let submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xB0),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        handle_authenticated_resolved_durable_submit_transaction(
+            &blob_store,
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &machine,
+        )
+        .unwrap();
+
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(blob_store.get_calls(), 1);
+        let commits = store.commits.lock().unwrap();
+        let object_changes: &DurableObjectChanges = commits[0].object_changes();
+        assert!(object_changes.mutations().is_empty());
+        assert_eq!(
+            object_changes.reads(),
+            &[runtime::DurableObjectHeadRead::new(object_id, head)]
+        );
+        let _ = blob_digest;
+    }
+
+    /// A declared `Write` access may read a blob-backed previous version: the
+    /// owned-effects entrypoint fetches and verifies it exactly like the
+    /// read-only entrypoint, and the new immutable version it commits is
+    /// always inline (blob upload/publication of a new version is not
+    /// implemented). The preinstalled-WASM entrypoint shares the identical
+    /// `load_and_authorize_objects` loader and is not separately exercised
+    /// here.
+    #[test]
+    fn authenticated_owned_write_updates_blob_backed_previous_version_to_inline() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let blob_store = InstrumentedBlobStore::default();
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xB1);
+        let signing_key = dev_signing_key(0xB1);
+        let sender: Address = dev_sender_address(&signing_key);
+        let object_id = ObjectId::new([0x71; 32]);
+        let (object_ref, _head, _blob_digest) = preload_blob_object(
+            &store,
+            &blob_store,
+            "sunrise-test",
+            object_id,
+            Owner::Address(sender),
+            0x71,
+        );
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref,
+            mode: AccessMode::Write,
+        }]);
+        let submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xB1),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        let machine = OwnedObjectEffectMachine {
+            expected_inputs: vec![(object_id, AccessMode::Write)],
+            replacement_byte: 0x72,
+            calls: AtomicUsize::new(0),
+        };
+
+        handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+            &blob_store,
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            2,
+            &machine,
+        )
+        .unwrap();
+
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(blob_store.get_calls(), 1);
+        let commits = store.commits.lock().unwrap();
+        let object_changes: &DurableObjectChanges = commits[0].object_changes();
+        assert_eq!(object_changes.mutations().len(), 1);
+        match object_changes.mutations()[0].mutation() {
+            runtime::DurableObjectMutation::Update { version, .. } => {
+                assert!(matches!(version.payload(), DurableObjectPayload::Inline(_)));
+                assert_eq!(version.object_version().get(), 2);
+            }
+            other => panic!("expected an inline Update mutation, got {other:?}"),
+        }
+    }
+
+    /// A [`RuntimeError`] surfaced by the supplied `BlobStore` is a typed
+    /// runtime/storage error, not silently treated as a missing blob.
+    #[test]
+    fn authenticated_object_dispatch_blob_store_runtime_error_is_typed() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let blob_store = InstrumentedBlobStore::default();
+        blob_store.fail_with(RuntimeError::DurableStoreUnavailable);
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xB2);
+        let signing_key = dev_signing_key(0xB2);
+        let sender: Address = dev_sender_address(&signing_key);
+        let object_id = ObjectId::new([0x73; 32]);
+        let (object_ref, ..) = preload_blob_object(
+            &store,
+            &blob_store,
+            "sunrise-test",
+            object_id,
+            Owner::Address(sender),
+            0x73,
+        );
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref,
+            mode: AccessMode::Read,
+        }]);
+        let submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xB2),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &blob_store,
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &machine,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::Runtime(RuntimeError::DurableStoreUnavailable)
+        );
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    /// A blob digest absent from the supplied `BlobStore` is a distinct typed
+    /// missing-blob error.
+    #[test]
+    fn authenticated_object_dispatch_missing_blob_is_typed() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let blob_store = InstrumentedBlobStore::default();
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xB3);
+        let signing_key = dev_signing_key(0xB3);
+        let sender: Address = dev_sender_address(&signing_key);
+        let object_id = ObjectId::new([0x74; 32]);
+        let (object_ref, head, blob_digest) = preload_blob_object(
+            &store,
+            &blob_store,
+            "sunrise-test",
+            object_id,
+            Owner::Address(sender),
+            0x74,
+        );
+        // The record/head are preloaded, but the blob content itself is
+        // never inserted into `blob_store`.
+        let _ = head;
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref,
+            mode: AccessMode::Read,
+        }]);
+        let submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xB3),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+        let empty_blob_store = InstrumentedBlobStore::default();
+
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &empty_blob_store,
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &machine,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::ObjectBlobMissing {
+                object_id,
+                blob_digest,
+            }
+        );
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+        assert!(store.commits.lock().unwrap().is_empty());
+    }
+
+    /// Fetched blob bytes are bounded at the same per-object limit as an
+    /// inline body before either digest is verified or the body is decoded:
+    /// oversized bytes that are also not a valid canonical `Object` still
+    /// reject as `ObjectBodyTooLarge`, never a decode error, proving the
+    /// bound runs first.
+    #[test]
+    fn authenticated_object_dispatch_oversized_blob_rejects_before_hashing_or_decode() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let blob_store = InstrumentedBlobStore::default();
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xB4);
+        let signing_key = dev_signing_key(0xB4);
+        let sender: Address = dev_sender_address(&signing_key);
+        let object_id = ObjectId::new([0x75; 32]);
+        // Deliberately malformed (not a canonical `Object` encoding) so a
+        // check that ran hashing or decoding first would fail differently.
+        let oversized_bytes: Vec<u8> = vec![0xAB; MAX_AUTHENTICATED_OBJECT_BODY_BYTES + 1];
+        let chain_id = ChainId::new("sunrise-test").unwrap();
+        let protocol_version = ProtocolVersion::new(3);
+        let blob_digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x75; 32]);
+        blob_store.insert(blob_digest, oversized_bytes);
+        let record_digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x76; 32]);
+        let provenance = DurableObjectProvenance::new(chain_id, protocol_version);
+        let record = DurableObjectVersionRecord::from_blob_reference(
+            object_id,
+            DurableObjectVersion::FIRST,
+            record_digest,
+            0,
+            provenance,
+            1,
+            blob_digest,
+        );
+        let head = DurableObjectHead::Current {
+            head_revision: runtime::ObjectHeadRevision::FIRST,
+            object_version: DurableObjectVersion::FIRST,
+            digest: record_digest,
+            owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Address(sender))
+                .unwrap(),
+            routing_projection: DurableObjectRoutingProjection::default(),
+        };
+        store.preload_object(object_id, head, Some(record));
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref: ObjectRef {
+                id: object_id,
+                version: 1,
+                digest: record_digest,
+            },
+            mode: AccessMode::Read,
+        }]);
+        let submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xB4),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &blob_store,
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &machine,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::ObjectBodyTooLarge {
+                object_id,
+                actual: MAX_AUTHENTICATED_OBJECT_BODY_BYTES + 1,
+                maximum: MAX_AUTHENTICATED_OBJECT_BODY_BYTES,
+            }
+        );
+        assert_eq!(blob_store.get_calls(), 1);
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A blob whose fetched bytes do not hash to their own claimed
+    /// `blob_digest` is a distinct typed corruption from
+    /// `ObjectBodyDigestMismatch`, and is caught before `objects::decode_object`
+    /// ever runs (the substituted bytes below are not a valid canonical
+    /// `Object` encoding either).
+    #[test]
+    fn authenticated_object_dispatch_blob_digest_mismatch_is_typed() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let blob_store = InstrumentedBlobStore::default();
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xB5);
+        let signing_key = dev_signing_key(0xB5);
+        let sender: Address = dev_sender_address(&signing_key);
+        let object_id = ObjectId::new([0x77; 32]);
+        let (object_ref, head, blob_digest) = preload_blob_object(
+            &store,
+            &blob_store,
+            "sunrise-test",
+            object_id,
+            Owner::Address(sender),
+            0x77,
+        );
+        // Substitute the stored bytes for something that does not hash to
+        // the payload's own claimed `blob_digest`.
+        blob_store.insert(blob_digest, vec![0xEE; 16]);
+        let _ = head;
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref,
+            mode: AccessMode::Read,
+        }]);
+        let submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xB5),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &blob_store,
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &machine,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            NodeCoreError::ObjectBlobDigestMismatch {
+                object_id,
+                blob_digest,
+            }
+        );
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Fetched blob bytes that are not a valid canonical `Object` encoding,
+    /// but do hash to their own claimed `blob_digest`, fail closed as a
+    /// typed `DurableInvocation` decode error rather than panicking.
+    #[test]
+    fn authenticated_object_dispatch_malformed_blob_bytes_fail_decode() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let blob_store = InstrumentedBlobStore::default();
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xB6);
+        let signing_key = dev_signing_key(0xB6);
+        let sender: Address = dev_sender_address(&signing_key);
+        let object_id = ObjectId::new([0x78; 32]);
+        let garbage: Vec<u8> = vec![0x11, 0x22, 0x33, 0x44];
+        let chain_id = ChainId::new("sunrise-test").unwrap();
+        let protocol_version = ProtocolVersion::new(3);
+        let blob_digest = BuiltinHashFunction::new(HashAlgorithmId::Sha2_256)
+            .hash(HashPurpose::Object, protocol_version, &chain_id, &garbage)
+            .unwrap();
+        blob_store.insert(blob_digest, garbage);
+        let record_digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x79; 32]);
+        let provenance = DurableObjectProvenance::new(chain_id, protocol_version);
+        let record = DurableObjectVersionRecord::from_blob_reference(
+            object_id,
+            DurableObjectVersion::FIRST,
+            record_digest,
+            0,
+            provenance,
+            1,
+            blob_digest,
+        );
+        let head = DurableObjectHead::Current {
+            head_revision: runtime::ObjectHeadRevision::FIRST,
+            object_version: DurableObjectVersion::FIRST,
+            digest: record_digest,
+            owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Address(sender))
+                .unwrap(),
+            routing_projection: DurableObjectRoutingProjection::default(),
+        };
+        store.preload_object(object_id, head, Some(record));
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref: ObjectRef {
+                id: object_id,
+                version: 1,
+                digest: record_digest,
+            },
+            mode: AccessMode::Read,
+        }]);
+        let submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xB6),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &blob_store,
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &machine,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, NodeCoreError::DurableInvocation(_)),
+            "expected a typed decode error, got {error:?}"
+        );
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A blob whose decoded object identity disagrees with the signed
+    /// reference is corruption distinct from a digest mismatch, exactly like
+    /// the existing inline record-mismatch checks.
+    #[test]
+    fn authenticated_object_dispatch_blob_identity_mismatch_is_typed() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let blob_store = InstrumentedBlobStore::default();
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xB7);
+        let signing_key = dev_signing_key(0xB7);
+        let sender: Address = dev_sender_address(&signing_key);
+        let object_id = ObjectId::new([0x7A; 32]);
+        let (object_ref, ..) = preload_blob_object(
+            &store,
+            &blob_store,
+            "sunrise-test",
+            object_id,
+            Owner::Address(sender),
+            0x7A,
+        );
+        // Overwrite the stored blob with a validly encoded but differently
+        // identified object, still hashing to the same `blob_digest` value
+        // is not possible; instead this proves the identity cross-check
+        // fires once the (different) content is legitimately fetched and
+        // decoded under its own consistent digest.
+        let substituted_object =
+            test_object(ObjectId::new([0x7B; 32]), 1, Owner::Address(sender), 0x7A);
+        let substituted_bytes = encode_object(&substituted_object).unwrap();
+        let chain_id = ChainId::new("sunrise-test").unwrap();
+        let protocol_version = ProtocolVersion::new(3);
+        let substituted_digest = BuiltinHashFunction::new(HashAlgorithmId::Sha2_256)
+            .hash(
+                HashPurpose::Object,
+                protocol_version,
+                &chain_id,
+                &substituted_bytes,
+            )
+            .unwrap();
+        // Re-preload the head/version so the record's own `digest` and
+        // `blob_digest` both consistently name the substituted content,
+        // isolating the identity check from the earlier digest checks.
+        let provenance = DurableObjectProvenance::new(chain_id, protocol_version);
+        let record = DurableObjectVersionRecord::from_blob_reference(
+            object_id,
+            DurableObjectVersion::FIRST,
+            substituted_digest,
+            substituted_object.schema_version,
+            provenance,
+            1,
+            substituted_digest,
+        );
+        let head = DurableObjectHead::Current {
+            head_revision: runtime::ObjectHeadRevision::FIRST,
+            object_version: DurableObjectVersion::FIRST,
+            digest: substituted_digest,
+            owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Address(sender))
+                .unwrap(),
+            routing_projection: DurableObjectRoutingProjection::default(),
+        };
+        store.preload_object(object_id, head, Some(record));
+        blob_store.insert(substituted_digest, substituted_bytes);
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref: ObjectRef {
+                id: object_id,
+                version: 1,
+                digest: substituted_digest,
+            },
+            mode: AccessMode::Read,
+        }]);
+        let _ = object_ref;
+        let submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xB7),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &blob_store,
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &machine,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::ObjectRecordMismatch { object_id });
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Focused corruption cases exercised only after a blob is successfully
+    /// fetched and its own `blob_digest` independently verifies, proving each
+    /// later independent check still fails closed: the record's own `digest`
+    /// re-verified against the same fetched bytes (distinct from the earlier
+    /// `blob_digest` check), the decoded object's `version` disagreeing with
+    /// the signed reference, the decoded object's `schema_version`
+    /// disagreeing with the row, and an unsupported `blob_digest` algorithm.
+    #[test]
+    fn authenticated_object_dispatch_blob_specific_corruption_cases_fail_closed() {
+        struct Case {
+            name: &'static str,
+            object: Object,
+            store_blob: bool,
+            blob_digest: fn(&[u8]) -> Digest32,
+            /// `None` means "compute correctly from the encoded bytes".
+            record_digest: Option<Digest32>,
+            record_schema_version: Option<u32>,
+            declared_version: u64,
+            expected_error: fn(ObjectId) -> NodeCoreError,
+        }
+
+        fn correct_digest(bytes: &[u8]) -> Digest32 {
+            BuiltinHashFunction::new(HashAlgorithmId::Sha2_256)
+                .hash(
+                    HashPurpose::Object,
+                    ProtocolVersion::new(3),
+                    &ChainId::new("sunrise-test").unwrap(),
+                    bytes,
+                )
+                .unwrap()
+        }
+
+        fn unsupported_algorithm_digest(_bytes: &[u8]) -> Digest32 {
+            Digest32::new(HashAlgorithmId::Blake3_256, [0x11; 32])
+        }
+
+        let sender: Address = dev_sender_address(&dev_signing_key(0xC1));
+        let cases = [
+            Case {
+                name: "record digest mismatch after a valid blob_digest",
+                object: test_object(ObjectId::new([0x81; 32]), 1, Owner::Address(sender), 0x81),
+                store_blob: true,
+                blob_digest: correct_digest,
+                record_digest: Some(Digest32::new(HashAlgorithmId::Sha2_256, [0xFF; 32])),
+                record_schema_version: None,
+                declared_version: 1,
+                expected_error: |object_id| NodeCoreError::ObjectBodyDigestMismatch { object_id },
+            },
+            Case {
+                name: "decoded object version mismatch",
+                object: test_object(ObjectId::new([0x82; 32]), 2, Owner::Address(sender), 0x82),
+                store_blob: true,
+                blob_digest: correct_digest,
+                record_digest: None,
+                record_schema_version: None,
+                declared_version: 1,
+                expected_error: |object_id| NodeCoreError::ObjectRecordMismatch { object_id },
+            },
+            Case {
+                name: "decoded object schema mismatch",
+                object: test_object(ObjectId::new([0x83; 32]), 1, Owner::Address(sender), 0x83),
+                store_blob: true,
+                blob_digest: correct_digest,
+                record_digest: None,
+                record_schema_version: Some(0xFFFF_FFFF),
+                declared_version: 1,
+                expected_error: |object_id| NodeCoreError::ObjectRecordMismatch { object_id },
+            },
+            Case {
+                name: "unsupported blob_digest algorithm fails closed",
+                object: test_object(ObjectId::new([0x84; 32]), 1, Owner::Address(sender), 0x84),
+                store_blob: true,
+                blob_digest: unsupported_algorithm_digest,
+                record_digest: None,
+                record_schema_version: None,
+                declared_version: 1,
+                expected_error: |object_id| NodeCoreError::ObjectDigestUnverifiable {
+                    object_id,
+                    algorithm: HashAlgorithmId::Blake3_256,
+                },
+            },
+        ];
+
+        for (index, case) in cases.into_iter().enumerate() {
+            let object_id = case.object.id;
+            let encoded_bytes = encode_object(&case.object).unwrap();
+            let blob_digest = (case.blob_digest)(&encoded_bytes);
+            let record_digest = case
+                .record_digest
+                .unwrap_or_else(|| correct_digest(&encoded_bytes));
+            let schema_version = case
+                .record_schema_version
+                .unwrap_or(case.object.schema_version);
+
+            let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+            let blob_store = InstrumentedBlobStore::default();
+            if case.store_blob {
+                blob_store.insert(blob_digest, encoded_bytes);
+            }
+            let provenance = DurableObjectProvenance::new(
+                ChainId::new("sunrise-test").unwrap(),
+                ProtocolVersion::new(3),
+            );
+            let record = DurableObjectVersionRecord::from_blob_reference(
+                object_id,
+                DurableObjectVersion::FIRST,
+                record_digest,
+                schema_version,
+                provenance,
+                1,
+                blob_digest,
+            );
+            let head = DurableObjectHead::Current {
+                head_revision: runtime::ObjectHeadRevision::FIRST,
+                object_version: DurableObjectVersion::FIRST,
+                digest: record_digest,
+                owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Address(sender))
+                    .unwrap(),
+                routing_projection: DurableObjectRoutingProjection::default(),
+            };
+            store.preload_object(object_id, head, Some(record));
+            let manifest = manifest_with(vec![AccessEntry {
+                object_ref: ObjectRef {
+                    id: object_id,
+                    version: case.declared_version,
+                    digest: record_digest,
+                },
+                mode: AccessMode::Read,
+            }]);
+            let signing_key = dev_signing_key(0xC1);
+            let node_config = config("sunrise-test");
+            let protocol_config = active_protocol_config(0xC1);
+            let submission = authenticated_submission_with_manifest(
+                "sunrise-test",
+                request(0xC1u8.wrapping_add(u8::try_from(index).unwrap())),
+                &signing_key,
+                Epoch::new(7),
+                0,
+                manifest,
+                &node_config,
+                &protocol_config,
+            );
+            let machine = IdempotentMachine {
+                calls: AtomicUsize::new(0),
+            };
+
+            let error = handle_authenticated_resolved_durable_submit_transaction(
+                &blob_store,
+                &store,
+                &durable_context(),
+                &resolver("sunrise-test"),
+                submission,
+                &machine,
+            )
+            .unwrap_err();
+
+            assert_eq!(
+                error,
+                (case.expected_error)(object_id),
+                "case: {}",
+                case.name
+            );
+            assert_eq!(
+                machine.calls.load(Ordering::SeqCst),
+                0,
+                "case: {}",
+                case.name
+            );
+        }
+    }
+
+    /// The version record's stored chain provenance is checked from the
+    /// record header alone, before any blob-store I/O: a cross-chain
+    /// blob-backed record rejects without ever calling `get_blob`.
+    #[test]
+    fn authenticated_object_dispatch_provenance_mismatch_rejects_before_blob_fetch() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let blob_store = InstrumentedBlobStore::default();
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xB8);
+        let signing_key = dev_signing_key(0xB8);
+        let sender: Address = dev_sender_address(&signing_key);
+        let object_id = ObjectId::new([0x7C; 32]);
+        let (object_ref, ..) = preload_blob_object(
+            &store,
+            &blob_store,
+            "sunrise-other-chain",
+            object_id,
+            Owner::Address(sender),
+            0x7C,
+        );
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref,
+            mode: AccessMode::Read,
+        }]);
+        let submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xB8),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &blob_store,
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            &machine,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::ObjectProvenanceMismatch { object_id });
+        assert_eq!(
+            blob_store.get_calls(),
+            0,
+            "provenance mismatch must reject before any blob-store I/O"
+        );
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Exact request replay returns the persisted receipt before any
+    /// `BlobStore` I/O, even when the replayed request's own manifest names a
+    /// blob-backed object.
+    #[test]
+    fn exact_replay_returns_before_blob_store_io() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let first_blob_store = InstrumentedBlobStore::default();
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xB9);
+        let signing_key = dev_signing_key(0xB9);
+        let sender: Address = dev_sender_address(&signing_key);
+        let object_id = ObjectId::new([0x7D; 32]);
+        let (object_ref, ..) = preload_blob_object(
+            &store,
+            &first_blob_store,
+            "sunrise-test",
+            object_id,
+            Owner::Address(sender),
+            0x7D,
+        );
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref,
+            mode: AccessMode::Read,
+        }]);
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        let first_submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xB9),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest.clone(),
+            &node_config,
+            &protocol_config,
+        );
+        handle_authenticated_resolved_durable_submit_transaction(
+            &first_blob_store,
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            first_submission,
+            &machine,
+        )
+        .unwrap();
+        assert_eq!(first_blob_store.get_calls(), 1);
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+
+        // The scripted store's `commit_invocation` does not itself persist
+        // the receipt for later `get_request_receipt` reads, unlike a real
+        // durable adapter; wire the exact committed receipt through so the
+        // second call is a genuine exact replay.
+        let commits = store.commits.lock().unwrap();
+        let committed_receipt = commits[0].receipt().clone();
+        drop(commits);
+        *store.receipt.lock().unwrap() = Some(committed_receipt);
+
+        let replay_blob_store = InstrumentedBlobStore::default();
+        let replay_submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xB9),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        handle_authenticated_resolved_durable_submit_transaction(
+            &replay_blob_store,
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            replay_submission,
+            &machine,
+        )
+        .unwrap();
+
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            replay_blob_store.get_calls(),
+            0,
+            "exact replay must return before any blob-store I/O"
+        );
+        assert_eq!(store.object_head_reads.load(Ordering::SeqCst), 1);
+    }
+
+    /// The aggregate 8 MiB inline/blob body budget is shared: an inline body
+    /// and a blob-fetched body count against the same running total, and the
+    /// bound rejects before the transition runs regardless of which entry
+    /// pushed it over.
+    #[test]
+    fn mixed_inline_and_blob_bodies_share_the_aggregate_bound() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let blob_store = InstrumentedBlobStore::default();
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xBA);
+        let signing_key = dev_signing_key(0xBA);
+        let sender: Address = dev_sender_address(&signing_key);
+        const PER_OBJECT_BYTES: usize = 300_000;
+        const _: () = assert!(PER_OBJECT_BYTES < MAX_AUTHENTICATED_OBJECT_BODY_BYTES);
+        // 30 objects at 300,000 bytes each is 9,000,000 bytes, safely over
+        // the 8 MiB aggregate bound while each individual body stays under
+        // the 1 MiB per-object bound and the 32-entry manifest bound.
+        const OBJECT_COUNT: usize = 30;
+        const _: () = assert!(OBJECT_COUNT <= MAX_AUTHENTICATED_OBJECT_READS);
+        const _: () =
+            assert!(OBJECT_COUNT * PER_OBJECT_BYTES > MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES);
+        let mut entries: Vec<AccessEntry> = Vec::with_capacity(OBJECT_COUNT);
+        for index in 0..OBJECT_COUNT {
+            let byte = u8::try_from(index).unwrap();
+            let object_id = ObjectId::new([byte; 32]);
+            if index % 2 == 0 {
+                let mut object = test_object(object_id, 1, Owner::Address(sender), byte);
+                object.data = Vec::new();
+                let empty_length = encode_object(&object).unwrap().len();
+                object.data = vec![0; PER_OBJECT_BYTES - empty_length];
+                let (record, digest) = hashed_object_version(object, "sunrise-test", 1);
+                let head = DurableObjectHead::Current {
+                    head_revision: runtime::ObjectHeadRevision::FIRST,
+                    object_version: DurableObjectVersion::FIRST,
+                    digest,
+                    owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Address(
+                        sender,
+                    ))
+                    .unwrap(),
+                    routing_projection: DurableObjectRoutingProjection::default(),
+                };
+                store.preload_object(object_id, head, Some(record));
+                entries.push(AccessEntry {
+                    object_ref: ObjectRef {
+                        id: object_id,
+                        version: 1,
+                        digest,
+                    },
+                    mode: AccessMode::Read,
+                });
+            } else {
+                let mut object = test_object(object_id, 1, Owner::Address(sender), byte);
+                object.data = Vec::new();
+                let empty_length = encode_object(&object).unwrap().len();
+                object.data = vec![0; PER_OBJECT_BYTES - empty_length];
+                let canonical_bytes = encode_object(&object).unwrap();
+                let chain_id = ChainId::new("sunrise-test").unwrap();
+                let protocol_version = ProtocolVersion::new(3);
+                let digest = BuiltinHashFunction::new(HashAlgorithmId::Sha2_256)
+                    .hash(
+                        HashPurpose::Object,
+                        protocol_version,
+                        &chain_id,
+                        &canonical_bytes,
+                    )
+                    .unwrap();
+                blob_store.insert(digest, canonical_bytes);
+                let provenance = DurableObjectProvenance::new(chain_id, protocol_version);
+                let record = DurableObjectVersionRecord::from_blob_reference(
+                    object_id,
+                    DurableObjectVersion::FIRST,
+                    digest,
+                    object.schema_version,
+                    provenance,
+                    1,
+                    digest,
+                );
+                let head = DurableObjectHead::Current {
+                    head_revision: runtime::ObjectHeadRevision::FIRST,
+                    object_version: DurableObjectVersion::FIRST,
+                    digest,
+                    owner_projection: DurableObjectOwnerProjection::from_owner(Owner::Address(
+                        sender,
+                    ))
+                    .unwrap(),
+                    routing_projection: DurableObjectRoutingProjection::default(),
+                };
+                store.preload_object(object_id, head, Some(record));
+                entries.push(AccessEntry {
+                    object_ref: ObjectRef {
+                        id: object_id,
+                        version: 1,
+                        digest,
+                    },
+                    mode: AccessMode::Read,
+                });
+            }
+        }
+        let manifest = manifest_with(entries);
+        let machine = IdempotentMachine {
+            calls: AtomicUsize::new(0),
+        };
+
+        let error = handle_authenticated_resolved_durable_submit_transaction(
+            &blob_store,
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            authenticated_submission_with_manifest(
+                "sunrise-test",
+                request(0xBA),
+                &signing_key,
+                Epoch::new(7),
+                0,
+                manifest,
+                &node_config,
+                &protocol_config,
+            ),
+            &machine,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NodeCoreError::ObjectBodyTooLarge {
+                maximum: MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES,
+                ..
+            }
+        ));
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 0);
+        assert!(store.commits.lock().unwrap().is_empty());
     }
 
     /// An object created under a different protocol version than the current
@@ -8295,6 +9638,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
         handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &resolver("sunrise-test"),
@@ -8362,6 +9706,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
         handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &resolver("sunrise-test"),
@@ -8428,6 +9773,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
         let error = handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &resolver("sunrise-test"),
@@ -8481,6 +9827,7 @@ mod tests {
         );
         assert!(matches!(
             handle_authenticated_resolved_durable_submit_transaction(
+                &MemoryBlobStore::default(),
                 &stale_store,
                 &durable_context(),
                 &resolver("sunrise-test"),
@@ -8527,6 +9874,7 @@ mod tests {
             .unwrap(),
         );
         let replay = handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &replay_store,
             &durable_context(),
             &resolver("sunrise-test"),
@@ -8577,6 +9925,7 @@ mod tests {
         };
 
         let error = handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &resolver("sunrise-test"),
@@ -8668,7 +10017,12 @@ mod tests {
         };
 
         let resolved = handle_authenticated_resolved_durable_submit_transaction(
-            &store, &context, &resolver, submission, &machine,
+            &MemoryBlobStore::default(),
+            &store,
+            &context,
+            &resolver,
+            submission,
+            &machine,
         )
         .unwrap();
 
@@ -8745,6 +10099,7 @@ mod tests {
 
         let first: ResolvedNodeOutput =
             handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+                &MemoryBlobStore::default(),
                 &store,
                 &context,
                 &hash_resolver,
@@ -8755,6 +10110,7 @@ mod tests {
             .unwrap();
         let replay: ResolvedNodeOutput =
             handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+                &MemoryBlobStore::default(),
                 &store,
                 &context,
                 &hash_resolver,
@@ -9114,6 +10470,7 @@ mod tests {
         };
         load_and_authorize_objects(
             &store,
+            &MemoryBlobStore::default(),
             &durable_context(),
             domain(0x44),
             &ChainId::new("sunrise-test").unwrap(),
@@ -9181,6 +10538,7 @@ mod tests {
         let engine = WasmExecutionEngine;
 
         let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &context,
             &hash_resolver,
@@ -9324,6 +10682,7 @@ mod tests {
         );
 
         let resolved: ResolvedNodeOutput = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &context,
             &hash_resolver,
@@ -9520,6 +10879,7 @@ mod tests {
         let engine = WasmExecutionEngine;
 
         let first = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &context,
             &hash_resolver,
@@ -9536,6 +10896,7 @@ mod tests {
         let empty_catalog: PreinstalledModuleCatalog =
             PreinstalledModuleCatalog::new(Vec::new()).unwrap();
         let replay = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &context,
             &hash_resolver,
@@ -9626,6 +10987,7 @@ mod tests {
                 },
             );
             let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
                 &store,
                 &durable_context(),
                 &hash_resolver,
@@ -9753,6 +11115,7 @@ mod tests {
                 },
             );
             let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
                 &store,
                 &durable_context(),
                 &hash_resolver,
@@ -9942,6 +11305,7 @@ mod tests {
         let engine = WasmExecutionEngine;
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -10025,6 +11389,7 @@ mod tests {
         let engine = WasmExecutionEngine;
 
         let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &context,
             &hash_resolver,
@@ -10124,6 +11489,7 @@ mod tests {
         let engine = WasmExecutionEngine;
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -10197,6 +11563,7 @@ mod tests {
         let engine = WasmExecutionEngine;
 
         let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &context,
             &hash_resolver,
@@ -10269,6 +11636,7 @@ mod tests {
         let engine = WasmExecutionEngine;
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -10339,6 +11707,7 @@ mod tests {
         let engine = WasmExecutionEngine;
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -10410,6 +11779,7 @@ mod tests {
         let engine = WasmExecutionEngine;
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &over_store,
             &durable_context(),
             &hash_resolver,
@@ -10483,6 +11853,7 @@ mod tests {
         );
 
         let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &context,
             &hash_resolver,
@@ -10560,6 +11931,7 @@ mod tests {
         // it produces no effect for the declared `Write` access. This must
         // still fail closed instead of silently committing as a no-op.
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -10652,6 +12024,7 @@ mod tests {
         let engine = WasmExecutionEngine;
 
         let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &context,
             &hash_resolver,
@@ -10716,6 +12089,7 @@ mod tests {
         };
 
         handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+            &MemoryBlobStore::default(),
             &store,
             &context,
             &hash_resolver,
@@ -10775,6 +12149,7 @@ mod tests {
 
         let error: NodeCoreError =
             handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+                &MemoryBlobStore::default(),
                 &store,
                 &durable_context(),
                 &resolver("sunrise-test"),
@@ -10827,6 +12202,7 @@ mod tests {
         );
 
         let error: NodeCoreError = handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &resolver("sunrise-test"),
@@ -10877,6 +12253,7 @@ mod tests {
 
             let error: NodeCoreError =
                 handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+                    &MemoryBlobStore::default(),
                     &store,
                     &durable_context(),
                     &resolver("sunrise-test"),
@@ -10937,6 +12314,7 @@ mod tests {
 
         let error: NodeCoreError =
             handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+                &MemoryBlobStore::default(),
                 &store,
                 &context,
                 &resolver("sunrise-test"),
@@ -11166,6 +12544,7 @@ mod tests {
 
         let race_error =
             handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+                &MemoryBlobStore::default(),
                 &store,
                 &context,
                 &resolver,
@@ -11214,6 +12593,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
         let resolved = handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &context,
             &resolver,
@@ -12980,6 +14360,7 @@ mod tests {
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
 
         let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &context,
             &hash_resolver,
@@ -13118,6 +14499,7 @@ mod tests {
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
 
         let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &context,
             &hash_resolver,
@@ -13257,6 +14639,7 @@ mod tests {
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
 
         let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &context,
             &hash_resolver,
@@ -13380,6 +14763,7 @@ mod tests {
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
 
         let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &context,
             &hash_resolver,
@@ -13489,6 +14873,7 @@ mod tests {
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
 
         let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &context,
             &hash_resolver,
@@ -13571,6 +14956,7 @@ mod tests {
         };
 
         let error = handle_authenticated_resolved_durable_submit_transaction(
+            &MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &resolver("sunrise-test"),
@@ -13618,6 +15004,7 @@ mod tests {
 
         let error =
             handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+                &MemoryBlobStore::default(),
                 &store,
                 &durable_context(),
                 &resolver("sunrise-test"),
@@ -13699,6 +15086,7 @@ mod tests {
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -13782,6 +15170,7 @@ mod tests {
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -13858,6 +15247,7 @@ mod tests {
         let engine = WasmExecutionEngine;
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -13930,6 +15320,7 @@ mod tests {
         let engine = WasmExecutionEngine;
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -14002,6 +15393,7 @@ mod tests {
         let engine = WasmExecutionEngine;
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -14080,6 +15472,7 @@ mod tests {
         let engine = WasmExecutionEngine;
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -14174,6 +15567,7 @@ mod tests {
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -14295,6 +15689,7 @@ mod tests {
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -14383,6 +15778,7 @@ mod tests {
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -14473,6 +15869,7 @@ mod tests {
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -14563,6 +15960,7 @@ mod tests {
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -14654,6 +16052,7 @@ mod tests {
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -14746,6 +16145,7 @@ mod tests {
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -14838,6 +16238,7 @@ mod tests {
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -14929,6 +16330,7 @@ mod tests {
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -15020,6 +16422,7 @@ mod tests {
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
 
         let error = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &durable_context(),
             &hash_resolver,
@@ -15369,6 +16772,7 @@ mod tests {
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
 
         let first = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &context,
             &hash_resolver,
@@ -15387,6 +16791,7 @@ mod tests {
         let empty_catalog: PreinstalledModuleCatalog =
             PreinstalledModuleCatalog::new(Vec::new()).unwrap();
         let replay = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+&MemoryBlobStore::default(),
             &store,
             &context,
             &hash_resolver,

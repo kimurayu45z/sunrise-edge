@@ -1775,10 +1775,11 @@ caller-supplied expected firmware version、`open app`によるexactly
 `0.1.0` pin追加）もimplemented and validated As-Isだが、`FakeTransport`のみに
 対するsoftware-only実装であり、real physical hardwareに対するvalidationは
 ない。S4cはphysical hardware validationが未実装のためincompleteであり、
-S4全体もincompleteである。現在のimplementation priorityはS4c Phase 2b、続いて
-S4d（physical-device HIL、golden/pixel UI evidence、release evidence）である。
-TypeScript client/explorer/walletと
-S5は引き続きdeferredであり、S5は順序を飛ばさず後続する。
+S4全体もincompleteである。2026-09-04の明示的なroadmap reorderにより、S4c Phase 2b、
+S4d（physical-device HIL、golden/pixel UI evidence、release evidence）、その他すべての
+残存Ledger作業はdeferredとし、旧順序を飛び越えてnon-Ledger S5 prerequisiteを進める。
+TypeScript client/explorer/walletはcompleteなCLI-First Node Production Gateまでdeferredのままであり、
+S4、S5、同gate、production、mainnet readinessはいずれもincompleteである。
 
 CLI Developer MVP completion criteria（capability criteria 2-3を満たしながら、product
 surfaceはARCHITECTURE.md DR-0081の順序に従う: local devnet、bounded query API、Rust
@@ -1943,10 +1944,11 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    `0.1.0` version pin追加、CLIの`--ledger-expected-firmware-version`必須flag追加も
    `FakeTransport`のみに対するsoftware-only実装としてimplemented and validated
    As-Isである。S4cはphysical hardware validationが
-   未実装のためincompleteであり、S4全体もincompleteである。次はS4c Phase 2b、続いて
-   S4d physical-device HIL/release evidenceである。
-   TypeScript client/explorer/walletとS5は引き続き既存の順序でdeferredである。
-   production/mainnet readinessは未達である。
+   未実装のためincompleteであり、S4全体もincompleteである。2026-09-04の明示的な
+   roadmap reorderにより、S4c Phase 2b、S4d physical-device HIL/release evidence、
+   その他すべての残存Ledger作業はdeferredとし、旧順序を飛び越えてnon-Ledger S5
+   prerequisiteを進める。TypeScript client/explorer/walletはcompleteなCLI-First Node
+   Production Gateまでdeferredのままである。S4、S5、同gate、production、mainnet readinessは未達である。
    前提として、`runtime-sqlite`へ`StructuredDurableDomainStateStore`/`IndexedOutboxRepository`を
    実装するadditive、local-only、non-productionな`SqliteDurableStore`を追加済み
    （implemented As-Is）。既存のopaque `SqliteStateStore`とは別テーブル・別`PRAGMA application_id`で、
@@ -2381,8 +2383,10 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
   recipient owner不変、same-boot/post-close-reopen exact replayのbyte-identical response/receiptと
   non-reapplication、changed signed requestによるrequest-id reuse 409時の両object canonical bytes・
   両receipt・sender nonce不変、writer-generation fencingを証明する。
-  これはS2 As-Isのみでproduction/mainnet readinessではない。S3はDR-0087で後続実装済み。TypeScript client/
-  explorer/walletとS4/S5は引き続きdeferredである。
+  これはS2 As-Isのみでproduction/mainnet readinessではない。S3はDR-0087で後続実装済み。
+  TypeScript client/explorer/walletはcompleteなCLI-First Node Production Gateまでdeferredであり、
+  S4はincomplete、残存Ledger作業はdeferredである。non-Ledger S5 prerequisiteはDR-0094から先行するが、
+  S5、同gate、production、mainnet readinessの完了を意味しない。
 - **S3**: **implemented and validated As-Is（2026-09-02、DR-0087）。** committed
   scheduleはbase=1、execution=`gas_used`単価=1、他category=0、fee registryは
   `DEVNET_ASSET_ID`を1:1で1つだけenableする。sourceのsender-owned `Write`をfee objectとし、
@@ -2477,7 +2481,7 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
     `FakeTransport`のみに対するsoftware-only実装であり、real physical hardwareに
     対するvalidationは一切ない：** 上記すべて（APDU protocol、identity/dashboard
     parsing、USB HID framing、device recognition）のphysical hardwareに対する
-    validationは次のS4c slice（S4c Phase 2b）で実装する。caller-supplied
+    validationはdeferredなS4c Phase 2bで実装する。caller-supplied
     `ExpectedFirmwareVersion`はper-connectionのoperator inputであり、S4dの
     pinned/workspace-committed multi-model app/firmware compatibility matrix
     ではない。off-by-default `usb-hid` feature配下以外の全moduleは`FakeTransport`
@@ -2750,7 +2754,9 @@ Phase 15 As-Is scope:
   inline owner projectionはwrite時にtyped `Owner`から導出し、immutable versionはheadと別APIで読む。head readは
   inline bytesをSELECTせず、immutable row metadataとinline presence/lengthのみを検証する。headのowner/routing projectionは
   routing hintでありauthorizationではない。executionは別途exact versionを読み、head version/digestとの一致、inline Object decode、
-  typed owner一致を検証しなければならず、blob-backed executionはfetch/content verification実装までfail closedとする。
+  typed owner一致を検証しなければならない。blob-backed bodyは明示的に分離された`BlobStore`
+  componentからfetchし、独立にverifyしてからdecode/authorizeする(DR-0094, implemented As-Is;
+  blob upload/publication、durable provider `BlobStore`、GC/checkpoint manifestは引き続き未実装)。
   memoryとPostgreSQLはstate/object/receipt/outboxを同一atomic boundaryで実装済みである。authenticated
   structured durable pathはsigned read-only manifestをexact head/immutable inline versionからloadし、verified
   senderに対するtyped owner authorizationと完全なhead assertionを同一commitへ接続した（implemented As-Is）。
@@ -2788,8 +2794,9 @@ Phase 15 As-Is scope:
   commitへ渡す。trap text/fuel accountingは固定reason/full-gas/empty-effectsへ正規化してから永続化する。
   exact replayはmodule resolve/object read/execution前にreceiptから返る。additive preinstalled-WASM native router
   （`preinstalled_wasm_structured_durable_router`/`_with_executor`）はこのentrypointへwiring済みである一方、
-  generic structured durable routerはread-only entrypointのままである。Shared/System owner、blob body、
-  arbitrary provider wiring、owned fast path certificateは未実装である。devnet/startup composition
+  generic structured durable routerはread-only entrypointのままである。Shared/System owner、
+  arbitrary provider wiring、owned fast path certificateは未実装である。blob-backed bodyのfetch/
+  verificationはDR-0094でimplemented As-Isだが、blob upload/publicationは未実装のままである。devnet/startup composition
   （`apps/devnet`）とfee debit（S3のuniform ordinary-asset fee slice、DR-0087）はimplemented As-Isである。
   node-core additive handlerはmanifest domainをI/O前にresolveし、typed receipt replayをstate readより先に行い、
   read-only assertionを含むstate/receipt/outboxをこのenvelopeへ構築する。definite commitまたはexact replay以外では
@@ -3260,10 +3267,11 @@ exactly `Sunrise Edge`/`0.1.0`のactive-app check、既存6-byte configuration
 への`0.1.0` pin追加）も`FakeTransport`のみに対するsoftware-only実装として
 As-Isで実装・検証済みである。S4cは
 physical hardware validationが
-未実装のためincompleteであり、S4全体もincompleteである。現在の
-implementation priorityはS4c Phase 2b、続いてS4d
-physical-device HIL/release evidenceである。TypeScript client/explorer/walletとS5は
-引き続き既存の順序でdeferredであり、S5は順序を飛ばさず後続する。
+未実装のためincompleteであり、S4全体もincompleteである。2026-09-04の明示的な
+roadmap reorderにより、S4c Phase 2b、S4d physical-device HIL/release evidence、
+その他すべての残存Ledger作業はdeferredとし、旧順序を飛び越えてnon-Ledger S5
+prerequisiteを進める。TypeScript client/explorer/walletはcompleteなCLI-First Node
+Production Gateまでdeferredのままである。S4、S5、同gate、production、mainnet readinessはincompleteである。
 capacity/PITR/HA等のS5 certification項目はS5または明示的なSLOがtriggerするまで
 引き続き凍結する。
 

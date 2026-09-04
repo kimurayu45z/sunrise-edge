@@ -34,7 +34,7 @@ use protocol_config::{
 };
 use protocol_types::ProtocolVersion;
 use runtime::{
-    AtomicityDomainId, Clock, DomainTransactionalStateStore, DueOutboxClaimRequest,
+    AtomicityDomainId, BlobStore, Clock, DomainTransactionalStateStore, DueOutboxClaimRequest,
     DurableOperationContext, DurableOutboxAcknowledgement, DurableOutboxAcknowledgementOutcome,
     DurableOutboxAcknowledgementRejection, DurableOutboxClaimOutcome, DurableOutboxClaimRejection,
     DurableOutboxLeaseId, IndeterminateCommitReason, IndexedOutboxContractError,
@@ -164,23 +164,33 @@ impl Error for StructuredDurableRouterError {}
 /// Keeping these components separate from [`Runtime`] lets normalized stores
 /// avoid implementing the legacy opaque [`runtime::StateStore`] interface.
 #[derive(Debug)]
-pub struct StructuredDurableNativeComponents<S, T, C, I> {
+pub struct StructuredDurableNativeComponents<S, B, T, C, I> {
     store: Arc<S>,
+    blob_store: Arc<B>,
     transport: Arc<T>,
     clock: Arc<C>,
     identities: Arc<I>,
     cancellation: Option<Arc<dyn InvocationCancellation>>,
 }
 
-impl<S, T, C, I> StructuredDurableNativeComponents<S, T, C, I> {
+impl<S, B, T, C, I> StructuredDurableNativeComponents<S, B, T, C, I> {
     /// Creates a composition that never cancels before storage dispatch.
     ///
+    /// `blob_store` is a separate explicit component from `store`: normalized
+    /// stores are never required to also implement [`runtime::BlobStore`].
     /// Existing compositions retain their original behavior. Use
     /// [`Self::with_cancellation`] when the host has an explicit trusted signal.
     #[must_use]
-    pub const fn new(store: Arc<S>, transport: Arc<T>, clock: Arc<C>, identities: Arc<I>) -> Self {
+    pub const fn new(
+        store: Arc<S>,
+        blob_store: Arc<B>,
+        transport: Arc<T>,
+        clock: Arc<C>,
+        identities: Arc<I>,
+    ) -> Self {
         Self {
             store,
+            blob_store,
             transport,
             clock,
             identities,
@@ -192,6 +202,7 @@ impl<S, T, C, I> StructuredDurableNativeComponents<S, T, C, I> {
     #[must_use]
     pub fn with_cancellation(
         store: Arc<S>,
+        blob_store: Arc<B>,
         transport: Arc<T>,
         clock: Arc<C>,
         identities: Arc<I>,
@@ -199,6 +210,7 @@ impl<S, T, C, I> StructuredDurableNativeComponents<S, T, C, I> {
     ) -> Self {
         Self {
             store,
+            blob_store,
             transport,
             clock,
             identities,
@@ -520,8 +532,8 @@ struct ResolvedDomainNativeHttpState<R, M, L> {
     blocking_executor: NativeBlockingExecutor,
 }
 
-struct StructuredDurableNativeHttpState<S, M, T, C, I> {
-    components: StructuredDurableNativeComponents<S, T, C, I>,
+struct StructuredDurableNativeHttpState<S, B, M, T, C, I> {
+    components: StructuredDurableNativeComponents<S, B, T, C, I>,
     protocol_config: ProtocolConfig,
     authority: StructuredDurableRequestAuthority,
     config: NodeConfig,
@@ -530,11 +542,11 @@ struct StructuredDurableNativeHttpState<S, M, T, C, I> {
     blocking_executor: NativeBlockingExecutor,
 }
 
-type SharedStructuredDurableNativeHttpState<S, M, T, C, I> =
-    Arc<StructuredDurableNativeHttpState<S, M, T, C, I>>;
+type SharedStructuredDurableNativeHttpState<S, B, M, T, C, I> =
+    Arc<StructuredDurableNativeHttpState<S, B, M, T, C, I>>;
 
-struct PreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I> {
-    components: StructuredDurableNativeComponents<S, T, C, I>,
+struct PreinstalledWasmStructuredDurableNativeHttpState<S, B, M, T, C, I> {
+    components: StructuredDurableNativeComponents<S, B, T, C, I>,
     preinstalled_wasm: PreinstalledWasmComposition,
     protocol_config: ProtocolConfig,
     authority: StructuredDurableRequestAuthority,
@@ -544,8 +556,8 @@ struct PreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I> {
     blocking_executor: NativeBlockingExecutor,
 }
 
-type SharedPreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I> =
-    Arc<PreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I>>;
+type SharedPreinstalledWasmStructuredDurableNativeHttpState<S, B, M, T, C, I> =
+    Arc<PreinstalledWasmStructuredDurableNativeHttpState<S, B, M, T, C, I>>;
 
 /// Builds the recoverable native HTTP router.
 ///
@@ -692,8 +704,8 @@ where
 /// domain-placement manifest, checked once here rather than per request, so
 /// this route never resolves its logical domain and its transaction-auth
 /// authority from two silently diverging sources.
-pub fn structured_durable_router<S, M, T, C, I>(
-    components: StructuredDurableNativeComponents<S, T, C, I>,
+pub fn structured_durable_router<S, B, M, T, C, I>(
+    components: StructuredDurableNativeComponents<S, B, T, C, I>,
     protocol_config: ProtocolConfig,
     authority: StructuredDurableRequestAuthority,
     config: NodeConfig,
@@ -703,6 +715,7 @@ pub fn structured_durable_router<S, M, T, C, I>(
 ) -> Result<Router, StructuredDurableRouterError>
 where
     S: IndexedOutboxRepository + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
     M: TransactionalNodeStateMachine + Send + Sync + 'static,
     T: Transport + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
@@ -720,8 +733,8 @@ where
 }
 
 /// Builds the normalized durable router with shared blocking admission.
-pub fn structured_durable_router_with_executor<S, M, T, C, I>(
-    components: StructuredDurableNativeComponents<S, T, C, I>,
+pub fn structured_durable_router_with_executor<S, B, M, T, C, I>(
+    components: StructuredDurableNativeComponents<S, B, T, C, I>,
     protocol_config: ProtocolConfig,
     authority: StructuredDurableRequestAuthority,
     config: NodeConfig,
@@ -731,6 +744,7 @@ pub fn structured_durable_router_with_executor<S, M, T, C, I>(
 ) -> Result<Router, StructuredDurableRouterError>
 where
     S: IndexedOutboxRepository + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
     M: TransactionalNodeStateMachine + Send + Sync + 'static,
     T: Transport + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
@@ -750,23 +764,23 @@ where
         .route(LIVENESS_PATH, get(liveness))
         .route(
             NODE_EVENT_PATH,
-            post(submit_structured_durable_event::<S, M, T, C, I>),
+            post(submit_structured_durable_event::<S, B, M, T, C, I>),
         )
         .route(
             QUERY_CONTEXT_PATH,
-            get(get_structured_durable_context::<S, M, T, C, I>),
+            get(get_structured_durable_context::<S, B, M, T, C, I>),
         )
         .route(
             QUERY_OBJECT_PATH,
-            get(get_structured_durable_object::<S, M, T, C, I>),
+            get(get_structured_durable_object::<S, B, M, T, C, I>),
         )
         .route(
             QUERY_RECEIPT_PATH,
-            get(get_structured_durable_receipt::<S, M, T, C, I>),
+            get(get_structured_durable_receipt::<S, B, M, T, C, I>),
         )
         .route(
             QUERY_NEXT_NONCE_PATH,
-            get(get_structured_durable_next_nonce::<S, M, T, C, I>),
+            get(get_structured_durable_next_nonce::<S, B, M, T, C, I>),
         )
         .layer(DefaultBodyLimit::max(MAX_HTTP_EVENT_BODY_BYTES))
         .with_state(state))
@@ -788,8 +802,8 @@ where
 /// an HTTP request or wall-clock time. [`structured_durable_router`] itself
 /// is unaffected by this composition and remains read-only.
 #[allow(clippy::too_many_arguments)]
-pub fn preinstalled_wasm_structured_durable_router<S, M, T, C, I>(
-    components: StructuredDurableNativeComponents<S, T, C, I>,
+pub fn preinstalled_wasm_structured_durable_router<S, B, M, T, C, I>(
+    components: StructuredDurableNativeComponents<S, B, T, C, I>,
     preinstalled_wasm: PreinstalledWasmComposition,
     protocol_config: ProtocolConfig,
     authority: StructuredDurableRequestAuthority,
@@ -800,6 +814,7 @@ pub fn preinstalled_wasm_structured_durable_router<S, M, T, C, I>(
 ) -> Result<Router, StructuredDurableRouterError>
 where
     S: IndexedOutboxRepository + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
     M: TransactionalNodeStateMachine + Send + Sync + 'static,
     T: Transport + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
@@ -819,8 +834,8 @@ where
 
 /// Builds the preinstalled-WASM durable router with shared blocking admission.
 #[allow(clippy::too_many_arguments)]
-pub fn preinstalled_wasm_structured_durable_router_with_executor<S, M, T, C, I>(
-    components: StructuredDurableNativeComponents<S, T, C, I>,
+pub fn preinstalled_wasm_structured_durable_router_with_executor<S, B, M, T, C, I>(
+    components: StructuredDurableNativeComponents<S, B, T, C, I>,
     preinstalled_wasm: PreinstalledWasmComposition,
     protocol_config: ProtocolConfig,
     authority: StructuredDurableRequestAuthority,
@@ -831,6 +846,7 @@ pub fn preinstalled_wasm_structured_durable_router_with_executor<S, M, T, C, I>(
 ) -> Result<Router, StructuredDurableRouterError>
 where
     S: IndexedOutboxRepository + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
     M: TransactionalNodeStateMachine + Send + Sync + 'static,
     T: Transport + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
@@ -851,23 +867,23 @@ where
         .route(LIVENESS_PATH, get(liveness))
         .route(
             NODE_EVENT_PATH,
-            post(submit_preinstalled_wasm_structured_durable_event::<S, M, T, C, I>),
+            post(submit_preinstalled_wasm_structured_durable_event::<S, B, M, T, C, I>),
         )
         .route(
             QUERY_CONTEXT_PATH,
-            get(get_preinstalled_wasm_structured_durable_context::<S, M, T, C, I>),
+            get(get_preinstalled_wasm_structured_durable_context::<S, B, M, T, C, I>),
         )
         .route(
             QUERY_OBJECT_PATH,
-            get(get_preinstalled_wasm_structured_durable_object::<S, M, T, C, I>),
+            get(get_preinstalled_wasm_structured_durable_object::<S, B, M, T, C, I>),
         )
         .route(
             QUERY_RECEIPT_PATH,
-            get(get_preinstalled_wasm_structured_durable_receipt::<S, M, T, C, I>),
+            get(get_preinstalled_wasm_structured_durable_receipt::<S, B, M, T, C, I>),
         )
         .route(
             QUERY_NEXT_NONCE_PATH,
-            get(get_preinstalled_wasm_structured_durable_next_nonce::<S, M, T, C, I>),
+            get(get_preinstalled_wasm_structured_durable_next_nonce::<S, B, M, T, C, I>),
         )
         .layer(DefaultBodyLimit::max(MAX_HTTP_EVENT_BODY_BYTES))
         .with_state(state))
@@ -1548,13 +1564,14 @@ where
         .into_response()
 }
 
-async fn submit_structured_durable_event<S, M, T, C, I>(
-    State(state): State<SharedStructuredDurableNativeHttpState<S, M, T, C, I>>,
+async fn submit_structured_durable_event<S, B, M, T, C, I>(
+    State(state): State<SharedStructuredDurableNativeHttpState<S, B, M, T, C, I>>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response
 where
     S: IndexedOutboxRepository + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
     M: TransactionalNodeStateMachine + Send + Sync + 'static,
     T: Transport + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
@@ -1572,13 +1589,14 @@ where
     .await
 }
 
-async fn submit_preinstalled_wasm_structured_durable_event<S, M, T, C, I>(
-    State(state): State<SharedPreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I>>,
+async fn submit_preinstalled_wasm_structured_durable_event<S, B, M, T, C, I>(
+    State(state): State<SharedPreinstalledWasmStructuredDurableNativeHttpState<S, B, M, T, C, I>>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response
 where
     S: IndexedOutboxRepository + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
     M: TransactionalNodeStateMachine + Send + Sync + 'static,
     T: Transport + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
@@ -1796,8 +1814,8 @@ fn invoke_query_context(
 /// The domain is resolved through [`resolve_query_domain`], so an inactive
 /// placement rejects before identity allocation, clock access, or storage
 /// I/O exactly like every other storage-backed query failure.
-fn prepare_query_storage_context<S, T, C, I>(
-    components: &StructuredDurableNativeComponents<S, T, C, I>,
+fn prepare_query_storage_context<S, B, T, C, I>(
+    components: &StructuredDurableNativeComponents<S, B, T, C, I>,
     protocol_config: &ProtocolConfig,
     authority: &StructuredDurableRequestAuthority,
     config: &NodeConfig,
@@ -1839,8 +1857,8 @@ where
     Ok((domain, context))
 }
 
-fn invoke_query_object<S, T, C, I>(
-    components: &StructuredDurableNativeComponents<S, T, C, I>,
+fn invoke_query_object<S, B, T, C, I>(
+    components: &StructuredDurableNativeComponents<S, B, T, C, I>,
     protocol_config: &ProtocolConfig,
     authority: &StructuredDurableRequestAuthority,
     config: &NodeConfig,
@@ -1882,8 +1900,8 @@ where
         .map_err(|_| QueryInvocationError::ResultEncoding)
 }
 
-fn invoke_query_receipt<S, T, C, I>(
-    components: &StructuredDurableNativeComponents<S, T, C, I>,
+fn invoke_query_receipt<S, B, T, C, I>(
+    components: &StructuredDurableNativeComponents<S, B, T, C, I>,
     protocol_config: &ProtocolConfig,
     authority: &StructuredDurableRequestAuthority,
     config: &NodeConfig,
@@ -1919,8 +1937,8 @@ where
         .map_err(|_| QueryInvocationError::ResultEncoding)
 }
 
-fn invoke_query_next_nonce<S, T, C, I>(
-    components: &StructuredDurableNativeComponents<S, T, C, I>,
+fn invoke_query_next_nonce<S, B, T, C, I>(
+    components: &StructuredDurableNativeComponents<S, B, T, C, I>,
     protocol_config: &ProtocolConfig,
     authority: &StructuredDurableRequestAuthority,
     config: &NodeConfig,
@@ -1956,11 +1974,12 @@ where
         .map_err(|_| QueryInvocationError::ResultEncoding)
 }
 
-async fn get_structured_durable_context<S, M, T, C, I>(
-    State(state): State<SharedStructuredDurableNativeHttpState<S, M, T, C, I>>,
+async fn get_structured_durable_context<S, B, M, T, C, I>(
+    State(state): State<SharedStructuredDurableNativeHttpState<S, B, M, T, C, I>>,
 ) -> Response
 where
     S: IndexedOutboxRepository + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
     M: TransactionalNodeStateMachine + Send + Sync + 'static,
     T: Transport + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
@@ -1974,12 +1993,13 @@ where
     .await
 }
 
-async fn get_structured_durable_object<S, M, T, C, I>(
-    State(state): State<SharedStructuredDurableNativeHttpState<S, M, T, C, I>>,
+async fn get_structured_durable_object<S, B, M, T, C, I>(
+    State(state): State<SharedStructuredDurableNativeHttpState<S, B, M, T, C, I>>,
     Path(object_id_hex): Path<String>,
 ) -> Response
 where
     S: IndexedOutboxRepository + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
     M: TransactionalNodeStateMachine + Send + Sync + 'static,
     T: Transport + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
@@ -2003,12 +2023,13 @@ where
     .await
 }
 
-async fn get_structured_durable_receipt<S, M, T, C, I>(
-    State(state): State<SharedStructuredDurableNativeHttpState<S, M, T, C, I>>,
+async fn get_structured_durable_receipt<S, B, M, T, C, I>(
+    State(state): State<SharedStructuredDurableNativeHttpState<S, B, M, T, C, I>>,
     Path(request_id_hex): Path<String>,
 ) -> Response
 where
     S: IndexedOutboxRepository + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
     M: TransactionalNodeStateMachine + Send + Sync + 'static,
     T: Transport + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
@@ -2033,12 +2054,13 @@ where
     .await
 }
 
-async fn get_structured_durable_next_nonce<S, M, T, C, I>(
-    State(state): State<SharedStructuredDurableNativeHttpState<S, M, T, C, I>>,
+async fn get_structured_durable_next_nonce<S, B, M, T, C, I>(
+    State(state): State<SharedStructuredDurableNativeHttpState<S, B, M, T, C, I>>,
     Path(sender_hex): Path<String>,
 ) -> Response
 where
     S: IndexedOutboxRepository + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
     M: TransactionalNodeStateMachine + Send + Sync + 'static,
     T: Transport + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
@@ -2062,11 +2084,12 @@ where
     .await
 }
 
-async fn get_preinstalled_wasm_structured_durable_context<S, M, T, C, I>(
-    State(state): State<SharedPreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I>>,
+async fn get_preinstalled_wasm_structured_durable_context<S, B, M, T, C, I>(
+    State(state): State<SharedPreinstalledWasmStructuredDurableNativeHttpState<S, B, M, T, C, I>>,
 ) -> Response
 where
     S: IndexedOutboxRepository + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
     M: TransactionalNodeStateMachine + Send + Sync + 'static,
     T: Transport + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
@@ -2080,12 +2103,13 @@ where
     .await
 }
 
-async fn get_preinstalled_wasm_structured_durable_object<S, M, T, C, I>(
-    State(state): State<SharedPreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I>>,
+async fn get_preinstalled_wasm_structured_durable_object<S, B, M, T, C, I>(
+    State(state): State<SharedPreinstalledWasmStructuredDurableNativeHttpState<S, B, M, T, C, I>>,
     Path(object_id_hex): Path<String>,
 ) -> Response
 where
     S: IndexedOutboxRepository + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
     M: TransactionalNodeStateMachine + Send + Sync + 'static,
     T: Transport + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
@@ -2109,12 +2133,13 @@ where
     .await
 }
 
-async fn get_preinstalled_wasm_structured_durable_receipt<S, M, T, C, I>(
-    State(state): State<SharedPreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I>>,
+async fn get_preinstalled_wasm_structured_durable_receipt<S, B, M, T, C, I>(
+    State(state): State<SharedPreinstalledWasmStructuredDurableNativeHttpState<S, B, M, T, C, I>>,
     Path(request_id_hex): Path<String>,
 ) -> Response
 where
     S: IndexedOutboxRepository + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
     M: TransactionalNodeStateMachine + Send + Sync + 'static,
     T: Transport + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
@@ -2139,12 +2164,13 @@ where
     .await
 }
 
-async fn get_preinstalled_wasm_structured_durable_next_nonce<S, M, T, C, I>(
-    State(state): State<SharedPreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I>>,
+async fn get_preinstalled_wasm_structured_durable_next_nonce<S, B, M, T, C, I>(
+    State(state): State<SharedPreinstalledWasmStructuredDurableNativeHttpState<S, B, M, T, C, I>>,
     Path(sender_hex): Path<String>,
 ) -> Response
 where
     S: IndexedOutboxRepository + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
     M: TransactionalNodeStateMachine + Send + Sync + 'static,
     T: Transport + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
@@ -2278,12 +2304,13 @@ enum StructuredDurableAuthenticatedExecution<'a> {
     },
 }
 
-fn invoke_structured_durable_event<S, M, T, C, I>(
-    state: &StructuredDurableNativeHttpState<S, M, T, C, I>,
+fn invoke_structured_durable_event<S, B, M, T, C, I>(
+    state: &StructuredDurableNativeHttpState<S, B, M, T, C, I>,
     body: &[u8],
 ) -> Result<Vec<u8>, InvocationError>
 where
     S: IndexedOutboxRepository,
+    B: BlobStore,
     M: TransactionalNodeStateMachine,
     T: Transport,
     C: Clock,
@@ -2301,12 +2328,13 @@ where
     )
 }
 
-fn invoke_preinstalled_wasm_structured_durable_event<S, M, T, C, I>(
-    state: &PreinstalledWasmStructuredDurableNativeHttpState<S, M, T, C, I>,
+fn invoke_preinstalled_wasm_structured_durable_event<S, B, M, T, C, I>(
+    state: &PreinstalledWasmStructuredDurableNativeHttpState<S, B, M, T, C, I>,
     body: &[u8],
 ) -> Result<Vec<u8>, InvocationError>
 where
     S: IndexedOutboxRepository,
+    B: BlobStore,
     M: TransactionalNodeStateMachine,
     T: Transport,
     C: Clock,
@@ -2332,8 +2360,8 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn invoke_structured_durable_event_with_execution<S, M, T, C, I>(
-    components: &StructuredDurableNativeComponents<S, T, C, I>,
+fn invoke_structured_durable_event_with_execution<S, B, M, T, C, I>(
+    components: &StructuredDurableNativeComponents<S, B, T, C, I>,
     protocol_config: &ProtocolConfig,
     authority: &StructuredDurableRequestAuthority,
     config: &NodeConfig,
@@ -2344,6 +2372,7 @@ fn invoke_structured_durable_event_with_execution<S, M, T, C, I>(
 ) -> Result<Vec<u8>, InvocationError>
 where
     S: IndexedOutboxRepository,
+    B: BlobStore,
     M: TransactionalNodeStateMachine,
     T: Transport,
     C: Clock,
@@ -2405,6 +2434,7 @@ where
             PreparedStructuredEvent::Authenticated(submission),
             StructuredDurableAuthenticatedExecution::ReadOnly,
         ) => handle_authenticated_resolved_durable_submit_transaction(
+            components.blob_store.as_ref(),
             components.store.as_ref(),
             &context,
             resolver,
@@ -2420,6 +2450,7 @@ where
                 fee_composition,
             },
         ) => handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            components.blob_store.as_ref(),
             components.store.as_ref(),
             &context,
             resolver,
@@ -2875,8 +2906,17 @@ fn node_error_response(error: &NodeCoreError) -> Response {
         NodeCoreError::ObjectOwnerKindUnsupported { .. } => {
             (StatusCode::NOT_IMPLEMENTED, "object-owner-kind-unsupported")
         }
-        NodeCoreError::ObjectBodyUnavailable { .. } => {
-            (StatusCode::NOT_IMPLEMENTED, "object-blob-body-unsupported")
+        // A blob absent from the supplied `BlobStore`, or a store `RuntimeError`
+        // (mapped generically below), is host/storage unavailability, not a
+        // caller fault: it never exposes blob bytes or storage details.
+        NodeCoreError::ObjectBlobMissing { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, "object-blob-unavailable")
+        }
+        // Fetched bytes that do not hash to their own claimed content digest
+        // are storage corruption, not a caller fault: opaque like every other
+        // digest/record-corruption variant below.
+        NodeCoreError::ObjectBlobDigestMismatch { .. } => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "invalid-node-output")
         }
         NodeCoreError::ObjectManifestTooLarge { .. } => (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -3862,6 +3902,158 @@ mod tests {
         }
     }
 
+    /// A [`BlobStore`] test double that counts every [`BlobStore::get_blob`]
+    /// call, so an end-to-end HTTP composition test can prove the exact
+    /// supplied blob store (not some other default) served the request.
+    #[derive(Clone, Default)]
+    struct CountingBlobStore {
+        blobs: Arc<std::sync::Mutex<std::collections::BTreeMap<Digest32, Vec<u8>>>>,
+        get_calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingBlobStore {
+        fn get_calls(&self) -> usize {
+            self.get_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl BlobStore for CountingBlobStore {
+        fn put_blob(&self, digest: Digest32, bytes: Vec<u8>) -> Result<(), RuntimeError> {
+            self.blobs.lock().unwrap().insert(digest, bytes);
+            Ok(())
+        }
+
+        fn get_blob(&self, digest: &Digest32) -> Result<Option<Vec<u8>>, RuntimeError> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.blobs.lock().unwrap().get(digest).cloned())
+        }
+    }
+
+    /// Directly commits one address-owned blob-backed object version and
+    /// head as fixture setup, bypassing every HTTP/node-core entrypoint,
+    /// exactly like [`commit_owned_object`] but with the canonical body
+    /// stored only in `blob_store`, keyed under its own content digest.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_owned_blob_object<S>(
+        store: &S,
+        blob_store: &CountingBlobStore,
+        context: &DurableOperationContext,
+        domain: AtomicityDomainId,
+        object: Object,
+        chain: &str,
+        created_checkpoint: u64,
+        receipt_byte: u8,
+    ) -> ObjectRef
+    where
+        S: IndexedOutboxRepository,
+    {
+        let object_id = object.id;
+        let object_version = object.version;
+        let owner = object.owner.clone();
+        let schema_version = object.schema_version;
+        let canonical_bytes = encode_object(&object).unwrap();
+        let chain_id = ChainId::new(chain).unwrap();
+        let digest = resolver()
+            .hash_for_purpose(Epoch::new(0), HashPurpose::Object, &canonical_bytes)
+            .unwrap();
+        blob_store.put_blob(digest, canonical_bytes).unwrap();
+        let provenance = DurableObjectProvenance::new(chain_id, ProtocolVersion::new(3));
+        let record = DurableObjectVersionRecord::from_blob_reference(
+            object_id,
+            DurableObjectVersion::new(object_version).unwrap(),
+            digest,
+            schema_version,
+            provenance,
+            created_checkpoint,
+            digest,
+        );
+        let changes = DurableObjectChanges::new(
+            vec![DurableObjectHeadRead::new(
+                object_id,
+                DurableObjectHead::Absent,
+            )],
+            vec![DurableObjectMutationEntry::new(
+                object_id,
+                DurableObjectMutation::Create {
+                    version: record,
+                    owner_projection: DurableObjectOwnerProjection::from_owner(owner).unwrap(),
+                    routing_projection: DurableObjectRoutingProjection::default(),
+                },
+            )],
+        )
+        .unwrap();
+        let receipt_request_id: RequestId = request_id(receipt_byte);
+        let receipt_event_digest: Digest32 = Digest32::new(
+            HashAlgorithmId::Sha2_256,
+            [receipt_byte.wrapping_add(1); 32],
+        );
+        let receipt_response: NodeResponse =
+            NodeResponse::new(receipt_request_id, NodeResponseStatus::Accepted, None).unwrap();
+        let receipt_record: NodeDedupRecord = NodeDedupRecord::new(
+            receipt_request_id,
+            receipt_event_digest,
+            vec![receipt_response],
+        )
+        .unwrap();
+        let receipt = DurableRequestReceipt::new(
+            DurableRequestId::new(*receipt_request_id.as_bytes()).unwrap(),
+            receipt_event_digest,
+            receipt_record.encode().unwrap(),
+        )
+        .unwrap();
+        let invocation =
+            DurableInvocationTransaction::new(domain, None, changes, receipt, None).unwrap();
+        assert_eq!(
+            store.commit_invocation(context, invocation),
+            DurableCommitOutcome::Committed
+        );
+        ObjectRef {
+            id: object_id,
+            version: object_version,
+            digest,
+        }
+    }
+
+    /// Builds the preinstalled-WASM durable router with an explicit,
+    /// caller-supplied `BlobStore` component instead of a default
+    /// [`MemoryBlobStore`], so a test can prove the exact supplied store is
+    /// the one the composition dispatches through.
+    #[allow(clippy::too_many_arguments)]
+    fn preinstalled_app_with_blob_store<S, B, C>(
+        store: Arc<S>,
+        blob_store: Arc<B>,
+        transport: Arc<MemoryTransport>,
+        clock: Arc<C>,
+        protocol_config: ProtocolConfig,
+        config: NodeConfig,
+        catalog: Arc<PreinstalledModuleCatalog>,
+        created_checkpoint: u64,
+    ) -> Router
+    where
+        S: IndexedOutboxRepository + Send + Sync + 'static,
+        B: BlobStore + Send + Sync + 'static,
+        C: Clock + Send + Sync + 'static,
+    {
+        let machine: Arc<IncrementMachine> = Arc::new(IncrementMachine::new(config.state_key()));
+        preinstalled_wasm_structured_durable_router(
+            StructuredDurableNativeComponents::new(
+                store,
+                blob_store,
+                transport,
+                clock,
+                Arc::new(SequenceIndexedIdentities::default()),
+            ),
+            PreinstalledWasmComposition::new(catalog, WasmExecutionEngine, created_checkpoint),
+            protocol_config,
+            structured_request_authority(),
+            config,
+            resolver(),
+            machine,
+            NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+        )
+        .unwrap()
+    }
+
     fn owned_object(id: ObjectId, owner: Address, byte: u8) -> Object {
         Object {
             id,
@@ -4560,6 +4752,42 @@ mod tests {
         structured_durable_router(
             StructuredDurableNativeComponents::new(
                 store,
+                Arc::new(MemoryBlobStore::default()),
+                transport,
+                clock,
+                Arc::new(SequenceIndexedIdentities::default()),
+            ),
+            protocol_config,
+            structured_request_authority(),
+            config,
+            resolver(),
+            machine,
+            NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+        )
+        .unwrap()
+    }
+
+    /// Builds the read-only structured durable router with an explicit,
+    /// caller-supplied `BlobStore` component instead of a default
+    /// [`MemoryBlobStore`], so a test can prove the exact supplied store is
+    /// (or is not) the one the composition dispatches through.
+    fn structured_app_with_blob_store<S, B>(
+        store: Arc<S>,
+        blob_store: Arc<B>,
+        transport: Arc<MemoryTransport>,
+        clock: Arc<ManualClock>,
+        protocol_config: ProtocolConfig,
+        config: NodeConfig,
+    ) -> Router
+    where
+        S: IndexedOutboxRepository + Send + Sync + 'static,
+        B: BlobStore + Send + Sync + 'static,
+    {
+        let machine: Arc<IncrementMachine> = Arc::new(IncrementMachine::new(config.state_key()));
+        structured_durable_router(
+            StructuredDurableNativeComponents::new(
+                store,
+                blob_store,
                 transport,
                 clock,
                 Arc::new(SequenceIndexedIdentities::default()),
@@ -4589,6 +4817,7 @@ mod tests {
         structured_durable_router(
             StructuredDurableNativeComponents::with_cancellation(
                 store,
+                Arc::new(MemoryBlobStore::default()),
                 transport,
                 clock,
                 Arc::new(SequenceIndexedIdentities::default()),
@@ -4614,7 +4843,13 @@ mod tests {
         machine: Arc<CountingMachine>,
     ) -> Router {
         structured_durable_router(
-            StructuredDurableNativeComponents::new(store, transport, clock, identities),
+            StructuredDurableNativeComponents::new(
+                store,
+                Arc::new(MemoryBlobStore::default()),
+                transport,
+                clock,
+                identities,
+            ),
             protocol_config,
             structured_request_authority(),
             config,
@@ -4642,6 +4877,7 @@ mod tests {
         preinstalled_wasm_structured_durable_router(
             StructuredDurableNativeComponents::new(
                 store,
+                Arc::new(MemoryBlobStore::default()),
                 transport,
                 clock,
                 Arc::new(SequenceIndexedIdentities::default()),
@@ -4675,6 +4911,7 @@ mod tests {
         preinstalled_wasm_structured_durable_router(
             StructuredDurableNativeComponents::with_cancellation(
                 store,
+                Arc::new(MemoryBlobStore::default()),
                 transport,
                 clock,
                 Arc::new(SequenceIndexedIdentities::default()),
@@ -4772,9 +5009,11 @@ mod tests {
         let mut mismatched = active_protocol_config(domain);
         mismatched.protocol_version = ProtocolVersion::new(2);
 
+        let blob_store = Arc::new(MemoryBlobStore::default());
         let mismatch = structured_durable_router(
             StructuredDurableNativeComponents::new(
                 Arc::clone(&store),
+                Arc::clone(&blob_store),
                 Arc::clone(&transport),
                 Arc::clone(&clock),
                 Arc::clone(&identities),
@@ -4800,7 +5039,7 @@ mod tests {
         missing_placement.transaction_auth_profile =
             Some(TransactionAuthProfile::ed25519_address_is_public_key());
         let missing = structured_durable_router(
-            StructuredDurableNativeComponents::new(store, transport, clock, identities),
+            StructuredDurableNativeComponents::new(store, blob_store, transport, clock, identities),
             missing_placement,
             structured_request_authority(),
             config(),
@@ -4828,6 +5067,7 @@ mod tests {
         let app = structured_durable_router(
             StructuredDurableNativeComponents::new(
                 Arc::clone(&store),
+                Arc::new(MemoryBlobStore::default()),
                 Arc::clone(&transport),
                 Arc::clone(&clock),
                 Arc::clone(&identities),
@@ -4901,6 +5141,7 @@ mod tests {
         let app = structured_durable_router(
             StructuredDurableNativeComponents::new(
                 Arc::clone(&store),
+                Arc::new(MemoryBlobStore::default()),
                 Arc::clone(&transport),
                 Arc::clone(&clock),
                 Arc::clone(&identities),
@@ -5122,9 +5363,20 @@ mod tests {
                 "object-owner-kind-unsupported",
             ),
             (
-                NodeCoreError::ObjectBodyUnavailable { object_id },
-                StatusCode::NOT_IMPLEMENTED,
-                "object-blob-body-unsupported",
+                NodeCoreError::ObjectBlobMissing {
+                    object_id,
+                    blob_digest: digest,
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "object-blob-unavailable",
+            ),
+            (
+                NodeCoreError::ObjectBlobDigestMismatch {
+                    object_id,
+                    blob_digest: digest,
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid-node-output",
             ),
             (
                 NodeCoreError::ObjectManifestTooLarge {
@@ -6846,6 +7098,112 @@ mod tests {
         );
     }
 
+    /// End-to-end composition proof: a signed `Write` access naming a
+    /// blob-backed previous version is only readable at all because the
+    /// router dispatches through the exact `BlobStore` supplied to
+    /// [`StructuredDurableNativeComponents::new`], not a hidden default. The
+    /// counting double proves it was called, and the committed new version
+    /// (always inline) carries the fetched blob's own data.
+    #[tokio::test]
+    async fn preinstalled_route_reads_blob_backed_object_through_supplied_blob_store() {
+        let fence = WriterFenceGeneration::new(3).unwrap();
+        let store = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let blob_store = Arc::new(CountingBlobStore::default());
+        let transport = Arc::new(MemoryTransport::default());
+        let config = config();
+        let domain = AtomicityDomainId::new([0xBB; 32]).unwrap();
+        let module_id = ModuleId::new([0x72; 32]);
+        let (registry, catalog, module_ref) = preinstalled_module_fixture(
+            &resolver(),
+            module_id,
+            1,
+            preinstalled_write_wasm_bytes(),
+            64,
+        );
+        let protocol_config = preinstalled_protocol_config(domain, registry);
+        let signing_key = dev_signing_key(0x53);
+        let sender = dev_sender_address(&signing_key);
+        let setup_context = DurableOperationContext::new(
+            fence,
+            StorageDeadline::new(20_000).unwrap(),
+            StorageCorrelationId::new([0xBB; 16]).unwrap(),
+        );
+        let write_object = owned_object(ObjectId::new([0xBC; 32]), sender, 0x40);
+        let write_ref = commit_owned_blob_object(
+            store.as_ref(),
+            blob_store.as_ref(),
+            &setup_context,
+            domain,
+            write_object,
+            "sunrise-test",
+            9,
+            0x41,
+        );
+        let write_object_id = write_ref.id;
+        let catalog = Arc::new(catalog);
+        let app = preinstalled_app_with_blob_store(
+            Arc::clone(&store),
+            Arc::clone(&blob_store),
+            Arc::clone(&transport),
+            Arc::new(ManualClock::new(10_000)),
+            protocol_config,
+            config,
+            Arc::clone(&catalog),
+            9,
+        );
+        let mut manifest = AccessManifest::new();
+        manifest.push(AccessEntry {
+            object_ref: write_ref,
+            mode: AccessMode::Write,
+        });
+        let id = request_id(0xBD);
+        let event = signed_preinstalled_wasm_submit_transaction_event(
+            &signing_key,
+            id,
+            0,
+            manifest,
+            module_ref,
+            vec![1, 2],
+        );
+
+        let response = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event.encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
+            .await
+            .unwrap();
+        let result = HttpNodeResult::decode(&bytes).unwrap();
+        assert_eq!(result.responses()[0].status(), NodeResponseStatus::Accepted);
+
+        assert_eq!(
+            blob_store.get_calls(),
+            1,
+            "the request must dispatch through the exact supplied blob store"
+        );
+        let write_v2 = store
+            .get_object_version(
+                &setup_context,
+                domain,
+                write_object_id,
+                DurableObjectVersion::new(2).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            write_v2.payload().inline().unwrap().object().data,
+            vec![0xCA, 0xFE]
+        );
+    }
+
     #[tokio::test]
     async fn preinstalled_route_exact_duplicate_does_not_reexecute_or_reapply() {
         let fence = WriterFenceGeneration::new(3).unwrap();
@@ -7663,6 +8021,7 @@ mod tests {
         let app = preinstalled_wasm_structured_durable_router_with_executor(
             StructuredDurableNativeComponents::new(
                 store,
+                Arc::new(MemoryBlobStore::default()),
                 transport,
                 Arc::new(ManualClock::new(10_000)),
                 Arc::new(SequenceIndexedIdentities::default()),
@@ -8721,6 +9080,7 @@ mod tests {
         let app = structured_durable_router(
             StructuredDurableNativeComponents::new(
                 store,
+                Arc::new(MemoryBlobStore::default()),
                 Arc::new(MemoryTransport::default()),
                 Arc::clone(&clock),
                 Arc::clone(&identities),
@@ -8994,8 +9354,10 @@ mod tests {
         let transport = Arc::new(MemoryTransport::default());
         let config = config();
         let protocol_config = active_protocol_config(domain);
-        let app = structured_app(
+        let blob_store = Arc::new(CountingBlobStore::default());
+        let app = structured_app_with_blob_store(
             Arc::clone(&store),
+            Arc::clone(&blob_store),
             transport,
             Arc::new(ManualClock::new(10_000)),
             protocol_config,
@@ -9024,6 +9386,11 @@ mod tests {
                 digest,
                 blob_digest,
             }
+        );
+        assert_eq!(
+            blob_store.get_calls(),
+            0,
+            "the query route must never fetch a blob body through the supplied blob store"
         );
     }
 
@@ -9162,6 +9529,7 @@ mod tests {
         let app = structured_durable_router(
             StructuredDurableNativeComponents::new(
                 store,
+                Arc::new(MemoryBlobStore::default()),
                 transport,
                 Arc::new(ManualClock::new(10_000)),
                 Arc::new(FailingIndexedIdentities {
@@ -9206,6 +9574,7 @@ mod tests {
         let app = structured_durable_router(
             StructuredDurableNativeComponents::new(
                 store,
+                Arc::new(MemoryBlobStore::default()),
                 transport,
                 Arc::new(ManualClock::new(10_000)),
                 Arc::new(FailingIndexedIdentities {
@@ -9250,6 +9619,7 @@ mod tests {
         let app = structured_durable_router(
             StructuredDurableNativeComponents::new(
                 store,
+                Arc::new(MemoryBlobStore::default()),
                 transport,
                 Arc::new(FailingClock),
                 Arc::new(SequenceIndexedIdentities::default()),
@@ -9345,6 +9715,7 @@ mod tests {
         let app = structured_durable_router(
             StructuredDurableNativeComponents::new(
                 store,
+                Arc::new(MemoryBlobStore::default()),
                 Arc::new(MemoryTransport::default()),
                 Arc::clone(&clock),
                 Arc::clone(&identities),
@@ -9661,6 +10032,7 @@ mod tests {
         let app = structured_durable_router(
             StructuredDurableNativeComponents::new(
                 Arc::clone(&store),
+                Arc::new(MemoryBlobStore::default()),
                 transport,
                 Arc::clone(&clock),
                 Arc::clone(&identities),
@@ -9817,6 +10189,7 @@ mod tests {
         let app = structured_durable_router_with_executor(
             StructuredDurableNativeComponents::new(
                 store,
+                Arc::new(MemoryBlobStore::default()),
                 transport,
                 Arc::new(ManualClock::new(10_000)),
                 Arc::new(SequenceIndexedIdentities::default()),
