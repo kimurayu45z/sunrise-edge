@@ -723,13 +723,33 @@ impl TlsBoundedStream {
     /// so — because a handshake never has already-authenticated plaintext
     /// to drain — retrying would busy-spin until the deadline instead of
     /// failing promptly.
+    ///
+    /// A peer that aborts the connection instead of closing it cleanly
+    /// surfaces here as an I/O error (`ConnectionReset`, `ConnectionAborted`,
+    /// or `BrokenPipe`) rather than the `Ok(0)` EOF above — which OS variant
+    /// the platform's TCP stack reports for "peer went away before the
+    /// handshake finished" is not portable (for example, a server that
+    /// closes the socket while the client's `ClientHello` is still in its
+    /// receive queue can make Linux emit `ECONNRESET` where another
+    /// platform would emit a clean EOF). Both observations mean exactly the
+    /// same thing during a handshake — the peer is gone and there is no
+    /// already-authenticated plaintext to drain — so this maps them to the
+    /// same [`TransportError::TlsHandshakeClosed`] boundary. This
+    /// reclassification is scoped to the handshake phase only:
+    /// [`Self::pump_read_once`] leaves post-handshake read errors, including
+    /// these same OS error kinds, as [`TransportError::Read`].
     fn pump_handshake_read_once(
         &mut self,
         deadline: Instant,
         read_timeout: Duration,
     ) -> Result<(), TransportError> {
-        if self.raw_read_tls(deadline, read_timeout)? == 0 {
-            return Err(TransportError::TlsHandshakeClosed);
+        match self.raw_read_tls(deadline, read_timeout) {
+            Ok(0) => return Err(TransportError::TlsHandshakeClosed),
+            Ok(_) => {}
+            Err(TransportError::Read(error)) if is_peer_gone(&error) => {
+                return Err(TransportError::TlsHandshakeClosed);
+            }
+            Err(error) => return Err(error),
         }
         self.conn
             .process_new_packets()
@@ -1116,6 +1136,16 @@ fn is_timeout(error: &std::io::Error) -> bool {
     matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
+/// Whether `error` is one of the OS error kinds that indicate a peer went
+/// away without a clean TCP close (used only to recognize an aborted
+/// handshake; see [`TlsBoundedStream::pump_handshake_read_once`]).
+fn is_peer_gone(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1201,6 +1231,39 @@ mod tests {
             transport.send(&invalid_content_type),
             Err(TransportError::InvalidRequestContentType)
         ));
+    }
+
+    #[test]
+    fn is_peer_gone_recognizes_only_the_aborted_connection_error_kinds() {
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+        ] {
+            assert!(
+                is_peer_gone(&io::Error::from(kind)),
+                "expected {kind:?} to be recognized as the peer going away"
+            );
+        }
+
+        // A deadline/timeout or an unrelated I/O error must not be
+        // reclassified: `raw_read_tls` already turns a timeout into
+        // `TransportError::RequestDeadlineExceeded` before `is_peer_gone` is
+        // ever consulted, and any other error kind must keep surfacing as
+        // `TransportError::Read` rather than being folded into
+        // `TlsHandshakeClosed`.
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::WouldBlock,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                !is_peer_gone(&io::Error::from(kind)),
+                "expected {kind:?} not to be recognized as the peer going away"
+            );
+        }
     }
 
     fn remote_tls_transport_args(
