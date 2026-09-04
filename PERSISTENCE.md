@@ -228,13 +228,17 @@ owner projections come from typed `Owner` encoding at write construction, but
 owner/routing projections are routing metadata rather than authorization. An
 execution caller must separately load the linked version, match its
 version/digest to the head, decode an inline Object, and compare typed owner;
-blob-backed execution fails closed until fetch/content verification. The SQL
+a blob-backed body is now fetched from an explicit `BlobStore` component and
+independently verified before decode/authorization (ARCHITECTURE.md DR-0094).
+The SQL
 `type_id` is the canonical Object record identifier,
 not the logical type hash retained in canonical Object bytes. Memory and
 PostgreSQL implement this section atomically with state, receipt, and outbox.
-Node-core now loads and authorizes authenticated read-only manifest entries and
-commits their complete head assertions through this section; mutating/consuming
-effects and blob upload/fetch verification remain deferred.
+Node-core now loads and authorizes authenticated read-only and owned
+mutating/consuming manifest entries, including a blob-backed input, and
+commits their complete head assertions through this section; blob
+upload/publication of a new version, a durable provider `BlobStore`, and
+GC/checkpoint manifest work remain deferred.
 Indexed repositories refine this structured store boundary. Node-core constructs the envelope after one
 manifest resolution and one pure transition, checks typed receipts before
 state reads, preserves read-only assertions, and withholds output for rejected

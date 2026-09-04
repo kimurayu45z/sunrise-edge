@@ -16,7 +16,7 @@ use native_http::{
 };
 use node_core::{NodeConfig, NodeCoreError};
 use objects::ObjectId;
-use runtime::{SystemClock, WriterFenceGeneration};
+use runtime::{MemoryBlobStore, SystemClock, WriterFenceGeneration};
 use runtime_sqlite::SqliteDurableStore;
 use std::{error::Error, fmt, num::NonZeroUsize, sync::Arc};
 
@@ -53,8 +53,15 @@ pub fn compose_devnet_router(
         DEVNET_GENERIC_STATE_KEY.to_vec(),
     )
     .map_err(DevnetCompositionError::NodeCore)?;
+    // The devnet's durable object store (`SqliteDurableStore`) has no durable
+    // `BlobStore` implementation yet (DR-0094): blob fetch/verification is
+    // wired As-Is with a process-local `MemoryBlobStore`, so a blob-backed
+    // object reference never survives a restart. Durable provider blob
+    // storage, upload/publication, and GC/checkpoint manifest work remain
+    // deferred; nothing in this devnet composition writes a blob reference.
     let components = StructuredDurableNativeComponents::new(
         store,
+        Arc::new(MemoryBlobStore::default()),
         Arc::new(DevnetTransport::new(admission)),
         Arc::new(SystemClock),
         Arc::new(DevnetOutboxIdentitySource::new_after(
