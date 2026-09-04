@@ -85,10 +85,13 @@ cross-provider ingress milestones implemented through Phase 17:
   declared scheme does not match the signer's/verifier's own scheme before
   any framing or cryptographic operation runs. Only Ed25519 with an
   `AddressIsPublicKey` address binding is implemented today; no production
-  signer is connected to the CLI. S4a now supplies only the strict Hardware
-  Signing Profile v1, signed-byte-only clear-signing view, and external-signer
-  host preflight described in [`SIGNING.md`](SIGNING.md); it does not supply a
-  device application or transport. `runtime::MemorySigner` is a public in-memory wiring
+  signer is connected to the CLI. S4a supplies the strict Hardware Signing
+  Profile v1, signed-byte-only clear-signing view, and external-signer host
+  preflight described in [`SIGNING.md`](SIGNING.md). The separate
+  [`sunriselayer/sunrise-edge-ledger-app`](https://github.com/sunriselayer/sunrise-edge-ledger-app)
+  repository now implements S4b's device application and Nano S+ Speculos
+  evidence As-Is; this workspace still has no host APDU/USB/HID transport or
+  CLI Ledger selection. `runtime::MemorySigner` is a public in-memory wiring
   fixture used to compose test/local runtimes; it is deliberately
   non-cryptographic and must never be used for protocol authentication.
   `protocol-config` only commits and resolves this profile
@@ -549,17 +552,18 @@ comparison, pinned device policy, and duplicate-`ObjectId` rejection), plus
 one correction to DR-0088's explicit blanket 230-byte whole-APDU data cap for
 `sign transaction`, raising FIRST's maximum command data from 230 to 255
 bytes and its first chunk from 205 to 230 bytes (CONTINUE/LAST chunks stay
-capped at 230, unchanged). This is a documentation-only clarification and
-correction — it changes no canonical transaction/signature byte or code in
-this repository. DR-0090 now records the separate
-`sunriselayer/sunrise-edge-ledger-app` PR #1 host-validated core milestone:
-an allocation-free `no_std` APDU state machine, independent canonical parser,
-exact policy recognition, signed-fields review model, and copied stable-fixture
-conformance are implemented As-Is there. That milestone still contains no
-Ledger SDK binary, SLIP-0010 derivation, signing, on-device UI, APDU/USB/HID
-transport, Speculos, reproducible device build, or physical-device evidence,
-so it does not complete S4b or S4. The current milestone remains S4b's actual
-dedicated Ledger device integration and Speculos evidence. S0-S3 are real
+capped at 230, unchanged). This was a documentation-only clarification and
+correction — it changed no canonical transaction/signature byte or code in
+this repository. DR-0090 records the separate repository's earlier PR #1
+host-core milestone. DR-0091 now records its merged PR #2 (`6f6f882`): the
+dedicated Ledger SDK application, actual SLIP-0010 derivation and Ed25519
+signing, on-device NBGL review, five-target clean builds, and fixed-seed Nano
+S+ Speculos/Ragger key, sender-substituted-frame signature, original-frame
+mismatch, rejection, and reset evidence are implemented and validated As-Is.
+S4b is therefore complete As-Is; S4 itself is not. S4c host
+APDU/USB/HID transport and explicit CLI Ledger selection are next, while
+physical-device HIL, golden UI evidence, release/reproducibility evidence, and
+the registered coin-type decision remain S4d. S0-S3 are real
 node/persistence/operations gate slices defined by reference to the existing,
 unchanged Phase 15 production exit criteria, the Post-MVP persistence
 implementation order, and the cross-phase release gate. S1 has two separate
@@ -732,14 +736,15 @@ device bounds or exact reference-transfer policy. The display is derived only
 from signed bytes and has no raw/blind-signing fallback. `build_signed_transaction`
 is unchanged in its stable output and remains the CLI's development-only path.
 
-This is not a Ledger integration. No USB/HID/Ledger dependency or device app
-exists in this workspace. The dedicated Rust device app belongs in a separate
-`sunrise-edge-ledger-app` repository; later host transport belongs in
-`clients/ledger`. S4 remains incomplete until Speculos plus physical-device
-HIL, address/user-confirmation flows, a pinned app/firmware matrix,
-reproducible build and release evidence exist and the CLI actually replaces
-`LocalSigner`. Existing Solana or Ethereum Ledger apps must never be reused
-for Sunrise signing (see `SIGNING.md`, `ARCHITECTURE.md` DR-0084/DR-0088).
+This workspace does not yet integrate Ledger with the CLI: no USB/HID/Ledger
+vendor dependency exists here. The dedicated Rust device app and Nano S+
+Speculos evidence now live in the separate `sunrise-edge-ledger-app`
+repository (S4b, DR-0091); S4c host transport belongs in `clients/ledger`.
+S4 remains incomplete until the CLI replaces `LocalSigner` through that host
+boundary and S4d supplies physical-device HIL, golden UI evidence, a pinned
+app/firmware matrix, reproducible build and release evidence. Existing Solana
+or Ethereum Ledger apps must never be reused for Sunrise signing (see
+`SIGNING.md`, `ARCHITECTURE.md` DR-0084/DR-0088/DR-0091).
 `clients/rust` also now has a typed, production-oriented expected-protocol-
 context verification boundary (`context::ExpectedProtocolContext`, DR-0085's
 S1a slice): a caller supplies the exact locally trusted `chain_id`,
@@ -838,13 +843,15 @@ since clarified the S4b device contract and corrected DR-0088's blanket
 230-byte whole-APDU data cap (FIRST 230→255 bytes, first chunk 205→230
 bytes, CONTINUE/LAST unchanged at 230) in `SIGNING.md` (documentation
 only, changing no canonical transaction/signature byte or implementation
-code). DR-0090 records that the separate Ledger repository now implements only
-the host-validated, SDK-independent core As-Is; no Ledger SDK binary, real key
-derivation/signing, on-device UI, APDU/USB/HID transport, Speculos, or
-physical-device evidence exists yet. S4b and S4 therefore remain incomplete,
-and the current milestone is the actual device integration and Speculos
-evidence; the TypeScript
-client, explorer, wallet, and S5 remain deferred until then.
+code). DR-0090 records the separate Ledger repository's earlier host-core
+milestone. DR-0091 records its merged PR #2 device application: five Ledger
+target builds and fixed-seed Nano S+ Speculos/Ragger derivation,
+sender-substituted-frame signing, original-frame sender-mismatch,
+reset-recovery, and rejection evidence are validated As-Is.
+S4b is complete As-Is, but S4 remains incomplete; S4c host APDU/USB/HID and CLI
+signer selection are next, followed by S4d physical/release evidence. The
+TypeScript client, explorer, wallet, and S5 remain deferred until the complete
+CLI-First Node Production Gate passes.
 This is real node/persistence/operations and remote-CLI
 evidence, not a mainnet-readiness or production-certification claim: passing
 S3 does not authorize skipping directly to later production claims.
