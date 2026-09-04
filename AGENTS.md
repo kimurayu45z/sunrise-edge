@@ -189,6 +189,8 @@ environmental limitation precisely.
 
 - Keep `README.md` focused on human orientation, current capabilities, setup,
   status, and risks.
+- Keep `DEVNET.md` as the exact local devnet/CLI operator walkthrough and
+  restart comparison; do not duplicate that runbook into the README.
 - Keep this file focused on durable agent/contributor instructions.
 - Keep `ARCHITECTURE.md` synchronized with implemented behavior and decision
   records.
@@ -235,8 +237,10 @@ work (see DR-0094 below) may proceed instead, but S4, S5, the
 that gate was never mainnet readiness on its own — it is a real
 node/persistence/operations gate defined entirely by reference to existing,
 unchanged Phase 15 To-Be exit criteria, the Post-MVP persistence
-implementation order, and the cross-phase release gate (see ARCHITECTURE.md
-DR-0085 for the full rationale and the S0-S5 ordered slices). S2's exact
+implementation order, and the cross-phase release gate. DR-0095 keeps S0-S3
+as the common baseline and makes S4 Hardware Signing and S5 Software
+Production parallel tracks without weakening either (see ARCHITECTURE.md
+DR-0085/DR-0095). S2's exact
 cross-owner destination
 policy is implemented by DR-0086. S3's uniform ordinary-asset fee composition,
 actual-gas settlement, trap fee-only charge, and restart/replay evidence are
@@ -300,7 +304,8 @@ certificate revocation/rotation/lifecycle handling, and no CA
 deployment/operations evidence; those remain explicitly deferred to later
 slices, not silently assumed. TypeScript-client/explorer/wallet criteria 7-9
 are kept verbatim, not completed or deleted, and remain deferred until the
-complete production gate passes. Existing production exit criteria remain
+Software Production Gate (S0-S3 + S5) passes; they do not wait for deferred
+S4 hardware work. Existing production exit criteria remain
 mandatory; capacity/PITR/HA/provider-certification work remains frozen
 until S5 or an explicit SLO triggers it. Node-core now asserts every
 declared read revision in its atomic write set. Runtime has the explicit atomicity
@@ -406,10 +411,10 @@ wallet signing stays browser-only) with restart/duplicate E2E
 evidence. `apps/devnet`, the bounded query API, `clients/rust`, `apps/cli`,
 and the restart/duplicate E2E
 (`apps/cli/tests/devnet_restart_duplicate_e2e.rs`) are implemented As-Is.
-Under DR-0085's CLI-first production-strategy pivot, `clients/typescript`,
-`apps/explorer`, and `apps/wallet` remain deferred (kept verbatim, not
-completed or deleted) until the new `CLI-First Node Production Gate`
-(`TODO.md`) passes. This replaces DR-0080's earlier `clients/typescript`/`demo/counter`
+Under DR-0085's CLI-first production-strategy pivot as amended by DR-0095,
+`clients/typescript`, `apps/explorer`, and `apps/wallet` remain deferred
+(kept verbatim, not completed or deleted) until the Software Production Gate
+(S0-S3 + S5) passes. This replaces DR-0080's earlier `clients/typescript`/`demo/counter`
 pairing; no `demo/counter` directory is created. The devnet's own
 demonstration contract is `sunrise.devnet.asset_account.v1`
 (`transfer`), moving balance between two ordinary asset accounts under the

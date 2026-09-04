@@ -298,7 +298,7 @@ impl ClearSigningPolicy {
 /// protocol/device-view crate must not depend on. The exact code digest
 /// below is valid only for one reference build documented in `SIGNING.md`:
 /// `chain_id = "sunrise-local-devnet"` (the exact value used by
-/// `README.md`'s "Getting started" local devnet walkthrough),
+/// `DEVNET.md`'s local devnet walkthrough),
 /// `protocol_version = 3`, hashing the exact committed
 /// `apps/devnet/src/modules/asset_account.wasm` bytes through the genesis
 /// SHA-256 hash suite. Any other devnet deployment (a different
