@@ -2425,9 +2425,12 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
     （既存のS4b five-target build listと一致するNano X/Nano S Plus/Stax/Flex/Apex P。
     build targetのないplain Nano Sは除外）・exactなLedger usage page `0xFFA0`
     （interface-number fallbackなし、strict equality）を検証してからのみopenする
-    （roadmapのdevice check、USB descriptor levelのみ）。full HID write検証、
+    （同じphysical pathに複数のHID top-level collectionがある場合は全recordを検査し、
+    少なくとも1件が3条件すべてを満たす場合のみacceptする。全件invalid時のtyped errorは
+    enumeration orderに依存しない。roadmapのdevice check、USB descriptor levelのみ）。full HID write検証、
     incomplete/malformedを即座に区別するread reassembly、bounded total elapsed
-    read time、Ledger short-APDU maximum 260 byte（response data最大258 byte +
+    read time（programmatic commandは30秒、human confirmationを待つ`verify public key`と
+    signing LASTは各120秒。packet数で乗算しない）、Ledger short-APDU maximum 260 byte（response data最大258 byte +
     2-byte status word）へのresponse bound、non-self-referentialな
     hand-built packet vectorsも実装する。**未実装：** active on-device application
     name/version検証とdevice firmware version検証（roadmapのapp/firmware check。
@@ -2443,7 +2446,13 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
     `--seed-file`または
     `--ledger-hid-path`+`--ledger-account`のexplicit all-or-none signer selectionを
     追加し、Ledger選択時はネットワークdispatch前にdevice接続・configuration・
-    public key checkを完了する。vendor dependencyはprotocol crate/`clients/rust`
+    public key checkを完了する。現Phase 1のoperator flowは`address`で1回のaddress確認、
+    `transfer`でconnect-time address・pre-sign address・transaction reviewの3回確認を
+    要求し、重複address確認はproduction UX完成の主張ではなくfail-closedな暫定動作である。
+    feature非依存の`FakeTransport` testはCLIのexact `DeviceSigningProfile::V1` +
+    `DEVNET_ASSET_TRANSFER_POLICY` helperをpolicy-conforming `PreparedTransaction`とvalid
+    Ed25519 signatureで実行し、local signerと同一canonical outputおよびpolicy mismatch時の
+    pre-device rejectionを証明する。vendor dependencyはprotocol crate/`clients/rust`
     には入らず`clients/ledger`に閉じ、CLIのone-runtime-dependency invariantは
     `sunrise-edge-client`と`sunrise-edge-ledger`の2つへDR-0092で明示的に改訂された。
     canonical transaction/signature bytesとlocal-signer pathは不変である。

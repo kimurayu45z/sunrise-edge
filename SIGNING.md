@@ -338,7 +338,17 @@ tooling rather than assuming it from this table:
   id, a recognized product-id model family (the exact S4b five-target build
   list — Nano X, Nano S Plus, Stax, Flex, Apex P), and exactly the Ledger
   APDU usage page `0xFFA0` (the **device** check; no interface-number
-  fallback) before ever opening it. **S4c is not complete**: this phase does
+  fallback) before ever opening it. If one physical path exposes multiple
+  HID top-level collections, the host checks every descriptor at that exact
+  path and accepts only when at least one satisfies all three identity
+  fields. Programmatic responses have a 30-second total read deadline;
+  `verify public key` and signing LAST, which wait for a human, each have a
+  bounded 120-second total read deadline. Neither deadline is multiplied by
+  the number of HID packets. The current operator flow therefore shows one
+  address confirmation for `address`, and three confirmations for
+  `transfer`: connect-time address, repeated pre-sign address, then the
+  transaction review. The repeated address check is intentional fail-closed
+  Phase 1 behavior, not finalized production UX. **S4c is not complete**: this phase does
   not verify the active on-device application's name/version or the device
   firmware version (the **app**/**firmware** checks — see "Device APDU
   contract" above), and none of it — the APDU protocol logic, the USB HID

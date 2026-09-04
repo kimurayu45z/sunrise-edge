@@ -66,7 +66,10 @@ impl<T: Transport> ExternalSigner for LedgerExternalSigner<T> {
     }
 
     fn sign_frame(&self, framed_message: &[u8]) -> Result<Vec<u8>, Self::Error> {
-        let mut device = self.device.borrow_mut();
+        let mut device = self
+            .device
+            .try_borrow_mut()
+            .map_err(|_| DeviceError::DeviceBusy)?;
         device.get_configuration()?.require_supported()?;
         let public_key = device.verify_public_key(self.path)?;
         if public_key != *self.address.as_bytes() {
@@ -120,6 +123,20 @@ mod tests {
             LedgerExternalSigner::connect(transport, DerivationPath::provisional(0).unwrap())
                 .unwrap_err();
         assert!(matches!(error, DeviceError::UnsupportedConfiguration(_)));
+    }
+
+    #[test]
+    fn concurrent_or_reentrant_use_is_a_typed_error_not_a_refcell_panic() {
+        let key = [0x24_u8; 32];
+        let transport = FakeTransport::new(vec![valid_configuration(), ok(key.to_vec())]);
+        let signer =
+            LedgerExternalSigner::connect(transport, DerivationPath::provisional(0).unwrap())
+                .unwrap();
+        let _active_call = signer.device.borrow_mut();
+
+        let error = signer.sign_frame(&[0xAB, 0xCD]).unwrap_err();
+
+        assert!(matches!(error, DeviceError::DeviceBusy));
     }
 
     #[test]

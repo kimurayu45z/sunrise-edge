@@ -42,6 +42,8 @@ use std::ffi::OsString;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
+#[cfg(feature = "usb-hid")]
+use sunrise_edge_client::ExternalSigner;
 use sunrise_edge_client::{
     AccessEntry, AccessManifest, AccessMode, Address, Amount, AssetId, AtomicityDomainId,
     CanonicalStruct, ChainId, Client, Digest32, ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
@@ -51,8 +53,6 @@ use sunrise_edge_client::{
     ProtocolVersion, ReceiptPollBounds, RequestId, SignatureSchemeId, SubmitTransactionRequest,
     TransactionRequest, Transport, decode_object,
 };
-#[cfg(feature = "usb-hid")]
-use sunrise_edge_client::{DEVNET_ASSET_TRANSFER_POLICY, DeviceSigningProfile, ExternalSigner};
 
 use crate::args::{ParsedArgs, parse_flags, scalar, switch};
 use crate::error::CliError;
@@ -61,7 +61,9 @@ use crate::net::{connect, tls_flag_specs};
 use crate::output::{bounded_hex_field, sanitize_line};
 use crate::parse::{parse_u16, parse_u32, parse_u64};
 use crate::seed::load_dev_seed;
-use crate::signer::{SignerSelection, parse_signer_selection, signer_flag_specs};
+use crate::signer::{
+    SignerSelection, finalize_with_ledger, parse_signer_selection, signer_flag_specs,
+};
 
 const ENDPOINT: &str = "--endpoint";
 const MODULE_ID: &str = "--module-id";
@@ -178,13 +180,7 @@ fn run_with_ledger(
     let sender = signer.address();
     let client = connect(endpoint, parsed)?;
     execute(&client, sender, inputs, |prepared| {
-        prepared
-            .sign_and_finalize_external(
-                &signer,
-                &DeviceSigningProfile::V1,
-                &DEVNET_ASSET_TRANSFER_POLICY,
-            )
-            .map_err(CliError::from)
+        finalize_with_ledger(prepared, &signer)
     })
 }
 

@@ -808,9 +808,10 @@ usage page — no interface-number fallback — (the **device** check,
 USB-descriptor level only) before ever opening it — full HID writes are
 verified, and read reassembly distinguishes an incomplete response from a
 malformed one (failing the latter immediately rather than looping until a
-timeout), bounded by one total elapsed-time deadline and a Ledger short-APDU
-response-size cap (260 bytes total: up to 258 bytes of response data plus
-the 2-byte status word). Physical-device HIL for all of this remains
+timeout), bounded by a 30-second total deadline for programmatic APDUs or a
+120-second total deadline for each APDU that waits for human confirmation,
+plus a Ledger short-APDU response-size cap (260 bytes total: up to 258 bytes
+of response data plus the 2-byte status word). Physical-device HIL for all of this remains
 deferred, and the roadmap's **app**/**firmware** identity checks are not yet
 implemented — both are a later S4c slice: the active application's
 name/version is CLA `B0` `INS 01`, and the device firmware version is CLA
@@ -825,7 +826,16 @@ byte vectors for the USB HID framing), with no native dependency.
 require an explicit, all-or-none signer selection (`--seed-file`, or both
 `--ledger-hid-path`/`--ledger-account` together); a Ledger selection
 without the `usb-hid` feature fails closed with a typed error rather than
-silently falling back to the local signer. The dedicated Rust device app
+silently falling back to the local signer. In the current Phase 1 flow,
+`address` asks for one on-device address confirmation. `transfer` asks for
+three confirmations: the connect-time address, the independently repeated
+pre-sign address, and the final transaction review. The repeated address
+check is intentional fail-closed behavior, not polished production UX; a
+later hardware-validated phase may reduce prompts only without weakening
+the pre-sign identity check. Programmatic APDUs have a 30-second total read
+deadline, while each human-confirmation APDU has a bounded 120-second total
+read deadline; neither deadline is multiplied by the number of HID packets.
+The dedicated Rust device app
 and Nano S+ Speculos evidence live in the separate
 `sunrise-edge-ledger-app` repository (S4b, DR-0091). S4c Phase 1 is host
 integration As-Is only, and S4c itself remains incomplete: S4 remains

@@ -29,7 +29,7 @@
 //! own encoder); neither proves agreement with a real Ledger device's
 //! firmware.
 //!
-//! **Device identity is USB-descriptor-level only.** [`identify_ledger_device`]
+//! **Device identity is USB-descriptor-level only.** [`classify_descriptor`]
 //! recognizes a device's USB vendor id, exact HID usage page, and product-id
 //! model family. It does not — and cannot, over this transport alone —
 //! verify the active on-device application's name/version or the device
@@ -53,9 +53,11 @@ use std::ffi::CString;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use hidapi::{DeviceInfo, HidApi, HidDevice};
+use hidapi::{HidApi, HidDevice};
 
-use crate::apdu::{ApduCommand, ApduResponse, Transport};
+use crate::apdu::{
+    ApduCommand, ApduResponse, INS_SIGN_TRANSACTION, INS_VERIFY_PUBLIC_KEY, P1_SIGN_LAST, Transport,
+};
 
 /// Ledger's USB vendor id, shared by every Ledger device model.
 pub const LEDGER_USB_VENDOR_ID: u16 = 0x2C97;
@@ -82,21 +84,30 @@ const TAG_APDU: u8 = 0x05;
 /// that do not use numbered HID reports.
 const REPORT_ID_PREFIX: u8 = 0x00;
 /// Secondary bound on the number of USB HID packets read for one logical
-/// APDU response, independent of [`TOTAL_READ_TIMEOUT`]: with
+/// APDU response, independent of the selected total-elapsed-time deadline
+/// (see [`read_timeout_for`]): with
 /// [`MAX_APDU_RESPONSE_LEN`] capping the declared length, a well-formed
 /// response never needs more than a handful of packets, so this bound
 /// exists only to stop a corrupted stream that keeps reporting "incomplete"
 /// from growing `Vec` allocations without limit before the wall-clock
 /// deadline below is reached.
 const MAX_READ_PACKETS: usize = 8;
-/// Bounds the *total* elapsed time reading one logical APDU response,
-/// across every USB HID packet it takes to deliver — not a per-packet
-/// timeout multiplied by [`MAX_READ_PACKETS`]. A device may legitimately
-/// hold the first packet back for a long time while a user reviews an
-/// on-device confirmation; a per-packet `hidapi` timeout that elapses with
-/// no data is therefore treated as "no data yet" and retried, as long as
-/// this overall deadline has not passed.
-const TOTAL_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bounds the *total* elapsed time reading one logical APDU response, across
+/// every USB HID packet it takes to deliver — not a per-packet timeout
+/// multiplied by [`MAX_READ_PACKETS`] — for a purely programmatic exchange
+/// (`get configuration`, `reset signing`, and `sign transaction` FIRST/
+/// CONTINUE) that returns before any on-device review screen is shown. A
+/// per-packet `hidapi` timeout that elapses with no data is treated as "no
+/// data yet" and retried, as long as this overall deadline has not passed.
+const PROGRAMMATIC_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// The same total-elapsed-time bound as [`PROGRAMMATIC_READ_TIMEOUT`], but
+/// for a command that requires a human to review and approve an on-device
+/// screen before the device replies (`verify public key`, and `sign
+/// transaction` LAST — the call that renders the transaction review and
+/// returns the signature): deliberately much longer, since a human can
+/// legitimately take minutes to read and approve a review page. See
+/// [`read_timeout_for`] for exactly which commands use which bound.
+const HUMAN_REVIEW_READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// Maximum accepted short-APDU response *data* length, excluding the
 /// trailing two-byte status word.
 const MAX_APDU_RESPONSE_DATA_LEN: usize = 258;
@@ -127,7 +138,7 @@ const MAX_APDU_RESPONSE_LEN: usize = MAX_APDU_RESPONSE_DATA_LEN + 2;
 /// active application name/version or firmware version — see this module's
 /// documentation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LedgerProductModel {
+enum LedgerProductModel {
     /// Ledger Nano X (`0x40xx`).
     NanoX,
     /// Ledger Nano S Plus (`0x50xx`).
@@ -193,10 +204,58 @@ fn classify_descriptor(
     Ok(model)
 }
 
-/// Identifies `info` as a supported Ledger device, or returns a typed
-/// rejection (see [`classify_descriptor`] for the exact policy).
-fn identify_ledger_device(info: &DeviceInfo) -> Result<LedgerProductModel, HidTransportError> {
-    classify_descriptor(info.vendor_id(), info.product_id(), info.usage_page())
+/// One USB HID descriptor's identity-relevant fields, decoupled from
+/// `hidapi::DeviceInfo` (which has no public constructor, so it cannot be
+/// built in a test) so the multi-collection selection policy in
+/// [`select_descriptor`] is directly unit-testable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DescriptorRecord {
+    vendor_id: u16,
+    product_id: u16,
+    usage_page: u16,
+}
+
+/// Selects a recognized Ledger device from every descriptor record sharing
+/// one physical platform path.
+///
+/// A single physical device node can expose more than one HID top-level
+/// collection at the exact same platform path (for example a
+/// keyboard/generic-HID collection alongside the vendor-specific APDU
+/// collection); this succeeds if *any* record in `records` passes
+/// [`classify_descriptor`], not only the first one enumerated. If `records`
+/// is empty, this is [`HidTransportError::DeviceNotFound`] for `path`. If at
+/// least one record exists but none pass, this deterministically returns
+/// the lexicographically smallest record's own rejection reason, so the
+/// result does not depend on the platform's enumeration order.
+fn select_descriptor(
+    records: &[DescriptorRecord],
+    path: &str,
+) -> Result<LedgerProductModel, HidTransportError> {
+    if records.is_empty() {
+        return Err(HidTransportError::DeviceNotFound {
+            path: path.to_string(),
+        });
+    }
+    for record in records {
+        if let Ok(model) =
+            classify_descriptor(record.vendor_id, record.product_id, record.usage_page)
+        {
+            return Ok(model);
+        }
+    }
+    let Some(selected_rejection) = records
+        .iter()
+        .min_by_key(|record| (record.vendor_id, record.product_id, record.usage_page))
+    else {
+        return Err(HidTransportError::DeviceNotFound {
+            path: path.to_string(),
+        });
+    };
+    classify_descriptor(
+        selected_rejection.vendor_id,
+        selected_rejection.product_id,
+        selected_rejection.usage_page,
+    )
 }
 
 /// Errors from the real USB/HID transport.
@@ -278,9 +337,12 @@ pub enum HidTransportError {
     /// More than [`MAX_READ_PACKETS`] packets were read without completing
     /// the declared response length.
     TooManyReadPackets,
-    /// [`TOTAL_READ_TIMEOUT`] elapsed before a complete response was
-    /// reassembled.
-    ReadTimedOut,
+    /// The command's selected read deadline (see [`read_timeout_for`])
+    /// elapsed before a complete response was reassembled.
+    ReadTimedOut {
+        /// The timeout that elapsed.
+        timeout: Duration,
+    },
     /// An internal framing bound (an arithmetic range this module's own
     /// invariants should always keep within range) was exceeded. This is a
     /// defensive, typed alternative to a panic or a silent
@@ -345,10 +407,9 @@ impl fmt::Display for HidTransportError {
                     "exceeded {MAX_READ_PACKETS} USB HID read packets for one APDU response"
                 )
             }
-            Self::ReadTimedOut => write!(
-                f,
-                "no complete APDU response was read within {TOTAL_READ_TIMEOUT:?}"
-            ),
+            Self::ReadTimedOut { timeout } => {
+                write!(f, "no complete APDU response was read within {timeout:?}")
+            }
             Self::FramingBoundsExceeded => f.write_str("internal USB HID framing bound exceeded"),
         }
     }
@@ -366,16 +427,15 @@ impl std::error::Error for HidTransportError {
 /// A real Ledger device reached over USB HID.
 pub struct HidTransport {
     device: HidDevice,
-    model: LedgerProductModel,
 }
 
 impl HidTransport {
     /// Opens the device at the exact platform HID path `path`, requiring it
-    /// to first resolve, through `HidApi::device_list`, to a currently
-    /// connected device reporting Ledger's USB vendor id, a recognized
+    /// to first resolve, through `HidApi::device_list`, to at least one
+    /// currently connected descriptor record at that path, and at least one
+    /// such record reporting Ledger's USB vendor id, a recognized
     /// product-id model family, and exactly the Ledger APDU usage page (see
-    /// [`identify_ledger_device`]) — before this ever calls
-    /// `HidApi::open_path`.
+    /// [`select_descriptor`]) — before this ever calls `HidApi::open_path`.
     ///
     /// There is no "first device" auto-selection: a caller must name the
     /// exact device explicitly, matching this workspace's existing "no
@@ -383,46 +443,20 @@ impl HidTransport {
     /// seed file). This check is USB-descriptor-level identity only; see
     /// this module's documentation for what it does not verify.
     pub fn open(path: &str) -> Result<Self, HidTransportError> {
-        let api = HidApi::new().map_err(HidTransportError::Hid)?;
-        let info = api
-            .device_list()
-            .find(|info| matches!(info.path().to_str(), Ok(candidate) if candidate == path))
-            .ok_or_else(|| HidTransportError::DeviceNotFound {
-                path: path.to_string(),
-            })?;
-        let model = identify_ledger_device(info)?;
         let c_path = CString::new(path).map_err(|_| HidTransportError::InvalidDevicePath)?;
-        let device = api.open_path(&c_path).map_err(HidTransportError::Hid)?;
-        Ok(Self { device, model })
-    }
-
-    /// The recognized device model this transport connected to.
-    #[must_use]
-    pub const fn product_model(&self) -> LedgerProductModel {
-        self.model
-    }
-
-    /// Lists the platform HID path and recognized model of every currently
-    /// connected, recognized Ledger device, for a caller (typically the
-    /// CLI) to present to an operator before they select one explicitly.
-    /// Devices that fail [`identify_ledger_device`] (for example a
-    /// different vendor's device, an unrecognized product model, or a
-    /// mismatched usage page) are silently omitted rather than surfaced as
-    /// an error, since this is a best-effort discovery listing, not a
-    /// strict open.
-    pub fn list_devices() -> Result<Vec<(String, LedgerProductModel)>, HidTransportError> {
         let api = HidApi::new().map_err(HidTransportError::Hid)?;
-        let mut devices = Vec::new();
-        for info in api.device_list() {
-            let Ok(model) = identify_ledger_device(info) else {
-                continue;
-            };
-            let Ok(path) = info.path().to_str() else {
-                continue;
-            };
-            devices.push((path.to_string(), model));
-        }
-        Ok(devices)
+        let records: Vec<DescriptorRecord> = api
+            .device_list()
+            .filter(|info| matches!(info.path().to_str(), Ok(candidate) if candidate == path))
+            .map(|info| DescriptorRecord {
+                vendor_id: info.vendor_id(),
+                product_id: info.product_id(),
+                usage_page: info.usage_page(),
+            })
+            .collect();
+        select_descriptor(&records, path)?;
+        let device = api.open_path(&c_path).map_err(HidTransportError::Hid)?;
+        Ok(Self { device })
     }
 }
 
@@ -432,7 +466,7 @@ impl Transport for HidTransport {
     fn exchange(&mut self, command: &ApduCommand) -> Result<ApduResponse, Self::Error> {
         let raw_command = encode_raw_apdu(command)?;
         write_packets(&self.device, &raw_command)?;
-        let raw_response = read_packets(&self.device)?;
+        let raw_response = read_packets(&self.device, read_timeout_for(command))?;
         decode_raw_apdu_response(&raw_response)
     }
 }
@@ -628,22 +662,46 @@ fn write_packets(device: &HidDevice, raw_apdu: &[u8]) -> Result<(), HidTransport
     Ok(())
 }
 
+/// Selects the bounded total read deadline for `command`, based on whether
+/// this app's own frozen `E0` contract requires a human to review and
+/// approve an on-device screen before replying: `verify public key`
+/// (always) and `sign transaction` LAST (the call that renders the
+/// transaction review and returns the signature) use
+/// [`HUMAN_REVIEW_READ_TIMEOUT`]; every other command — `get configuration`,
+/// `reset signing`, and `sign transaction` FIRST/CONTINUE — returns before
+/// any review UI and uses the much shorter [`PROGRAMMATIC_READ_TIMEOUT`].
+///
+/// A pure function of `command`'s `ins`/`p1` fields (never sleeps or
+/// blocks), so this policy is directly unit-testable.
+fn read_timeout_for(command: &ApduCommand) -> Duration {
+    let requires_human_review = matches!(
+        (command.ins, command.p1),
+        (INS_VERIFY_PUBLIC_KEY, _) | (INS_SIGN_TRANSACTION, P1_SIGN_LAST)
+    );
+    if requires_human_review {
+        HUMAN_REVIEW_READ_TIMEOUT
+    } else {
+        PROGRAMMATIC_READ_TIMEOUT
+    }
+}
+
 /// Reads USB HID packets until a complete APDU response is reassembled,
-/// bounded by [`TOTAL_READ_TIMEOUT`] total elapsed time (not a per-packet
-/// timeout multiplied by [`MAX_READ_PACKETS`]) and, secondarily, by
-/// [`MAX_READ_PACKETS`] itself. A header/sequence/declared-length problem
-/// from [`decode_hid_packets`] fails immediately via `?`; it is never
-/// treated as "keep waiting".
-fn read_packets(device: &HidDevice) -> Result<Vec<u8>, HidTransportError> {
+/// bounded by `timeout` total elapsed time (not a per-packet timeout
+/// multiplied by [`MAX_READ_PACKETS`]) and, secondarily, by
+/// [`MAX_READ_PACKETS`] itself. `timeout` is selected per command by
+/// [`read_timeout_for`]. A header/sequence/declared-length problem from
+/// [`decode_hid_packets`] fails immediately via `?`; it is never treated as
+/// "keep waiting".
+fn read_packets(device: &HidDevice, timeout: Duration) -> Result<Vec<u8>, HidTransportError> {
     let deadline = Instant::now()
-        .checked_add(TOTAL_READ_TIMEOUT)
+        .checked_add(timeout)
         .ok_or(HidTransportError::FramingBoundsExceeded)?;
     let mut packets: Vec<[u8; PACKET_SIZE]> = Vec::new();
 
     loop {
         let now = Instant::now();
         if now >= deadline {
-            return Err(HidTransportError::ReadTimedOut);
+            return Err(HidTransportError::ReadTimedOut { timeout });
         }
         if packets.len() >= MAX_READ_PACKETS {
             return Err(HidTransportError::TooManyReadPackets);
@@ -661,7 +719,7 @@ fn read_packets(device: &HidDevice) -> Result<Vec<u8>, HidTransportError> {
         if read == 0 {
             // `hidapi`'s own per-call timeout elapsed with no data; retry
             // until the overall deadline above is reached (see
-            // `TOTAL_READ_TIMEOUT`'s documentation for why).
+            // `read_timeout_for`'s documentation for why).
             continue;
         }
         if read != PACKET_SIZE {
@@ -958,5 +1016,90 @@ mod tests {
             error,
             HidTransportError::UnrecognizedUsagePage { usage_page: 0x0001 }
         ));
+    }
+
+    #[test]
+    fn select_descriptor_accepts_a_later_valid_collection_on_the_same_path() {
+        let records = [
+            DescriptorRecord {
+                vendor_id: LEDGER_USB_VENDOR_ID,
+                product_id: 0x5001,
+                usage_page: 0x0001,
+            },
+            DescriptorRecord {
+                vendor_id: LEDGER_USB_VENDOR_ID,
+                product_id: 0x5001,
+                usage_page: LEDGER_USAGE_PAGE,
+            },
+        ];
+
+        assert_eq!(
+            select_descriptor(&records, "/dev/hidraw-ledger").unwrap(),
+            LedgerProductModel::NanoSPlus
+        );
+    }
+
+    #[test]
+    fn select_descriptor_reports_an_exact_missing_path() {
+        let error = select_descriptor(&[], "/dev/hidraw-missing").unwrap_err();
+
+        assert!(matches!(
+            error,
+            HidTransportError::DeviceNotFound { path }
+                if path == "/dev/hidraw-missing"
+        ));
+    }
+
+    #[test]
+    fn select_descriptor_rejection_does_not_depend_on_enumeration_order() {
+        let first = DescriptorRecord {
+            vendor_id: 0x1234,
+            product_id: 0x5001,
+            usage_page: LEDGER_USAGE_PAGE,
+        };
+        let second = DescriptorRecord {
+            vendor_id: 0x2345,
+            product_id: 0x4001,
+            usage_page: LEDGER_USAGE_PAGE,
+        };
+
+        for records in [[first, second], [second, first]] {
+            let error = select_descriptor(&records, "/dev/hidraw-invalid").unwrap_err();
+            assert!(matches!(
+                error,
+                HidTransportError::UnrecognizedVendorId { actual: 0x1234 }
+            ));
+        }
+    }
+
+    #[test]
+    fn read_timeout_distinguishes_programmatic_and_human_review_commands() {
+        use crate::apdu::{
+            CLA, INS_GET_CONFIGURATION, INS_RESET_SIGNING, P1_DEFAULT, P1_SIGN_CONTINUE,
+            P1_SIGN_FIRST, P1_VERIFY_PUBLIC_KEY, P2_DEFAULT,
+        };
+
+        let command = |ins: u8, p1: u8| ApduCommand {
+            cla: CLA,
+            ins,
+            p1,
+            p2: P2_DEFAULT,
+            data: Vec::new(),
+        };
+
+        for programmatic in [
+            command(INS_GET_CONFIGURATION, P1_DEFAULT),
+            command(INS_RESET_SIGNING, P1_DEFAULT),
+            command(INS_SIGN_TRANSACTION, P1_SIGN_FIRST),
+            command(INS_SIGN_TRANSACTION, P1_SIGN_CONTINUE),
+        ] {
+            assert_eq!(read_timeout_for(&programmatic), PROGRAMMATIC_READ_TIMEOUT);
+        }
+        for human_review in [
+            command(INS_VERIFY_PUBLIC_KEY, P1_VERIFY_PUBLIC_KEY),
+            command(INS_SIGN_TRANSACTION, P1_SIGN_LAST),
+        ] {
+            assert_eq!(read_timeout_for(&human_review), HUMAN_REVIEW_READ_TIMEOUT);
+        }
     }
 }

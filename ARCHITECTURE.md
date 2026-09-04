@@ -4119,8 +4119,10 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   **`hid::HidTransport`: real, device-checked, but not hardware-validated.**
   This module owns two independent layers. First, USB device identification
   (the **device** check): `HidTransport::open` resolves the caller's exact
-  path through `HidApi::device_list` and requires `identify_ledger_device`
-  to recognize it — Ledger's USB vendor id `0x2c97`, a product-id family in
+  path through `HidApi::device_list`, checks every descriptor record sharing
+  that path (one physical device may expose several HID top-level
+  collections), and requires at least one record to satisfy all three
+  identity fields — Ledger's USB vendor id `0x2c97`, a product-id family in
   the exact S4b five-target build list (Nano X, Nano S Plus, Stax, Flex,
   Apex P — see DR-0091; the plain Nano S is deliberately excluded, since no
   S4b build target covers it), and exactly the Ledger HID usage page
@@ -4132,8 +4134,8 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   platform-`cfg`-specific policy for when it is safe, a mismatched usage
   page is treated as unrecognized. An unrecognized vendor id, product
   family, or usage page is a typed rejection before `HidApi::open_path` is
-  ever called, and `list_devices` surfaces the same recognized model per
-  path for a caller to present to an operator. This is USB-descriptor-level
+  ever called; when every same-path record is invalid, the typed error is
+  selected independently of enumeration order. This is USB-descriptor-level
   identity only: it is not, and cannot be over this transport, the active
   on-device application's name/version or the device firmware version.
   Those live on two different CLAs depending on device context, neither of
@@ -4158,10 +4160,11 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   out-of-order sequence index, or a declared length over the bounded
   short-APDU maximum of 260 bytes — up to 258 response-data bytes plus the
   2-byte status word) and fails immediately on the latter
-  rather than looping until a timeout; and the complete read is bounded by
-  one wall-clock deadline (30 seconds total, not a per-packet timeout
-  multiplied by a packet-count limit) plus a small secondary packet-count
-  bound. Every arithmetic step in this framing (offsets, remaining lengths,
+  rather than looping until a timeout; and each complete read is bounded by
+  a command-class wall-clock deadline (30 seconds for programmatic commands,
+  120 seconds for each `verify public key` or signing LAST command that waits
+  for a human), never a per-packet timeout multiplied by a packet-count
+  limit, plus a small secondary packet-count bound. Every arithmetic step in this framing (offsets, remaining lengths,
   sequence increments) uses checked arithmetic with a typed
   `FramingBoundsExceeded` fallback in place of a panic or a silent
   saturating/truncating substitute. Its pure encode/decode functions have
@@ -4202,7 +4205,15 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   calls `sign_and_finalize_external` with `DeviceSigningProfile::V1` and
   `DEVNET_ASSET_TRANSFER_POLICY` — the same host preflight DR-0088 already
   implements — so canonical transaction/signature bytes and the local-signer
-  path are both completely unchanged.
+  path are both completely unchanged. A feature-independent `FakeTransport`
+  test executes this exact CLI helper with a real policy-conforming
+  `PreparedTransaction` and a valid Ed25519 response, compares its canonical
+  output with the local signer, and proves a policy mismatch is rejected
+  before device signing. The current operator interaction is also explicit:
+  `address` requires one on-device address confirmation, while `transfer`
+  requires three (connect-time address, repeated pre-sign address, then the
+  transaction review). The repeated address prompt is deliberate fail-closed
+  Phase 1 behavior, not a production-UX claim.
 
   **Completion boundary.** This is S4c Phase 1 host integration As-Is only,
   and S4c itself is not complete. It adds no device application, no

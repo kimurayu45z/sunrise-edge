@@ -5,8 +5,6 @@
 //! This module defines only the exact command/status bytes `SIGNING.md`
 //! freezes; it performs no I/O itself.
 
-use std::fmt;
-
 /// This application's fixed instruction class.
 pub const CLA: u8 = 0xE0;
 
@@ -18,6 +16,9 @@ pub const INS_VERIFY_PUBLIC_KEY: u8 = 0x02;
 pub const INS_SIGN_TRANSACTION: u8 = 0x04;
 /// `reset signing` instruction.
 pub const INS_RESET_SIGNING: u8 = 0x06;
+
+/// The only `P1` `get configuration` and `reset signing` ever use.
+pub const P1_DEFAULT: u8 = 0x00;
 
 /// `verify public key`'s only valid `P1`; `P1=00` is invalid because the
 /// command always requires on-device confirmation.
@@ -108,18 +109,4 @@ pub trait Transport {
     /// or fails with `Self::Error` (for example on disconnect, timeout, or a
     /// malformed/short physical frame).
     fn exchange(&mut self, command: &ApduCommand) -> Result<ApduResponse, Self::Error>;
-}
-
-impl fmt::Display for ApduCommand {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "cla={:02x} ins={:02x} p1={:02x} p2={:02x} data_len={}",
-            self.cla,
-            self.ins,
-            self.p1,
-            self.p2,
-            self.data.len()
-        )
-    }
 }

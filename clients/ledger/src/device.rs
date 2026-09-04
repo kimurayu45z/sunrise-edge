@@ -10,8 +10,8 @@ use sunrise_edge_client::DeviceSigningProfile;
 
 use crate::apdu::{
     ApduCommand, ApduResponse, CLA, INS_GET_CONFIGURATION, INS_RESET_SIGNING, INS_SIGN_TRANSACTION,
-    INS_VERIFY_PUBLIC_KEY, P1_SIGN_CONTINUE, P1_SIGN_FIRST, P1_SIGN_LAST, P1_VERIFY_PUBLIC_KEY,
-    P2_DEFAULT, STATUS_SUCCESS, Transport,
+    INS_VERIFY_PUBLIC_KEY, P1_DEFAULT, P1_SIGN_CONTINUE, P1_SIGN_FIRST, P1_SIGN_LAST,
+    P1_VERIFY_PUBLIC_KEY, P2_DEFAULT, STATUS_SUCCESS, Transport,
 };
 use crate::configuration::Configuration;
 use crate::error::{DeviceError, status_to_error};
@@ -38,12 +38,6 @@ impl<T: Transport> LedgerDevice<T> {
         Self { transport }
     }
 
-    /// Returns a reference to the underlying transport (used by tests to
-    /// inspect exactly which commands were sent).
-    pub const fn transport(&self) -> &T {
-        &self.transport
-    }
-
     /// `get configuration`: returns the device's exact six-byte
     /// profile/version/flags response, decoded but not yet validated.
     ///
@@ -52,7 +46,7 @@ impl<T: Transport> LedgerDevice<T> {
     /// [`Self::sign_transaction`]; this method itself does not enforce that
     /// order so a caller can also inspect/log an unsupported configuration.
     pub fn get_configuration(&mut self) -> Result<Configuration, DeviceError<T::Error>> {
-        let response = self.exchange(INS_GET_CONFIGURATION, 0, P2_DEFAULT, Vec::new())?;
+        let response = self.exchange(INS_GET_CONFIGURATION, P1_DEFAULT, P2_DEFAULT, Vec::new())?;
         Configuration::decode(&response.data).map_err(DeviceError::UnsupportedConfiguration)
     }
 
@@ -77,7 +71,7 @@ impl<T: Transport> LedgerDevice<T> {
 
     /// `reset signing`: idempotently wipes any buffered signing session.
     pub fn reset_signing(&mut self) -> Result<(), DeviceError<T::Error>> {
-        let response = self.exchange(INS_RESET_SIGNING, 0, P2_DEFAULT, Vec::new())?;
+        let response = self.exchange(INS_RESET_SIGNING, P1_DEFAULT, P2_DEFAULT, Vec::new())?;
         require_exact_len(&response.data, 0)?;
         Ok(())
     }
@@ -293,7 +287,7 @@ mod tests {
         let returned = device.verify_public_key(path).unwrap();
         assert_eq!(returned, key);
 
-        let sent = device.transport().commands();
+        let sent = device.transport.commands();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].ins, INS_VERIFY_PUBLIC_KEY);
         assert_eq!(sent[0].p1, P1_VERIFY_PUBLIC_KEY);
@@ -344,7 +338,7 @@ mod tests {
         let returned = device.sign_transaction(path, &frame).unwrap();
         assert_eq!(returned, signature);
 
-        let sent = device.transport().commands();
+        let sent = device.transport.commands();
         assert_eq!(sent.len(), 3);
         assert_eq!(sent[0].p1, P1_SIGN_FIRST);
         assert_eq!(sent[1].p1, P1_SIGN_CONTINUE);
@@ -371,7 +365,7 @@ mod tests {
 
         device.sign_transaction(path, &frame).unwrap();
 
-        let sent = device.transport().commands();
+        let sent = device.transport.commands();
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[0].p1, P1_SIGN_FIRST);
         assert_eq!(sent[1].p1, P1_SIGN_LAST);
@@ -391,7 +385,7 @@ mod tests {
             .sign_transaction(DerivationPath::provisional(0).unwrap(), &frame)
             .unwrap();
 
-        let sent = device.transport().commands();
+        let sent = device.transport.commands();
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[0].p1, P1_SIGN_FIRST);
         assert_eq!(sent[0].data.len(), 4 + 21 + (MAX_CHUNK_BYTES - 1));
@@ -406,7 +400,7 @@ mod tests {
             .sign_transaction(DerivationPath::provisional(0).unwrap(), &[])
             .unwrap_err();
         assert!(matches!(error, DeviceError::EmptyFrame));
-        assert!(device.transport().commands().is_empty());
+        assert!(device.transport.commands().is_empty());
     }
 
     #[test]
@@ -422,7 +416,7 @@ mod tests {
                 minimum: 2
             }
         ));
-        assert!(device.transport().commands().is_empty());
+        assert!(device.transport.commands().is_empty());
     }
 
     #[test]
@@ -433,7 +427,7 @@ mod tests {
             .sign_transaction(DerivationPath::provisional(0).unwrap(), &frame)
             .unwrap_err();
         assert!(matches!(error, DeviceError::FrameTooLarge { .. }));
-        assert!(device.transport().commands().is_empty());
+        assert!(device.transport.commands().is_empty());
     }
 
     #[test]
@@ -533,7 +527,7 @@ mod tests {
         // all observed; no signature was ever produced, and the reset
         // attempt's own failure never replaces the primary `Transport`
         // error above.
-        let sent = device.transport().commands();
+        let sent = device.transport.commands();
         assert_eq!(sent.len(), 3);
         assert_eq!(sent[2].ins, INS_RESET_SIGNING);
     }
@@ -556,7 +550,7 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, DeviceError::InvalidOrUnrecognizedData));
-        let sent = device.transport().commands();
+        let sent = device.transport.commands();
         assert_eq!(sent.len(), 3);
         assert_eq!(sent[0].p1, P1_SIGN_FIRST);
         assert_eq!(sent[1].p1, P1_SIGN_CONTINUE);
@@ -586,7 +580,7 @@ mod tests {
                 actual: 1
             }
         ));
-        let sent = device.transport().commands();
+        let sent = device.transport.commands();
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[1].ins, INS_RESET_SIGNING);
     }
@@ -606,6 +600,6 @@ mod tests {
         assert!(matches!(error, DeviceError::UserRejected));
         // No reset was attempted: the device never accepted FIRST in the
         // first place, so there is no session to defensively wipe.
-        assert_eq!(device.transport().commands().len(), 1);
+        assert_eq!(device.transport.commands().len(), 1);
     }
 }

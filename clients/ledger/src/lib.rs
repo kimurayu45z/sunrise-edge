@@ -54,6 +54,6 @@ pub use device::LedgerDevice;
 pub use error::DeviceError;
 pub use fake::{FakeTransport, FakeTransportError};
 #[cfg(feature = "usb-hid")]
-pub use hid::{HidTransport, HidTransportError, LEDGER_USB_VENDOR_ID, LedgerProductModel};
+pub use hid::{HidTransport, HidTransportError, LEDGER_USB_VENDOR_ID};
 pub use path::{DerivationPath, DerivationPathError};
 pub use signer::LedgerExternalSigner;

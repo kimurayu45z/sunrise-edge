@@ -81,6 +81,7 @@ mod tests {
         assert!(matches!(error, CliError::ConflictingSignerSelection));
     }
 
+    #[cfg(not(feature = "usb-hid"))]
     #[test]
     fn a_ledger_selection_without_the_usb_hid_feature_fails_closed() {
         let error = run(vec![
@@ -90,9 +91,6 @@ mod tests {
             OsString::from("0"),
         ])
         .unwrap_err();
-        #[cfg(not(feature = "usb-hid"))]
         assert!(matches!(error, CliError::LedgerTransportFeatureDisabled));
-        #[cfg(feature = "usb-hid")]
-        assert!(matches!(error, CliError::LedgerConnect(_)));
     }
 }

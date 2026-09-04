@@ -79,6 +79,11 @@ pub enum DeviceError<E> {
     /// a non-empty, correctly bounded frame. This is a typed, defensive
     /// alternative to a panic; it should never actually occur.
     NoChunksPlanned,
+    /// The device session was already borrowed by another in-progress call
+    /// (a concurrent or re-entrant use of the same signer). A typed
+    /// rejection in place of the panic `RefCell::borrow_mut` would raise;
+    /// see [`crate::signer::LedgerExternalSigner`].
+    DeviceBusy,
 }
 
 impl<E: fmt::Display> fmt::Display for DeviceError<E> {
@@ -121,6 +126,9 @@ impl<E: fmt::Display> fmt::Display for DeviceError<E> {
             Self::NoChunksPlanned => {
                 f.write_str("internal error: no signing chunks were planned for a non-empty frame")
             }
+            Self::DeviceBusy => f.write_str(
+                "device session is already in use by another call (concurrent or re-entrant use is not supported)",
+            ),
         }
     }
 }

@@ -40,12 +40,13 @@
 //! blob fetch remain deferred (see `ARCHITECTURE.md` §44 / DR-0083).
 //! [`key::LocalSigner`] is
 //! an explicit development-only, in-memory key, never a keystore; real
-//! external/hardware signing — including any future dedicated Ledger
-//! device application — is a deferred, not-yet-implemented boundary (see
-//! `ARCHITECTURE.md` DR-0084). [`transaction::PreparedTransaction`] exposes
-//! exactly the bytes such an external signer would need and independently
-//! verifies whatever signature comes back before producing output, so this
-//! crate is ready for that boundary without weakening today's signing path.
+//! external/hardware signing remains outside this vendor-neutral crate.
+//! S4c Phase 1's dedicated Ledger host adapter now lives downstream in
+//! `clients/ledger` (see `ARCHITECTURE.md` DR-0092), depending on this crate
+//! rather than reversing the dependency. [`transaction::PreparedTransaction`]
+//! exposes exactly the bytes such an external signer needs and independently
+//! verifies whatever signature comes back before producing output, preserving
+//! the local signing path and this crate's vendor independence.
 
 pub mod client;
 pub mod context;

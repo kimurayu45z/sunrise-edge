@@ -63,12 +63,6 @@ impl DerivationPath {
         Ok(Self { account })
     }
 
-    /// The non-hardened `account` component this path was built from.
-    #[must_use]
-    pub const fn account(self) -> u32 {
-        self.account
-    }
-
     /// Encodes the exact 21-byte wire form: one depth byte followed by five
     /// big-endian hardened `u32` components.
     #[must_use]
