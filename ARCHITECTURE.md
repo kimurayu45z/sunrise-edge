@@ -1576,8 +1576,9 @@ cross-owner duplicate-transfer restart/duplicate HTTP E2E
 the designs defined below and in "Rust client library" / "Rust client
 external-signer boundary and Developer MVP CLI". Under the CLI-first
 production-strategy pivot (see "Local devnet architecture" above and
-DR-0085), the TypeScript client, explorer, and wallet remain deferred until
-the CLI-First Node Production Gate passes (`TODO.md#cli-first-node-production-gate`);
+DR-0085, amended by DR-0095), the TypeScript client, explorer, and wallet
+remain deferred until the Software Production Gate (S0-S3 + S5) passes
+(`TODO.md#software-and-hardware-release-gates`);
 no other `clients/*`/`apps/*` path from DR-0081 exists yet. Known current
 limitations that
 must stay visible at devnet startup and in documentation once implemented:
@@ -1993,7 +1994,7 @@ The restart/duplicate E2E is implemented As-Is (see
 `apps/cli/tests/devnet_restart_duplicate_e2e.rs` and "Local devnet
 architecture" above). Under the CLI-first production-strategy pivot (DR-0085),
 `clients/typescript`, `apps/explorer`, and `apps/wallet` remain deferred until
-the CLI-First Node Production Gate passes (see
+the Software Production Gate (S0-S3 + S5) passes (see
 `TODO.md#cli-developer-mvp-gate` and `TODO.md#cli-first-node-production-gate`).
 
 ## 46. Hardware Signing Profile v1 and external-signer preflight
@@ -3431,11 +3432,11 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   `--ledger-expected-firmware-version` CLI flag) — strictly in software,
   against `FakeTransport` only; S4c itself is still not complete, since it
   still needs Phase 2b's real hardware validation. S4
-  remains incomplete, and both S4c Phase 2b and S4d's physical-device HIL
-  and release evidence are next. S5 remains its
-  ordered successor, and the TypeScript
-  client/explorer/wallet surface remains deferred until the complete
-  CLI-First Node Production Gate passes.
+  remains incomplete. DR-0095 supersedes the old strict ordering: S4c Phase
+  2b and S4d's physical-device HIL/release evidence are deferred, while S5 is
+  an independent parallel software-production track. The TypeScript client,
+  explorer, and wallet remain deferred until the Software Production Gate
+  (S0-S3 + S5) passes; they do not wait for deferred S4 hardware work.
 
   **S1 implementation status (2026-09-01): both remote TLS transport and
   expected-protocol-context verification are implemented and tested As-Is;
@@ -3653,8 +3654,7 @@ version 1, and fail closed on zero identity/rule version, empty access, or
     transfer, receipt, orderly restart, persisted state) by hand — not the
     raw byte-identical duplicate replay itself, which only the automated E2E
     proves (implemented As-Is by this decision; see criterion 10,
-    `apps/cli/tests/devnet_restart_duplicate_e2e.rs`, and README "Run the
-    local devnet and CLI").
+    `apps/cli/tests/devnet_restart_duplicate_e2e.rs`, and `DEVNET.md`).
   - S1 (implemented As-Is; see "S1 implementation status" above): remote TLS
     transport and mandatory trusted protocol-context validation before
     signing, as two separate concerns. The transport performs normal TLS
@@ -3875,7 +3875,7 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   without an `execution`/`wasmi` runtime dependency, and emits bounded ASCII
   lines only after the complete signed value matches one exact policy.
 
-  **No blind signing.** The first policy is limited to the fixed README
+  **No blind signing.** The first policy is limited to the fixed `DEVNET.md`
   reference devnet module id/version/code digest, transfer argument schema,
   three ordered `Write` entries, and source-bound fee authorization. Any
   unknown module/digest/entrypoint/arguments/access/fee shape is a typed
@@ -3957,7 +3957,7 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   rendering any review screen, returning `6A80` and wiping the buffered
   frame/derivation state on mismatch, so a wrong-key session can never
   reach a display page. (6) Pins the device policy's chain id, protocol
-  version, and epoch (`sunrise-local-devnet`, `3`, `0`, the same README
+  version, and epoch (`sunrise-local-devnet`, `3`, `0`, the same `DEVNET.md`
   reference context DR-0088 already used) together with the exact devnet
   fee `AssetId`
   (`ccad27f687338b99953183728647bc1177388eb45a37afd9812c0d286b433ea8`, the
@@ -4498,3 +4498,35 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   provider-certification evidence all remain deferred and unimplemented. S4,
   S5, the `CLI-First Node Production Gate`, production, and mainnet readiness
   remain incomplete; this DR changes none of their exit criteria.
+
+- DR-0095: Separate the software-production and hardware-signing release
+  tracks inside the existing CLI-First Node Production Gate, and restore the
+  README to a human-facing entry point.
+
+  **Roadmap sequencing, not a weaker release gate.** S0-S3 remain the common
+  implemented As-Is baseline. The `Software Production Gate` consists of that
+  baseline plus every existing S5 criterion. The `Hardware Signing Release
+  Gate` consists of every existing S4 criterion. S4 and S5 may proceed in
+  parallel; the explicitly deferred S4c Phase 2b/S4d Ledger hardware work no
+  longer blocks completing S5 or starting the TypeScript client, explorer,
+  and wallet after the Software Production Gate passes. The complete
+  `CLI-First Node Production Gate`, live protocol activation, and any
+  production or mainnet-readiness claim still require both tracks plus the
+  existing independent security/release criteria. No S4, S5, Phase 15-17, or
+  cross-phase release criterion is deleted, completed, or weakened.
+
+  **Documentation ownership.** `README.md` is a concise project entry point:
+  orientation, honest current capabilities and limitations, build commands,
+  workspace map, invariants, and links. The detailed local devnet transfer and
+  orderly-restart walkthrough moves without changing its command contract to
+  `DEVNET.md`. `TODO.md` remains the authoritative roadmap and completion
+  checklist; this file remains the architecture and decision record. Detailed
+  persistence, PostgreSQL, and hardware-signing contracts remain in
+  `PERSISTENCE.md`, `POSTGRES.md`, and `SIGNING.md` respectively. Historical
+  decision text remains historical evidence rather than being duplicated into
+  a continuously growing README status narrative.
+
+  **Compatibility.** This decision changes documentation structure and future
+  work ordering only. It changes no canonical bytes, identifiers, digests,
+  signature payloads, execution effects, object layout, persistence schema,
+  runtime API, CLI flag, module/WAT/WASM byte, or implemented capability.

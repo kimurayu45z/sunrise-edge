@@ -1732,7 +1732,8 @@ authenticated owned object Read/Write/Consume、preinstalled deterministic WASM�
 query API、Rust client library、Rust-only CLI、restart/duplicate E2E、明示的な
 non-production limitations）だけに絞る。criteria 7-9（TypeScript client、explorer、
 wallet）はverbatimのまま以下に残すが、完了済み・削除済み・弱められたとは一切みなさず、
-新設する["CLI-First Node Production Gate"](#cli-first-node-production-gate)を通過した
+["CLI-First Node Production Gate"](#cli-first-node-production-gate)内の
+[Software Production Gate](#software-and-hardware-release-gates)（S0-S3 + S5）を通過した
 "後に"resequenceする。この転換はbrowser向けproduct surfaceを断念するものではなく、
 本物のnodeのproduction hardening（persistence、operations、release evidence）を
 ブラウザ向けUIより先に固めるという順序の変更である。
@@ -1744,7 +1745,7 @@ developer CLIを実際に構築・検証できるsingle-node CLI Developer MVP�
 HA/failover、provider-managed pooler、real-provider certification、provider deploymentの
 作業はgate通過後の`Post-MVP Production Hardening`へ凍結する。
 
-**Current status (2026-09-04): criteria 1-6・10・11はimplemented and validated
+**Current status (2026-09-05): criteria 1-6・10・11はimplemented and validated
 As-Isであり、CLI Developer MVP Gateは通過済みである。** これはproduction readinessの
 宣言ではない。CLI-First Node Production GateのS0-S3もimplemented and validated
 As-Isであり（S1のremote TLS transportとsigning前の独立したtrusted
@@ -1778,15 +1779,18 @@ caller-supplied expected firmware version、`open app`によるexactly
 S4全体もincompleteである。2026-09-04の明示的なroadmap reorderにより、S4c Phase 2b、
 S4d（physical-device HIL、golden/pixel UI evidence、release evidence）、その他すべての
 残存Ledger作業はdeferredとし、旧順序を飛び越えてnon-Ledger S5 prerequisiteを進める。
-TypeScript client/explorer/walletはcompleteなCLI-First Node Production Gateまでdeferredのままであり、
-S4、S5、同gate、production、mainnet readinessはいずれもincompleteである。
+DR-0095はこのreorderをSoftware Production Gate（S0-S3 + S5）とHardware Signing
+Release Gate（S4）のparallel trackとして明文化し、既存criteriaを変更せず、
+TypeScript client/explorer/walletはSoftware Production Gate（S0-S3 + S5）までdeferredのままであり、
+deferredなS4 Ledger hardware workの完了は待たない。S4、S5、completeな
+CLI-First Node Production Gate、production、mainnet readinessはいずれもincompleteである。
 
 CLI Developer MVP completion criteria（capability criteria 2-3を満たしながら、product
 surfaceはARCHITECTURE.md DR-0081の順序に従う: local devnet、bounded query API、Rust
 client、Rust CLI、TypeScript client、explorer、wallet、restart/duplicate E2E、
 explicit dev limitations）。**pivot後のgateはcriteria 1-6・10・11だけであり、
 criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以下に残すが、
-["CLI-First Node Production Gate"](#cli-first-node-production-gate)を通過するまで
+[Software Production Gate](#software-and-hardware-release-gates)（S0-S3 + S5）を通過するまで
 明示的にdefer/resequenceする（削除・完了扱い・弱体化ではない）:**
 
 1. native HTTPとlocal durable SQLiteを使い、停止・再起動できるsingle-node local devnetを
@@ -1810,7 +1814,7 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
 7. `clients/typescript`でkey/address、canonical transaction encode/sign、submit、
    receipt wait、queryを提供するTypeScript client libraryを実装し、同じstable vectorsを共有する。
    **（pivot後: この criterion のcontentは変更しない。実装着手は
-   ["CLI-First Node Production Gate"](#cli-first-node-production-gate)通過後まで
+   [Software Production Gate](#software-and-hardware-release-gates)（S0-S3 + S5）通過後まで
    deferする。）**
 8. `apps/explorer`として、SvelteKit + shadcn-svelte（Luma）によるstatic/CSR専用のexplorer app
    を実装する。request-time server-side rendering、SvelteKit server adapter、
@@ -1818,7 +1822,7 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    server-held sessionやkeyは一切使わない。dynamic chain dataは`clients/typescript`経由の
    client-side fetchのみとする。
    **（pivot後: この criterion のcontentは変更しない。実装着手は
-   ["CLI-First Node Production Gate"](#cli-first-node-production-gate)通過後まで
+   [Software Production Gate](#software-and-hardware-release-gates)（S0-S3 + S5）通過後まで
    deferする。）**
 9. `apps/wallet`として、同様にSvelteKit + shadcn-svelte（Luma）によるstatic/CSR専用のwallet app
    を実装する。制約は8と同一（SSR/server adapter/server route/server actionsなし）に加え、
@@ -1826,7 +1830,7 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    `apps/explorer`と`apps/wallet`の間でreal duplicationが発生するまで、共有UI packageは
    導入しない。
    **（pivot後: この criterion のcontentは変更しない。実装着手は
-   ["CLI-First Node Production Gate"](#cli-first-node-production-gate)通過後まで
+   [Software Production Gate](#software-and-hardware-release-gates)（S0-S3 + S5）通過後まで
    deferする。）**
 10. devnet再起動後もstate/object/receipt/nonceが保持され、同一request retryがeffectを
     二重適用しないことを自動E2Eで証明する（`apps/cli/tests/devnet_restart_duplicate_e2e.rs`
@@ -1947,8 +1951,9 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    未実装のためincompleteであり、S4全体もincompleteである。2026-09-04の明示的な
    roadmap reorderにより、S4c Phase 2b、S4d physical-device HIL/release evidence、
    その他すべての残存Ledger作業はdeferredとし、旧順序を飛び越えてnon-Ledger S5
-   prerequisiteを進める。TypeScript client/explorer/walletはcompleteなCLI-First Node
-   Production Gateまでdeferredのままである。S4、S5、同gate、production、mainnet readinessは未達である。
+   prerequisiteを進める。TypeScript client/explorer/walletはSoftware Production Gate
+   （S0-S3 + S5）までdeferredのままであり、S4の完了は待たない。S4、S5、completeな
+   CLI-First Node Production Gate、production、mainnet readinessは未達である。
    前提として、`runtime-sqlite`へ`StructuredDurableDomainStateStore`/`IndexedOutboxRepository`を
    実装するadditive、local-only、non-productionな`SqliteDurableStore`を追加済み
    （implemented As-Is）。既存のopaque `SqliteStateStore`とは別テーブル・別`PRAGMA application_id`で、
@@ -2194,7 +2199,7 @@ CLI Developer MVP Gateの実装期間を通じてこのmonorepo内に留め、�
 ディレクトリとする。gate通過後も下記extraction条件を満たすまでは同様とする。pivot後、
 criteria 7-9（`clients/typescript`/`apps/explorer`/
 `apps/wallet`）のディレクトリ作成自体も
-["CLI-First Node Production Gate"](#cli-first-node-production-gate)通過後まで実装着手を
+[Software Production Gate](#software-and-hardware-release-gates)（S0-S3 + S5）通過後まで実装着手を
 deferする。`apps/cli`は`clients/rust`にのみ依存するRust-only client（Node/browser
 runtimeには依存しない）。`apps/explorer`と`apps/wallet`は別々のSvelteKit + shadcn-svelte
 （Luma）static/CSR app（request-time SSR、server adapter、`+page.server`/`+layout.server`/
@@ -2208,11 +2213,14 @@ artifactをtargetできるようになるまで、`clients/*`のいずれにつ�
 
 ## CLI-First Node Production Gate
 
-CLI Developer MVP Gate（criteria 1-6・10・11）を通過した後、TypeScript client・
-explorer・wallet（criteria 7-9）へ進む前に、本物のnode自体をproduction-orientedへ
-近づけるgateを課す。これはUIより先にnode/persistence/operationsを固める順序の
-決定であり、新しいproduction criteriaを発明するものではない：以下はすべて既存の
-criteriaを変更せず参照するだけである。
+CLI Developer MVP Gate（criteria 1-6・10・11）を通過した後、本物のnode自体を
+production-orientedへ近づけるgateを課す。これはUIより先に
+node/persistence/operationsを固める決定であり、新しいproduction criteriaを
+発明するものではない。2026-09-05のDR-0095により、S0-S3を共通baselineとし、
+S4 Hardware Signing Release GateとS5 Software Production Gateを並行trackとして扱う。
+TypeScript client・explorer・wallet（criteria 7-9）はSoftware Production Gateの後に
+着手できるが、completeなCLI-First Node Production Gate、production、mainnet readiness
+にはS4とS5の両方が必要である。以下はすべて既存criteriaを変更せず参照する。
 
 **参照する既存criteria（すべてunchanged）:**
 
@@ -2261,13 +2269,30 @@ criteriaを変更せず参照するだけである。
 Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
 独立したsecurity auditは、このgate通過後も引き続き必須である。
 
-**ordered slices（S0-S5）:**
+### Software and hardware release gates
+
+- **Common baseline:** S0-S3。すべてimplemented and validated As-Is。
+- **Software Production Gate:** common baselineとS5の全criteria。これを通過した後、
+  TypeScript client・explorer・walletへ着手できる。これはcompleteなnode-production、
+  production、mainnet readinessの宣言ではない。
+- **Hardware Signing Release Gate:** S4の全criteria。remaining physical-device/HIL/release
+  workは明示的にdeferredであり、Software Production Gateやその後のbrowser surfaceを
+  blockしない。
+- **Complete CLI-First Node Production Gate:** Software Production GateとHardware Signing
+  Release Gateの両方、および本節が参照する独立security/release criteriaを満たした状態。
+  Ledgerをdeferしたままcompleteとは扱わない。
+
+この並行化はS4/S5または既存production criteriaの削除・完了扱い・weakenではない。
+protocol version 3のlive activationやproduction/mainnet readinessに対する既存の
+hard constraintも変更しない。
+
+**common baseline and parallel tracks（S0-S3, then S4/S5）:**
 
 - **S0**: automated restart/duplicate E2Eと、それとは別の、local devnet/CLIの
   start・transfer・receipt・orderly restart・persisted stateをhandsで再現できる
   documented command列（implemented As-Is；criteria 10、
   `apps/cli/tests/devnet_restart_duplicate_e2e.rs`が
-  raw byte-identical duplicate replayを証明し、README「Getting started」の
+  raw byte-identical duplicate replayを証明し、`DEVNET.md`の
   local devnet/CLIコマンド列がそれとは独立にstart/transfer/receipt/orderly
   restart/persisted stateをhandsで再現する。documented commandはraw byte-identical
   duplicate replay自体を再現するものではない）。
@@ -2384,9 +2409,9 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
   non-reapplication、changed signed requestによるrequest-id reuse 409時の両object canonical bytes・
   両receipt・sender nonce不変、writer-generation fencingを証明する。
   これはS2 As-Isのみでproduction/mainnet readinessではない。S3はDR-0087で後続実装済み。
-  TypeScript client/explorer/walletはcompleteなCLI-First Node Production Gateまでdeferredであり、
+  TypeScript client/explorer/walletはSoftware Production Gate（S0-S3 + S5）までdeferredであり、
   S4はincomplete、残存Ledger作業はdeferredである。non-Ledger S5 prerequisiteはDR-0094から先行するが、
-  S5、同gate、production、mainnet readinessの完了を意味しない。
+  S5、completeなCLI-First Node Production Gate、production、mainnet readinessの完了を意味しない。
 - **S3**: **implemented and validated As-Is（2026-09-02、DR-0087）。** committed
   scheduleはbase=1、execution=`gas_used`単価=1、他category=0、fee registryは
   `DEVNET_ASSET_ID`を1:1で1つだけenableする。sourceのsender-owned `Write`をfee objectとし、
@@ -2523,7 +2548,7 @@ capacity/PITR/HAは、S5で明示的にtriggerされる（S5のcertificationやS
 （`Post-MVP Production Hardening`冒頭の凍結宣言）を変更しない。
 
 **production targetはconservativeにmulti-validator L1であり、single-operator
-serviceではない。** このgateのS0-S5順序と既存のvalidator-set/consensus
+serviceではない。** このgateのS0-S3 baseline、S4/S5 parallel tracksと既存のvalidator-set/consensus
 criteriaは、単一operatorが恒久的に運用する前提のserviceではなく、複数
 validatorが独立に運用するL1へ向けたstepとして設計されている。
 
@@ -3270,8 +3295,9 @@ physical hardware validationが
 未実装のためincompleteであり、S4全体もincompleteである。2026-09-04の明示的な
 roadmap reorderにより、S4c Phase 2b、S4d physical-device HIL/release evidence、
 その他すべての残存Ledger作業はdeferredとし、旧順序を飛び越えてnon-Ledger S5
-prerequisiteを進める。TypeScript client/explorer/walletはcompleteなCLI-First Node
-Production Gateまでdeferredのままである。S4、S5、同gate、production、mainnet readinessはincompleteである。
+prerequisiteを進める。TypeScript client/explorer/walletはSoftware Production Gate
+（S0-S3 + S5）までdeferredのままであり、S4の完了は待たない。S4、S5、completeな
+CLI-First Node Production Gate、production、mainnet readinessはincompleteである。
 capacity/PITR/HA等のS5 certification項目はS5または明示的なSLOがtriggerするまで
 引き続き凍結する。
 
