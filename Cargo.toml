@@ -28,6 +28,7 @@ members = [
     "apps/devnet",
     "apps/cli",
     "clients/rust",
+    "clients/ledger",
 ]
 resolver = "3"
 
@@ -63,8 +64,10 @@ node-wire = { path = "crates/node-wire" }
 native-http = { path = "crates/native-http" }
 signing-view = { path = "crates/signing-view" }
 sunrise-edge-client = { path = "clients/rust" }
+sunrise-edge-ledger = { path = "clients/ledger" }
 sunrise-edge-devnet = { path = "apps/devnet" }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
+hidapi = { version = "=2.6.7", default-features = false, features = ["linux-native-basic-udev"] }
 ed25519-zebra = { version = "=4.2.0", default-features = false }
 postgres = "=0.19.14"
 postgres_rustls = "=0.1.6"

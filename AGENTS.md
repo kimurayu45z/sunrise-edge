@@ -217,8 +217,12 @@ and S0-S3 of the production sequence are satisfied As-Is. S4a's strict
 hardware-signing profile, signed-byte-only clear-signing fixture, and host
 external-signer preflight are implemented As-Is by DR-0088. S4b's separate
 dedicated Ledger device application, five-target builds, and Nano S+ Speculos
-evidence are implemented As-Is by DR-0091; S4 is not complete. The current
-priority is S4c's host APDU/USB/HID transport and CLI Ledger signer selection
+evidence are implemented As-Is by DR-0091; S4 is not complete. DR-0092
+implements S4c Phase 1's host APDU/USB/HID transport and explicit CLI Ledger
+signer selection As-Is, including profile/address checks and strict
+USB-descriptor-level device recognition, but not active-app/firmware identity
+checks or physical-hardware evidence. The current priority is S4c Phase 2's
+staged app/firmware checks and physical validation
 for the `CLI-First Node Production Gate`
 (`TODO.md`) — a real
 node/persistence/operations gate defined entirely by reference to existing,
