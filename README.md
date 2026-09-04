@@ -42,6 +42,10 @@ The current product path is CLI-first:
 - The separate **Hardware Signing Release Gate** is S4. Its profile, dedicated
   Ledger app, and software-side host integration are implemented As-Is, but
   physical-device validation and release evidence are explicitly deferred.
+  **S4c remains incomplete pending Phase 2b physical-hardware validation.**
+  The CLI default signer is still `LocalSigner`, a development-only,
+  non-keystore in-memory key with no zeroization; replacing it remains part of
+  S4.
 - The complete **CLI-First Node Production Gate** requires both the Software
   Production Gate and Hardware Signing Release Gate, plus the referenced
   independent security/release criteria. It has not passed.

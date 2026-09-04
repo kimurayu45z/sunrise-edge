@@ -86,7 +86,7 @@ hex.
 Profile v1 recognizes only the exact local reference transfer identified by:
 
 - the device policy pins exactly chain id `sunrise-local-devnet`, protocol
-  version `3`, and epoch `0` (the README reference context) — any other
+  version `3`, and epoch `0` (the [`DEVNET.md`](DEVNET.md) reference context) — any other
   outer/inner value is a typed rejection, not a best-effort match;
 - module object id
   `0d5dd10aec2c315b1dc564c694439e46bac4b61426d22e0d7ddb764c49197fe7`;

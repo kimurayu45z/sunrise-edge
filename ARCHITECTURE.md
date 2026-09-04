@@ -3646,8 +3646,11 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   production exit criteria and an independent security audit remain required
   afterward, unchanged.
 
-  **Ordered slices.** The CLI-First Node Production Gate's work is sequenced
-  as S0-S5 (see `TODO.md#cli-first-node-production-gate`):
+  **Ordered slices, amended by DR-0095.** This decision originally sequenced
+  the CLI-First Node Production Gate as S0-S5 (see
+  `TODO.md#cli-first-node-production-gate`). DR-0095 preserves S0-S3 as the
+  common baseline but supersedes the strict S4-before-S5 ordering: S4 and S5
+  are independent parallel tracks.
 
   - S0: an automated restart/duplicate E2E, plus a separate documented
     command sequence that reproduces the local devnet/CLI experience (start,
