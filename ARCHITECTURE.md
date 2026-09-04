@@ -1961,10 +1961,11 @@ against a composed local devnet router — one exercising `context`/
 `next-nonce`/`object`, and one exercising a complete signed `transfer`
 against freshly seeded accounts through to a waited, present receipt.
 DR-0088 subsequently implements S4a's strict host-side profile, exact
-signed-byte clear-signing fixture, and external-signer preflight. The Ledger
-device application, APDU/host transport, on-device implementation, and
-hardware-in-the-loop tests remain entirely unimplemented and are not claimed
-by that host boundary.
+signed-byte clear-signing fixture, and external-signer preflight. DR-0091
+records the separate repository's S4b Ledger SDK application and Nano S+
+Speculos evidence As-Is. Host APDU/USB/HID transport, CLI signer selection,
+physical-device HIL, and release evidence remain unimplemented and are not
+claimed by either boundary.
 
 **Development-only residual: no memory zeroization.** `load_dev_seed`'s read
 buffer and decoded `[u8; 32]` seed, and `LocalSigner`'s in-memory signing
@@ -1985,11 +1986,13 @@ the CLI-First Node Production Gate passes (see
 ## 46. Hardware Signing Profile v1 and external-signer preflight
 
 S4 is split into four ordered boundaries so a host library cannot become a
-surrogate for device-side authorization. S4a is the implemented As-Is boundary
-in this repository; S4b is a separate dedicated Ledger application repository;
-S4c adds host APDU/USB and CLI selection; S4d is the Speculos, physical-device,
-and release-evidence gate. S4 is not complete until S4d passes and the CLI has
-an actual production signing path replacing its development-only seed flow.
+surrogate for device-side authorization. S4a is implemented As-Is in this
+repository; S4b's separate dedicated Ledger application and Nano S+ Speculos
+evidence are implemented As-Is in `sunriselayer/sunrise-edge-ledger-app` by
+DR-0091. S4c adds host APDU/USB and CLI selection; S4d completes the remaining
+physical-device, reproducibility, and release-evidence gate. S4 is not complete
+until S4d passes and the CLI has an actual production signing path replacing
+its development-only seed flow.
 
 `crypto::decode_signature_frame` is the strict counterpart to the established
 `frame_signature_message` encoder. It accepts only canonical type `0x2001`,
@@ -2022,16 +2025,16 @@ sender. The host view is only preflight/conformance evidence: the eventual
 device app must independently parse and display the received frame.
 
 `SIGNING.md` is normative for the fixed profile bounds, stable display fixture,
-provisional explicitly unregistered development derivation path, and the
-future bounded APDU state machine/status words. The dedicated device app must
-live in a separate `sunrise-edge-ledger-app` repository because its custom
-targets, Rust SDK/C bindings, Speculos workflow, device matrix, and Ledger
-release lifecycle cannot pass or be hidden from this workspace's host-target
-gate. S4c will place vendor host dependencies in a new `clients/ledger` crate,
-never a protocol crate or `clients/rust`, and will explicitly amend the CLI's
-current one-runtime-dependency invariant. No device app, APDU transport,
-USB/HID dependency, Speculos evidence, physical-device evidence, registered
-SLIP-0044 allocation, or release artifact exists in S4a.
+provisional explicitly unregistered development derivation path, and bounded
+APDU state machine/status words. The dedicated device app lives in the separate
+`sunrise-edge-ledger-app` repository because its custom targets, Rust SDK/C
+bindings, Speculos workflow, device matrix, and Ledger release lifecycle cannot
+pass or be hidden from this workspace's host-target gate. DR-0091 records that
+device-side S4b boundary. S4c will place vendor host dependencies in a new
+`clients/ledger` crate, never a protocol crate or `clients/rust`, and will
+explicitly amend the CLI's current one-runtime-dependency invariant. No host
+APDU/USB/HID dependency, physical-device evidence, registered SLIP-0044
+allocation, or release artifact exists yet.
 
 ## Decision record
 - DR-0001: Use a single canonical framed binary format for hashes, signatures, and protocol-critical payloads.
@@ -3303,8 +3306,10 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   and commits trap fee-only effects as described by DR-0087. The active
   module/semantics declaration is version 3; historical v1/v2 declarations,
   the `0xF001`/`0xF002`/`0xF003` schemas, and WAT/WASM/code hash remain pinned.
-  DR-0088 subsequently implements only S4a's hardware-signing profile/host
-  preflight. S4b is next; this is still not production or mainnet readiness.
+  DR-0088 subsequently implements S4a's hardware-signing profile/host
+  preflight, and DR-0091 records S4b's separate device application and Nano S+
+  Speculos evidence As-Is. S4c is next; this is still not production or mainnet
+  readiness.
 - DR-0082: Add the bounded canonical Developer MVP query surface described in
   "Bounded Developer MVP query API". Keep query selectors non-authoritative,
   resolve all chain/domain/epoch/storage authority from trusted composition,
@@ -3387,12 +3392,12 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   subsequently makes eight S4b device-contract clarifications in `SIGNING.md`
   and one correction to DR-0088's blanket 230-byte whole-APDU data cap (FIRST rises
   230→255 bytes, first chunk 205→230 bytes, CONTINUE/LAST unchanged at
-  230). DR-0090 subsequently records the separate
-  `sunriselayer/sunrise-edge-ledger-app` repository's host-validated `no_std`
-  core milestone, without adding any Ledger SDK device app or
-  Speculos/physical-device evidence; S4 remains incomplete and the current
-  implementation priority is S4b's actual device integration/Speculos
-  evidence. S5 remains its
+  230). DR-0090 records the separate
+  `sunriselayer/sunrise-edge-ledger-app` repository's earlier host-validated
+  `no_std` core milestone. DR-0091 records its merged PR #2 device application,
+  five-target builds, and fixed-seed Nano S+ Speculos evidence; S4b is complete
+  As-Is, S4 remains incomplete, and S4c host APDU/USB/HID plus CLI signer
+  selection are next. S5 remains its
   ordered successor, and the TypeScript
   client/explorer/wallet surface remains deferred until the complete
   CLI-First Node Production Gate passes.
@@ -3814,10 +3819,10 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   distribution through `FastCertificate`, multiple governed fee assets,
   production gas calibration, sufficient-balance preflight, treasury sharding,
   Shared/System/blob objects, or crash/power-loss durability. TypeScript,
-  explorer, and wallet stay deferred. DR-0088 subsequently implements only
-  S4a's hardware profile/host preflight; S4b dedicated device application and
-  Speculos evidence are next. S5, Phase 16/17 exit criteria, and independent
-  audit remain mandatory.
+  explorer, and wallet stay deferred. DR-0088 implements S4a's hardware
+  profile/host preflight, and DR-0091 records S4b's dedicated device application
+  and Nano S+ Speculos evidence As-Is. S4c host/CLI integration is next. S5,
+  Phase 16/17 exit criteria, and independent audit remain mandatory.
 - DR-0088: Implement only S4a's hardware-signing profile and host preflight in
   this repository, with the dedicated Ledger application isolated in a
   separate repository and S4 completion reserved for physical evidence.
@@ -3992,3 +3997,46 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   derivation/signing and Speculos UX evidence without weakening these bounds.
   S4c/S4d, the TypeScript client/explorer/wallet, and S5 remain deferred in
   their existing order.
+- DR-0091: Complete S4b As-Is in the separate Ledger repository without
+  claiming S4, production, or mainnet readiness.
+
+  **Implemented device boundary.** Merged
+  `sunriselayer/sunrise-edge-ledger-app` PR #2 (merge commit `6f6f882`) pins
+  `ledger_device_sdk` 1.37.0 and digest-pinned official builder/dev-tools
+  images, then integrates DR-0090's independent allocation-free core into a
+  `no_std`/`no_main` Ledger application. It builds cleanly for Nano S+, Nano X,
+  Stax, Flex, and Apex P. The device adapter performs exact SLIP-0010 Ed25519
+  derivation at the provisional hardened path, converts the SDK's raw
+  `04 || X || Y` point once to RFC 8032 compressed bytes, compares that key
+  with the signed Transaction sender before review, renders the bounded
+  signed-fields-only policy through NBGL, and signs only the session-captured
+  path and exact buffered signature frame after approval.
+
+  **Deterministic evidence.** Host conformance pins every one of the 32 review
+  facts and RFC 8032 conversion vectors. A fixed public development seed under
+  Nano S+ Speculos/Ragger pins the exact six-byte configuration, exact derived
+  public key, and exact 64-byte signature for a 1,221-byte canonical-shape
+  fixture whose sender is replaced with that derived key. The byte-identical
+  copied source fixture retains its original `01…01` sender and proves sender
+  mismatch before review; the suite also proves explicit reset recovery in the
+  same emulator backend and user rejection. Unknown INS retains `6D00` while
+  wiping an active core session. Malformed APDU length, locked-device, SDK
+  fault, in-review `6901`, and CLA `B0` behavior remain explicitly SDK/OS-owned
+  rather than application status words. The full Python dependency closure is
+  version/hash locked and installed with `--require-hashes`; CI runs host
+  checks, every target build, and Nano S+ Speculos from clean checkouts.
+
+  **Compatibility and completion boundary.** No file in this workspace and no
+  Sunrise canonical transaction, signature, object, receipt, nonce, submit, or
+  protocol-activation byte changed to implement the separate device app. S4b
+  is implemented and validated As-Is, but S4 is incomplete. S4c is next: a
+  separate `clients/ledger` host APDU/USB/HID crate plus explicit CLI signer
+  selection and device/app/firmware/profile/address checks. S4d still requires
+  golden/pixel UI evidence, broader adversarial device-session and disconnect/
+  reset evidence, physical-device HIL for every claimed model, a pinned
+  app/firmware compatibility matrix, two-clean-build reproducibility evidence,
+  Ledger release/submission, a registered coin-type decision and migration
+  policy, and actual replacement of the CLI's development-only `LocalSigner`.
+  Nano X/Stax/Flex/Apex P are build-validated only, not emulated or physically
+  validated. TypeScript client, explorer, wallet, and S5 remain deferred in the
+  existing order.

@@ -3,12 +3,15 @@
 This document specifies Hardware Signing Profile v1, the S4a host/device
 conformance boundary. It does not document a released hardware wallet.
 
-S4a is implemented As-Is: the hardware signing profile, the clear-signing
-view derived only from the exact signed frame, and the host seam. **No Ledger
-device application, APDU transport, USB/HID dependency, Speculos evidence, or
-physical-device evidence exists in this repository. S4 is not complete.**
-`LocalSigner` remains a development-only, non-keystore in-memory key with no
-zeroization; S4a does not replace it.
+S4a is implemented As-Is in this repository: the hardware signing profile,
+the clear-signing view derived only from the exact signed frame, and the host
+seam. S4b is implemented and validated As-Is in the separate
+[`sunriselayer/sunrise-edge-ledger-app`](https://github.com/sunriselayer/sunrise-edge-ledger-app)
+repository by merged PR #2 (`6f6f882`): the dedicated device application,
+five-target builds, and Nano S+ Speculos evidence. **No host APDU/USB/HID
+dependency, CLI Ledger selection, or physical-device evidence exists in this
+repository. S4 is not complete.** `LocalSigner` remains a development-only,
+non-keystore in-memory key with no zeroization; S4a/S4b do not replace it.
 
 ## Signed input and bounds
 
@@ -137,24 +140,30 @@ same value:
 
 Getting the byte order or sign bit wrong on the first path, or re-transforming
 the second path's already-compressed output, both silently produce a
-different, wrong public key/address rather than a decode error. **S4b is not
-complete until the separate device-app repository adds a pinned,
-deterministic test vector** (fixed seed/path in, fixed 32-byte compressed
-public key out) **exercising whichever of the two paths above the device app
-implements; if the device app implements both, the vector must additionally
-show they agree on the same output for the same input.** This document
-intentionally does not assert such a vector's bytes, since fabricating one
-here would not be verified against a real device or SDK.
+different, wrong public key/address rather than a decode error. S4b's separate
+device app implements the raw `04 || X || Y` path and pins it under the public
+development-only mnemonic `glory promote mansion idle axis finger extra
+february uncover one trip resource lawn turtle enact monster seven myth punch
+hobby comfort wild raise skin` at `m/44'/21333'/0'/0'/0'` (account 0) to the
+exact compressed public key
+`df8608651a39745d3ae6eb2d4378619fd033c24eee6962c97b21750ce0fd88fb`.
+This mnemonic is public test material and must never hold funds. The vector is
+pinned in `tests/speculos/conftest.py` and `tests/speculos/test_device.py` at
+device-repository merge commit `6f6f882`; RFC 8032 vectors independently
+exercise the conversion. The app does not implement the already-compressed
+helper path, so a two-path agreement claim is neither made nor required for the
+implemented boundary.
 
 This provisional path may be used only by devnet/Speculos builds. A Ledger
 submission or mainnet claim requires a later decision record that pins the
 registered allocation and migration policy; changing it requires a new
 hardware signing profile rather than silently reinterpreting v1.
 
-## Future APDU contract
+## Device APDU contract
 
-S4a freezes the following byte contract for the separate
-`sunrise-edge-ledger-app` repository. It does not implement transport code.
+S4a freezes the following byte contract, and the separate
+`sunrise-edge-ledger-app` repository implements its application side under
+S4b. This repository does not implement host transport code.
 All multi-byte APDU integers are big-endian, independently of canonical
 transaction integers inside the opaque chunk stream.
 
@@ -241,9 +250,9 @@ and scheduler are untrusted.
 
 The table above is the app's own status-word contract for its `E0` CLA only.
 It is explicitly separate from status words and behavior owned by the Ledger
-SDK/OS layer beneath the app, which this document does not define and which
-the separate S4b repository must re-verify against current Ledger platform
-documentation rather than assume from this table:
+SDK/OS layer beneath the app, which this document does not define. The separate
+S4b repository re-verifies that behavior against its pinned Ledger SDK/platform
+tooling rather than assuming it from this table:
 
 - `6E03`: the Ledger I/O framework's own malformed-APDU-length rejection —
   a raw `Lc`/received-length mismatch caught by the SDK's transport layer
@@ -255,6 +264,10 @@ documentation rather than assume from this table:
 - `E000`: an unhandled panic/exception caught by the Ledger SDK's own fault
   handling, not a status this app returns deliberately; it indicates the
   app's own state machine did not run to a normal typed outcome.
+- `6901`: the current Ledger SDK's in-review command rejection while the
+  synchronous confirmation UI is active. It is returned before the app core
+  receives the second APDU and therefore cannot be treated as an app-core
+  status or proof that the core wiped its pending review state.
 - CLA `B0`: Ledger's common/dashboard CLA, used for device/app/firmware
   discovery and other platform-level requests per Ledger's own integration
   guidelines. Ledger devices intercept CLA `B0` before it reaches this
@@ -267,16 +280,21 @@ documentation rather than assume from this table:
 - **S4a (this repository, As-Is):** strict signature-frame decoding,
   device-profile transaction decoding, exact clear-signing policy and stable
   display fixture, plus the Rust client's external-signer seam.
-- **S4b (separate repository):** a dedicated Rust Ledger application based
-  on Ledger's Rust application tooling, independently parsing the exact frame
-  and passing the shared fixtures under Speculos. Solana and Ethereum apps
-  are never reused.
+- **S4b (separate repository, implemented and validated As-Is by DR-0091):**
+  the dedicated Rust Ledger application independently parses the exact frame,
+  derives and signs on-device, builds for five Ledger targets, and passes the
+  fixed key/signature/rejection/reset suite under Nano S+ Speculos. The exact
+  signature uses the sender-substituted canonical-shape fixture; the
+  byte-identical copied source fixture is the sender-mismatch case. Solana and
+  Ethereum apps are never reused.
 - **S4c (this repository):** a separate `clients/ledger` host crate for the
   APDU/USB boundary and an explicit CLI signer choice. Vendor dependencies do
   not enter protocol crates or `clients/rust`.
-- **S4d (release gate):** Speculos CI plus physical-device HIL for every
-  claimed model, verified address/confirmation flows, pinned app and firmware
-  matrix, reproducible device-app build hash, and release/submission evidence.
+- **S4d (release gate):** preserve the existing Nano S+ Speculos CI and add
+  golden/pixel UI evidence, physical-device HIL for every claimed model,
+  broader reset/disconnect/adversarial session evidence, verified address/
+  confirmation flows, a pinned app and firmware matrix, two-clean-build
+  reproducibility evidence, and release/submission evidence.
 
 S4c is only host integration As-Is. S4 is complete only after S4d and after
 the production signing path actually replaces the CLI's dev-only
@@ -285,8 +303,8 @@ new signature schemes, and general module registration are outside S4a.
 
 ## External references
 
-The separate S4b implementation must re-check current primary guidance before
-pinning its SDK/toolchain: Ledger's
+The separate S4b implementation re-checks and pins its SDK/toolchain against
+current primary guidance. Future changes must repeat that check using Ledger's
 [device-app getting started guide](https://developers.ledger.com/docs/device-app/getting-started),
 [Rust app boilerplate](https://developers.ledger.com/docs/device-app/integration/how-to/app-boilerplate),
 [clear-signing transaction guidance](https://developers.ledger.com/docs/device-app/integration/design-guidelines/transactions),
