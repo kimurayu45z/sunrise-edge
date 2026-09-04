@@ -61,9 +61,9 @@ use crate::net::{connect, tls_flag_specs};
 use crate::output::{bounded_hex_field, sanitize_line};
 use crate::parse::{parse_u16, parse_u32, parse_u64};
 use crate::seed::load_dev_seed;
-use crate::signer::{
-    SignerSelection, finalize_with_ledger, parse_signer_selection, signer_flag_specs,
-};
+#[cfg(feature = "usb-hid")]
+use crate::signer::finalize_with_ledger;
+use crate::signer::{SignerSelection, parse_signer_selection, signer_flag_specs};
 
 const ENDPOINT: &str = "--endpoint";
 const MODULE_ID: &str = "--module-id";

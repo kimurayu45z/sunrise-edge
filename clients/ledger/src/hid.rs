@@ -151,18 +151,6 @@ enum LedgerProductModel {
     ApexP,
 }
 
-impl fmt::Display for LedgerProductModel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::NanoX => "nano-x",
-            Self::NanoSPlus => "nano-s-plus",
-            Self::Stax => "stax",
-            Self::Flex => "flex",
-            Self::ApexP => "apex-p",
-        })
-    }
-}
-
 fn classify_product_id(product_id: u16) -> Option<LedgerProductModel> {
     match u8::try_from(product_id >> 8).ok()? {
         0x40 => Some(LedgerProductModel::NanoX),
@@ -425,8 +413,18 @@ impl std::error::Error for HidTransportError {
 }
 
 /// A real Ledger device reached over USB HID.
+///
+/// Field declaration order is load-bearing: Rust drops struct fields in
+/// declaration order (top to bottom), so `device` must be declared before
+/// `_api_keepalive`. The pinned `hidapi` currently keeps its global library
+/// initialization alive, but retaining the exact context that enumerated and
+/// opened this handle avoids depending on that implementation detail across
+/// backends or future dependency upgrades.
 pub struct HidTransport {
     device: HidDevice,
+    /// Keeps the `HidApi` context `device` was opened from alive until after
+    /// `device` is dropped; never read directly.
+    _api_keepalive: HidApi,
 }
 
 impl HidTransport {
@@ -456,7 +454,10 @@ impl HidTransport {
             .collect();
         select_descriptor(&records, path)?;
         let device = api.open_path(&c_path).map_err(HidTransportError::Hid)?;
-        Ok(Self { device })
+        Ok(Self {
+            device,
+            _api_keepalive: api,
+        })
     }
 }
 
