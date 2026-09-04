@@ -62,6 +62,21 @@ For the authoritative roadmap and completion criteria, see
 [`TODO.md`](TODO.md#cli-first-node-production-gate). For the implemented
 architecture and dated decisions, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
+### Disclosed MVP constraints
+
+The CLI Developer MVP Gate operates under fixed, disclosed constraints:
+
+- Single validator; owned-object execution only.
+- One fixed ordinary fee asset and one distinct ordinary treasury, with no
+  validator or certificate distribution.
+- Local SQLite only.
+- Cross-owner movement is limited to the exact, policy-bounded existing
+  destination; literal owner reassignment remains fail-closed.
+- The four `GET` query routes are an unauthenticated, bounded public-read API.
+- Query and submission share one `--max-concurrent` admission budget, so
+  either can starve the other.
+- Security and operations remain non-production.
+
 ## Design goals
 
 - Object-centric, versioned state instead of one global mutable key-value store.
