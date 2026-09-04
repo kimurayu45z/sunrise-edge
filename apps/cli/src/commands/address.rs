@@ -13,7 +13,7 @@ use crate::seed::load_dev_seed;
 use crate::signer::{SignerSelection, parse_signer_selection, signer_flag_specs};
 
 /// Runs `address --seed-file <path>` or
-/// `address --ledger-hid-path <path> --ledger-account <n>`.
+/// `address --ledger-hid-path <path> --ledger-account <n> --ledger-expected-firmware-version <version>`.
 pub fn run<I>(args: I) -> Result<(), CliError>
 where
     I: IntoIterator<Item = OsString>,

@@ -174,10 +174,12 @@ pub enum CliError {
     /// The `sunrise-edge-client` library rejected a call. Boxed because
     /// `ClientError` is large relative to this enum's other variants.
     Client(Box<ClientError>),
-    /// No signer was selected: neither `--seed-file` nor both
-    /// `--ledger-hid-path`/`--ledger-account` were supplied.
+    /// No signer was selected: neither `--seed-file` nor all three of
+    /// `--ledger-hid-path`/`--ledger-account`/
+    /// `--ledger-expected-firmware-version` were supplied.
     MissingSignerSelection,
-    /// `--seed-file` was combined with either Ledger signer flag; exactly
+    /// `--seed-file` was combined with any of `--ledger-hid-path`,
+    /// `--ledger-account`, or `--ledger-expected-firmware-version`; exactly
     /// one signer must be selected.
     ConflictingSignerSelection,
     /// Exactly one of the paired `--ledger-hid-path`/`--ledger-account`/
@@ -323,10 +325,10 @@ impl fmt::Display for CliError {
             Self::Transport(error) => write!(f, "{error}"),
             Self::Client(error) => write!(f, "{error}"),
             Self::MissingSignerSelection => f.write_str(
-                "no signer selected; supply --seed-file, or both --ledger-hid-path and --ledger-account",
+                "no signer selected; supply --seed-file, or all of --ledger-hid-path, --ledger-account, and --ledger-expected-firmware-version",
             ),
             Self::ConflictingSignerSelection => f.write_str(
-                "--seed-file cannot be combined with --ledger-hid-path or --ledger-account; select exactly one signer",
+                "--seed-file cannot be combined with --ledger-hid-path, --ledger-account, or --ledger-expected-firmware-version; select exactly one signer",
             ),
             Self::PartialLedgerSignerConfiguration { missing } => write!(
                 f,

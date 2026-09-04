@@ -20,16 +20,20 @@
 //! `transfer` (the devnet asset transfer with an explicit destination-owner
 //! expectation). `address` and `transfer` each require an explicit,
 //! all-or-none signer selection (see `signer::parse_signer_selection`):
-//! `--seed-file` (the development-only, non-keystore local signer) or both
-//! `--ledger-hid-path`/`--ledger-account` (a Ledger hardware signer, checked
-//! against its device-reported configuration and on-device-confirmed public
-//! key/address before any signing). The real USB/HID transport
-//! (`--ledger-hid-path`) requires this binary to be built with the
-//! `usb-hid` Cargo feature; without it, a Ledger selection fails closed with
-//! a typed, actionable error rather than silently falling back to the local
-//! signer. Output is deterministic, line-oriented `key=value` text; every
-//! error is typed and actionable, and every error exits the process
-//! non-zero.
+//! `--seed-file` (the development-only, non-keystore local signer) or all
+//! three of `--ledger-hid-path`, `--ledger-account`, and
+//! `--ledger-expected-firmware-version` (a Ledger hardware signer). A Ledger
+//! selection runs a staged identity check before any signing: the device's
+//! dashboard/firmware identity is verified against
+//! `--ledger-expected-firmware-version`, the Sunrise application is opened
+//! and its own reported app/version identity verified, and only then are the
+//! device-reported configuration and on-device-confirmed public key/address
+//! checked. The real USB/HID transport (`--ledger-hid-path`) requires this
+//! binary to be built with the `usb-hid` Cargo feature; without it, a Ledger
+//! selection fails closed with a typed, actionable error rather than
+//! silently falling back to the local signer. Output is deterministic,
+//! line-oriented `key=value` text; every error is typed and actionable, and
+//! every error exits the process non-zero.
 
 mod args;
 mod commands;

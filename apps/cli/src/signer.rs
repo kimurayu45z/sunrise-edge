@@ -118,11 +118,13 @@ pub fn parse_signer_selection(parsed: &ParsedArgs) -> Result<SignerSelection, Cl
 ///
 /// Generic over [`Transport`] so this exact connect-then-verify sequence is
 /// unit-testable with `sunrise_edge_ledger::FakeTransport`, independent of
-/// the `usb-hid` feature and any real USB/HID hardware. Its only non-test
-/// caller is behind `#[cfg(feature = "usb-hid")]`
-/// (`commands::transfer::run_with_ledger`, `commands::address::run_with_ledger`),
-/// so a default (non-test, non-`usb-hid`) build sees no call site at all.
-#[allow(dead_code, reason = "used by usb-hid-gated callers and by tests")]
+/// the `usb-hid` feature and any real USB/HID hardware. [`connect_ledger_staged`]
+/// inlines this same connect-then-verify sequence for its own final step
+/// rather than calling this function, so this function currently has no
+/// non-test caller; it is kept so the sequence remains independently
+/// unit-testable in isolation from the staged dashboard/firmware/open-app
+/// flow.
+#[allow(dead_code, reason = "kept for isolated unit testing; see doc comment")]
 pub fn connect_ledger_with<T: Transport>(
     transport: T,
     account: u32,
@@ -157,9 +159,11 @@ where
 ///    exactly [`sunrise_edge_ledger::EXPECTED_APP_NAME`] at exactly
 ///    [`sunrise_edge_ledger::EXPECTED_APP_VERSION`]
 ///    ([`verify_active_app`]).
-/// 4. Only then runs the existing device-reported configuration and
-///    on-device-confirmed public key/address checks
-///    ([`connect_ledger_with`]).
+/// 4. Only then connects the [`LedgerExternalSigner`], which itself checks
+///    the device-reported configuration and then fetches and confirms the
+///    on-device-confirmed public key/address at `account`'s provisional
+///    derivation path — the same connect-then-verify sequence
+///    [`connect_ledger_with`] performs, inlined here rather than called.
 ///
 /// Generic over [`Transport`] (the same transport type for both stages) so
 /// this exact sequence is unit-testable end to end with

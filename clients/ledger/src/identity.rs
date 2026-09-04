@@ -6,8 +6,9 @@
 //! "Device APDU contract", the CLA `B0`/dashboard `E0` bullets.
 //!
 //! These are Ledger OS-owned commands, not this app's own frozen `E0`
-//! contract in [`crate::apdu`]: CLA `B0` is intercepted by the Ledger OS
-//! before it ever reaches the Sunrise application, and dashboard-context
+//! contract in [`crate::apdu`]: CLA `B0` is handled by the Ledger Rust
+//! SDK's I/O layer (`Comm::next_command`) before it is ever dispatched to
+//! the Sunrise application's own command loop, and dashboard-context
 //! `E0` `INS 01`/`INS D8` are reachable only before the Sunrise application
 //! is the active app.
 
@@ -16,7 +17,8 @@ use std::fmt;
 use crate::apdu::{ApduCommand, ApduResponse, MAX_RESPONSE_DATA_LEN, STATUS_SUCCESS, Transport};
 
 /// CLA Ledger reserves for the currently active application's own identity,
-/// intercepted by the Ledger OS before it ever reaches this app.
+/// handled by the Ledger Rust SDK's I/O layer before it is ever dispatched
+/// to this app.
 pub const CLA_APP: u8 = 0xB0;
 /// `get app and version`.
 pub const INS_GET_APP_AND_VERSION: u8 = 0x01;
