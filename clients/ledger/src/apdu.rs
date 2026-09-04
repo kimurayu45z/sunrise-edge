@@ -55,6 +55,11 @@ pub const STATUS_UNSUPPORTED_CLA: u16 = 0x6E00;
 /// Internal failure after the device wiped its state.
 pub const STATUS_INTERNAL_FAILURE: u16 = 0x6F00;
 
+/// Maximum accepted short-APDU response data length, excluding the trailing
+/// two-byte status word. Higher-level decoders enforce this too so an
+/// injected transport cannot bypass the physical framing bound.
+pub const MAX_RESPONSE_DATA_LEN: usize = 258;
+
 /// One complete APDU command: `CLA || INS || P1 || P2 || Lc || data`.
 ///
 /// `data` must fit the short (single-byte `Lc`) APDU form: at most 255

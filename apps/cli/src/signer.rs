@@ -3,18 +3,25 @@
 //! and `ARCHITECTURE.md`'s Hardware Signing Profile v1 decision records).
 //!
 //! Exactly one signer must be selected: `--seed-file` alone (development-
-//! only, in-memory, never a keystore), or both `--ledger-hid-path` and
-//! `--ledger-account` together (a real Ledger device, verified by its
-//! device-reported configuration and on-device-confirmed public key/address
-//! before any signing — see [`connect_ledger_with`] and
-//! `sunrise_edge_ledger::LedgerExternalSigner`). Any other combination —
-//! neither, both groups at once, or exactly one of the two Ledger flags — is
-//! a typed rejection before any network dispatch or device connection.
+//! only, in-memory, never a keystore), or `--ledger-hid-path`,
+//! `--ledger-account`, and `--ledger-expected-firmware-version` together (a
+//! real Ledger device, verified by its dashboard/firmware identity, its
+//! reported application identity, its device-reported configuration, and
+//! its on-device-confirmed public key/address before any signing — see
+//! [`connect_ledger_staged`] and `sunrise_edge_ledger::LedgerExternalSigner`).
+//! Any other combination — neither, both groups at once, or exactly one or
+//! two of the three Ledger flags — is a typed rejection before any network
+//! dispatch or device connection. `--ledger-expected-firmware-version` is
+//! itself validated ([`sunrise_edge_ledger::ExpectedFirmwareVersion::new`])
+//! during selection parsing, strictly before any device dispatch.
 
 use sunrise_edge_client::{
     DEVNET_ASSET_TRANSFER_POLICY, DeviceSigningProfile, PreparedTransaction,
 };
-use sunrise_edge_ledger::{DerivationPath, LedgerExternalSigner, Transport};
+use sunrise_edge_ledger::{
+    DerivationPath, ExpectedFirmwareVersion, IdentityError, LedgerExternalSigner, Transport,
+    verify_active_app, verify_dashboard_and_open,
+};
 
 use crate::args::{FlagSpec, ParsedArgs, scalar};
 use crate::error::CliError;
@@ -26,6 +33,9 @@ pub const SEED_FILE: &str = "--seed-file";
 pub const LEDGER_HID_PATH: &str = "--ledger-hid-path";
 /// Ledger provisional derivation account flag.
 pub const LEDGER_ACCOUNT: &str = "--ledger-account";
+/// Ledger expected dashboard-reported firmware (Secure Element) version
+/// flag.
+pub const LEDGER_EXPECTED_FIRMWARE_VERSION: &str = "--ledger-expected-firmware-version";
 
 /// The signer-selection flags every signer-capable subcommand accepts, in
 /// addition to its own flags.
@@ -35,6 +45,7 @@ pub fn signer_flag_specs() -> Vec<FlagSpec> {
         scalar(SEED_FILE),
         scalar(LEDGER_HID_PATH),
         scalar(LEDGER_ACCOUNT),
+        scalar(LEDGER_EXPECTED_FIRMWARE_VERSION),
     ]
 }
 
@@ -54,6 +65,9 @@ pub enum SignerSelection {
         /// Non-hardened `account` component of the provisional derivation
         /// path `m/44'/21333'/account'/0'/0'`.
         account: u32,
+        /// The exact dashboard-reported firmware (Secure Element) version
+        /// this host requires before opening the Sunrise application.
+        expected_firmware_version: ExpectedFirmwareVersion,
     },
 }
 
@@ -62,23 +76,37 @@ pub fn parse_signer_selection(parsed: &ParsedArgs) -> Result<SignerSelection, Cl
     let local = parsed.is_present(SEED_FILE);
     let ledger_hid = parsed.is_present(LEDGER_HID_PATH);
     let ledger_account = parsed.is_present(LEDGER_ACCOUNT);
+    let ledger_firmware = parsed.is_present(LEDGER_EXPECTED_FIRMWARE_VERSION);
 
-    match (local, ledger_hid, ledger_account) {
-        (true, false, false) => Ok(SignerSelection::Local {
+    match (local, ledger_hid, ledger_account, ledger_firmware) {
+        (true, false, false, false) => Ok(SignerSelection::Local {
             seed_file: parsed.require(SEED_FILE)?.to_string(),
         }),
-        (false, true, true) => Ok(SignerSelection::Ledger {
-            hid_path: parsed.require(LEDGER_HID_PATH)?.to_string(),
-            account: parse_u32(LEDGER_ACCOUNT, parsed.require(LEDGER_ACCOUNT)?)?,
-        }),
-        (false, false, false) => Err(CliError::MissingSignerSelection),
-        (true, _, _) => Err(CliError::ConflictingSignerSelection),
-        (false, true, false) => Err(CliError::PartialLedgerSignerConfiguration {
-            missing: LEDGER_ACCOUNT,
-        }),
-        (false, false, true) => Err(CliError::PartialLedgerSignerConfiguration {
-            missing: LEDGER_HID_PATH,
-        }),
+        (false, true, true, true) => {
+            let expected_firmware_version =
+                ExpectedFirmwareVersion::new(parsed.require(LEDGER_EXPECTED_FIRMWARE_VERSION)?)
+                    .map_err(CliError::LedgerExpectedFirmwareVersion)?;
+            let account = parse_u32(LEDGER_ACCOUNT, parsed.require(LEDGER_ACCOUNT)?)?;
+            DerivationPath::provisional(account)
+                .map_err(|error| CliError::LedgerConnect(Box::new(error)))?;
+            Ok(SignerSelection::Ledger {
+                hid_path: parsed.require(LEDGER_HID_PATH)?.to_string(),
+                account,
+                expected_firmware_version,
+            })
+        }
+        (false, false, false, false) => Err(CliError::MissingSignerSelection),
+        (true, _, _, _) => Err(CliError::ConflictingSignerSelection),
+        (false, hid, account, _firmware) => {
+            let missing = if !hid {
+                LEDGER_HID_PATH
+            } else if !account {
+                LEDGER_ACCOUNT
+            } else {
+                LEDGER_EXPECTED_FIRMWARE_VERSION
+            };
+            Err(CliError::PartialLedgerSignerConfiguration { missing })
+        }
     }
 }
 
@@ -103,6 +131,117 @@ pub fn connect_ledger_with<T: Transport>(
         .map_err(|error| CliError::LedgerConnect(Box::new(error)))?;
     LedgerExternalSigner::connect(transport, path)
         .map_err(|error| CliError::LedgerConnect(Box::new(error)))
+}
+
+#[allow(dead_code, reason = "used by usb-hid-gated callers and by tests")]
+fn identity_error<E>(error: IdentityError<E>) -> CliError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    CliError::LedgerIdentity(Box::new(error))
+}
+
+/// Runs `SIGNING.md`'s complete staged device-identity sequence before ever
+/// connecting a [`LedgerExternalSigner`]:
+///
+/// 1. Over `dashboard_transport` (the device at the dashboard, no
+///    application open): verifies the dashboard's own reported identity is
+///    exactly `BOLOS`, that its firmware has a supported target id, no
+///    OS-Upgrade (OSU) marker, and exactly matches `expected_firmware_version`
+///    ([`verify_dashboard_and_open`]), then opens the Sunrise application.
+/// 2. Drops `dashboard_transport` and calls `reconnect` to obtain a fresh
+///    transport to the now-open Sunrise application (a real caller
+///    reconnects at the same USB/HID path; see
+///    `crate::signer::reconnect_same_hid_path` under the `usb-hid` feature).
+/// 3. Over the reconnected transport: verifies the active application is
+///    exactly [`sunrise_edge_ledger::EXPECTED_APP_NAME`] at exactly
+///    [`sunrise_edge_ledger::EXPECTED_APP_VERSION`]
+///    ([`verify_active_app`]).
+/// 4. Only then runs the existing device-reported configuration and
+///    on-device-confirmed public key/address checks
+///    ([`connect_ledger_with`]).
+///
+/// Generic over [`Transport`] (the same transport type for both stages) so
+/// this exact sequence is unit-testable end to end with
+/// `sunrise_edge_ledger::FakeTransport`, independent of the `usb-hid`
+/// feature and any real USB/HID hardware.
+#[allow(dead_code, reason = "used by usb-hid-gated callers and by tests")]
+pub fn connect_ledger_staged<T, F>(
+    dashboard_transport: T,
+    expected_firmware_version: &ExpectedFirmwareVersion,
+    account: u32,
+    reconnect: F,
+) -> Result<LedgerExternalSigner<T>, CliError>
+where
+    T: Transport,
+    F: FnOnce() -> Result<T, CliError>,
+{
+    let path = DerivationPath::provisional(account)
+        .map_err(|error| CliError::LedgerConnect(Box::new(error)))?;
+    let mut dashboard_transport = dashboard_transport;
+    verify_dashboard_and_open(&mut dashboard_transport, expected_firmware_version)
+        .map_err(identity_error)?;
+    drop(dashboard_transport);
+
+    let mut app_transport = reconnect()?;
+    verify_active_app(&mut app_transport).map_err(identity_error)?;
+
+    LedgerExternalSigner::connect(app_transport, path)
+        .map_err(|error| CliError::LedgerConnect(Box::new(error)))
+}
+
+/// Retries `attempt` until it succeeds or `deadline` (measured against a
+/// monotonic clock, never wall-clock time) has passed, sleeping
+/// `retry_interval` between attempts. Never retries forever: once the
+/// deadline has passed, `attempt`'s most recent failure is returned instead
+/// of retrying again.
+#[allow(dead_code, reason = "used by usb-hid-gated callers and by tests")]
+fn retry_until_deadline<T, E>(
+    deadline: std::time::Instant,
+    retry_interval: std::time::Duration,
+    mut attempt: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    loop {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(error);
+                }
+                std::thread::sleep(retry_interval);
+            }
+        }
+    }
+}
+
+/// Bounded deadline this host waits, in total, for the device to reappear
+/// at the same HID path after `open app` (see
+/// [`reconnect_same_hid_path`]).
+#[cfg(feature = "usb-hid")]
+const LEDGER_RECONNECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Sleep between reconnect attempts within [`LEDGER_RECONNECT_DEADLINE`].
+#[cfg(feature = "usb-hid")]
+const LEDGER_RECONNECT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Reopens `path` after `open app`, retrying with a bounded monotonic
+/// deadline and a fixed retry sleep: the device visibly re-enumerates its
+/// USB/HID interface when it switches from the dashboard to an opened
+/// application, so the very next `HidTransport::open` attempt commonly
+/// fails transiently. Never blocks indefinitely — once
+/// [`LEDGER_RECONNECT_DEADLINE`] elapses, this fails closed with a typed
+/// [`CliError::LedgerReconnectTimedOut`] carrying the most recent attempt's
+/// failure, rather than retrying forever or silently giving up early.
+#[cfg(feature = "usb-hid")]
+pub fn reconnect_same_hid_path(path: &str) -> Result<sunrise_edge_ledger::HidTransport, CliError> {
+    let deadline = std::time::Instant::now() + LEDGER_RECONNECT_DEADLINE;
+    retry_until_deadline(deadline, LEDGER_RECONNECT_RETRY_INTERVAL, || {
+        sunrise_edge_ledger::HidTransport::open(path)
+    })
+    .map_err(|error| CliError::LedgerReconnectTimedOut {
+        path: path.to_string(),
+        deadline_ms: u64::try_from(LEDGER_RECONNECT_DEADLINE.as_millis()).unwrap_or(u64::MAX),
+        last_error: error.to_string(),
+    })
 }
 
 /// Applies the CLI's one approved Ledger clear-signing profile and policy,
@@ -219,7 +358,7 @@ mod tests {
         };
         let mut responses: Vec<ApduResponse> = vec![
             ApduResponse {
-                data: vec![0x00, 0x01, 1, 0, 0, 0x00],
+                data: vec![0x00, 0x01, 0, 1, 0, 0x00],
                 status_word: STATUS_SUCCESS,
             },
             ApduResponse {
@@ -227,7 +366,7 @@ mod tests {
                 status_word: STATUS_SUCCESS,
             },
             ApduResponse {
-                data: vec![0x00, 0x01, 1, 0, 0, 0x00],
+                data: vec![0x00, 0x01, 0, 1, 0, 0x00],
                 status_word: STATUS_SUCCESS,
             },
             ApduResponse {
@@ -264,10 +403,11 @@ mod tests {
     }
 
     #[test]
-    fn selects_ledger_when_both_ledger_flags_are_present() {
+    fn selects_ledger_when_all_three_ledger_flags_are_present() {
         let selection = parse_signer_selection(&parsed(&[
             (LEDGER_HID_PATH, "/dev/hidraw0"),
             (LEDGER_ACCOUNT, "3"),
+            (LEDGER_EXPECTED_FIRMWARE_VERSION, "1.6.0"),
         ]))
         .unwrap();
         assert_eq!(
@@ -275,6 +415,7 @@ mod tests {
             SignerSelection::Ledger {
                 hid_path: "/dev/hidraw0".to_string(),
                 account: 3,
+                expected_firmware_version: ExpectedFirmwareVersion::new("1.6.0").unwrap(),
             }
         );
     }
@@ -288,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_local_combined_with_either_ledger_flag() {
+    fn rejects_local_combined_with_any_ledger_flag() {
         assert!(matches!(
             parse_signer_selection(&parsed(&[
                 (SEED_FILE, "seed.hex"),
@@ -303,15 +444,23 @@ mod tests {
         assert!(matches!(
             parse_signer_selection(&parsed(&[
                 (SEED_FILE, "seed.hex"),
+                (LEDGER_EXPECTED_FIRMWARE_VERSION, "1.6.0"),
+            ])),
+            Err(CliError::ConflictingSignerSelection)
+        ));
+        assert!(matches!(
+            parse_signer_selection(&parsed(&[
+                (SEED_FILE, "seed.hex"),
                 (LEDGER_HID_PATH, "/dev/hidraw0"),
                 (LEDGER_ACCOUNT, "0"),
+                (LEDGER_EXPECTED_FIRMWARE_VERSION, "1.6.0"),
             ])),
             Err(CliError::ConflictingSignerSelection)
         ));
     }
 
     #[test]
-    fn rejects_exactly_one_of_the_two_ledger_flags() {
+    fn rejects_exactly_one_or_two_of_the_three_ledger_flags() {
         assert!(matches!(
             parse_signer_selection(&parsed(&[(LEDGER_HID_PATH, "/dev/hidraw0")])),
             Err(CliError::PartialLedgerSignerConfiguration {
@@ -324,6 +473,21 @@ mod tests {
                 missing: LEDGER_HID_PATH
             })
         ));
+        assert!(matches!(
+            parse_signer_selection(&parsed(&[(LEDGER_EXPECTED_FIRMWARE_VERSION, "1.6.0")])),
+            Err(CliError::PartialLedgerSignerConfiguration {
+                missing: LEDGER_HID_PATH
+            })
+        ));
+        assert!(matches!(
+            parse_signer_selection(&parsed(&[
+                (LEDGER_HID_PATH, "/dev/hidraw0"),
+                (LEDGER_ACCOUNT, "0"),
+            ])),
+            Err(CliError::PartialLedgerSignerConfiguration {
+                missing: LEDGER_EXPECTED_FIRMWARE_VERSION
+            })
+        ));
     }
 
     #[test]
@@ -332,11 +496,39 @@ mod tests {
             parse_signer_selection(&parsed(&[
                 (LEDGER_HID_PATH, "/dev/hidraw0"),
                 (LEDGER_ACCOUNT, "not-a-number"),
+                (LEDGER_EXPECTED_FIRMWARE_VERSION, "1.6.0"),
             ])),
             Err(CliError::InvalidInteger {
                 flag: LEDGER_ACCOUNT,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_hardened_ledger_account_during_selection_before_device_dispatch() {
+        let error = parse_signer_selection(&parsed(&[
+            (LEDGER_HID_PATH, "/dev/hidraw0"),
+            (LEDGER_ACCOUNT, "2147483648"),
+            (LEDGER_EXPECTED_FIRMWARE_VERSION, "1.6.0"),
+        ]))
+        .unwrap_err();
+        assert!(matches!(error, CliError::LedgerConnect(_)));
+    }
+
+    #[test]
+    fn rejects_an_empty_expected_firmware_version_before_any_device_dispatch() {
+        let error = parse_signer_selection(&parsed(&[
+            (LEDGER_HID_PATH, "/dev/hidraw0"),
+            (LEDGER_ACCOUNT, "0"),
+            (LEDGER_EXPECTED_FIRMWARE_VERSION, ""),
+        ]))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::LedgerExpectedFirmwareVersion(
+                sunrise_edge_ledger::ExpectedFirmwareVersionError::Empty
+            )
         ));
     }
 
@@ -348,7 +540,7 @@ mod tests {
         let key = [0x11_u8; 32];
         let transport = FakeTransport::new(vec![
             ApduResponse {
-                data: vec![0x00, 0x01, 1, 0, 0, 0x00],
+                data: vec![0x00, 0x01, 0, 1, 0, 0x00],
                 status_word: 0x9000,
             },
             ApduResponse {
@@ -367,6 +559,220 @@ mod tests {
 
         let error = connect_ledger_with(FakeTransport::new(vec![]), 0x8000_0000).unwrap_err();
         assert!(matches!(error, CliError::LedgerConnect(_)));
+    }
+
+    // ---- connect_ledger_staged ----
+
+    fn ok(data: Vec<u8>) -> sunrise_edge_ledger::ApduResponse {
+        sunrise_edge_ledger::ApduResponse {
+            data,
+            status_word: sunrise_edge_ledger::apdu::STATUS_SUCCESS,
+        }
+    }
+
+    fn lv(bytes: &[u8]) -> Vec<u8> {
+        let mut out = vec![u8::try_from(bytes.len()).unwrap()];
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    fn app_and_version_response(name: &str, version: &str) -> Vec<u8> {
+        let mut data = vec![1_u8];
+        data.extend(lv(name.as_bytes()));
+        data.extend(lv(version.as_bytes()));
+        data
+    }
+
+    const VALID_TARGET_ID: u32 = 0x3310_0004;
+
+    fn firmware_response(target_id: u32, se_version: &str) -> Vec<u8> {
+        let mut data = target_id.to_be_bytes().to_vec();
+        data.extend(lv(se_version.as_bytes()));
+        data.extend(lv(&[0x00]));
+        data
+    }
+
+    fn valid_expected_firmware() -> ExpectedFirmwareVersion {
+        ExpectedFirmwareVersion::new("1.6.0").unwrap()
+    }
+
+    fn valid_dashboard_transport() -> sunrise_edge_ledger::FakeTransport {
+        sunrise_edge_ledger::FakeTransport::new(vec![
+            ok(app_and_version_response("BOLOS", "1.6.0")),
+            ok(firmware_response(VALID_TARGET_ID, "1.6.0")),
+            ok(Vec::new()),
+        ])
+    }
+
+    fn valid_app_transport(key: [u8; 32]) -> sunrise_edge_ledger::FakeTransport {
+        sunrise_edge_ledger::FakeTransport::new(vec![
+            ok(app_and_version_response(
+                sunrise_edge_ledger::identity::EXPECTED_APP_NAME,
+                sunrise_edge_ledger::identity::EXPECTED_APP_VERSION,
+            )),
+            ok(vec![0x00, 0x01, 0, 1, 0, 0x00]),
+            ok(key.to_vec()),
+        ])
+    }
+
+    #[test]
+    fn connect_ledger_staged_runs_the_complete_sequence_in_order_and_succeeds() {
+        let key = [0x55_u8; 32];
+        let app_transport = valid_app_transport(key);
+        let mut reconnect_calls = 0_u32;
+
+        let signer = connect_ledger_staged(
+            valid_dashboard_transport(),
+            &valid_expected_firmware(),
+            0,
+            || {
+                reconnect_calls += 1;
+                Ok(app_transport)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(signer.address(), sunrise_edge_client::Address::new(key));
+        assert_eq!(reconnect_calls, 1);
+    }
+
+    #[test]
+    fn connect_ledger_staged_never_reconnects_when_the_dashboard_identity_check_fails() {
+        let dashboard_transport = sunrise_edge_ledger::FakeTransport::new(vec![ok(
+            app_and_version_response("SomeOtherApp", "1.6.0"),
+        )]);
+
+        let error = connect_ledger_staged(
+            dashboard_transport,
+            &valid_expected_firmware(),
+            0,
+            || -> Result<sunrise_edge_ledger::FakeTransport, CliError> {
+                panic!("reconnect must never be called once the dashboard identity check fails")
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CliError::LedgerIdentity(_)));
+    }
+
+    #[test]
+    fn connect_ledger_staged_rejects_an_invalid_path_before_dashboard_dispatch() {
+        let error = connect_ledger_staged(
+            sunrise_edge_ledger::FakeTransport::new(Vec::new()),
+            &valid_expected_firmware(),
+            0x8000_0000,
+            || -> Result<sunrise_edge_ledger::FakeTransport, CliError> {
+                panic!("reconnect must not run for an invalid derivation path")
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CliError::LedgerConnect(_)));
+    }
+
+    #[test]
+    fn connect_ledger_staged_never_reconnects_when_the_firmware_version_mismatches() {
+        let dashboard_transport = sunrise_edge_ledger::FakeTransport::new(vec![
+            ok(app_and_version_response("BOLOS", "1.6.0")),
+            ok(firmware_response(VALID_TARGET_ID, "1.5.9")),
+        ]);
+
+        let error = connect_ledger_staged(
+            dashboard_transport,
+            &valid_expected_firmware(),
+            0,
+            || -> Result<sunrise_edge_ledger::FakeTransport, CliError> {
+                panic!("reconnect must never be called once the firmware version mismatches")
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CliError::LedgerIdentity(_)));
+    }
+
+    #[test]
+    fn connect_ledger_staged_reconnects_but_never_checks_configuration_when_the_active_app_check_fails()
+     {
+        let dashboard_transport = valid_dashboard_transport();
+        let app_transport = sunrise_edge_ledger::FakeTransport::new(vec![ok(
+            app_and_version_response("SomeOtherApp", "0.1.0"),
+        )]);
+        let mut reconnect_calls = 0_u32;
+
+        let error =
+            connect_ledger_staged(dashboard_transport, &valid_expected_firmware(), 0, || {
+                reconnect_calls += 1;
+                Ok(app_transport)
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, CliError::LedgerIdentity(_)));
+        assert_eq!(
+            reconnect_calls, 1,
+            "reconnect must be attempted exactly once, after the dashboard stage succeeded"
+        );
+    }
+
+    #[test]
+    fn connect_ledger_staged_propagates_a_reconnect_failure() {
+        let dashboard_transport = valid_dashboard_transport();
+
+        let error = connect_ledger_staged(
+            dashboard_transport,
+            &valid_expected_firmware(),
+            0,
+            || -> Result<sunrise_edge_ledger::FakeTransport, CliError> {
+                Err(CliError::LedgerReconnectTimedOut {
+                    path: "/dev/hidraw0".to_string(),
+                    deadline_ms: 30_000,
+                    last_error: "no device found".to_string(),
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CliError::LedgerReconnectTimedOut { .. }));
+    }
+
+    // ---- retry_until_deadline ----
+
+    #[test]
+    fn retry_until_deadline_returns_the_first_success() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        let mut attempts = 0_u32;
+        let result: Result<u32, &str> =
+            retry_until_deadline(deadline, std::time::Duration::from_millis(1), || {
+                attempts += 1;
+                Ok(42)
+            });
+        assert_eq!(result, Ok(42));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn retry_until_deadline_retries_until_a_later_success() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut attempts = 0_u32;
+        let result: Result<u32, &str> =
+            retry_until_deadline(deadline, std::time::Duration::from_millis(5), || {
+                attempts += 1;
+                if attempts < 3 { Err("not yet") } else { Ok(7) }
+            });
+        assert_eq!(result, Ok(7));
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn retry_until_deadline_gives_up_once_the_monotonic_deadline_passes() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        let mut attempts = 0_u32;
+        let result: Result<u32, &str> =
+            retry_until_deadline(deadline, std::time::Duration::from_millis(5), || {
+                attempts += 1;
+                Err("still failing")
+            });
+        assert_eq!(result, Err("still failing"));
+        assert!(attempts >= 2, "expected at least one retry, got {attempts}");
     }
 
     #[test]

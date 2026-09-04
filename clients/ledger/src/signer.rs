@@ -94,7 +94,7 @@ mod tests {
     }
 
     fn valid_configuration() -> ApduResponse {
-        ok(vec![0x00, 0x01, 1, 0, 0, 0x00])
+        ok(vec![0x00, 0x01, 0, 1, 0, 0x00])
     }
 
     #[test]

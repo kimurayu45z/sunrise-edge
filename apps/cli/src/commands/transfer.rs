@@ -157,26 +157,44 @@ where
                     .map_err(CliError::from)
             })
         }
-        SignerSelection::Ledger { hid_path, account } => {
-            run_with_ledger(endpoint, &parsed, &hid_path, account, inputs)
-        }
+        SignerSelection::Ledger {
+            hid_path,
+            account,
+            expected_firmware_version,
+        } => run_with_ledger(
+            endpoint,
+            &parsed,
+            &hid_path,
+            account,
+            &expected_firmware_version,
+            inputs,
+        ),
     }
 }
 
-/// Connects a real Ledger device and completes `transfer` using it as the
-/// external signer (see `SIGNING.md` and `ARCHITECTURE.md`'s Hardware
-/// Signing Profile v1 decision records).
+/// Connects a real Ledger device — running `SIGNING.md`'s complete staged
+/// dashboard/firmware/open-app/reconnect/active-app sequence and the
+/// existing device-reported configuration/public key/address checks, all
+/// strictly before this function ever constructs a network [`Client`] — and
+/// completes `transfer` using it as the external signer (see `SIGNING.md`
+/// and `ARCHITECTURE.md`'s Hardware Signing Profile v1 decision records).
 #[cfg(feature = "usb-hid")]
 fn run_with_ledger(
     endpoint: &str,
     parsed: &ParsedArgs,
     hid_path: &str,
     account: u32,
+    expected_firmware_version: &sunrise_edge_ledger::ExpectedFirmwareVersion,
     inputs: TransferInputs,
 ) -> Result<(), CliError> {
-    let transport = sunrise_edge_ledger::HidTransport::open(hid_path)
+    let dashboard_transport = sunrise_edge_ledger::HidTransport::open(hid_path)
         .map_err(|error| CliError::LedgerConnect(Box::new(error)))?;
-    let signer = crate::signer::connect_ledger_with(transport, account)?;
+    let signer = crate::signer::connect_ledger_staged(
+        dashboard_transport,
+        expected_firmware_version,
+        account,
+        || crate::signer::reconnect_same_hid_path(hid_path),
+    )?;
     let sender = signer.address();
     let client = connect(endpoint, parsed)?;
     execute(&client, sender, inputs, |prepared| {
@@ -192,6 +210,7 @@ fn run_with_ledger(
     _parsed: &ParsedArgs,
     _hid_path: &str,
     _account: u32,
+    _expected_firmware_version: &sunrise_edge_ledger::ExpectedFirmwareVersion,
     _inputs: TransferInputs,
 ) -> Result<(), CliError> {
     Err(CliError::LedgerTransportFeatureDisabled)

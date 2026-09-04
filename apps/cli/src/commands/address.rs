@@ -27,18 +27,34 @@ where
             println!("address={}", signer.address());
             Ok(())
         }
-        SignerSelection::Ledger { hid_path, account } => run_with_ledger(&hid_path, account),
+        SignerSelection::Ledger {
+            hid_path,
+            account,
+            expected_firmware_version,
+        } => run_with_ledger(&hid_path, account, &expected_firmware_version),
     }
 }
 
-/// Connects a real Ledger device, confirms its address, and prints it.
+/// Connects a real Ledger device — running `SIGNING.md`'s complete staged
+/// dashboard/firmware/open-app/reconnect/active-app sequence before the
+/// existing device-reported configuration/public key/address checks — and
+/// prints the confirmed address.
 #[cfg(feature = "usb-hid")]
-fn run_with_ledger(hid_path: &str, account: u32) -> Result<(), CliError> {
+fn run_with_ledger(
+    hid_path: &str,
+    account: u32,
+    expected_firmware_version: &sunrise_edge_ledger::ExpectedFirmwareVersion,
+) -> Result<(), CliError> {
     use sunrise_edge_client::ExternalSigner;
 
-    let transport = sunrise_edge_ledger::HidTransport::open(hid_path)
+    let dashboard_transport = sunrise_edge_ledger::HidTransport::open(hid_path)
         .map_err(|error| CliError::LedgerConnect(Box::new(error)))?;
-    let signer = crate::signer::connect_ledger_with(transport, account)?;
+    let signer = crate::signer::connect_ledger_staged(
+        dashboard_transport,
+        expected_firmware_version,
+        account,
+        || crate::signer::reconnect_same_hid_path(hid_path),
+    )?;
     println!("address={}", signer.address());
     Ok(())
 }
@@ -46,7 +62,11 @@ fn run_with_ledger(hid_path: &str, account: u32) -> Result<(), CliError> {
 /// This binary was not built with the `usb-hid` feature: fail closed with
 /// an actionable error before any device connection is even attempted.
 #[cfg(not(feature = "usb-hid"))]
-fn run_with_ledger(_hid_path: &str, _account: u32) -> Result<(), CliError> {
+fn run_with_ledger(
+    _hid_path: &str,
+    _account: u32,
+    _expected_firmware_version: &sunrise_edge_ledger::ExpectedFirmwareVersion,
+) -> Result<(), CliError> {
     Err(CliError::LedgerTransportFeatureDisabled)
 }
 
@@ -89,8 +109,28 @@ mod tests {
             OsString::from("/dev/hidraw0"),
             OsString::from("--ledger-account"),
             OsString::from("0"),
+            OsString::from("--ledger-expected-firmware-version"),
+            OsString::from("1.6.0"),
         ])
         .unwrap_err();
         assert!(matches!(error, CliError::LedgerTransportFeatureDisabled));
+    }
+
+    #[test]
+    fn a_ledger_selection_missing_the_expected_firmware_version_flag_is_rejected_before_any_device_dispatch()
+     {
+        let error = run(vec![
+            OsString::from("--ledger-hid-path"),
+            OsString::from("/dev/hidraw0"),
+            OsString::from("--ledger-account"),
+            OsString::from("0"),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::PartialLedgerSignerConfiguration {
+                missing: "--ledger-expected-firmware-version"
+            }
+        ));
     }
 }

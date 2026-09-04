@@ -1766,9 +1766,16 @@ Flex/Apex Pのclean build、fixed-seed Nano S+ Speculos/Ragger key/signature/sen
 reset/rejection evidenceをimplemented and validated As-Isとして提供する。S4bはAs-Isで
 complete、DR-0092によりS4c Phase 1 host APDU/USB/HID transportとCLI signer
 selection（profile/address check、USB descriptor levelのdevice check）も
-implemented and validated As-Isである。S4cはactive-app/firmware identity check
-（S4c Phase 2）とphysical hardware validationが未実装のためincompleteであり、
-S4全体もincompleteである。現在のimplementation priorityはS4c Phase 2、続いて
+implemented and validated As-Isである。DR-0093によりS4c Phase 2aのactive-app/
+firmware identity check（strict Ledger OS identity/dashboard response
+parsing、dashboard `BOLOS` check、bootloader/OSU rejection、exact
+caller-supplied expected firmware version、`open app`によるexactly
+`Sunrise Edge`のopen、bounded same-explicit-path reconnect、exactly
+`Sunrise Edge`/`0.1.0`のactive-app check、既存6-byte configurationへの
+`0.1.0` pin追加）もimplemented and validated As-Isだが、`FakeTransport`のみに
+対するsoftware-only実装であり、real physical hardwareに対するvalidationは
+ない。S4cはphysical hardware validationが未実装のためincompleteであり、
+S4全体もincompleteである。現在のimplementation priorityはS4c Phase 2b、続いて
 S4d（physical-device HIL、golden/pixel UI evidence、release evidence）である。
 TypeScript client/explorer/walletと
 S5は引き続きdeferredであり、S5は順序を飛ばさず後続する。
@@ -1927,8 +1934,16 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    S4c Phase 1 host `clients/ledger` crate（APDU/USB/HID transport、FakeTransport-testedな
    protocol、feature-gatedかつphysical-hardware未検証のHidTransport、USB descriptor
    levelのdevice check）とCLI all-or-none signer selectionはimplemented and validated
-   As-Isである。S4cはactive-app/firmware identity checkとphysical hardware validationが
-   未実装のためincompleteであり、S4全体もincompleteである。次はS4c Phase 2、続いて
+   As-Isである。DR-0093によりS4c Phase 2aのactive-app/firmware identity check
+   （CLA `B0`/dashboard context CLA `E0`上のstrict identity/dashboard parsing、
+   dashboard `BOLOS` check、target id・OSU rejectionをfirmware version比較より
+   先に行うorder、exact caller-supplied `ExpectedFirmwareVersion`、`open app`による
+   exactly `Sunrise Edge`のopen、bounded same-explicit-path reconnect、exactly
+   `Sunrise Edge`/`0.1.0`のactive-app check）と、既存6-byte configurationへの
+   `0.1.0` version pin追加、CLIの`--ledger-expected-firmware-version`必須flag追加も
+   `FakeTransport`のみに対するsoftware-only実装としてimplemented and validated
+   As-Isである。S4cはphysical hardware validationが
+   未実装のためincompleteであり、S4全体もincompleteである。次はS4c Phase 2b、続いて
    S4d physical-device HIL/release evidenceである。
    TypeScript client/explorer/walletとS5は引き続き既存の順序でdeferredである。
    production/mainnet readinessは未達である。
@@ -2411,7 +2426,8 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
     `6901`/CLA `B0`は分離し、Python dependency closure、Docker image、GitHub Actionsをpinする。
     このrepositoryにnested appやworkspace `exclude`は作らず、canonical transaction/
     signature/object/receipt/nonce/submit bytesは変更しない。
-  - **S4c: Phase 1 implemented and validated As-Is（2026-09-04、DR-0092）、S4c全体は
+  - **S4c: Phase 1（2026-09-04、DR-0092）とPhase 2a（2026-09-04、DR-0093）が
+    implemented and validated As-Is、S4c全体は
     incomplete。** this repositoryのseparate `clients/ledger`（`sunrise-edge-ledger`）
     crateが`SIGNING.md`のfrozen host APDU/USB/HID contract（FIRST/CONTINUE/LAST
     chunking、exact status word、`get configuration` profile/flags検証、provisional
@@ -2432,21 +2448,51 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
     read time（programmatic commandは30秒、human confirmationを待つ`verify public key`と
     signing LASTは各120秒。packet数で乗算しない）、Ledger short-APDU maximum 260 byte（response data最大258 byte +
     2-byte status word）へのresponse bound、non-self-referentialな
-    hand-built packet vectorsも実装する。**未実装：** active on-device application
-    name/version検証とdevice firmware version検証（roadmapのapp/firmware check。
-    app name/versionはCLA `B0` `INS 01`、firmware versionはdashboard context限定の
-    CLA `E0` `INS 01`——Sunrise app自体のE0とは別のOS-owned用途——であり、両方には
-    dashboard probe→Sunrise app open/reconnect→Sunrise E0 commandsという staged
-    sequenceが必要。このapp自体はどちらも送らない）、
-    および上記すべて（APDU protocol、USB HID framing、device recognition）のreal
-    physical hardwareに対するvalidation。これらは次のS4c slice（S4c Phase 2）で
-    実装する。off-by-default `usb-hid` feature配下以外の全moduleは`FakeTransport`
+    hand-built packet vectorsも実装する。
+
+    **Phase 1が未実装だったactive-app/firmware identity checkはPhase 2a
+    （DR-0093）でsoftware実装済み：** 新しい`clients/ledger::identity` moduleが
+    Ledger自身のOS-owned identity/dashboard commands（CLA `B0` `INS 01`
+    "Get App And Version"、dashboard context限定のCLA `E0` `INS 01` "Get OS
+    Version"・CLA `E0` `INS D8` "Open App"。正確なcommand/response shapeは
+    Ledger公式`device-sdk-ts`のpinned commit `7f8a719`——`GetAppAndVersionCommand.ts`・
+    `GetOsVersionCommand.ts`・`OpenAppCommand.ts`——を一次資料とする）に対して、
+    strictなresponse parsing（format byte固定、non-empty ASCII `u8`-length-prefixed
+    name/version、optional trailing flags field、余剰byteのtyped rejection、
+    Ledgerのshort-APDU response data上限258 byteの事前check）を実装する。
+    `verify_dashboard_and_open`はdashboardがexactly `BOLOS`と報告することを
+    OS-owned CLA `E0` firmware queryへ送る前にcheckし、firmware versionを
+    compareする前にtarget idのtop nibble（normal Secure Element OS）と`-osu`
+    （OS Upgrade）markerをrejectし（bootloader/OSU deviceがgenericな
+    version mismatchへ後退しないようにする）、その後にのみdashboard-reported
+    Secure Element versionをcaller-supplied・事前validated（non-empty ASCII、
+    64 byte以下）な`ExpectedFirmwareVersion`とexact一致させ、exactly
+    `Sunrise Edge`で`open app`を送る。callerがexact同一のexplicit pathで
+    reconnectした後、`verify_active_app`はactive applicationがexactly name
+    `Sunrise Edge`・exactly version `0.1.0`を報告することをCLA `B0`でcheckする。
+    既存の6-byte `get configuration`（`configuration::Configuration::require_supported`）
+    もexact version `0.1.0`をpinするよう拡張された。既存のprofile/address
+    preflight（`get configuration`確認とon-device-confirmed `verify public key`）は
+    これらすべてのidentity checkの後に変わらず続く。**Phase 2aもPhase 1と同じく
+    `FakeTransport`のみに対するsoftware-only実装であり、real physical hardwareに
+    対するvalidationは一切ない：** 上記すべて（APDU protocol、identity/dashboard
+    parsing、USB HID framing、device recognition）のphysical hardwareに対する
+    validationは次のS4c slice（S4c Phase 2b）で実装する。caller-supplied
+    `ExpectedFirmwareVersion`はper-connectionのoperator inputであり、S4dの
+    pinned/workspace-committed multi-model app/firmware compatibility matrix
+    ではない。off-by-default `usb-hid` feature配下以外の全moduleは`FakeTransport`
     によりnative dependencyなしでdeterministicにtestされ、`usb-hid`有効時の
-    descriptor/framing testsもall-feature gateで検証する。CLIは`address`/`transfer`へ
-    `--seed-file`または
-    `--ledger-hid-path`+`--ledger-account`のexplicit all-or-none signer selectionを
-    追加し、Ledger選択時はネットワークdispatch前にdevice接続・configuration・
-    public key checkを完了する。現Phase 1のoperator flowは`address`で1回のaddress確認、
+    descriptor/framing/identity testsもall-feature gateで検証する。CLIは
+    `address`/`transfer`へ`--seed-file`または
+    `--ledger-hid-path`+`--ledger-account`+`--ledger-expected-firmware-version`の
+    explicit all-or-none signer selection（第3 flagはdevice dispatch前に事前
+    validated）を追加し、Ledger選択時はネットワークdispatch前にdevice接続・
+    dashboard identity・firmware・open app・reconnect後のactive-app identity・
+    configuration・public key checkのすべてを`signer::connect_ledger_staged`で
+    完了する。real `usb-hid`のreconnectは同一explicit pathへの`HidTransport::open`を
+    bounded monotonic deadline（30秒）・fixed retry sleep（500ミリ秒）で再試行し、
+    timeout時はtyped `CliError::LedgerReconnectTimedOut`でfail closedする。
+    現在のoperator flowは`address`で1回のaddress確認、
     `transfer`でconnect-time address・pre-sign address・transaction reviewの3回確認を
     要求し、重複address確認はproduction UX完成の主張ではなくfail-closedな暫定動作である。
     feature非依存の`FakeTransport` testはCLIのexact `DeviceSigningProfile::V1` +
@@ -3205,10 +3251,17 @@ repositoryのPR #1 host-core milestoneを記録する。DR-0091はmerge済みPR 
 （`6f6f882`）のdedicated Ledger SDK device app、five-target build、fixed-seed Nano S+
 Speculos/Ragger evidenceをAs-Isとして記録する。S4bはAs-Isでcomplete、DR-0092により
 S4c Phase 1 host APDU/USB/HID transportとCLI signer selection（profile/address check、
-USB descriptor levelのdevice check）はAs-Isで実装・検証済みである。S4cは
-active-app/firmware identity check（S4c Phase 2）とphysical hardware validationが
+USB descriptor levelのdevice check）はAs-Isで実装・検証済みである。DR-0093により
+S4c Phase 2aのactive-app/firmware identity check（strict Ledger OS
+identity/dashboard parsing、dashboard `BOLOS` check、bootloader/OSU
+rejection、exact caller-supplied expected firmware version、`open app`に
+よるexactly `Sunrise Edge`のopen、bounded same-explicit-path reconnect、
+exactly `Sunrise Edge`/`0.1.0`のactive-app check、既存6-byte configuration
+への`0.1.0` pin追加）も`FakeTransport`のみに対するsoftware-only実装として
+As-Isで実装・検証済みである。S4cは
+physical hardware validationが
 未実装のためincompleteであり、S4全体もincompleteである。現在の
-implementation priorityはS4c Phase 2、続いてS4d
+implementation priorityはS4c Phase 2b、続いてS4d
 physical-device HIL/release evidenceである。TypeScript client/explorer/walletとS5は
 引き続き既存の順序でdeferredであり、S5は順序を飛ばさず後続する。
 capacity/PITR/HA等のS5 certification項目はS5または明示的なSLOがtriggerするまで

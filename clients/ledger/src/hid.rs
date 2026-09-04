@@ -34,7 +34,8 @@
 //! model family. It does not — and cannot, over this transport alone —
 //! verify the active on-device application's name/version or the device
 //! firmware version. Those live on two different CLAs depending on device
-//! context, neither of which this module sends: the active application's
+//! context and are implemented by [`crate::identity`], not by this transport
+//! layer: the active application's
 //! name/version is CLA `B0` `INS 01` ("get app and version"); the device
 //! firmware version is CLA `E0` `INS 01`, but only while the device is at
 //! the dashboard with no application open — a distinct, OS-owned use of the
@@ -43,11 +44,11 @@
 //! APDU contract"). Querying both therefore requires a staged sequence this
 //! module does not implement: probe at the dashboard first, then open (or
 //! have the operator open) the Sunrise application and reconnect, then send
-//! this crate's own `E0` commands. That staged app/firmware identity check
-//! is an explicitly separate, not-yet-implemented S4c slice (see
-//! `ARCHITECTURE.md` DR-0092); nothing in this module or its tests verifies
-//! it, and no caller should treat a successful [`HidTransport::open`] as
-//! proof of active-app or firmware identity.
+//! this crate's own `E0` commands. S4c Phase 2a implements that staged
+//! software check through [`crate::identity`] and the CLI (DR-0093), while
+//! physical-hardware validation remains S4c Phase 2b. Nothing in this
+//! transport module alone verifies app/firmware identity, and no caller
+//! should treat a successful [`HidTransport::open`] as such proof.
 
 use std::ffi::CString;
 use std::fmt;
@@ -56,7 +57,8 @@ use std::time::{Duration, Instant};
 use hidapi::{HidApi, HidDevice};
 
 use crate::apdu::{
-    ApduCommand, ApduResponse, INS_SIGN_TRANSACTION, INS_VERIFY_PUBLIC_KEY, P1_SIGN_LAST, Transport,
+    ApduCommand, ApduResponse, INS_SIGN_TRANSACTION, INS_VERIFY_PUBLIC_KEY, MAX_RESPONSE_DATA_LEN,
+    P1_SIGN_LAST, Transport,
 };
 
 /// Ledger's USB vendor id, shared by every Ledger device model.
@@ -110,14 +112,13 @@ const PROGRAMMATIC_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const HUMAN_REVIEW_READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// Maximum accepted short-APDU response *data* length, excluding the
 /// trailing two-byte status word.
-const MAX_APDU_RESPONSE_DATA_LEN: usize = 258;
 /// The short-APDU response maximum this host accepts: up to
-/// [`MAX_APDU_RESPONSE_DATA_LEN`] bytes of response data plus the two-byte
+/// [`MAX_RESPONSE_DATA_LEN`] bytes of response data plus the two-byte
 /// status word (260 bytes total). Every response this device contract
 /// actually returns is far smaller (64 bytes for a signature at most), so
 /// this bound exists to reject a corrupted or hostile declared length
 /// before it can drive an unbounded read loop or allocation.
-const MAX_APDU_RESPONSE_LEN: usize = MAX_APDU_RESPONSE_DATA_LEN + 2;
+const MAX_APDU_RESPONSE_LEN: usize = MAX_RESPONSE_DATA_LEN + 2;
 
 /// A Ledger device model this crate recognizes by its USB product-id family
 /// (the product id's most-significant byte).

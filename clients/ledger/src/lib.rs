@@ -8,10 +8,12 @@
 //! frozen `SIGNING.md` device contract: exact APDU bytes/status words
 //! ([`apdu`]), the provisional derivation path ([`path`]), `get
 //! configuration` decoding/validation ([`configuration`]), the FIRST/
-//! CONTINUE/LAST signing state machine ([`device`]), and a
-//! `sunrise_edge_client::ExternalSigner` implementation ([`signer`]) that
-//! performs device-reported configuration and public key/address checks
-//! before every signature.
+//! CONTINUE/LAST signing state machine ([`device`]), the Ledger OS
+//! identity/dashboard commands used to verify the active application and
+//! device firmware before opening the Sunrise application ([`identity`]),
+//! and a `sunrise_edge_client::ExternalSigner` implementation ([`signer`])
+//! that performs device-reported configuration and public key/address
+//! checks before every signature.
 //!
 //! Every type above [`hid`] is generic over the injectable
 //! [`apdu::Transport`] trait, so [`fake::FakeTransport`] exercises the
@@ -45,6 +47,7 @@ pub mod error;
 pub mod fake;
 #[cfg(feature = "usb-hid")]
 pub mod hid;
+pub mod identity;
 pub mod path;
 pub mod signer;
 
@@ -55,5 +58,9 @@ pub use error::DeviceError;
 pub use fake::{FakeTransport, FakeTransportError};
 #[cfg(feature = "usb-hid")]
 pub use hid::{HidTransport, HidTransportError, LEDGER_USB_VENDOR_ID};
+pub use identity::{
+    AppIdentity, ExpectedFirmwareVersion, ExpectedFirmwareVersionError, FirmwareIdentity,
+    IdentityError, IdentityParseError, verify_active_app, verify_dashboard_and_open,
+};
 pub use path::{DerivationPath, DerivationPathError};
 pub use signer::LedgerExternalSigner;
