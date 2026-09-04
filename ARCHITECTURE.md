@@ -3387,9 +3387,12 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   subsequently makes eight S4b device-contract clarifications in `SIGNING.md`
   and one correction to DR-0088's blanket 230-byte whole-APDU data cap (FIRST rises
   230→255 bytes, first chunk 205→230 bytes, CONTINUE/LAST unchanged at
-  230), without adding any device app or Speculos/physical-device
-  evidence; S4 remains incomplete and the current implementation priority is S4b's
-  separate dedicated Ledger application/Speculos evidence. S5 remains its
+  230). DR-0090 subsequently records the separate
+  `sunriselayer/sunrise-edge-ledger-app` repository's host-validated `no_std`
+  core milestone, without adding any Ledger SDK device app or
+  Speculos/physical-device evidence; S4 remains incomplete and the current
+  implementation priority is S4b's actual device integration/Speculos
+  evidence. S5 remains its
   ordered successor, and the TypeScript
   client/explorer/wallet surface remains deferred until the complete
   CLI-First Node Production Gate passes.
@@ -3955,3 +3958,37 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   canonical identifier, or implementation code changes, since none exists
   yet for S4b. TypeScript client, explorer, wallet, and S5 remain
   deferred, unaffected by this clarification.
+- DR-0090: Establish the first separate-repository S4b implementation milestone
+  as a host-validated device core without treating it as a Ledger application or
+  S4 completion.
+
+  **Implemented boundary.** `sunriselayer/sunrise-edge-ledger-app` PR #1
+  introduces an allocation-free `no_std` core with the application-owned E0
+  APDU state machine, exact app status words and chunk bounds, an independent
+  from-scratch canonical decoder, strict Transaction v1 and nested-object
+  decoding, duplicate-`ObjectId` rejection, the exact devnet transfer policy,
+  a signed-fields-only bounded review value, and a `PublicKeyDeriver` boundary.
+  The core selects the validated path supplied to that boundary and compares
+  the returned RFC 8032 public key byte-for-byte with the signed sender before
+  emitting a transaction-review outcome. Its copied fixture is byte-identical
+  to `signing-view`'s stable frame at source commit `1dd4d2d`, and all 32 pinned
+  display facts are checked independently. Twenty-five host tests and pinned
+  GitHub CI validate that slice.
+
+  **No canonical or source-workspace change.** This milestone changes no
+  Sunrise Edge canonical encoder, transaction/signature byte, identifier,
+  policy activation, or code dependency in this repository. The device core is
+  deliberately isolated in the separate repository and depends on none of this
+  workspace's crates; copied stable data and differential conformance preserve
+  the independence required by DR-0088.
+
+  **Completion boundary.** The merged repository still has no Ledger SDK
+  binary, device-target build, actual SLIP-0010 derivation, Ed25519 signing,
+  on-device address or transaction UI, APDU/USB/HID transport, Speculos/Ragger
+  evidence, reproducible device artifact, or physical-device result. It is a
+  host-validated Phase-0 core only, not a dedicated device application and not
+  S4b, S4, production, or mainnet readiness. The next S4b slice must integrate
+  the core into current Ledger Rust tooling and establish deterministic
+  derivation/signing and Speculos UX evidence without weakening these bounds.
+  S4c/S4d, the TypeScript client/explorer/wallet, and S5 remain deferred in
+  their existing order.
