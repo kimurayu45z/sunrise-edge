@@ -108,6 +108,10 @@ pub fn connect_ledger_with<T: Transport>(
 /// Applies the CLI's one approved Ledger clear-signing profile and policy,
 /// then independently verifies the returned signature before producing
 /// canonical signed transaction bytes.
+#[allow(
+    dead_code,
+    reason = "used by usb-hid-gated production code and feature-independent tests"
+)]
 pub fn finalize_with_ledger<T: Transport>(
     prepared: PreparedTransaction,
     signer: &LedgerExternalSigner<T>,
