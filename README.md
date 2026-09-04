@@ -550,12 +550,16 @@ one correction to DR-0088's explicit blanket 230-byte whole-APDU data cap for
 `sign transaction`, raising FIRST's maximum command data from 230 to 255
 bytes and its first chunk from 205 to 230 bytes (CONTINUE/LAST chunks stay
 capped at 230, unchanged). This is a documentation-only clarification and
-correction — it changes no canonical transaction/signature byte or
-implementation code, since S4b has none yet; no device
-app, APDU transport, USB/HID dependency, or Speculos/physical-device
-evidence exists in this or any other repository, so S4 remains incomplete
-and the current milestone is still S4b's separate dedicated Ledger device
-app and Speculos evidence. S0-S3 are real
+correction — it changes no canonical transaction/signature byte or code in
+this repository. DR-0090 now records the separate
+`sunriselayer/sunrise-edge-ledger-app` PR #1 host-validated core milestone:
+an allocation-free `no_std` APDU state machine, independent canonical parser,
+exact policy recognition, signed-fields review model, and copied stable-fixture
+conformance are implemented As-Is there. That milestone still contains no
+Ledger SDK binary, SLIP-0010 derivation, signing, on-device UI, APDU/USB/HID
+transport, Speculos, reproducible device build, or physical-device evidence,
+so it does not complete S4b or S4. The current milestone remains S4b's actual
+dedicated Ledger device integration and Speculos evidence. S0-S3 are real
 node/persistence/operations gate slices defined by reference to the existing,
 unchanged Phase 15 production exit criteria, the Post-MVP persistence
 implementation order, and the cross-phase release gate. S1 has two separate
@@ -834,9 +838,12 @@ since clarified the S4b device contract and corrected DR-0088's blanket
 230-byte whole-APDU data cap (FIRST 230→255 bytes, first chunk 205→230
 bytes, CONTINUE/LAST unchanged at 230) in `SIGNING.md` (documentation
 only, changing no canonical transaction/signature byte or implementation
-code), but no device app, APDU transport, or Speculos/physical-device evidence
-exists yet, so S4 remains incomplete and the current milestone is still S4b's
-separate dedicated Ledger device app and Speculos evidence; the TypeScript
+code). DR-0090 records that the separate Ledger repository now implements only
+the host-validated, SDK-independent core As-Is; no Ledger SDK binary, real key
+derivation/signing, on-device UI, APDU/USB/HID transport, Speculos, or
+physical-device evidence exists yet. S4b and S4 therefore remain incomplete,
+and the current milestone is the actual device integration and Speculos
+evidence; the TypeScript
 client, explorer, wallet, and S5 remain deferred until then.
 This is real node/persistence/operations and remote-CLI
 evidence, not a mainnet-readiness or production-certification claim: passing

@@ -1758,11 +1758,15 @@ public key encoding・status word分離・device-side sender比較・device poli
 duplicate ObjectId rejectionなど）をclarifyし、加えてDR-0088のsign transaction全体
 230-byte APDU capをFIRST最大255-byte・first chunk最大230-byteへ訂正した
 （continuation chunkは230-byteのまま不変。Sunrise canonical transaction/signature
-bytesや実装コードの変更はない）。device app・APDU
-transport・Speculos evidenceはこのrepositoryにも別repositoryにも存在せず、S4は引き続き
-incompleteである。現在のimplementation priorityはseparate repositoryで行うS4b dedicated
-Ledger device application/Speculosである。TypeScript client/explorer/walletとS5は引き続き
-deferredであり、S5は順序を飛ばさず後続する。
+bytesやこのrepositoryの実装コードの変更はない）。DR-0090により、separate
+`sunriselayer/sunrise-edge-ledger-app` repositoryのPR #1ではallocation-free `no_std`
+APDU state machine・independent canonical parser・exact policy recognition・signed-fields
+review model・copied stable fixture conformanceからなるhost-validated coreがimplemented and
+validated As-Isになった。ただしLedger SDK binary・SLIP-0010 derivation・Ed25519 signing・
+on-device UI・APDU/USB/HID transport・Speculos/reproducible-build/physical-device evidenceは
+存在せず、S4b/S4は引き続きincompleteである。現在のimplementation priorityはactual
+dedicated Ledger device integration/Speculosである。TypeScript client/explorer/walletと
+S5は引き続きdeferredであり、S5は順序を飛ばさず後続する。
 
 CLI Developer MVP completion criteria（capability criteria 2-3を満たしながら、product
 surfaceはARCHITECTURE.md DR-0081の順序に従う: local devnet、bounded query API、Rust
@@ -1911,10 +1915,13 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    active module/semanticsはv3、historical v1/v2 bytesとWAT/WASM/code hashは不変である。
    S4a hardware-signing profile/host preflightはDR-0088で後続実装済み。DR-0089はS4b device
    contractを`SIGNING.md`上でclarifyし、DR-0088のAPDU 230-byte capをFIRST最大255-byte・
-   first chunk最大230-byteへ訂正した（continuationは230-byteで不変）。device app・APDU
-   transport・Speculos evidenceはまだ存在しない。次はS4b dedicated Ledger device
-   application/Speculosであり、TypeScript client/explorer/walletとS5は引き続きdeferredである。
-   production/mainnet readinessは未達である。
+   first chunk最大230-byteへ訂正した（continuationは230-byteで不変）。DR-0090により、merge
+   済みseparate `sunrise-edge-ledger-app` repositoryのPR #1はhost-validated `no_std` coreを
+   As-Isで提供するのみで、Ledger SDK device app・実際のSLIP-0010 derivation/signing・
+   on-device UI・APDU/USB/HID transport・Speculos・reproducible device build・physical
+   evidenceはまだ存在しない。S4b/S4は引き続きincompleteであり、次はactual device
+   integration/Speculosである。TypeScript client/explorer/walletとS5は引き続き既存の順序で
+   deferredである。production/mainnet readinessは未達である。
    前提として、`runtime-sqlite`へ`StructuredDurableDomainStateStore`/`IndexedOutboxRepository`を
    実装するadditive、local-only、non-productionな`SqliteDurableStore`を追加済み
    （implemented As-Is）。既存のopaque `SqliteStateStore`とは別テーブル・別`PRAGMA application_id`で、
@@ -2377,7 +2384,7 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
     digest algorithm/digest/entrypoint/args/access/fee shapeはtyped rejectionで、raw args/
     blind-signing fallbackはない。`request_id`、destination owner、transferred asset metadata、
     module nameはsigned contentとして表示しない。
-  - **S4b: device contract clarified・一部訂正（2026-09-04、DR-0089）、実装はnext。**
+  - **S4b: host-validated core implemented As-Is（2026-09-04、DR-0090）、device integrationはnext。**
     `SIGNING.md`が
     SLIP-0010 Ed25519 derivation、RFC 8032 compressed公開鍵への到達経路を2種
     （`ECPrivateKey::public_key`の生`04||X||Y`はapp側でY反転・sign bit変換が必要、
@@ -2390,11 +2397,15 @@ Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
     全体230-byte APDU capをFIRST最大255-byte（`total_length` 4 + path 21 + first chunk
     230）・first chunk最大230-byte（旧205-byteから訂正）へ訂正する（continuation chunkは
     230-byteのまま不変）。この訂正もSunrise canonical transaction/signature bytesや実装
-    コードを変更しない。**device app・APDU transport・Speculos evidenceはこのrepositoryにも
-    別repositoryにも存在しない。** separate `sunrise-edge-ledger-app` repositoryでdedicated
-    Rust Ledger application、exact APDU state machine、independent canonical parse/clear
-    signing、address confirmation、Speculos fixture/UX testを実装するのが引き続きnextであり、
-    このrepositoryにnested appやworkspace `exclude`は作らない。
+    コードを変更しない。separate `sunriselayer/sunrise-edge-ledger-app` PR #1はexact E0 APDU
+    state machine、independent canonical parse、exact devnet transfer policy、device-side sender
+    pre-review checkを強制するderiver boundary、signed-fields-only review model、25 host tests、
+    pinned CIをhost-validated `no_std` coreとして実装済みである。ただしこれはLedger SDK
+    device binaryではなく、SLIP-0010 key derivation、Ed25519 signing、on-device address/transaction
+    confirmation、APDU/USB/HID transport、Speculos fixture/UX、reproducible device build、physical
+    device evidenceを一切追加しない。したがってS4b/S4は未完了で、actual dedicated Rust Ledger
+    applicationとSpeculos evidenceが引き続きnextである。このrepositoryにnested appや
+    workspace `exclude`は作らない。
   - **S4c:** this repositoryのseparate `clients/ledger` crateにhost APDU/USB transportを置き、
     CLIへall-or-none signer selection、device/app/firmware/profile/address検証を追加する。
     vendor dependencyはprotocol crate/`clients/rust`へ入れず、CLIのone-runtime-dependency
@@ -3142,9 +3153,13 @@ production persistence作業そのものである。S3は実装・検証済み�
 hardware-signing profile/host preflightとして実装・検証済み（DR-0088）である。
 DR-0089はS4b device contractをdocument上でclarifyし、DR-0088のAPDU 230-byte capを
 FIRST最大255-byte・first chunk最大230-byteへ訂正しただけでdevice app・Speculos
-evidenceを追加しておらず、現在のimplementation priorityはS4b dedicated Ledger device
-application/Speculosである。S5は
-順序を飛ばさず後続する。
+evidenceを追加していない。DR-0090により、merge済みseparate `sunrise-edge-ledger-app`
+repositoryのPR #1はhost-validated `no_std` coreをAs-Isで提供するのみで、Ledger SDK
+device app・実際のSLIP-0010 derivation/signing・on-device UI・APDU/USB/HID transport・
+Speculos・reproducible device build・physical evidenceはまだ存在しない。S4b/S4は
+引き続きincompleteであり、現在のimplementation priorityはactual device
+integration/Speculosである。TypeScript client/explorer/walletとS5は引き続き既存の
+順序でdeferredであり、S5は順序を飛ばさず後続する。
 capacity/PITR/HA等のS5 certification項目はS5または明示的なSLOがtriggerするまで
 引き続き凍結する。
 
