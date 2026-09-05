@@ -4738,3 +4738,57 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   `seed_asset_accounts`/`compose_devnet_router` gain a required parameter,
   with every call site in this repository updated, not left on a deprecated
   overload.
+
+- DR-0097: Introduce an Initial Code Security Audit Entry Gate immediately after the
+  completed CLI Developer MVP instead of making the first independent audit
+  wait for the entire production operations and multi-validator roadmap.
+
+  **Problem.** The previous roadmap placed independent audit inside or after
+  S5 and the complete CLI-First Node Production Gate. That conflated an
+  immutable code-audit scope with mainnet release certification: adding
+  FastCertificate, every external event family, checkpoint publication,
+  PITR/off-host restore, HA orchestration, PKI rotation, physical storage
+  faults, and long-running capacity evidence before inviting external review
+  would accumulate more unaudited surface and postpone feedback on the
+  already implemented transaction path.
+
+  **Decision.** Freeze and audit the current CLI-first security core first:
+  canonical encoding/hashing/signatures, authenticated `SubmitTransaction`,
+  nonce/replay/dedup, owned-object and preinstalled-WASM effects, fees,
+  structured runtime atomicity, SQLite/PostgreSQL state/object/receipt/outbox
+  and blob contracts, bounded native HTTP, and Rust client/CLI signing and TLS
+  context boundaries. The only currently known code change required before that scope is
+  frozen is to close the public event surface: until a non-`SubmitTransaction`
+  family has its own authentication and authorization, external ingress must
+  reject it before identity allocation, time, storage, or transition work.
+  Implementing every such family is explicitly not an initial-audit
+  prerequisite. A concise threat model/audit packet, a clean immutable commit,
+  and the complete repository gate are the remaining documentation and
+  evidence prerequisites.
+
+  **Deferred does not mean deleted.** FastCertificate and atomic certificate
+  publication remain mandatory before multi-validator protocol-v3 activation.
+  Any non-`SubmitTransaction` family later exposed externally must gain its
+  family-specific authentication/authorization and a focused delta audit.
+  Checkpoint/state-root publication and verified restore remain production
+  state-recovery work. PITR/off-host restore, HA/failover orchestration, TLS
+  certificate lifecycle, and additional fault/load/soak/capacity certification
+  follow a selected deployment topology and explicit RPO/RTO/SLO; they do not
+  block the first code audit. The final production release gate still requires
+  all relevant operational evidence and resolution of material findings from
+  both the initial audit and later delta reviews.
+
+  **Existing PostgreSQL evidence is not reopened as new implementation.** The
+  atomic state/object/receipt/outbox commit, indexed due-work claim,
+  same-identity reconciliation, retained attempt history, and idempotent
+  acknowledgement already exist As-Is. Existing database-process SIGKILL,
+  bounded data/WAL ENOSPC, connection exhaustion, snapshot restore, TLS
+  commit-loss, and PgBouncer rehearsals enter the audit evidence packet as
+  implemented bounds. They do not prove PITR, real HA, provider PKI, physical
+  media faults, or production capacity, which remain honestly deferred.
+
+  **Compatibility.** This decision only reorders gates and audit timing. It
+  changes no canonical bytes, type IDs, hashes, signatures, execution effects,
+  object or persistence layout, HTTP behavior, module bytes, CLI behavior, or
+  production/mainnet completion criterion. Remaining Ledger work and the
+  TypeScript client/explorer/wallet stay deferred exactly as before.
