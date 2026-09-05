@@ -9,7 +9,7 @@
 //! `Create`, owner changes, CLI commands, minting, or fee integration; those
 //! remain future, separately reviewed slices.
 //!
-//! **Canonical type IDs (Standard Asset v1 family, `0x70xx`/`0x71xx`):**
+//! **Canonical type IDs owned by this crate:**
 //! - `0x7001` — [`AssetId`] (moved from its original `fees` location).
 //! - `0x7100` — the canonical AssetId derivation input (private framing detail).
 //! - `0x7101` — [`StandardAssetDefinitionV1`].
