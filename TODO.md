@@ -2259,8 +2259,19 @@ header total timeout、socket-read idle timeout、body total timeout、response-
 one-request connectionを全router familyへ一律適用し、既存body-size boundと
 `NativeBlockingExecutor`を独立して維持する。raw TCPのadversarial testはincomplete header/body、
 connection overload後のrecovery、slow-drip body total timeout、stalled/slow-drip response write、legitimate
-livenessを検証する。これは指摘の第三者re-review完了やproduction proxy/
-kernel/TLS/load certificationを意味しない。
+livenessを検証する。
+
+**Initial audit remediation re-review完了（2026-09-05）。** PR #130 head
+`cdf438c51b1609eb4886d8edcddc22af183f48c0`に対するfresh GPT Daybreak Blue Standard
+single-pass static source audit（scan id
+`034f9d08-2613-402d-868e-0fce48bb6bfc`）は、declared scope内でstatus `completed`、
+coverage `complete`、reportable findings 0となり、上記High 1件・Medium 3件を全てfixedと
+dispositionした。canonical evidenceは
+`docs/security/audits/2026-09-05-pr-130-daybreak/`に保存する。これはsource-only auditであり、
+production proxy/kernel/TLS、PostgreSQL deployment/operations、HA、backup、load/soak、physical
+hardware、Software Production Gate、CLI-First Node Production Gate、production readiness、
+mainnet readinessの完了またはcertificationを意味しない。初回audit後のsecurity-critical変更は
+引き続き`docs/security/initial-code-audit-scope.md`のfocused delta-audit ruleへ従う。
 
 ### 最小completion criteria
 

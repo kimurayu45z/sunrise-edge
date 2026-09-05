@@ -1,0 +1,113 @@
+{
+  "documentType": "codex-security.scan-manifest",
+  "scan": {
+    "artifacts": [
+      {
+        "mediaType": "application/json",
+        "path": "findings.json",
+        "sha256": "b588fb771d2f59819ada9da1a284d137b0b70e4e68cb2d8f667a9152991f41d1"
+      },
+      {
+        "mediaType": "application/json",
+        "path": "coverage.json",
+        "sha256": "22d6078ec3fccc39d3c54c1d2cfe2b0e48acb1acd11a614ec98c52b89486334e"
+      }
+    ],
+    "completedAt": "2026-09-05T12:31:14.663978Z",
+    "coverageRef": "coverage.json",
+    "findingsRef": "findings.json",
+    "id": "034f9d08-2613-402d-868e-0fce48bb6bfc",
+    "preservedSources": {
+      "checkpoints/4d7980b9ddffbb24d0b3cb7fb8ae6b37b586be80f9f4920d80e0bd09e23bba81.json": "b8283df2193b190b2a73c32de51ba241863361253f83f6b09fe990da323a24ed",
+      "checkpoints/7c67fe63989d24fe565c3bf0695f5ee9fd8c3af9954a8eab8af37f1aa6d7babd.json": "7c67fe63989d24fe565c3bf0695f5ee9fd8c3af9954a8eab8af37f1aa6d7babd"
+    },
+    "producer": {
+      "name": "codex-security-plugin",
+      "version": "0.1.23"
+    },
+    "scope": {
+      "artifactsReviewed": [
+        "SECURITY.md",
+        "docs/security/initial-code-audit-scope.md",
+        "Cargo.toml, Cargo.lock, rust-toolchain.toml",
+        "in-scope protocol, canonical encoding, hashing, crypto, commitment, object, ABI, protocol-config, system-module, execution, and fee crates",
+        "in-scope runtime, SQLite, PostgreSQL, node-wire, node-core, and native-http crates",
+        "in-scope Rust client, signing-view, devnet, CLI source, and named CLI end-to-end test source"
+      ],
+      "context": "The target remained at exact HEAD cdf438c51b1609eb4886d8edcddc22af183f48c0 with an empty working-tree status. No source files were changed.",
+      "excludePaths": [],
+      "includePaths": [
+        "."
+      ],
+      "limitations": [
+        "No builds, tests, application execution, dependency installation, or network calls were performed by explicit instruction; checked-in regression tests were inspected only as source.",
+        "No online dependency advisory database was queried. Locked versions, manifest features, source origins, and in-scope dependency use were inspected, but current advisory status is not dynamically verified.",
+        "Production proxy, kernel, TLS termination, PostgreSQL deployment, credentials, backup, HA, PKI, load/soak, physical hardware, and mainnet behavior were outside this source-only conclusion.",
+        "Capability preflight found three usable worker slots rather than the recommended six; work was completed in a smaller set of parallel waves with an independent baseline."
+      ],
+      "runtimeStatus": "not executed by instruction",
+      "summary": "Fresh, independent Standard single-pass static source audit of immutable Sunrise Edge revision cdf438c51b1609eb4886d8edcddc22af183f48c0. SECURITY.md and docs/security/initial-code-audit-scope.md defined the binding security policy and included/excluded source boundary.",
+      "validationMode": "independent architecture map, baseline review, six focused source receipts, and parent-led static validation"
+    },
+    "sealedAt": "2026-09-05T12:31:14.663978Z",
+    "startedAt": "2026-09-05T12:30:40.014562Z",
+    "status": "completed",
+    "target": {
+      "displayName": "sunrise-edge",
+      "kind": "git_revision",
+      "revision": "cdf438c51b1609eb4886d8edcddc22af183f48c0",
+      "targetId": "target_sha256_5bd4c525ca61acfe28cfb4b8fe8b7d91bdbaa14d924d5750152c908955053558"
+    },
+    "threatModel": {
+      "assets": [
+        "Canonical bytes, stable identifiers, hash and signature domains, and exact chain/protocol/epoch/request identity.",
+        "Profile-2 sender and funded-owner authority while preserving explicitly weaker historical profile-1 bytes.",
+        "Application state, sender nonce, immutable object versions/provenance, receipts, and outbox atomicity.",
+        "Ordinary asset balances, committed destination policy, the composition-owned treasury, and fee conservation.",
+        "Committed preinstalled module code, manifest, semantics, version, and execution checkpoint.",
+        "Structured and blob persistence, namespaces, writer fences, deadlines, and indeterminate reconciliation.",
+        "Development seed bytes, explicit TLS trust inputs, expected protocol context, and bounded ingress/transport capacity."
+      ],
+      "assumptions": [
+        "Historical profile 1 intentionally retains ZIP-215 funded-owner semantics and does not bind the outer request ID; trusted committed configuration selects profiles, and the concrete devnet/CLI select profile 2.",
+        "The concrete devnet uses native_http::serve. A different embedding host serving a raw Router must prove equivalent pre-parser lifecycle controls.",
+        "Full canonical ProtocolConfig byte pinning is deferred; the client verifies eight selected signer-relevant context fields.",
+        "Blob publication can precede a rejected structured commit and leave an unreachable content-addressed orphan; GC is absent. The sole active module emits fixed 76-byte bodies below the 64 KiB blob threshold.",
+        "WasmExecutionEngine has fuel and byte/count bounds but no explicit Store memory limiter. The sole active trusted WAT declares one page and has no memory.grow; future catalog modules require focused review.",
+        "Unix seed-file permission/inode controls do not establish non-Unix filesystem protection.",
+        "Stale Rust comments do not override stricter executable behavior or SECURITY.md."
+      ],
+      "attackerCapabilities": [
+        "An unauthenticated caller can send malformed or canonical bounded requests, repeat, delay, reorder, or relabel them, select public lookup keys, and consume available admission capacity.",
+        "A valid sender controls every signed transaction field, but not trusted protocol configuration, catalog semantics, treasury identity, namespace, writer fence, checkpoint, or clock.",
+        "Relays, transports, and schedulers may drop, mutate, duplicate, delay, replay, or reorder delivery.",
+        "No starting capability includes an operator account, sender private key, database administrator, trusted configuration, release infrastructure, or deployment credential."
+      ],
+      "securityObjectives": [
+        "Authenticate exact trusted context and request-bound canonical transaction bytes before privileged or mutable work.",
+        "Preserve profile-1 and Transaction-v1 history without a profile-2 downgrade.",
+        "Reconcile request ID plus complete event digest before nonce, module, object, or application work and reject different-event reuse.",
+        "Commit nonce, state, object, receipt, and outbox effects atomically or surface indeterminate state for exact reconciliation.",
+        "Verify every object and owner and constrain destination, treasury, fees, and effects to signed and committed policy.",
+        "Resolve executable code only from the trusted committed catalog.",
+        "Reject externally inactive event families before side effects.",
+        "Keep object-query v2 additive and historical inline data explicitly unverified/rejected by the generic client.",
+        "Bound attacker-controlled connections, frames, bodies, modules, gas, outputs, deadlines, retries, leases, and concurrent work.",
+        "Keep source conclusions separate from production and mainnet readiness."
+      ],
+      "summary": "The concrete in-scope executable server is a loopback-only experimental devnet. A SubmitTransaction passes pre-parser connection/header/body limits, canonical NodeEvent decoding, submit-only family policy, committed profile-2 authentication, persisted request-receipt and event-digest reconciliation, nonce/object/module/fee authorization, a typed atomic state/object/receipt/outbox commit, and indexed delivery. Public queries are unauthenticated reads. The Rust client has separate loopback and explicit remote-TLS transports plus a locally expected protocol-context gate. PostgreSQL is an in-scope adapter library with no concrete in-scope deployment. This map does not establish production or mainnet readiness.",
+      "trustBoundaries": [
+        "Unauthenticated local caller to the loopback devnet listener; native_http::serve owns the pre-parser lifecycle bounds.",
+        "Reusable Axum Router to embedding host; Router body/work bounds are distinct from serve/serve_with_policy connection/header/body-idle/response controls.",
+        "HTTP bytes to authenticated mutation; non-SubmitTransaction families and invalid profile-2 signatures fail before identity, clock, module, or storage.",
+        "Valid sender to signed transaction; profile 2 binds exact request_id and Transaction-v1 signable bytes under a distinct message family.",
+        "Authenticated transaction to object state; signed references, provenance, body digests, every Address owner, destination policy, treasury identity, and effects are checked.",
+        "Execution effects to atomic persistence; nonce, state, objects, receipt, and outbox share one typed invocation.",
+        "Public query response to client use; v2 inline data carries recomputation context, while v1 inline data is explicitly unverified and rejected by the generic client.",
+        "Trusted startup composition to request processing; protocol configuration, catalog, treasury, namespace, writer fence, clock, checkpoint, and identity source are not request inputs.",
+        "CLI transport authentication to protocol intent; endpoint TLS and locally expected protocol-context verification are separate gates."
+      ]
+    }
+  },
+  "schemaVersion": "1.0"
+}
