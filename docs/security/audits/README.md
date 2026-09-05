@@ -11,3 +11,8 @@ review.
   `cdf438c51b1609eb4886d8edcddc22af183f48c0`; complete coverage within the
   declared scope, zero reportable findings, and all four initial findings
   dispositioned as fixed.
+- [2026-09-05 PR #130 post-review delta](2026-09-05-pr-130-post-review-delta/README.md):
+  focused review of executable commit
+  `b74c1ae1d12a2ce7d5c691b613457933c998defe` against
+  `4db26d470901cb7895e7c32444be072029932013`; complete coverage of the two-file
+  delta and zero reportable findings.
