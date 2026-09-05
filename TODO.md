@@ -1918,7 +1918,7 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    （DR-0081；旧DR-0080の`clients/typescript`/`demo/counter`という組み合わせを置き換え、
    `demo/counter`は作成しない）。devnetの最初のstateful preinstalled moduleは
    `sunrise.devnet.asset_account.v1`（`transfer` entrypoint）とし、同一senderが所有する
-   2つのordinary asset-account objectの間でのみ残高を移動する。fees::AssetIdを使った
+   2つのordinary asset-account objectの間でのみ残高を移動する。`standard_assets::AssetId`を使った
    real 32-byte asset識別、conservation、amount underflow/overflow/asset ID mismatchの
    fail closedを満たす。destination側owner authorizationとowner変更は既存のowned-effects
    pathで引き続きfail closedのため、このMVPはsame-sender movementのみを示し、
@@ -2337,30 +2337,45 @@ definition、coin、capabilityを別objectにする。各coinはexact `AssetId` 
 持ち、1 ownerが同じassetの複数coinを所有できる。object identity/versionが
 anti-double-spend/version mechanismであり、coin bodyの別sequenceはv1に入れない。
 
-**Current status:** DR-0104による名称、モデル、互換性、fail-closed activation
+**Current status:** DR-0104による名称、モデル、development fixtureのreplacement、fail-closed activation
 boundaryはaccepted。認証に使ったprofileのowner policyでauthenticated executionの
-Address-owned outputをcommit前に再検証するprerequisiteのみimplemented As-Is。
-`fees::AssetId`とdevnet-local `0xF001`/`0xF010`/`0xF011`は不変で、現在の
-devnet assetをStandard Asset v1とは再解釈しない。以下の残存criteriaはopenであり、
+Address-owned outputをcommit前に再検証するprerequisiteに加え、`AssetId`と
+`StandardAssetDefinitionV1`/`StandardAssetCoinV1`/`StandardAssetMintCapabilityV1`
+のcanonical identity/value schema（`crates/standard-assets`）がimplemented As-Is。
+`AssetId`のcanonical type ID（`0x7001`）は同じprotocol conceptへそのまま使い、`fees`から新しい
+dependency-lightな`standard-assets` crateへownershipを移した。各consumerは
+`standard-assets`から直接importし、未リリースAPIのcompatibility facadeは設けない。Sunrise Edgeはまだreleaseされておらず、
+devnet-local `0xF001`/`0xF010`/`0xF011`はpublic compatibility obligationではない
+development fixtureであり、Standard Asset v1 activationはこれをmigrateや
+dual-supportではなくreplaceする前提とする。以下の残存criteriaはopenであり、
 Standard Asset v1、Unique Asset v1、builder/public-testnet asset surfaceはまだ有効ではない。
 
 ### Completion criteria
 
 1. **実装済み（documentation only、DR-0104）。** Standard Asset v1と
    Unique Asset v1の名称、owned coin + typed capabilityの分離、object-versionによる
-   double-spend防止、devnet/fee compatibility boundaryをarchitecture decisionとして固定した。
+   double-spend防止、devnet fixtureのreplacement boundaryとfee integration boundaryをarchitecture decisionとして固定した。
 2. **実装済み（prerequisite only）。** authenticated executionが返すCreated/Mutated
    objectのAddress ownerを、transactionを認証した同じprofile-versioned policyで
    object mutation構築前にfail closed再検証する。これ自体はCreateを認可しない。
-3. **未実装。** canonicalかつdomain-separatedな`AssetId` derivationを実装する。
-   new coin `ObjectId`はcoin固有formulaを増やさず、exact signed transaction hash context +
-   creation ordinalを使う既存のgeneric versioned created-object derivationを共有し、historical v1
-   behaviorと既存vectorを不変にする。実装前にidentifier namespace全体をauditし、additiveな
-   安定type ID/tag/domain/feature/module/ABIを初めてallocateし、exact bytes、hash-suite
-   migration後の歴史的再現、negative/vectorをpinする。
-4. **未実装。** Standard Asset v1のdefinition、`StandardAssetCoinV1`、typed authority
-   capabilityを別々のbounded canonical schemaとして実装し、unknown version/field/tag、
-   non-canonical bytes、duplicate identityをfail closedにする。
+3. **部分実装。** identifier namespace全体をauditし、`HashDomain::AssetId = 0x000E`/
+   `HashPurpose::AssetId`と`0x70xx`/`0x71xx`帯の`StandardAssetDefinitionV1`
+   (`0x7101`)/`StandardAssetCoinV1` (`0x7102`)/`StandardAssetMintCapabilityV1`
+   (`0x7103`)をadditiveにallocateした。`derive_asset_id`はchain、protocol
+   version、Standard Asset v1、authenticated creation authority、canonical
+   typed `AssetCreationSeed`、epoch/hash-suite scheduleをbindし、`HashSuite::algorithm_for`が
+   選ぶprotocol-configuration hash algorithmのみを使う（caller-selected algorithmは
+   不可）。definitionは作成時protocol versionを明示的に保持し、別versionのresolverでの
+   再検証をfail closedにする。deterministic stable vectorとnegative/adversarial testをpinした。
+   new coin `ObjectId`がcoin固有formulaを増やさず既存のgeneric versioned
+   created-object derivation（exact signed transaction hash context +
+   creation ordinal）を共有することはCreateが存在しないため未実装のまま。
+4. **部分実装。** `StandardAssetDefinitionV1`、`StandardAssetCoinV1`、
+   `StandardAssetMintCapabilityV1`を別々のbounded canonical schemaとして
+   `crates/standard-assets`に実装し、unknown version/field/tag、non-canonical
+   bytes、unknown hash algorithm、zero coin amountをfail closedにした。
+   duplicate identityのfail closed拒否はobject storeと`Create` pathに依存するため、
+   それらが存在しない本sliceでは未実装のまま。
 5. **未実装。** whole-coin transferはcanonical signed recipientへのexact owner change、
    partial transferはsender remainderのMutate + recipient coinのCreate、mergeはsame-assetの
    sender-owned coin 1個をchecked sumへMutateし、残りのsender-owned inputsをConsumeする。

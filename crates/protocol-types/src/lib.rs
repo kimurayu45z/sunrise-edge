@@ -258,6 +258,8 @@ pub enum HashDomain {
     ConsensusMessage = 0x000C,
     /// Canonical node ingress events used for persisted idempotency.
     NodeEvent = 0x000D,
+    /// Standard Asset v1 identifier derivation.
+    AssetId = 0x000E,
 }
 
 impl HashDomain {
@@ -286,6 +288,7 @@ impl TryFrom<u16> for HashDomain {
             0x000B => Ok(Self::StateNode),
             0x000C => Ok(Self::ConsensusMessage),
             0x000D => Ok(Self::NodeEvent),
+            0x000E => Ok(Self::AssetId),
             other => Err(TypeError::UnknownHashDomain(other)),
         }
     }
@@ -351,6 +354,8 @@ pub enum HashPurpose {
     NodeEvent,
     /// Governance-installed system-module manifest hashing.
     SystemModuleManifest,
+    /// Standard Asset v1 identifier derivation.
+    AssetId,
 }
 
 impl HashPurpose {
@@ -368,6 +373,7 @@ impl HashPurpose {
             Self::ConsensusMessage => HashDomain::ConsensusMessage,
             Self::NodeEvent => HashDomain::NodeEvent,
             Self::SystemModuleManifest => HashDomain::SystemModule,
+            Self::AssetId => HashDomain::AssetId,
         }
     }
 }
@@ -387,7 +393,10 @@ pub struct HashSuite {
     pub code_hash: HashAlgorithmId,
     /// Protocol configuration hash algorithm. Also used for
     /// [`HashPurpose::SystemModuleManifest`], since a system-module manifest
-    /// is itself committed, governance-installed protocol configuration.
+    /// is itself committed, governance-installed protocol configuration, and
+    /// for [`HashPurpose::AssetId`], since Standard Asset v1 identity
+    /// derivation is governance-configured protocol identity, not a
+    /// caller-selected algorithm.
     pub config_hash: HashAlgorithmId,
     /// Certificate hash algorithm.
     pub certificate_hash: HashAlgorithmId,
@@ -428,6 +437,7 @@ impl HashSuite {
             HashPurpose::ConsensusMessage => self.certificate_hash,
             HashPurpose::NodeEvent => self.certificate_hash,
             HashPurpose::SystemModuleManifest => self.config_hash,
+            HashPurpose::AssetId => self.config_hash,
         }
     }
 }
@@ -515,6 +525,31 @@ mod tests {
         );
         assert_eq!(
             suite.algorithm_for(HashPurpose::SystemModuleManifest),
+            HashAlgorithmId::Sha3_256
+        );
+    }
+
+    #[test]
+    fn asset_id_purpose_uses_asset_id_domain_and_config_hash_algorithm() {
+        assert_eq!(HashPurpose::AssetId.domain(), HashDomain::AssetId);
+        assert_eq!(HashDomain::AssetId.as_u16(), 0x000E);
+        assert_eq!(HashDomain::try_from(0x000E), Ok(HashDomain::AssetId));
+
+        let suite = HashSuite {
+            id: HashSuiteId::new(1),
+            transaction_hash: HashAlgorithmId::Sha2_256,
+            object_digest: HashAlgorithmId::Sha2_256,
+            effects_hash: HashAlgorithmId::Sha2_256,
+            code_hash: HashAlgorithmId::Sha2_256,
+            config_hash: HashAlgorithmId::Sha3_256,
+            certificate_hash: HashAlgorithmId::Sha2_256,
+        };
+        assert_eq!(
+            suite.algorithm_for(HashPurpose::AssetId),
+            suite.algorithm_for(HashPurpose::ProtocolConfig)
+        );
+        assert_eq!(
+            suite.algorithm_for(HashPurpose::AssetId),
             HashAlgorithmId::Sha3_256
         );
     }

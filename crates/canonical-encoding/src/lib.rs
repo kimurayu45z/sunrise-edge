@@ -581,6 +581,9 @@ mod tests {
 
         let node_event = encode_hash_domain(HashDomain::NodeEvent).unwrap();
         assert_eq!(hex(&node_event), "534e52450201010001000100020000000d00");
+
+        let asset_id = encode_hash_domain(HashDomain::AssetId).unwrap();
+        assert_eq!(hex(&asset_id), "534e52450201010001000100020000000e00");
     }
 
     #[test]

@@ -445,7 +445,7 @@ The S3 local-devnet fee slice is implemented As-Is by
 [DR-0087](decisions/0081-0087-cli-first-roadmap.md); validator/
 certificate distribution and production stablecoin economics remain deferred.
 A fee asset is an ordinary
-`fees::AssetId`-tagged asset account using the same single account/transfer
+`standard_assets::AssetId`-tagged asset account using the same single account/transfer
 path as every other asset, never a privileged native coin or a second
 balance/transfer implementation. Fee-asset selection (which `AssetId`(s) may
 pay fees, at what rate) is protocol policy layered over ordinary asset

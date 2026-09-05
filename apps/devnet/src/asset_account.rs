@@ -12,8 +12,8 @@ use canonical_encoding::{
     CanonicalDecodingError, CanonicalEncodingError, CanonicalFrame, CanonicalStruct,
     decode_canonical_frame,
 };
-use fees::AssetId;
 use protocol_types::{Digest32, HashAlgorithmId};
+use standard_assets::AssetId;
 use std::{error::Error, fmt};
 
 /// Canonical type ID for an asset-account body.

@@ -5,9 +5,10 @@
 
 use canonical_encoding::{CanonicalEncodingError, CanonicalStruct, encode_digest32, encode_epoch};
 use core::fmt;
-use fees::{Amount, AssetId, FeeError, encode_asset_id};
+use fees::{Amount, FeeError};
 use protocol_types::{Digest32, Epoch};
 use runtime::ValidatorId;
+use standard_assets::{AssetId, encode_asset_id};
 use std::collections::BTreeSet;
 use std::error::Error;
 
@@ -542,7 +543,10 @@ pub fn encode_bond_asset_config(config: &BondAssetConfig) -> Result<Vec<u8>, Bon
     config.validate()?;
 
     let mut canonical = CanonicalStruct::new(BOND_ASSET_CONFIG_TYPE_ID, ENCODING_VERSION);
-    canonical.field_bytes(1, encode_asset_id(&config.asset_id)?)?;
+    canonical.field_bytes(
+        1,
+        encode_asset_id(&config.asset_id).map_err(FeeError::from)?,
+    )?;
     canonical.field_u64(2, config.min_bond.get())?;
     canonical.field_bytes(3, [u8::from(config.enabled)])?;
     canonical.field_u64(4, config.unbonding_epochs)?;
@@ -574,7 +578,7 @@ pub fn encode_bond_asset_registry(registry: &BondAssetRegistry) -> Result<Vec<u8
 pub fn encode_bond_object(bond: &BondObject) -> Result<Vec<u8>, BondError> {
     let mut canonical = CanonicalStruct::new(BOND_OBJECT_TYPE_ID, ENCODING_VERSION);
     canonical.field_bytes(1, bond.validator_id.as_bytes())?;
-    canonical.field_bytes(2, encode_asset_id(&bond.asset_id)?)?;
+    canonical.field_bytes(2, encode_asset_id(&bond.asset_id).map_err(FeeError::from)?)?;
     canonical.field_u64(3, bond.amount.get())?;
     canonical.field_bytes(4, encode_epoch(bond.bonded_epoch)?)?;
     if let Some(unlock_epoch) = bond.unlock_epoch {

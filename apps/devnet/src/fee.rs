@@ -11,7 +11,7 @@ use crate::asset_account::{AssetAccount, decode_asset_account, encode_asset_acco
 use node_core::{FeeChargeBodies, FeeChargeRequest, FeeCompositionError, FeeEffectComposer};
 
 /// Settles a fee charge by debiting the payer and crediting the treasury,
-/// both ordinary [`AssetAccount`] bodies for the same [`fees::AssetId`].
+/// both ordinary [`AssetAccount`] bodies for the same [`standard_assets::AssetId`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AssetAccountFeeComposer;
 
@@ -64,7 +64,8 @@ impl FeeEffectComposer for AssetAccountFeeComposer {
 mod tests {
     use super::*;
     use crate::asset_account::DEVNET_ASSET_ID;
-    use fees::{Amount, AssetId};
+    use fees::Amount;
+    use standard_assets::AssetId;
 
     fn request<'a>(
         amount: u64,

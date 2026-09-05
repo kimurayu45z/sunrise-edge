@@ -18,6 +18,7 @@ objects.workspace = true
 protocol-types.workspace = true
 rustls.workspace = true
 signing-view.workspace = true
+standard-assets.workspace = true
 
 [dev-dependencies]
 native-http.workspace = true

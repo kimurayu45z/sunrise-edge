@@ -16,6 +16,7 @@ protocol-config.workspace = true
 protocol-types.workspace = true
 runtime.workspace = true
 system-modules.workspace = true
+standard-assets.workspace = true
 
 [dev-dependencies]
 ed25519-zebra.workspace = true

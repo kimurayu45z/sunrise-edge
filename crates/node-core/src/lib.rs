@@ -15037,8 +15037,8 @@ mod tests {
 
     // ── S3 fee lifecycle ─────────────────────────────────────────────────
 
-    fn fee_asset_id() -> fees::AssetId {
-        fees::AssetId::new([0xF3; 32])
+    fn fee_asset_id() -> standard_assets::AssetId {
+        standard_assets::AssetId::new([0xF3; 32])
     }
 
     fn fee_gas_schedule() -> fees::GasSchedule {

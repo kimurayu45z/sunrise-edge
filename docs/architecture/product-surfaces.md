@@ -43,7 +43,7 @@ protocol behavior:
   development owner and per required distinct fee-treasury owner. At most 63
   transfer owners may be configured, reserving the 64th bounded seed slot for
   that treasury owner. All accounts carry the same fixed, non-placeholder
-  `fees::AssetId`; one starts funded and the other starts empty. A transfer may
+  `standard_assets::AssetId`; one starts funded and the other starts empty. A transfer may
   pair one configured owner's source with another configured owner's existing
   destination under the exact committed S2 policy. Their object IDs remain
   distinct and deterministic for that owner and slot. Restart verifies every

@@ -3472,7 +3472,7 @@ fn node_error_response(error: &NodeCoreError) -> Response {
             "fee-settlement-overflow",
         ),
         NodeCoreError::FeePaymentRejected(
-            fees::FeeError::InvalidAssetIdLength(_)
+            fees::FeeError::StandardAsset(_)
             | fees::FeeError::ZeroFeeUnitsPerAssetUnit
             | fees::FeeError::RegistryTooLarge(_)
             | fees::FeeError::TooManySigners(_)
@@ -5934,7 +5934,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_error_mapping_classifies_fee_request_and_composition_failures() {
-        let asset_id = fees::AssetId::new([0x56; 32]);
+        let asset_id = standard_assets::AssetId::new([0x56; 32]);
         let cases: Vec<(NodeCoreError, StatusCode, &'static str)> = vec![
             (
                 NodeCoreError::FeePaymentRequired,

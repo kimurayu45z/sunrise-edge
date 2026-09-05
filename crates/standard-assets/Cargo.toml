@@ -1,13 +1,11 @@
 [package]
-name = "bonds"
+name = "standard-assets"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [dependencies]
 canonical-encoding.workspace = true
-fees.workspace = true
+hashing.workspace = true
 objects.workspace = true
 protocol-types.workspace = true
-runtime.workspace = true
-standard-assets.workspace = true

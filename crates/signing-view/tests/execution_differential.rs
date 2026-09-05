@@ -13,13 +13,14 @@
 
 use abi::{AccessEntry, AccessManifest};
 use execution::{Transaction, encode_transaction_signable as execution_encode_signable};
-use fees::{Amount, AssetId, FeePayment};
+use fees::{Amount, FeePayment};
 use objects::{AccessMode, Address, ObjectId, ObjectRef};
 use protocol_types::{ChainId, Digest32, Epoch, HashAlgorithmId, ProtocolVersion};
 use signing_view::{
     DeviceSigningProfile, TransactionSignable, decode_transaction_signable,
     encode_transaction_signable,
 };
+use standard_assets::AssetId;
 
 fn sample_object_ref(id_byte: u8, version: u64, digest_byte: u8) -> ObjectRef {
     ObjectRef {

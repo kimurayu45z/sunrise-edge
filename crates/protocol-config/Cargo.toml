@@ -14,3 +14,6 @@ fees.workspace = true
 protocol-types.workspace = true
 protocol-upgrades.workspace = true
 system-modules.workspace = true
+
+[dev-dependencies]
+standard-assets.workspace = true
