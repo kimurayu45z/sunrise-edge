@@ -695,11 +695,14 @@ where
 /// repository. Storage authority and operational identities come solely from
 /// the embedding host.
 ///
-/// This is also the only native route that authenticates `SubmitTransaction`
-/// events: for that event kind, [`authenticate_submit_transaction_event`] runs
-/// from `protocol_config` and the validated ingress context before any access-plan
-/// derivation, identity allocation, clock read, storage I/O, transition,
-/// outbox claim, or send. `protocol_config.protocol_version` must equal
+/// This and [`preinstalled_wasm_structured_durable_router`] are the two native
+/// route families that authenticate `SubmitTransaction` events. This router
+/// uses the read-only execution path, while the preinstalled router additionally
+/// executes its composition-trusted catalog. For `SubmitTransaction`,
+/// [`authenticate_submit_transaction_event`] runs from `protocol_config` and
+/// the validated ingress context before any access-plan derivation, identity
+/// allocation, clock read, storage I/O, transition, outbox claim, or send.
+/// `protocol_config.protocol_version` must equal
 /// `config.protocol_version()` and `protocol_config` must carry a
 /// domain-placement manifest, checked once here rather than per request, so
 /// this route never resolves its logical domain and its transaction-auth
@@ -794,10 +797,13 @@ where
 /// [`node_core::handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution`]
 /// instead of the read-only entrypoint, so a signed owned `Write`/`Consume`
 /// object access can execute a trusted preinstalled deterministic WASM
-/// contract call and commit its object effects. Every other event kind
-/// still runs through the same generic [`TransactionalNodeStateMachine`]
-/// path as [`structured_durable_router`]. `preinstalled_wasm`'s catalog,
-/// engine, and `created_checkpoint` are fixed, composition-trusted values
+/// contract call and commit its object effects. Under DR-0099, every other
+/// event kind fails closed at native HTTP ingress before identity, clock,
+/// storage, machine, outbox, or transport work. The generic
+/// [`TransactionalNodeStateMachine`] machinery remains available internally
+/// in node-core for a future family-specific authenticated route.
+/// `preinstalled_wasm`'s catalog, engine, and `created_checkpoint` are fixed,
+/// composition-trusted values
 /// (see [`PreinstalledWasmComposition`]); none of them is ever derived from
 /// an HTTP request or wall-clock time. [`structured_durable_router`] itself
 /// is unaffected by this composition and remains read-only.
@@ -6190,6 +6196,10 @@ mod tests {
 
     #[tokio::test]
     async fn every_native_event_route_rejects_all_unauthenticated_families_before_side_effects() {
+        // The four plain constructors delegate directly to their corresponding
+        // `_with_executor` constructors and install the same handler state, so
+        // this matrix covers both public constructor forms without duplicating
+        // the 28 request/side-effect assertions.
         for (index, kind) in externally_unsupported_event_kinds().into_iter().enumerate() {
             let request_byte: u8 = u8::try_from(0x60_usize + index).unwrap();
             let event: NodeEvent = event_with_kind(
@@ -8568,6 +8578,30 @@ mod tests {
                 .unwrap();
             assert_eq!(oversized_body.status(), StatusCode::PAYLOAD_TOO_LARGE);
         }
+    }
+
+    #[tokio::test]
+    async fn unattended_recovery_rejects_when_shared_blocking_capacity_is_exhausted() {
+        let runtime: Arc<MemoryRuntime> =
+            Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
+        let blocking_executor: NativeBlockingExecutor =
+            NativeBlockingExecutor::new(NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap()));
+        let _held_permit = blocking_executor.try_acquire().unwrap();
+
+        let result = recover_outboxes_once(
+            runtime,
+            config(),
+            Arc::new(SequenceLeaseIds::default()),
+            blocking_executor,
+            None,
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(NativeOutboxRecoveryError::CapacityExhausted)
+        ));
     }
 
     #[tokio::test]
