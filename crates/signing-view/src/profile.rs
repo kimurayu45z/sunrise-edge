@@ -3,7 +3,7 @@
 /// Strictly bounded parsing and display limits for one hardware signing
 /// device profile.
 ///
-/// See `docs/signing/hardware-signing.md`, "Hardware Signing Profile v1", for the normative
+/// See `docs/signing/hardware-signing.md`, "Signed input and bounds", for the normative
 /// specification these bounds implement. [`crate::view::build_clear_signing_view`]
 /// fails closed — it never truncates, wraps, or partially renders a
 /// value — if any signed field exceeds its bound here; a transaction that

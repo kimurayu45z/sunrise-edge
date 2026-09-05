@@ -161,7 +161,7 @@ implemented:
 single validator; owned-object only (Create and Shared/System ownership remain
 fail-closed; a blob-backed input is fetched and independently verified through
 an explicit `BlobStore` component
-[DR-0094](decisions/0094-0098-blobs-audit-and-documentation.md)), and
+([DR-0094](decisions/0094-0098-blobs-audit-and-documentation.md)), and
 [DR-0096](decisions/0094-0098-blobs-audit-and-documentation.md) publishes only
 a new version larger than the fixed inline threshold); one fixed ordinary fee
 asset and one ordinary treasury without validator/certificate distribution,
@@ -627,7 +627,7 @@ the fixed profile/policy, then pass that same frame to the signer. Existing
 sender. The host view is only preflight/conformance evidence: the eventual
 device app must independently parse and display the received frame.
 
-`docs/signing/hardware-signing.md` is normative for the fixed profile bounds, stable display fixture,
+[`docs/signing/hardware-signing.md`](../signing/hardware-signing.md) is normative for the fixed profile bounds, stable display fixture,
 provisional explicitly unregistered development derivation path, and bounded
 APDU state machine/status words. The dedicated device app lives in the separate
 `sunrise-edge-ledger-app` repository because its custom targets, Rust SDK/C

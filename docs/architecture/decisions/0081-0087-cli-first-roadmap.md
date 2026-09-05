@@ -168,8 +168,9 @@ fee decisions.
 - DR-0085: Adopt a CLI-first production strategy and add the CLI-First Node
   Production Gate. This is a sequencing decision, not a scope change: it
   reorders when work starts, and it does not complete, delete, weaken, or
-  reinterpret any existing production criterion anywhere in `TODO.md`,
-  `docs/operations/persistence.md`, or `docs/operations/postgres.md`.
+  reinterpret any existing production criterion anywhere in
+  [`TODO.md`](../../../TODO.md), [`docs/operations/persistence.md`](../../operations/persistence.md), or
+  [`docs/operations/postgres.md`](../../operations/postgres.md).
 
   **Rationale.** The Developer MVP Gate ([DR-0076](0076-0080-developer-mvp-foundation.md), resequenced by DR-0081) put
   a browser-facing product surface (TypeScript client, explorer, wallet) in
@@ -205,7 +206,7 @@ fee decisions.
   DR-0087. S4a is implemented and validated As-Is by
   [DR-0088](0088-0093-hardware-signing.md), and
   [DR-0089](0088-0093-hardware-signing.md)
-  subsequently makes eight S4b device-contract clarifications in `docs/signing/hardware-signing.md`
+  subsequently makes eight S4b device-contract clarifications in [`docs/signing/hardware-signing.md`](../../signing/hardware-signing.md)
   and one correction to DR-0088's blanket 230-byte whole-APDU data cap (FIRST rises
   230→255 bytes, first chunk 205→230 bytes, CONTINUE/LAST unchanged at
   230). [DR-0090](0088-0093-hardware-signing.md) records the separate

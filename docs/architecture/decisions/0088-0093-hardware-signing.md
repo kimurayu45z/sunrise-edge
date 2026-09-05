@@ -16,7 +16,7 @@ transport decisions.
   without an `execution`/`wasmi` runtime dependency, and emits bounded ASCII
   lines only after the complete signed value matches one exact policy.
 
-  **No blind signing.** The first policy is limited to the fixed `docs/guides/devnet.md`
+  **No blind signing.** The first policy is limited to the fixed [`docs/guides/devnet.md`](../../guides/devnet.md)
   reference devnet module id/version/code digest, transfer argument schema,
   three ordered `Write` entries, and source-bound fee authorization. Any
   unknown module/digest/entrypoint/arguments/access/fee shape is a typed
@@ -98,7 +98,7 @@ transport decisions.
   rendering any review screen, returning `6A80` and wiping the buffered
   frame/derivation state on mismatch, so a wrong-key session can never
   reach a display page. (6) Pins the device policy's chain id, protocol
-  version, and epoch (`sunrise-local-devnet`, `3`, `0`, the same `docs/guides/devnet.md`
+  version, and epoch (`sunrise-local-devnet`, `3`, `0`, the same [`docs/guides/devnet.md`](../../guides/devnet.md)
   reference context DR-0088 already used) together with the exact devnet
   fee `AssetId`
   (`ccad27f687338b99953183728647bc1177388eb45a37afd9812c0d286b433ea8`, the

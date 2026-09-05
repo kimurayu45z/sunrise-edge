@@ -12,7 +12,7 @@ five-target builds, and Nano S+ Speculos evidence. S4c Phase 1 and Phase 2a
 are implemented As-Is in this repository's `clients/ledger` crate: the host
 APDU/USB/HID transport for the exact contract below, USB-descriptor-level
 device-model recognition, and `apps/cli`'s explicit, all-or-none Ledger
-signer selection (Phase 1, DR-0092); and, by Phase 2a (DR-0093), the staged
+signer selection (Phase 1, [DR-0092](../architecture/decisions/0088-0093-hardware-signing.md)); and, by Phase 2a ([DR-0093](../architecture/decisions/0088-0093-hardware-signing.md)), the staged
 dashboard/firmware/open-app/reconnect/active-app identity sequence over CLA
 `B0` and dashboard-context CLA `E0` (see "Device APDU contract" below), a
 required `--ledger-expected-firmware-version` CLI flag, and this app's own
@@ -315,7 +315,7 @@ tooling rather than assuming it from this table:
   table above once the Sunrise application is active, unaffected by CLA
   `B0` interception. `clients/ledger::identity` implements exactly this
   staged sequence, plus CLA `E0` `INS D8` ("open app") to open the Sunrise
-  application, as of S4c Phase 2a (DR-0093; see "Delivery sequence" below
+  application, as of S4c Phase 2a ([DR-0093](../architecture/decisions/0088-0093-hardware-signing.md); see "Delivery sequence" below
   and "External references"). It is exercised only against `FakeTransport`;
   no physical-device evidence exists for it.
 
@@ -324,14 +324,14 @@ tooling rather than assuming it from this table:
 - **S4a (this repository, As-Is):** strict signature-frame decoding,
   device-profile transaction decoding, exact clear-signing policy and stable
   display fixture, plus the Rust client's external-signer seam.
-- **S4b (separate repository, implemented and validated As-Is by DR-0091):**
+- **S4b (separate repository, implemented and validated As-Is by [DR-0091](../architecture/decisions/0088-0093-hardware-signing.md)):**
   the dedicated Rust Ledger application independently parses the exact frame,
   derives and signs on-device, builds for five Ledger targets, and passes the
   fixed key/signature/rejection/reset suite under Nano S+ Speculos. The exact
   signature uses the sender-substituted canonical-shape fixture; the
   byte-identical copied source fixture is the sender-mismatch case. Solana and
   Ethereum apps are never reused.
-- **S4c Phase 1 (this repository, implemented As-Is by DR-0092):** a
+- **S4c Phase 1 (this repository, implemented As-Is by [DR-0092](../architecture/decisions/0088-0093-hardware-signing.md)):** a
   separate `clients/ledger` host crate implements the APDU/USB/HID boundary
   above against an injectable transport (a deterministic `FakeTransport`
   used by every protocol test, and a real but not yet hardware-validated
@@ -362,7 +362,7 @@ tooling rather than assuming it from this table:
   contract" above), and none of it — the APDU protocol logic, the USB HID
   framing, or the device recognition — has been validated against physical
   hardware.
-- **S4c Phase 2a (this repository, implemented As-Is by DR-0093):** add the
+- **S4c Phase 2a (this repository, implemented As-Is by [DR-0093](../architecture/decisions/0088-0093-hardware-signing.md)):** add the
   active on-device application identity check and the device firmware
   identity check (the **app**/**firmware** checks) over the CLA `B0`/
   dashboard-context CLA `E0` commands documented in the CLA `B0`/`E0`

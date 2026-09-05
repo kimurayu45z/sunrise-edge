@@ -23,7 +23,7 @@ pub const TRANSACTION_V1_MESSAGE_TYPE: &str = "transaction-v1";
 ///
 /// Every line is derived only from bytes the wrapping
 /// [`crypto::SignatureFrameView`] and its decoded [`TransactionSignable`]
-/// payload actually carry — see `docs/signing/hardware-signing.md`, "Clear-signing display", for
+/// payload actually carry — see `docs/signing/hardware-signing.md`, "Clear-signing policy", for
 /// the normative rule: never an unsigned request id, a queried destination
 /// owner, an asset symbol, or a module display name. Lines are exposed as an
 /// ordered slice, not a single joined string, so a caller (a real device's

@@ -20,7 +20,7 @@ provider as a protocol assumption.
 ## Read before changing code
 
 1. Read [`README.md`](README.md) for project orientation and setup.
-2. Use the [`architecture index`](docs/architecture/README.md) to read the
+2. Use the [architecture index](docs/architecture/README.md) to read the
    relevant subsystem and decision records.
 3. Read the relevant requirements and implementation phase in [`TODO.md`](TODO.md).
 4. Inspect the affected crate APIs, tests, and dependency direction.
@@ -206,11 +206,8 @@ environmental limitation precisely.
 ## Roadmap source of truth
 
 `TODO.md` is the only source of truth for current implementation status, active
-roadmap sequencing, deferred work, and completion gates. Re-check it before
-starting each slice; do not copy changing milestone status into this file or the
-README. Architecture documents record implemented behavior and accepted
-decisions, not the live work queue.
-
-Re-check `main`, the open stacked PR chain, and `TODO.md` before starting each
-slice, because repository state may have advanced since context was last
-loaded.
+roadmap sequencing, deferred work, and completion gates; do not copy changing
+milestone status into this file or the README. Architecture documents record
+implemented behavior and accepted decisions, not the live work queue. Re-check
+`main`, the open stacked PR chain, and `TODO.md` before starting each slice,
+because repository state may have advanced since context was last loaded.
