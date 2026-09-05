@@ -250,7 +250,11 @@ committed placement used by the later normalized durable handler, preventing
 authentication under one configuration followed by routing under another.
 Exact replays authenticate again before durable receipt reconciliation.
 Generic node-core handlers and the legacy native routers fail closed on
-`SubmitTransaction`; non-transaction event behavior is unchanged.
+`SubmitTransaction`. DR-0099 additionally closes every native public
+`POST /v1/events` route to all seven non-transaction families before identity,
+clock, storage, machine, outbox, or transport work; the generic node-core
+behavior remains available only as internal reusable machinery until a future
+family-specific authenticated route is explicitly implemented.
 
 **Hard activation constraint:** this closes the strict authentication-to-
 durable-routing gap and the persistent transaction-nonce replay gap, but it

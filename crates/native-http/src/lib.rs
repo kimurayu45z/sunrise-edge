@@ -17,16 +17,16 @@ use core::fmt;
 use execution::{ExecutionError, WasmExecutionEngine};
 use hashing::HashSuiteResolver;
 use node_core::{
-    AuthenticatedSubmitTransaction, FeeEffectComposer, MAX_NODE_OUTPUT_ITEMS,
-    MAX_NODE_PAYLOAD_BYTES, NodeConfig, NodeCoreError, NodeEvent, NodeEventKind, NodeOutboxBatch,
-    NodeOutboxDelivery, OutboxClaim, OutboxLeaseId, PreinstalledFeeComposition,
-    PreinstalledModuleCatalog, RequestId, TransactionAuthError, TransactionalNodeStateMachine,
-    acknowledge_outbox_message, acknowledge_outbox_message_in_domain,
-    authenticate_submit_transaction_event, claim_next_outbox_message,
-    claim_next_outbox_message_in_domain, handle_authenticated_resolved_durable_submit_transaction,
+    FeeEffectComposer, MAX_NODE_OUTPUT_ITEMS, MAX_NODE_PAYLOAD_BYTES, NodeConfig, NodeCoreError,
+    NodeEvent, NodeEventKind, NodeOutboxBatch, NodeOutboxDelivery, OutboxClaim, OutboxLeaseId,
+    PreinstalledFeeComposition, PreinstalledModuleCatalog, RequestId, TransactionAuthError,
+    TransactionalNodeStateMachine, acknowledge_outbox_message,
+    acknowledge_outbox_message_in_domain, authenticate_submit_transaction_event,
+    claim_next_outbox_message, claim_next_outbox_message_in_domain,
+    handle_authenticated_resolved_durable_submit_transaction,
     handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution,
-    handle_idempotent_event, handle_resolved_durable_idempotent_event,
-    handle_resolved_idempotent_event, query_object, query_request_receipt, query_sender_next_nonce,
+    handle_idempotent_event, handle_resolved_idempotent_event, query_object, query_request_receipt,
+    query_sender_next_nonce,
 };
 use objects::{Address, ObjectId};
 use protocol_config::{
@@ -695,11 +695,14 @@ where
 /// repository. Storage authority and operational identities come solely from
 /// the embedding host.
 ///
-/// This is also the only native route that authenticates `SubmitTransaction`
-/// events: for that event kind, [`authenticate_submit_transaction_event`] runs
-/// from `protocol_config` and the validated ingress context before any access-plan
-/// derivation, identity allocation, clock read, storage I/O, transition,
-/// outbox claim, or send. `protocol_config.protocol_version` must equal
+/// This and [`preinstalled_wasm_structured_durable_router`] are the two native
+/// route families that authenticate `SubmitTransaction` events. This router
+/// uses the read-only execution path, while the preinstalled router additionally
+/// executes its composition-trusted catalog. For `SubmitTransaction`,
+/// [`authenticate_submit_transaction_event`] runs from `protocol_config` and
+/// the validated ingress context before any access-plan derivation, identity
+/// allocation, clock read, storage I/O, transition, outbox claim, or send.
+/// `protocol_config.protocol_version` must equal
 /// `config.protocol_version()` and `protocol_config` must carry a
 /// domain-placement manifest, checked once here rather than per request, so
 /// this route never resolves its logical domain and its transaction-auth
@@ -794,10 +797,13 @@ where
 /// [`node_core::handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution`]
 /// instead of the read-only entrypoint, so a signed owned `Write`/`Consume`
 /// object access can execute a trusted preinstalled deterministic WASM
-/// contract call and commit its object effects. Every other event kind
-/// still runs through the same generic [`TransactionalNodeStateMachine`]
-/// path as [`structured_durable_router`]. `preinstalled_wasm`'s catalog,
-/// engine, and `created_checkpoint` are fixed, composition-trusted values
+/// contract call and commit its object effects. Under DR-0099, every other
+/// event kind fails closed at native HTTP ingress before identity, clock,
+/// storage, machine, outbox, or transport work. The generic
+/// [`TransactionalNodeStateMachine`] machinery remains available internally
+/// in node-core for a future family-specific authenticated route.
+/// `preinstalled_wasm`'s catalog, engine, and `created_checkpoint` are fixed,
+/// composition-trusted values
 /// (see [`PreinstalledWasmComposition`]); none of them is ever derived from
 /// an HTTP request or wall-clock time. [`structured_durable_router`] itself
 /// is unaffected by this composition and remains read-only.
@@ -2200,6 +2206,15 @@ enum InvocationError {
     Delivery(OutboxDeliveryError),
     Indexed(IndexedOutboxRecoveryError),
     ResultEncoding,
+    /// A known [`NodeEventKind`] whose family requires per-family
+    /// authentication and authorization that no native route implements yet
+    /// (DR-0099). `SubmitTransaction` is the only kind any native route
+    /// authenticates; every other kind must fail closed here, before any
+    /// identity allocation, clock read, storage I/O, machine access-plan or
+    /// transition, outbox work, or transport send. The error deliberately
+    /// carries no event-kind detail so every family maps to the same opaque
+    /// response.
+    EventFamilyRequiresAuthenticatedRoute,
 }
 
 /// Rejects a `SubmitTransaction` event before any machine or storage work.
@@ -2218,6 +2233,36 @@ fn reject_unauthenticated_submit_transaction(event: &NodeEvent) -> Result<(), In
     Ok(())
 }
 
+/// Rejects every known `NodeEventKind` other than `SubmitTransaction` before
+/// any identity allocation, clock read, storage I/O, machine access-plan or
+/// transition, outbox work, or transport send (DR-0099).
+///
+/// This is an external-boundary policy, not a node-core change: node-core's
+/// generic [`TransactionalNodeStateMachine`] path remains fully implemented
+/// and reusable, and this function only decides which event kinds native-http
+/// is currently willing to hand to it. `ReceiveVote`, `ReceiveCertificate`,
+/// `ReceiveConsensusMessage`, `ApplyGovernanceCertificate`,
+/// `ApplyProtocolUpgrade`, `ApplyValidatorSetChange`, and `Tick` each need
+/// their own authentication and authorization the native adapter does not
+/// implement yet, so every one of them maps to the same opaque
+/// `501 event-family-requires-authenticated-route` response on every native
+/// route, including the two legacy routes that never authenticate
+/// `SubmitTransaction` either. The match is exhaustive over
+/// [`NodeEventKind`] so a future kind must be classified here explicitly
+/// rather than silently falling through to acceptance.
+fn reject_unauthenticated_event_family(event: &NodeEvent) -> Result<(), InvocationError> {
+    match event.kind() {
+        NodeEventKind::SubmitTransaction => Ok(()),
+        NodeEventKind::ReceiveVote
+        | NodeEventKind::ReceiveCertificate
+        | NodeEventKind::ReceiveConsensusMessage
+        | NodeEventKind::ApplyGovernanceCertificate
+        | NodeEventKind::ApplyProtocolUpgrade
+        | NodeEventKind::ApplyValidatorSetChange
+        | NodeEventKind::Tick => Err(InvocationError::EventFamilyRequiresAuthenticatedRoute),
+    }
+}
+
 fn invoke_event<R, M, L>(
     state: &NativeHttpState<R, M, L>,
     body: &[u8],
@@ -2229,6 +2274,7 @@ where
     L: OutboxLeaseIdSource,
 {
     let event = NodeEvent::decode(body).map_err(InvocationError::Node)?;
+    reject_unauthenticated_event_family(&event)?;
     reject_unauthenticated_submit_transaction(&event)?;
     let request_id = event.request_id();
     let output = handle_idempotent_event(
@@ -2262,6 +2308,7 @@ where
     L: OutboxLeaseIdSource,
 {
     let event = NodeEvent::decode(body).map_err(InvocationError::Node)?;
+    reject_unauthenticated_event_family(&event)?;
     reject_unauthenticated_submit_transaction(&event)?;
     let request_id = event.request_id();
     let resolved = handle_resolved_idempotent_event(
@@ -2382,27 +2429,13 @@ where
         return Err(InvocationError::CancelledBeforeStorage);
     }
     let event = NodeEvent::decode(body).map_err(InvocationError::Node)?;
+    reject_unauthenticated_event_family(&event)?;
     validate_native_event_context(&event, config).map_err(InvocationError::Node)?;
     let request_id = event.request_id();
-    enum PreparedStructuredEvent {
-        Authenticated(Box<AuthenticatedSubmitTransaction>),
-        Generic(NodeEvent),
-    }
-    let prepared_event: PreparedStructuredEvent =
-        if event.kind() == NodeEventKind::SubmitTransaction {
-            PreparedStructuredEvent::Authenticated(Box::new(
-                authenticate_submit_transaction_event(event, config, protocol_config)
-                    .map_err(InvocationError::Node)?,
-            ))
-        } else {
-            PreparedStructuredEvent::Generic(event)
-        };
-    let placement: &DomainPlacementManifest = protocol_config
-        .domain_placement
-        .as_ref()
-        .ok_or(ProtocolConfigError::MissingDomainPlacement)
-        .map_err(NodeCoreError::from)
-        .map_err(InvocationError::Node)?;
+    let submission = Box::new(
+        authenticate_submit_transaction_event(event, config, protocol_config)
+            .map_err(InvocationError::Node)?,
+    );
     let identity = components
         .identities
         .next_attempt_identity()
@@ -2429,27 +2462,23 @@ where
     if components.is_cancelled() {
         return Err(InvocationError::CancelledBeforeStorage);
     }
-    let resolved = match (prepared_event, execution) {
-        (
-            PreparedStructuredEvent::Authenticated(submission),
-            StructuredDurableAuthenticatedExecution::ReadOnly,
-        ) => handle_authenticated_resolved_durable_submit_transaction(
-            components.blob_store.as_ref(),
-            components.store.as_ref(),
-            &context,
-            resolver,
-            *submission,
-            machine,
-        ),
-        (
-            PreparedStructuredEvent::Authenticated(submission),
-            StructuredDurableAuthenticatedExecution::PreinstalledWasm {
-                catalog,
-                engine,
-                created_checkpoint,
-                fee_composition,
-            },
-        ) => handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+    let resolved = match execution {
+        StructuredDurableAuthenticatedExecution::ReadOnly => {
+            handle_authenticated_resolved_durable_submit_transaction(
+                components.blob_store.as_ref(),
+                components.store.as_ref(),
+                &context,
+                resolver,
+                *submission,
+                machine,
+            )
+        }
+        StructuredDurableAuthenticatedExecution::PreinstalledWasm {
+            catalog,
+            engine,
+            created_checkpoint,
+            fee_composition,
+        } => handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
             components.blob_store.as_ref(),
             components.store.as_ref(),
             &context,
@@ -2459,15 +2488,6 @@ where
             *submission,
             created_checkpoint,
             fee_composition,
-        ),
-        (PreparedStructuredEvent::Generic(event), _) => handle_resolved_durable_idempotent_event(
-            components.store.as_ref(),
-            &context,
-            placement,
-            config,
-            resolver,
-            event,
-            machine,
         ),
     }
     .map_err(InvocationError::Node)?;
@@ -2596,6 +2616,10 @@ fn invocation_error_response(error: &InvocationError) -> Response {
         InvocationError::ResultEncoding => {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "result-encoding-failed")
         }
+        InvocationError::EventFamilyRequiresAuthenticatedRoute => error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "event-family-requires-authenticated-route",
+        ),
     }
 }
 
@@ -3281,6 +3305,7 @@ mod tests {
         NodeStateAccessMode, NodeStateAccessPlan, NodeStateSnapshot, NodeStateUpdate,
         OutboundMessage, PreinstalledModuleCatalogEntry, PreinstalledModuleSemanticsEnvelope,
         TransactionalNodeTransition, encode_preinstalled_semantics_envelope,
+        handle_resolved_durable_idempotent_event,
     };
     use objects::{
         AccessMode, Address, Object, ObjectId, ObjectRef, Owner, decode_object, encode_object,
@@ -3291,19 +3316,19 @@ mod tests {
         HashSuiteSchedule, ProtocolVersion, SignatureSchemeId, ValidatorId,
     };
     use runtime::{
-        AtomicStateMutationSet, AtomicStateReadSet, AtomicStateTransaction, CompareAndSwapResult,
-        ComposedRuntime, DurableCommitOutcome, DurableCommitRejection, DurableDomainStateStore,
-        DurableInvocationTransaction, DurableObjectChanges, DurableObjectHead,
-        DurableObjectHeadRead, DurableObjectMutation, DurableObjectMutationEntry,
-        DurableObjectOwnerProjection, DurableObjectPayload, DurableObjectProvenance,
-        DurableObjectRoutingProjection, DurableObjectVersion, DurableObjectVersionRecord,
-        DurableOutboxClaim, DurableReadError, DurableRequestId, DurableRequestReceipt,
-        IndexedOutboxRepository, ManualClock, MemoryBlobStore, MemoryDurableStateStore,
-        MemoryRuntime, MemoryScheduler, MemorySigner, MemoryStateStore, MemoryTransport,
-        ObjectHeadRevision, OutboxRequestId, RequestOutboxClaimRequest, RuntimeError,
-        StateMutation, StateMutationEntry, StateReadAssertion, StateRevision, StateStore,
-        StructuredDurableDomainStateStore, SystemClock, TransactionalStateStore,
-        VersionedStateValue,
+        AtomicStateMutationSet, AtomicStateReadSet, AtomicStateTransaction, AtomicStateWriteResult,
+        AtomicStateWriteSet, CompareAndSwapResult, ComposedRuntime, DurableCommitOutcome,
+        DurableCommitRejection, DurableDomainStateStore, DurableInvocationTransaction,
+        DurableObjectChanges, DurableObjectHead, DurableObjectHeadRead, DurableObjectMutation,
+        DurableObjectMutationEntry, DurableObjectOwnerProjection, DurableObjectPayload,
+        DurableObjectProvenance, DurableObjectRoutingProjection, DurableObjectVersion,
+        DurableObjectVersionRecord, DurableOutboxClaim, DurableReadError, DurableRequestId,
+        DurableRequestReceipt, IndexedOutboxRepository, ManualClock, MemoryBlobStore,
+        MemoryDurableStateStore, MemoryRuntime, MemoryScheduler, MemorySigner, MemoryStateStore,
+        MemoryTransport, ObjectHeadRevision, OutboxRequestId, RequestOutboxClaimRequest,
+        RuntimeError, StateMutation, StateMutationEntry, StateReadAssertion, StateRevision,
+        StateStore, StructuredDurableDomainStateStore, SystemClock, TransactionalStateStore,
+        Transport, VersionedStateValue,
     };
     use runtime_sqlite::{SqliteDurableStore, SqliteNamespace, SqliteStateStore};
     use std::{
@@ -3439,14 +3464,8 @@ mod tests {
         )
     }
 
-    /// A generic, non-transaction event used by tests that exercise dedup,
-    /// outbox, cancellation, and commit machinery independently of
-    /// transaction authentication. `ReceiveVote` is an arbitrary non-
-    /// `SubmitTransaction` kind: every route processes it through the same
-    /// generic [`TransactionalNodeStateMachine`] path `SubmitTransaction`
-    /// used before this change, so it keeps that coverage intact while
-    /// `SubmitTransaction` itself now carries a real signed transaction (see
-    /// [`signed_submit_transaction_event`]).
+    /// A generic, non-transaction event used by direct node-core/recovery
+    /// fixture setup. Native HTTP rejects this family at its external boundary.
     fn event(request_id: RequestId) -> NodeEvent {
         NodeEvent::new(
             ChainId::new("sunrise-test").unwrap(),
@@ -3454,6 +3473,30 @@ mod tests {
             Epoch::new(7),
             request_id,
             node_core::NodeEventKind::ReceiveVote,
+            canonical(TEST_PAYLOAD_TYPE_ID, 9),
+        )
+        .unwrap()
+    }
+
+    fn externally_unsupported_event_kinds() -> [NodeEventKind; 7] {
+        [
+            NodeEventKind::ReceiveVote,
+            NodeEventKind::ReceiveCertificate,
+            NodeEventKind::ReceiveConsensusMessage,
+            NodeEventKind::ApplyGovernanceCertificate,
+            NodeEventKind::ApplyProtocolUpgrade,
+            NodeEventKind::ApplyValidatorSetChange,
+            NodeEventKind::Tick,
+        ]
+    }
+
+    fn event_with_kind(request_id: RequestId, kind: NodeEventKind, chain_id: ChainId) -> NodeEvent {
+        NodeEvent::new(
+            chain_id,
+            ProtocolVersion::new(3),
+            Epoch::new(7),
+            request_id,
+            kind,
             canonical(TEST_PAYLOAD_TYPE_ID, 9),
         )
         .unwrap()
@@ -4215,6 +4258,90 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct CountingStateStore {
+        inner: MemoryStateStore,
+        calls: AtomicUsize,
+    }
+
+    impl CountingStateStore {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl StateStore for CountingStateStore {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, RuntimeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(key)
+        }
+
+        fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), RuntimeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.put(key, value)
+        }
+
+        fn compare_and_swap(
+            &self,
+            key: Vec<u8>,
+            expected: Option<Vec<u8>>,
+            new_value: Vec<u8>,
+        ) -> Result<CompareAndSwapResult, RuntimeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.compare_and_swap(key, expected, new_value)
+        }
+    }
+
+    impl TransactionalStateStore for CountingStateStore {
+        fn get_versioned(&self, key: &[u8]) -> Result<VersionedStateValue, RuntimeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_versioned(key)
+        }
+
+        fn commit_atomic(
+            &self,
+            write_set: AtomicStateWriteSet,
+        ) -> Result<AtomicStateWriteResult, RuntimeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.commit_atomic(write_set)
+        }
+    }
+
+    impl runtime::DomainTransactionalStateStore for CountingStateStore {
+        fn get_versioned_in_domain(
+            &self,
+            domain: AtomicityDomainId,
+            key: &[u8],
+        ) -> Result<VersionedStateValue, RuntimeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_versioned_in_domain(domain, key)
+        }
+
+        fn commit_transaction(
+            &self,
+            transaction: AtomicStateTransaction,
+        ) -> Result<AtomicStateWriteResult, RuntimeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.commit_transaction(transaction)
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingTransport {
+        send_calls: AtomicUsize,
+    }
+
+    impl Transport for CountingTransport {
+        fn send(&self, _message: Vec<u8>) -> Result<(), RuntimeError> {
+            self.send_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn drain_outbound(&self) -> Result<Vec<Vec<u8>>, RuntimeError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[derive(Default)]
     struct SequenceLeaseIds {
         next: Mutex<u64>,
     }
@@ -4234,6 +4361,21 @@ mod tests {
             let mut bytes = [0_u8; 32];
             bytes[..8].copy_from_slice(&next.to_le_bytes());
             OutboxLeaseId::new(bytes).map_err(|_| OutboxLeaseIdSourceError::Exhausted)
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingLeaseIds {
+        calls: AtomicUsize,
+    }
+
+    impl OutboxLeaseIdSource for CountingLeaseIds {
+        fn next_lease_id(
+            &self,
+            _request_id: RequestId,
+        ) -> Result<OutboxLeaseId, OutboxLeaseIdSourceError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            OutboxLeaseId::new([0x73; 32]).map_err(|_| OutboxLeaseIdSourceError::Exhausted)
         }
     }
 
@@ -4402,6 +4544,7 @@ mod tests {
         acknowledgements: Mutex<VecDeque<DurableOutboxAcknowledgementOutcome>>,
         claim_requests: Mutex<Vec<DueOutboxClaimRequest>>,
         acknowledgement_requests: Mutex<Vec<DurableOutboxAcknowledgement>>,
+        storage_calls: AtomicUsize,
     }
 
     impl ScriptedIndexedStore {
@@ -4414,16 +4557,19 @@ mod tests {
                 acknowledgements: Mutex::new(acknowledgements.into()),
                 claim_requests: Mutex::new(Vec::new()),
                 acknowledgement_requests: Mutex::new(Vec::new()),
+                storage_calls: AtomicUsize::new(0),
             }
         }
     }
 
     impl StateStore for ScriptedIndexedStore {
         fn get(&self, _key: &[u8]) -> Result<Option<Vec<u8>>, RuntimeError> {
+            self.storage_calls.fetch_add(1, Ordering::SeqCst);
             Err(RuntimeError::DurableStoreUnavailable)
         }
 
         fn put(&self, _key: Vec<u8>, _value: Vec<u8>) -> Result<(), RuntimeError> {
+            self.storage_calls.fetch_add(1, Ordering::SeqCst);
             Err(RuntimeError::DurableStoreUnavailable)
         }
 
@@ -4433,6 +4579,7 @@ mod tests {
             _expected: Option<Vec<u8>>,
             _new_value: Vec<u8>,
         ) -> Result<CompareAndSwapResult, RuntimeError> {
+            self.storage_calls.fetch_add(1, Ordering::SeqCst);
             Err(RuntimeError::DurableStoreUnavailable)
         }
     }
@@ -4444,6 +4591,7 @@ mod tests {
             _domain: AtomicityDomainId,
             _key: &[u8],
         ) -> Result<VersionedStateValue, DurableReadError> {
+            self.storage_calls.fetch_add(1, Ordering::SeqCst);
             Err(DurableReadError::Unavailable)
         }
 
@@ -4452,6 +4600,7 @@ mod tests {
             _context: &DurableOperationContext,
             _transaction: AtomicStateTransaction,
         ) -> DurableCommitOutcome {
+            self.storage_calls.fetch_add(1, Ordering::SeqCst);
             DurableCommitOutcome::Rejected(DurableCommitRejection::UnavailableBeforeCommit)
         }
     }
@@ -4463,6 +4612,7 @@ mod tests {
             _domain: AtomicityDomainId,
             _request_id: DurableRequestId,
         ) -> Result<Option<DurableRequestReceipt>, DurableReadError> {
+            self.storage_calls.fetch_add(1, Ordering::SeqCst);
             Err(DurableReadError::Unavailable)
         }
 
@@ -4471,6 +4621,7 @@ mod tests {
             _context: &DurableOperationContext,
             _transaction: DurableInvocationTransaction,
         ) -> DurableCommitOutcome {
+            self.storage_calls.fetch_add(1, Ordering::SeqCst);
             DurableCommitOutcome::Rejected(DurableCommitRejection::UnavailableBeforeCommit)
         }
     }
@@ -4481,6 +4632,7 @@ mod tests {
             _context: &DurableOperationContext,
             _request: RequestOutboxClaimRequest,
         ) -> DurableOutboxClaimOutcome {
+            self.storage_calls.fetch_add(1, Ordering::SeqCst);
             self.claims
                 .lock()
                 .unwrap()
@@ -4493,6 +4645,7 @@ mod tests {
             _context: &DurableOperationContext,
             request: DueOutboxClaimRequest,
         ) -> DurableOutboxClaimOutcome {
+            self.storage_calls.fetch_add(1, Ordering::SeqCst);
             self.claim_requests.lock().unwrap().push(request);
             self.claims
                 .lock()
@@ -4506,6 +4659,7 @@ mod tests {
             _context: &DurableOperationContext,
             acknowledgement: DurableOutboxAcknowledgement,
         ) -> DurableOutboxAcknowledgementOutcome {
+            self.storage_calls.fetch_add(1, Ordering::SeqCst);
             self.acknowledgement_requests
                 .lock()
                 .unwrap()
@@ -4737,6 +4891,26 @@ mod tests {
             Arc::new(SequenceLeaseIds::default()),
             NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
         )
+    }
+
+    type ObservedLegacyRuntime = ComposedRuntime<
+        CountingStateStore,
+        CountingBlobStore,
+        MemorySigner,
+        CountingTransport,
+        CountingClock,
+        MemoryScheduler,
+    >;
+
+    fn observed_legacy_runtime() -> Arc<ObservedLegacyRuntime> {
+        Arc::new(ComposedRuntime::new(
+            CountingStateStore::default(),
+            CountingBlobStore::default(),
+            MemorySigner::new(ValidatorId::new([0x44; 32])),
+            CountingTransport::default(),
+            CountingClock::new(10_000),
+            MemoryScheduler::default(),
+        ))
     }
 
     fn resolved_app(
@@ -5151,6 +5325,89 @@ mod tests {
         assert_eq!(machine.transition_calls.load(Ordering::SeqCst), 1);
         assert_eq!(identities.calls.load(Ordering::SeqCst), 2);
         assert_eq!(clock.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(transport.drain_outbound().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn structured_event_route_rejects_excess_blocking_work_without_blocking_liveness() {
+        let fence: WriterFenceGeneration = WriterFenceGeneration::new(3).unwrap();
+        let store: Arc<MemoryDurableStateStore> = Arc::new(MemoryDurableStateStore::new(fence));
+        store.set_time(10_000);
+        let transport: Arc<MemoryTransport> = Arc::new(MemoryTransport::default());
+        let config: NodeConfig = config();
+        let entered: Arc<Notify> = Arc::new(Notify::new());
+        let release: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
+        let machine: Arc<BlockingMachine> = Arc::new(BlockingMachine {
+            inner: IncrementMachine::new(config.state_key()),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let blocking_executor: NativeBlockingExecutor =
+            NativeBlockingExecutor::new(NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap()));
+        let app: Router = structured_durable_router_with_executor(
+            StructuredDurableNativeComponents::new(
+                store,
+                Arc::new(MemoryBlobStore::default()),
+                Arc::clone(&transport),
+                Arc::new(ManualClock::new(10_000)),
+                Arc::new(SequenceIndexedIdentities::default()),
+            ),
+            active_protocol_config(AtomicityDomainId::new([0x8B; 32]).unwrap()),
+            structured_request_authority(),
+            config,
+            resolver(),
+            machine,
+            blocking_executor,
+        )
+        .unwrap();
+        let first_signing_key: ed25519_zebra::SigningKey = dev_signing_key(0x36);
+        let first_event: NodeEvent =
+            signed_submit_transaction_event(&first_signing_key, request_id(0x37), 0);
+        let second_signing_key: ed25519_zebra::SigningKey = dev_signing_key(0x38);
+        let second_event: NodeEvent =
+            signed_submit_transaction_event(&second_signing_key, request_id(0x39), 0);
+
+        let first_app: Router = app.clone();
+        let first = tokio::spawn(async move {
+            first_app
+                .oneshot(
+                    Request::post(NODE_EVENT_PATH)
+                        .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                        .body(Body::from(first_event.encode().unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        entered.notified().await;
+
+        let liveness: Response = app
+            .clone()
+            .oneshot(Request::get(LIVENESS_PATH).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let overloaded: Response = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(second_event.encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let (released, release_signal) = release.as_ref();
+        *released.lock().unwrap() = true;
+        release_signal.notify_all();
+        let first: Response = first.await.unwrap();
+
+        assert_eq!(liveness.status(), StatusCode::NO_CONTENT);
+        assert_eq!(overloaded.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            to_bytes(overloaded.into_body(), 128).await.unwrap(),
+            "blocking-capacity-exhausted"
+        );
+        assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(transport.drain_outbound().unwrap().len(), 1);
     }
 
@@ -5907,6 +6164,10 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "submit-transaction-requires-authenticated-route"
+        );
+        assert_eq!(
             resolved_runtime
                 .state_store()
                 .get_versioned_in_domain(domain, node_config.state_key())
@@ -5914,6 +6175,180 @@ mod tests {
                 .value(),
             None
         );
+    }
+
+    async fn assert_event_family_rejected(app: Router, event: NodeEvent) {
+        let response: Response = app
+            .oneshot(
+                Request::post(NODE_EVENT_PATH)
+                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
+                    .body(Body::from(event.encode().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            to_bytes(response.into_body(), 128).await.unwrap(),
+            "event-family-requires-authenticated-route"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_native_event_route_rejects_all_unauthenticated_families_before_side_effects() {
+        // The four plain constructors delegate directly to their corresponding
+        // `_with_executor` constructors and install the same handler state, so
+        // this matrix covers both public constructor forms without duplicating
+        // the 28 request/side-effect assertions.
+        for (index, kind) in externally_unsupported_event_kinds().into_iter().enumerate() {
+            let request_byte: u8 = u8::try_from(0x60_usize + index).unwrap();
+            let event: NodeEvent = event_with_kind(
+                request_id(request_byte),
+                kind,
+                ChainId::new("sunrise-test").unwrap(),
+            );
+
+            let legacy_runtime: Arc<ObservedLegacyRuntime> = observed_legacy_runtime();
+            let legacy_machine: Arc<CountingMachine> =
+                Arc::new(CountingMachine::new(config().state_key()));
+            let legacy_lease_ids: Arc<CountingLeaseIds> = Arc::new(CountingLeaseIds::default());
+            let legacy: Router = router(
+                Arc::clone(&legacy_runtime),
+                config(),
+                resolver(),
+                Arc::clone(&legacy_machine),
+                Arc::clone(&legacy_lease_ids),
+                NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+            );
+            assert_event_family_rejected(legacy, event.clone()).await;
+            assert_eq!(legacy_runtime.state_store().calls(), 0);
+            assert_eq!(legacy_runtime.blob_store().get_calls(), 0);
+            assert_eq!(legacy_runtime.clock().calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                legacy_runtime.transport().send_calls.load(Ordering::SeqCst),
+                0
+            );
+            assert_eq!(legacy_lease_ids.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(legacy_machine.access_plan_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(legacy_machine.transition_calls.load(Ordering::SeqCst), 0);
+
+            let resolved_runtime: Arc<ObservedLegacyRuntime> = observed_legacy_runtime();
+            let resolved_machine: Arc<CountingMachine> =
+                Arc::new(CountingMachine::new(config().state_key()));
+            let resolved_lease_ids: Arc<CountingLeaseIds> = Arc::new(CountingLeaseIds::default());
+            let resolved: Router = resolved_domain_router(
+                Arc::clone(&resolved_runtime),
+                placement(0x88, 7),
+                config(),
+                resolver(),
+                Arc::clone(&resolved_machine),
+                Arc::clone(&resolved_lease_ids),
+                NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+            );
+            assert_event_family_rejected(resolved, event.clone()).await;
+            assert_eq!(resolved_runtime.state_store().calls(), 0);
+            assert_eq!(resolved_runtime.blob_store().get_calls(), 0);
+            assert_eq!(resolved_runtime.clock().calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                resolved_runtime
+                    .transport()
+                    .send_calls
+                    .load(Ordering::SeqCst),
+                0
+            );
+            assert_eq!(resolved_lease_ids.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(resolved_machine.access_plan_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(resolved_machine.transition_calls.load(Ordering::SeqCst), 0);
+
+            let structured_store: Arc<ScriptedIndexedStore> =
+                Arc::new(ScriptedIndexedStore::new(Vec::new(), Vec::new()));
+            let structured_blob_store: Arc<CountingBlobStore> =
+                Arc::new(CountingBlobStore::default());
+            let structured_transport: Arc<MemoryTransport> = Arc::new(MemoryTransport::default());
+            let structured_clock: Arc<CountingClock> = Arc::new(CountingClock::new(10_000));
+            let structured_identities: Arc<CountingIndexedIdentities> =
+                Arc::new(CountingIndexedIdentities::default());
+            let structured_machine: Arc<CountingMachine> =
+                Arc::new(CountingMachine::new(config().state_key()));
+            let structured: Router = structured_durable_router(
+                StructuredDurableNativeComponents::new(
+                    Arc::clone(&structured_store),
+                    Arc::clone(&structured_blob_store),
+                    Arc::clone(&structured_transport),
+                    Arc::clone(&structured_clock),
+                    Arc::clone(&structured_identities),
+                ),
+                active_protocol_config(AtomicityDomainId::new([0x89; 32]).unwrap()),
+                structured_request_authority(),
+                config(),
+                resolver(),
+                Arc::clone(&structured_machine),
+                NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+            )
+            .unwrap();
+            assert_event_family_rejected(structured, event.clone()).await;
+            assert_eq!(structured_store.storage_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(structured_blob_store.get_calls(), 0);
+            assert_eq!(structured_clock.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(structured_identities.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                structured_machine.access_plan_calls.load(Ordering::SeqCst),
+                0
+            );
+            assert_eq!(
+                structured_machine.transition_calls.load(Ordering::SeqCst),
+                0
+            );
+            assert!(structured_transport.drain_outbound().unwrap().is_empty());
+
+            let preinstalled_store: Arc<ScriptedIndexedStore> =
+                Arc::new(ScriptedIndexedStore::new(Vec::new(), Vec::new()));
+            let preinstalled_blob_store: Arc<CountingBlobStore> =
+                Arc::new(CountingBlobStore::default());
+            let preinstalled_transport: Arc<MemoryTransport> = Arc::new(MemoryTransport::default());
+            let preinstalled_clock: Arc<CountingClock> = Arc::new(CountingClock::new(10_000));
+            let preinstalled_identities: Arc<CountingIndexedIdentities> =
+                Arc::new(CountingIndexedIdentities::default());
+            let preinstalled_machine: Arc<CountingMachine> =
+                Arc::new(CountingMachine::new(config().state_key()));
+            let preinstalled: Router = preinstalled_wasm_structured_durable_router(
+                StructuredDurableNativeComponents::new(
+                    Arc::clone(&preinstalled_store),
+                    Arc::clone(&preinstalled_blob_store),
+                    Arc::clone(&preinstalled_transport),
+                    Arc::clone(&preinstalled_clock),
+                    Arc::clone(&preinstalled_identities),
+                ),
+                PreinstalledWasmComposition::new(
+                    Arc::new(PreinstalledModuleCatalog::new(Vec::new()).unwrap()),
+                    WasmExecutionEngine,
+                    9,
+                ),
+                active_protocol_config(AtomicityDomainId::new([0x8A; 32]).unwrap()),
+                structured_request_authority(),
+                config(),
+                resolver(),
+                Arc::clone(&preinstalled_machine),
+                NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
+            )
+            .unwrap();
+            assert_event_family_rejected(preinstalled, event).await;
+            assert_eq!(preinstalled_store.storage_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(preinstalled_blob_store.get_calls(), 0);
+            assert_eq!(preinstalled_clock.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(preinstalled_identities.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                preinstalled_machine
+                    .access_plan_calls
+                    .load(Ordering::SeqCst),
+                0
+            );
+            assert_eq!(
+                preinstalled_machine.transition_calls.load(Ordering::SeqCst),
+                0
+            );
+            assert!(preinstalled_transport.drain_outbound().unwrap().is_empty());
+        }
     }
 
     struct FailOnceTransport {
@@ -6709,12 +7144,14 @@ mod tests {
                 cancellation.clone(),
             );
             let id: RequestId = request_id(u8::try_from(0x30_usize + cancel_at_call).unwrap());
+            let signing_key: ed25519_zebra::SigningKey = dev_signing_key(0x34);
+            let submit: NodeEvent = signed_submit_transaction_event(&signing_key, id, 0);
 
             let response: Response = app
                 .oneshot(
                     Request::post(NODE_EVENT_PATH)
                         .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                        .body(Body::from(event(id).encode().unwrap()))
+                        .body(Body::from(submit.encode().unwrap()))
                         .unwrap(),
                 )
                 .await
@@ -6777,6 +7214,8 @@ mod tests {
         let domain: AtomicityDomainId = AtomicityDomainId::new([0x85; 32]).unwrap();
         let protocol_config: ProtocolConfig = active_protocol_config(domain);
         let id: RequestId = request_id(0x35);
+        let signing_key: ed25519_zebra::SigningKey = dev_signing_key(0x35);
+        let submit: NodeEvent = signed_submit_transaction_event(&signing_key, id, 0);
         let app: Router = structured_app_with_cancellation(
             Arc::clone(&store),
             Arc::clone(&transport),
@@ -6790,7 +7229,7 @@ mod tests {
             .oneshot(
                 Request::post(NODE_EVENT_PATH)
                     .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                    .body(Body::from(event(id).encode().unwrap()))
+                    .body(Body::from(submit.encode().unwrap()))
                     .unwrap(),
             )
             .await
@@ -6847,6 +7286,9 @@ mod tests {
         .unwrap();
 
         let current_request_id = request_id(0x22);
+        let signing_key: ed25519_zebra::SigningKey = dev_signing_key(0x22);
+        let submit: NodeEvent =
+            signed_submit_transaction_event(&signing_key, current_request_id, 0);
         let protocol_config = active_protocol_config(domain);
         let app = structured_app(
             Arc::clone(&store),
@@ -6859,7 +7301,7 @@ mod tests {
             .oneshot(
                 Request::post(NODE_EVENT_PATH)
                     .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                    .body(Body::from(event(current_request_id).encode().unwrap()))
+                    .body(Body::from(submit.encode().unwrap()))
                     .unwrap(),
             )
             .await
@@ -6923,6 +7365,8 @@ mod tests {
         let domain = placement.domain();
         let protocol_config = active_protocol_config(domain);
         let id = request_id(0x23);
+        let signing_key: ed25519_zebra::SigningKey = dev_signing_key(0x23);
+        let submit: NodeEvent = signed_submit_transaction_event(&signing_key, id, 0);
         let app = structured_app(
             Arc::clone(&store),
             Arc::clone(&transport),
@@ -6935,7 +7379,7 @@ mod tests {
             .oneshot(
                 Request::post(NODE_EVENT_PATH)
                     .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                    .body(Body::from(event(id).encode().unwrap()))
+                    .body(Body::from(submit.encode().unwrap()))
                     .unwrap(),
             )
             .await
@@ -6978,12 +7422,14 @@ mod tests {
             protocol_config,
             config,
         );
+        let signing_key: ed25519_zebra::SigningKey = dev_signing_key(0x24);
+        let submit: NodeEvent = signed_submit_transaction_event(&signing_key, request_id(0x24), 0);
 
         let response = app
             .oneshot(
                 Request::post(NODE_EVENT_PATH)
                     .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                    .body(Body::from(event(request_id(0x24)).encode().unwrap()))
+                    .body(Body::from(submit.encode().unwrap()))
                     .unwrap(),
             )
             .await
@@ -8010,12 +8456,14 @@ mod tests {
                 cancellation.clone(),
             );
             let id = request_id(u8::try_from(0xD0_usize + cancel_at_call).unwrap());
+            let signing_key: ed25519_zebra::SigningKey = dev_signing_key(0x5A);
+            let submit: NodeEvent = signed_submit_transaction_event(&signing_key, id, 0);
 
             let response = app
                 .oneshot(
                     Request::post(NODE_EVENT_PATH)
                         .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                        .body(Body::from(event(id).encode().unwrap()))
+                        .body(Body::from(submit.encode().unwrap()))
                         .unwrap(),
                 )
                 .await
@@ -8044,80 +8492,6 @@ mod tests {
                 None
             );
         }
-    }
-
-    #[tokio::test]
-    async fn preinstalled_route_admission_rejects_when_blocking_capacity_exhausted() {
-        let fence = WriterFenceGeneration::new(3).unwrap();
-        let store = Arc::new(MemoryDurableStateStore::new(fence));
-        store.set_time(10_000);
-        let transport = Arc::new(MemoryTransport::default());
-        let config = config();
-        let domain = AtomicityDomainId::new([0xC7; 32]).unwrap();
-        let protocol_config = active_protocol_config(domain);
-        let blocking_executor =
-            NativeBlockingExecutor::new(NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap()));
-        let entered = Arc::new(Notify::new());
-        let release = Arc::new((Mutex::new(false), Condvar::new()));
-        let machine = Arc::new(BlockingMachine {
-            inner: IncrementMachine::new(config.state_key()),
-            entered: Arc::clone(&entered),
-            release: Arc::clone(&release),
-        });
-        let catalog = Arc::new(PreinstalledModuleCatalog::new(Vec::new()).unwrap());
-        let app = preinstalled_wasm_structured_durable_router_with_executor(
-            StructuredDurableNativeComponents::new(
-                store,
-                Arc::new(MemoryBlobStore::default()),
-                transport,
-                Arc::new(ManualClock::new(10_000)),
-                Arc::new(SequenceIndexedIdentities::default()),
-            ),
-            PreinstalledWasmComposition::new(catalog, WasmExecutionEngine, 9),
-            protocol_config,
-            structured_request_authority(),
-            config,
-            resolver(),
-            machine,
-            blocking_executor.clone(),
-        )
-        .unwrap();
-
-        let first_app = app.clone();
-        let first = tokio::spawn(async move {
-            first_app
-                .oneshot(
-                    Request::post(NODE_EVENT_PATH)
-                        .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                        .body(Body::from(event(request_id(0xC8)).encode().unwrap()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-        });
-        entered.notified().await;
-
-        let overloaded = app
-            .oneshot(
-                Request::post(NODE_EVENT_PATH)
-                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                    .body(Body::from(event(request_id(0xC9)).encode().unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let (released, release_signal) = release.as_ref();
-        *released.lock().unwrap() = true;
-        release_signal.notify_all();
-        let first = first.await.unwrap();
-
-        assert_eq!(overloaded.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            to_bytes(overloaded.into_body(), 128).await.unwrap(),
-            "blocking-capacity-exhausted"
-        );
-        assert_eq!(first.status(), StatusCode::OK);
     }
 
     /// Proves `structured_durable_router` and `preinstalled_wasm_structured_durable_router`
@@ -8207,248 +8581,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_route_persists_dispatches_and_returns_canonical_result() {
-        let runtime = Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
-        let config = config();
-        let id = request_id(0x41);
-        let event_bytes = event(id).encode().unwrap();
-        let app = app(runtime.clone(), config.clone());
-        let response = app
-            .clone()
-            .oneshot(
-                Request::post(NODE_EVENT_PATH)
-                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                    .body(Body::from(event_bytes.clone()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
-            NODE_RESULT_MEDIA_TYPE
-        );
-        let bytes = to_bytes(response.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
-            .await
-            .unwrap();
-        let result = HttpNodeResult::decode(&bytes).unwrap();
-        assert_eq!(result.request_id(), id);
-        assert_eq!(result.responses().len(), 1);
-
-        let state = runtime
-            .state_store()
-            .get(config.state_key())
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            decode_canonical_frame(&state)
-                .unwrap()
-                .required_u64(1)
-                .unwrap(),
-            1
-        );
-        assert_eq!(runtime.transport().drain_outbound().unwrap().len(), 1);
-
-        let layout = PersistenceLayout::new(config.chain_id().clone(), config.protocol_version());
-        let delivery = runtime
-            .state_store()
-            .get(&layout.outbox_delivery_key(*id.as_bytes()))
-            .unwrap()
-            .unwrap();
-        let delivery = NodeOutboxDelivery::decode(&delivery).unwrap();
-        assert_eq!(delivery.next_index(), 1);
-        assert_eq!(delivery.lease(), None);
-
-        let duplicate = app
-            .oneshot(
-                Request::post(NODE_EVENT_PATH)
-                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                    .body(Body::from(event_bytes))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(duplicate.status(), StatusCode::OK);
-        let duplicate_bytes = to_bytes(duplicate.into_body(), MAX_HTTP_EVENT_BODY_BYTES)
-            .await
-            .unwrap();
-        assert_eq!(HttpNodeResult::decode(&duplicate_bytes).unwrap(), result);
-        let state = runtime
-            .state_store()
-            .get(config.state_key())
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            decode_canonical_frame(&state)
-                .unwrap()
-                .required_u64(1)
-                .unwrap(),
-            1
-        );
-        assert!(runtime.transport().drain_outbound().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn resolved_domain_route_commits_and_delivers_only_in_manifest_domain() {
-        let runtime = Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
-        let config = config();
-        let placement = placement(0x51, 7);
-        let domain = placement.domain();
-        let id = request_id(0x52);
-        let event_bytes = event(id).encode().unwrap();
-        let app = resolved_app(Arc::clone(&runtime), placement, config.clone());
-
-        let response = app
-            .clone()
-            .oneshot(
-                Request::post(NODE_EVENT_PATH)
-                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                    .body(Body::from(event_bytes.clone()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(runtime.transport().drain_outbound().unwrap().len(), 1);
-        assert_eq!(runtime.state_store().get(config.state_key()).unwrap(), None);
-
-        let state = runtime
-            .state_store()
-            .get_versioned_in_domain(domain, config.state_key())
-            .unwrap();
-        assert_eq!(
-            decode_canonical_frame(state.value().unwrap())
-                .unwrap()
-                .required_u64(1),
-            Ok(1)
-        );
-        let layout = PersistenceLayout::new(config.chain_id().clone(), config.protocol_version());
-        let delivery = runtime
-            .state_store()
-            .get_versioned_in_domain(domain, &layout.outbox_delivery_key(*id.as_bytes()))
-            .unwrap();
-        let delivery = NodeOutboxDelivery::decode(delivery.value().unwrap()).unwrap();
-        assert_eq!(delivery.next_index(), 1);
-        assert_eq!(delivery.lease(), None);
-
-        let duplicate = app
-            .oneshot(
-                Request::post(NODE_EVENT_PATH)
-                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                    .body(Body::from(event_bytes))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(duplicate.status(), StatusCode::OK);
-        assert!(runtime.transport().drain_outbound().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn resolved_domain_route_rejects_inactive_placement_without_state() {
-        let runtime = Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
-        let config = config();
-        let placement = placement(0x53, 8);
-        let domain = placement.domain();
-        let app = resolved_app(Arc::clone(&runtime), placement, config.clone());
-        let response = app
-            .oneshot(
-                Request::post(NODE_EVENT_PATH)
-                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                    .body(Body::from(event(request_id(0x54)).encode().unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            runtime
-                .state_store()
-                .get_versioned_in_domain(domain, config.state_key())
-                .unwrap()
-                .value(),
-            None
-        );
-        assert!(runtime.transport().drain_outbound().unwrap().is_empty());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn blocking_work_is_isolated_and_excess_requests_are_not_queued() {
-        let runtime = Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
-        let config = config();
-        let lease_ids = Arc::new(SequenceLeaseIds::default());
-        let blocking_executor =
+    async fn unattended_recovery_rejects_when_shared_blocking_capacity_is_exhausted() {
+        let runtime: Arc<MemoryRuntime> =
+            Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
+        let blocking_executor: NativeBlockingExecutor =
             NativeBlockingExecutor::new(NativeBlockingPolicy::new(NonZeroUsize::new(1).unwrap()));
-        let entered = Arc::new(Notify::new());
-        let release = Arc::new((Mutex::new(false), Condvar::new()));
-        let machine = Arc::new(BlockingMachine {
-            inner: IncrementMachine::new(config.state_key()),
-            entered: Arc::clone(&entered),
-            release: Arc::clone(&release),
-        });
-        let app = router_with_executor(
-            Arc::clone(&runtime),
-            config.clone(),
-            resolver(),
-            machine,
-            Arc::clone(&lease_ids),
-            blocking_executor.clone(),
-        );
+        let _held_permit = blocking_executor.try_acquire().unwrap();
 
-        let first_app = app.clone();
-        let first = tokio::spawn(async move {
-            first_app
-                .oneshot(
-                    Request::post(NODE_EVENT_PATH)
-                        .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                        .body(Body::from(event(request_id(0x51)).encode().unwrap()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-        });
-        entered.notified().await;
-
-        let live = app
-            .clone()
-            .oneshot(Request::get(LIVENESS_PATH).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let overloaded = app
-            .oneshot(
-                Request::post(NODE_EVENT_PATH)
-                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                    .body(Body::from(event(request_id(0x52)).encode().unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let recovery = recover_outboxes_once(
+        let result = recover_outboxes_once(
             runtime,
-            config,
-            lease_ids,
+            config(),
+            Arc::new(SequenceLeaseIds::default()),
             blocking_executor,
             None,
-            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
         )
         .await;
 
-        let (released, release_signal) = release.as_ref();
-        *released.lock().unwrap() = true;
-        release_signal.notify_all();
-        let first = first.await.unwrap();
-
-        assert_eq!(live.status(), StatusCode::NO_CONTENT);
-        assert_eq!(overloaded.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(matches!(
-            recovery,
+            result,
             Err(NativeOutboxRecoveryError::CapacityExhausted)
         ));
-        let overload_body = to_bytes(overloaded.into_body(), 128).await.unwrap();
-        assert_eq!(overload_body, "blocking-capacity-exhausted");
-        assert_eq!(first.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -8868,89 +9021,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_route_recovers_failed_send_after_lease_expiry_without_reapplying_state() {
-        let runtime = Arc::new(FailOnceRuntime::new());
-        let config = config();
-        let id = request_id(0x45);
-        let event_bytes = event(id).encode().unwrap();
-        let app = app(runtime.clone(), config.clone());
-
-        let failed_send = app
-            .clone()
-            .oneshot(
-                Request::post(NODE_EVENT_PATH)
-                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                    .body(Body::from(event_bytes.clone()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(failed_send.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-        let state = runtime
-            .state_store()
-            .get(config.state_key())
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            decode_canonical_frame(&state)
-                .unwrap()
-                .required_u64(1)
-                .unwrap(),
-            1
-        );
-        assert!(runtime.transport().drain_outbound().unwrap().is_empty());
-
-        let active_lease = app
-            .clone()
-            .oneshot(
-                Request::post(NODE_EVENT_PATH)
-                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                    .body(Body::from(event_bytes.clone()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(active_lease.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-        runtime.clock.set(31_000);
-        let recovered = app
-            .oneshot(
-                Request::post(NODE_EVENT_PATH)
-                    .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                    .body(Body::from(event_bytes))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(recovered.status(), StatusCode::OK);
-        assert_eq!(runtime.transport().drain_outbound().unwrap().len(), 1);
-
-        let state = runtime
-            .state_store()
-            .get(config.state_key())
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            decode_canonical_frame(&state)
-                .unwrap()
-                .required_u64(1)
-                .unwrap(),
-            1
-        );
-        let layout = PersistenceLayout::new(config.chain_id().clone(), config.protocol_version());
-        let delivery = runtime
-            .state_store()
-            .get(&layout.outbox_delivery_key(*id.as_bytes()))
-            .unwrap()
-            .unwrap();
-        let delivery = NodeOutboxDelivery::decode(&delivery).unwrap();
-        assert_eq!(delivery.attempts(), 2);
-        assert_eq!(delivery.next_index(), 1);
-        assert_eq!(delivery.lease(), None);
-    }
-
-    #[tokio::test]
     async fn native_route_rejects_media_type_and_malformed_event() {
         let runtime = Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
         let app = app(runtime.clone(), config());
@@ -8986,6 +9056,7 @@ mod tests {
         );
 
         let malformed = app
+            .clone()
             .oneshot(
                 Request::post(NODE_EVENT_PATH)
                     .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
@@ -8995,35 +9066,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(runtime.state_store().get(b"http/node-state").unwrap(), None);
-    }
+        assert_eq!(
+            to_bytes(malformed.into_body(), 128).await.unwrap(),
+            "invalid-node-event"
+        );
 
-    #[tokio::test]
-    async fn native_route_maps_context_conflict_and_body_limit() {
-        let runtime = Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
-        let app = app(runtime, config());
-        let wrong_context = NodeEvent::new(
-            ChainId::new("other-chain").unwrap(),
-            ProtocolVersion::new(3),
-            Epoch::new(7),
-            request_id(0x43),
-            node_core::NodeEventKind::Tick,
-            canonical(TEST_PAYLOAD_TYPE_ID, 1),
-        )
-        .unwrap();
-
-        let conflict = app
-            .clone()
+        let mut unknown_kind_frame = CanonicalStruct::new(0xE001, 1);
+        unknown_kind_frame.field_str(1, "sunrise-test").unwrap();
+        unknown_kind_frame.field_u32(2, 3).unwrap();
+        unknown_kind_frame.field_u64(3, 7).unwrap();
+        unknown_kind_frame
+            .field_bytes(4, request_id(0x45).as_bytes().to_vec())
+            .unwrap();
+        unknown_kind_frame.field_u16(5, u16::MAX).unwrap();
+        unknown_kind_frame
+            .field_bytes(6, canonical(TEST_PAYLOAD_TYPE_ID, 9))
+            .unwrap();
+        let unknown_kind = app
             .oneshot(
                 Request::post(NODE_EVENT_PATH)
                     .header(header::CONTENT_TYPE, NODE_EVENT_MEDIA_TYPE)
-                    .body(Body::from(wrong_context.encode().unwrap()))
+                    .body(Body::from(unknown_kind_frame.finish().unwrap()))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(unknown_kind.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            to_bytes(unknown_kind.into_body(), 128).await.unwrap(),
+            "invalid-node-event"
+        );
+        assert_eq!(runtime.state_store().get(b"http/node-state").unwrap(), None);
+    }
 
+    #[tokio::test]
+    async fn native_route_enforces_body_limit() {
+        let runtime = Arc::new(MemoryRuntime::new(ValidatorId::new([0x44; 32])));
+        let app = app(runtime, config());
         let oversized = app
             .oneshot(
                 Request::post(NODE_EVENT_PATH)
