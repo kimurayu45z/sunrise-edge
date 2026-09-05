@@ -2211,6 +2211,66 @@ signing keyはbrowser限定とする。両app間で共有UI packageは、real du
 独立したrelease cadenceが存在し、(c) E2Eがin-tree buildではなくreleaseされたdevnet
 artifactをtargetできるようになるまで、`clients/*`のいずれについても延期する。
 
+## Initial Code Security Audit Entry Gate
+
+**目的（2026-09-05、ARCHITECTURE.md DR-0097）:** production/mainnetの全機能と
+運用証跡を揃えてから初めて第三者監査を開始する旧解釈を廃止し、現在すでに動く
+CLI-first nodeのsecurity-critical coreを早期にfreezeして監査へ出す。このgateは
+「監査を開始できる固定scope」を定義するだけであり、Software Production Gate、
+CLI-First Node Production Gate、production readiness、mainnet readinessを意味しない。
+後から追加するprotocol/event/provider surfaceはfocused delta auditを受け、最終release
+gateでは全auditの重大指摘解消を引き続き要求する。
+
+**Current status:** audit scopeの大部分は実装・自動検証済みだが、外部event ingressを
+`SubmitTransaction`だけへ閉じるfail-closed変更と、audit scope/threat model packetの
+固定が未完了であるため、このgateは未通過。これを次の最優先sliceとする。
+
+### 最小completion criteria
+
+1. public/native `POST /v1/events`のaudit対象surfaceを、現在唯一end-to-endで認証・認可
+   される`SubmitTransaction`へ明示的に限定する。`ReceiveVote`、`ReceiveCertificate`、
+   `ReceiveConsensusMessage`、governance/protocol-upgrade/validator-set certificate、
+   `Tick`を含む全non-`SubmitTransaction` kindは、各family固有の認証・認可を実装するまで
+   external ingressでtypedかつopaqueに、identity allocation・clock・storage I/O・state
+   transitionより前にfail closedする。全familyを先に実装することはこのgateの条件ではない。
+2. immutable audit commitとin-scope surfaceを固定する。初回監査対象はcanonical encoding/
+   hashing/signature framing、`SubmitTransaction` authentication、nonce/replay/dedup、owned
+   object access/effects、preinstalled deterministic WASM、ordinary-asset fee composition、
+   runtime structured transaction、SQLite/PostgreSQLのatomic state/object/receipt/outbox、
+   両adapterのblob-reference mapping、runtime publication contractとlocal SQLite blob store、
+   native HTTP bounds/error mapping、Rust client/CLIの
+   pre-signing context/TLS boundaryとする。
+3. `SECURITY.md`または同等のaudit packetに、trust boundary、attacker capabilities、key/
+   signer assumptions、supported surface、known limitations、out-of-scope項目、完全な検証
+   command、private vulnerability reporting routeを記録する。既存stable vectorsと
+   `npm ci --prefix adapters/cloudflare-workers` + `./scripts/check-all.sh`が固定audit commitで
+   成功し、作業treeがcleanであることを記録する。
+
+この3 criteriaを満たしたimmutable commitを対象に、直ちに初回第三者code security auditを
+開始する。current in-scope codeのCritical/High指摘をremediationし、監査開始後に追加した
+protocol-critical surfaceは同じ監査のdelta reviewまたは後続focused auditへ送る。最終
+production releaseにはMedium以下を含むaccepted-risk記録と、cross-phase release gateが
+要求する重大指摘解消を別途必要とする。
+
+### 初回監査を待たせない項目の分類
+
+| 項目 | 初回code audit前 | production/live activation前 |
+| --- | --- | --- |
+| FastCertificate + certificate publicationのatomic composition | out-of-scopeとしてdefer | multi-validator protocol v3 activation前に実装し、delta audit必須 |
+| non-`SubmitTransaction` event family | 全family実装は不要。external ingressでfail closedだけ必須 | externally受理する各familyの認証・認可を実装し、delta audit必須 |
+| checkpoint/state-root publication + verified restore | defer | production state recovery/commitmentをclaimする前に実装・rehearsal・delta audit |
+| PostgreSQL transactional outbox | state/receipt/outbox atomic commit、indexed claim/ack、reconciliationはimplemented As-Isで監査対象 | provider運用、retention、monitoringを選定deploymentへ接続 |
+| PITR、backup、off-host restore | defer | concrete RPO/RTOとdeployment topologyが要求する範囲でrelease前にrehearsal |
+| HA、writer failover、fencing orchestration | durable fence contractは監査対象、実HAはdefer | chosen topologyとsplit-brain threat modelに基づきrelease前に証明 |
+| TLS certificate rotation/revocation | current TLS/context boundaryは監査対象、lifecycle運用はdefer | chosen PKI/ingressのrotationをrelease前にrehearsal |
+| real fault、ENOSPC、load/soak/capacity | 既存bounded fault証跡を監査対象とし、追加網羅はdefer | concrete SLO/limitsから必要caseとbudgetを決めてcertify |
+
+この分類は項目の削除ではなく、**初回監査の開始条件からproduction operationsを外す**
+resequenceである。現時点でPostgreSQL transactional outbox contractは再実装TODOではない。
+database-process SIGKILL、pre-commit data/WAL ENOSPC、connection exhaustion、snapshot restore、
+TLS commit-loss、PgBouncer rehearsalも既存As-Is evidenceとして監査へ提示し、未実装の
+physical media faultや長期soakを同じ項目として重複実装しない。
+
 ## CLI-First Node Production Gate
 
 CLI Developer MVP Gate（criteria 1-6・10・11）を通過した後、本物のnode自体を
@@ -2218,6 +2278,7 @@ production-orientedへ近づけるgateを課す。これはUIより先に
 node/persistence/operationsを固める決定であり、新しいproduction criteriaを
 発明するものではない。2026-09-05のDR-0095により、S0-S3を共通baselineとし、
 S4 Hardware Signing Release GateとS5 Software Production Gateを並行trackとして扱う。
+Initial Code Security Audit Entry Gateと初回監査はこのproduction gateの完了を待たずに先行する。
 TypeScript client・explorer・wallet（criteria 7-9）はSoftware Production Gateの後に
 着手できるが、completeなCLI-First Node Production Gate、production、mainnet readiness
 にはS4とS5の両方が必要である。以下はすべて既存criteriaを変更せず参照する。
@@ -2266,8 +2327,8 @@ TypeScript client・explorer・wallet（criteria 7-9）はSoftware Production Ga
   unauthenticatedのまま受理してよいことを意味しない）。
 
 **このgateを通過してもmainnetではない。** provider Phase 16（Cloudflare）・
-Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、
-独立したsecurity auditは、このgate通過後も引き続き必須である。
+Phase 17（Deno/Vercel/Supabase/AWS）のTo-Be production exit criteriaと、初回監査後に
+追加されたsurfaceのdelta audit、全監査の重大指摘解消は引き続き必須である。
 
 ### Software and hardware release gates
 
@@ -2537,11 +2598,13 @@ hard constraintも変更しない。
     reproducibility evidence、Ledger release/submission evidenceを揃え、CLIのdev-only
     `LocalSigner`をactual production pathで置き換える。Sunrise Edgeにはまだregistered
     BIP44/SLIP-0044 coin typeがなく、S4aのpathはdevnet-only provisionalである。
-- **S5**: production persistence（PERSISTENCE.md/POSTGRES.mdのTo-Be）、
-  transactional outbox運用、provider deployment（Cloudflare Durable Object/AWS）、
-  operations（observability、runbook）、security（independent audit）、release
-  evidence（migration/backup/disaster recovery rehearsal、reproducible build）を
-  完成させる。
+- **S5**: Initial Code Security Audit Entry Gateを先行させた後、production persistence
+  （PERSISTENCE.md/POSTGRES.mdのTo-Be）、既に実装済みのtransactional outbox contractを
+  selected providerの運用へ接続する作業、provider deployment（Cloudflare Durable
+  Object/AWS）、operations（observability、runbook）、初回監査後のdelta security review、
+  release evidence（migration/backup/disaster recovery rehearsal、reproducible build）を
+  完成させる。transactional outboxのatomic commit/indexed claim/ack contract自体を
+  未実装として作り直さない。
 
 capacity/PITR/HAは、S5で明示的にtriggerされる（S5のcertificationやSLOが実際に
 それらを要求する）までfrozenのままとする。これは既存の凍結方針

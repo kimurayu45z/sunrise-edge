@@ -42,6 +42,11 @@ The current product path is CLI-first:
   restart, though ordinary devnet traffic never crosses the threshold today.
   A durable production/cloud provider `BlobStore` (PostgreSQL/Cloudflare/AWS),
   garbage collection, and checkpoint manifests remain unimplemented.
+- The next milestone is the **Initial Code Security Audit Entry Gate**: close public
+  event ingress to the currently authenticated `SubmitTransaction` surface,
+  freeze the audit scope and threat model, then start an external audit. It
+  does not wait for FastCertificate, PITR/HA, provider operations, or the other
+  production-only work; later surfaces require focused delta review.
 - The **Software Production Gate** consists of S0-S3 plus S5. S5 persistence,
   provider deployment, operations, security-audit, and release evidence remain
   incomplete.
