@@ -394,10 +394,11 @@ mod tests {
     use canonical_encoding::CanonicalStruct;
     use crypto::CryptoError;
     use execution::decode_transaction;
-    use fees::{Amount, AssetId, FeePayment};
+    use fees::{Amount, FeePayment};
     use objects::{AccessMode, ObjectId};
     use protocol_types::{Digest32, HashAlgorithmId};
     use signing_view::{ClearSigningPolicyError, DEVNET_ASSET_TRANSFER_POLICY, SigningViewError};
+    use standard_assets::AssetId;
     use std::{cell::Cell, fmt};
 
     fn sample_module_ref() -> ObjectRef {

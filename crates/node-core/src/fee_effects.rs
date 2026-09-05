@@ -17,8 +17,9 @@
 use core::fmt;
 use std::error::Error;
 
-use fees::{AssetId, FeeAssetRegistry, GasSchedule};
+use fees::{FeeAssetRegistry, GasSchedule};
 use objects::ObjectId;
+use standard_assets::AssetId;
 
 /// Deterministic settlement input for one fee charge over two asset-account
 /// bodies: the payer (declared, sender-owned) and the trusted composition

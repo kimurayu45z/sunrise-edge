@@ -10,9 +10,9 @@ use canonical_encoding::{
 use core::fmt;
 use objects::{ObjectRef, decode_object_ref, encode_object_ref};
 use runtime::ValidatorId;
+use standard_assets::{AssetId, StandardAssetError, decode_asset_id, encode_asset_id};
 use std::error::Error;
 
-const ASSET_ID_TYPE_ID: u16 = 0x7001;
 const FEE_PAYMENT_TYPE_ID: u16 = 0x7002;
 const FEE_ASSET_TYPE_ID: u16 = 0x7003;
 const FEE_ASSET_REGISTRY_TYPE_ID: u16 = 0x7004;
@@ -21,15 +21,14 @@ const FEE_USAGE_TYPE_ID: u16 = 0x7006;
 const VALIDATOR_FEE_SHARE_TYPE_ID: u16 = 0x7007;
 const FEE_DISTRIBUTION_TYPE_ID: u16 = 0x7008;
 const ENCODING_VERSION: u16 = 1;
-const IDENTIFIER_LEN: usize = 32;
 const MAX_REGISTRY_ASSETS: usize = u16::MAX as usize - 1;
 const MAX_SIGNERS: usize = u16::MAX as usize - 3;
 
 /// Errors returned by fee helpers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeeError {
-    /// An asset identifier had the wrong length.
-    InvalidAssetIdLength(usize),
+    /// A general-purpose asset identifier was malformed.
+    StandardAsset(StandardAssetError),
     /// Fee conversion rates must be explicitly non-zero.
     ZeroFeeUnitsPerAssetUnit,
     /// The fee-asset registry contains more items than can be canonically encoded.
@@ -61,10 +60,7 @@ pub enum FeeError {
 impl fmt::Display for FeeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidAssetIdLength(length) => write!(
-                f,
-                "asset identifiers must be {IDENTIFIER_LEN} bytes, got {length}"
-            ),
+            Self::StandardAsset(error) => error.fmt(f),
             Self::ZeroFeeUnitsPerAssetUnit => {
                 write!(f, "fee-units-per-asset-unit must be non-zero")
             }
@@ -116,43 +112,9 @@ impl From<objects::ObjectError> for FeeError {
     }
 }
 
-/// A stable canonical asset identifier.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AssetId {
-    bytes: [u8; IDENTIFIER_LEN],
-}
-
-impl AssetId {
-    /// Creates an asset identifier.
-    #[must_use]
-    pub const fn new(bytes: [u8; IDENTIFIER_LEN]) -> Self {
-        Self { bytes }
-    }
-
-    /// Parses an asset identifier from raw bytes.
-    pub fn try_from_slice(bytes: &[u8]) -> Result<Self, FeeError> {
-        if bytes.len() != IDENTIFIER_LEN {
-            return Err(FeeError::InvalidAssetIdLength(bytes.len()));
-        }
-
-        let mut array = [0u8; IDENTIFIER_LEN];
-        array.copy_from_slice(bytes);
-        Ok(Self::new(array))
-    }
-
-    /// Returns the raw bytes.
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; IDENTIFIER_LEN] {
-        &self.bytes
-    }
-}
-
-impl fmt::Display for AssetId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.bytes {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+impl From<StandardAssetError> for FeeError {
+    fn from(value: StandardAssetError) -> Self {
+        Self::StandardAsset(value)
     }
 }
 
@@ -371,22 +333,6 @@ pub struct FeeDistribution {
     pub total_amount: Amount,
     /// Deterministic signer payouts in canonical validator order.
     pub shares: Vec<ValidatorFeeShare>,
-}
-
-/// Encodes an asset identifier.
-pub fn encode_asset_id(asset_id: &AssetId) -> Result<Vec<u8>, FeeError> {
-    let mut canonical = CanonicalStruct::new(ASSET_ID_TYPE_ID, ENCODING_VERSION);
-    canonical.field_bytes(1, asset_id.as_bytes())?;
-    Ok(canonical.finish()?)
-}
-
-/// Decodes one canonical asset identifier.
-pub fn decode_asset_id(input: &[u8]) -> Result<AssetId, FeeError> {
-    let frame: CanonicalFrame<'_> = decode_canonical_frame(input)?;
-    frame.require_type(ASSET_ID_TYPE_ID)?;
-    frame.require_version(ENCODING_VERSION)?;
-    frame.require_only_fields(&[1])?;
-    AssetId::try_from_slice(frame.required_field(1)?)
 }
 
 /// Encodes a fee payment.
@@ -660,12 +606,12 @@ mod tests {
     }
 
     #[test]
-    fn asset_id_decoder_rejects_wrong_length() {
-        let mut short = CanonicalStruct::new(ASSET_ID_TYPE_ID, ENCODING_VERSION);
+    fn asset_id_decoder_propagates_standard_asset_errors() {
+        let mut short = CanonicalStruct::new(standard_assets::ASSET_ID_TYPE_ID, ENCODING_VERSION);
         short.field_bytes(1, [0x11; 31]).unwrap();
         assert_eq!(
             decode_asset_id(&short.finish().unwrap()),
-            Err(FeeError::InvalidAssetIdLength(31))
+            Err(StandardAssetError::InvalidAssetIdLength(31))
         );
     }
 

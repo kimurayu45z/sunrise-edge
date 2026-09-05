@@ -1,6 +1,6 @@
 # Architecture decision DR-0104
 
-Establish the Asset Standards Gate and the compatibility boundary for the
+Establish the Asset Standards Gate and the activation/replacement boundary for the
 first standard-asset foundation.
 
 - **DR-0104: gate asset semantics before builder or public-testnet exposure.**
@@ -68,13 +68,49 @@ first standard-asset foundation.
   creation, and the resulting derivation context must remain sufficient to
   reproduce historical identifiers after a hash-suite or protocol upgrade.
 
-  This decision intentionally allocates no canonical type ID, enum tag, hash
+  The initial gate intentionally allocated no canonical type ID, enum tag, hash
   domain ID, feature flag, module ID, host-ABI number, or fixed vector. Before
   implementation activates any of these bytes, a follow-up additive decision
   must audit the complete existing identifier namespace, allocate every stable
   value once, specify the exact canonical fields and byte order, and pin both
   derivation and negative/adversarial vectors. No existing identifier may be
   reused or reinterpreted.
+
+  **Implemented identity and value schemas (this slice).** A follow-up audit
+  of the complete existing identifier namespace has allocated the stable
+  values below for identity and value schemas only. Module activation,
+  `Create`, owner change, transfer, CLI, fee integration, metadata, standalone
+  minting, and supply accounting activate none of these bytes and remain
+  future work. `HashDomain::AssetId = 0x000E` and the corresponding
+  `HashPurpose::AssetId` bind Standard Asset v1 identity derivation into the
+  existing domain-separated hashing framework; `HashSuite::algorithm_for`
+  selects the active suite's protocol-configuration hash algorithm for this
+  purpose, the same algorithm already used for
+  `HashPurpose::SystemModuleManifest`, so no caller may select a derivation
+  algorithm. `AssetId` moves from `fees` into the asset subsystem with its
+  existing `0x7001` canonical type ID because its meaning has not changed.
+  The audit reserves unused `0x7100` through `0x7103` for this implementation:
+  `StandardAssetDefinitionV1` is `0x7101`, `StandardAssetCoinV1` is `0x7102`, and
+  `StandardAssetMintCapabilityV1` is `0x7103` (the AssetId derivation input
+  frame, `0x7100`, is a private encoding detail, not a public schema).
+  `StandardAssetDefinitionV1` binds `asset_id`, `creation_authority: Address`,
+  a non-zero 32-byte caller-supplied `creation_seed`, `creation_epoch`,
+  `creation_protocol_version`, and `derivation_algorithm`, and can validate
+  that the supplied resolver has the recorded protocol version before its
+  stored `asset_id` and `derivation_algorithm` are recomputed.
+  `StandardAssetCoinV1` binds exactly one `asset_id` and a non-zero
+  `amount`. `StandardAssetMintCapabilityV1` binds exactly one `asset_id`.
+  Strict decoders reject wrong type/version, missing/unknown fields,
+  malformed lengths, unknown hash algorithms, a zero coin amount, and
+  trailing bytes; derivation is pinned to change with creation authority,
+  creation seed, chain, protocol version, and epoch/hash-suite schedule. The
+  `AssetCreationSeed` type is deliberately distinct from node-core's
+  request-idempotency `RequestId`; a caller may derive the former from the
+  latter, but Rust code cannot accidentally interchange the two. No module
+  activation, `Create`, owner change, CLI
+  surface, minting, or fee integration exists yet, and duplicate-identity
+  fail-closed enforcement remains future work because it requires the object
+  store and `Create` path this slice does not implement.
 
   **Create and owner change remain narrow future capabilities.** Although the
   execution layer can represent `ObjectEffect::Created`, no existing generic or
@@ -101,12 +137,17 @@ first standard-asset foundation.
   transaction before any object mutation can commit. This check is necessary
   but is not itself Create or owner-change authorization.
 
-  **Compatibility and fees.** `fees::AssetId` and its canonical encoding remain
-  unchanged. The existing devnet-local asset account and catalog bytes
-  (`0xF001`, `0xF010`, and `0xF011`), their pinned WAT/WASM and hashes, seeded
-  object identifiers, transfer behavior, and fee vectors remain historical
-  compatibility constraints. They are not relabeled as Standard Asset v1 and
-  require no migration in this decision. A Standard Asset v1 selected by fee
+  **Development fixtures and fees.** `AssetId` belongs to the new,
+  dependency-light `standard-assets` crate; fee code imports that protocol
+  type directly instead of exposing a transitional compatibility facade. No
+  Sunrise Edge release exists. The
+  existing devnet-local asset account and catalog bytes (`0xF001`, `0xF010`,
+  and `0xF011`), their pinned WAT/WASM and hashes, seeded object identifiers,
+  transfer behavior, and fee vectors are therefore development fixtures, not
+  a public compatibility obligation: Standard Asset v1 activation is expected
+  to replace them outright, not migrate or dual-support them. This decision
+  does not relabel them as Standard Asset v1 and does not commit to
+  preserving them historically. A Standard Asset v1 selected by fee
   policy pays fees from ordinary Standard Asset v1 coin objects under the same
   ownership, exact-version, checked-arithmetic, and atomic-effect rules as
   transfers; fee eligibility and rates remain protocol policy, never a native
@@ -116,13 +157,14 @@ first standard-asset foundation.
   certificate-signer distribution design remains open and requires its own
   bounded, deterministic decision before activation.
 
-  **Deferred slices.** Canonical definition/coin/capability schemas and
-  stable identifiers; authenticated issuance; metadata authenticity and
-  update rules; mint, burn, fixed or capped supply, supply accounting and
-  proofs; capability taxonomy, delegation, transfer, revocation, recovery, and
-  destruction; freeze/close/allowance behavior; Standard Asset module code and
-  activation; governed fee-asset admission; and the complete Unique Asset v1
-  design and implementation all remain future work. Until those slices and
-  their focused delta security review are complete, the names and derivation
-  requirements in this decision are a foundation, not a claim that a
-  production asset standard is available.
+  **Deferred slices.** Authenticated issuance (`Create`); coin `ObjectId`
+  derivation reuse from the generic created-object formula; owner change and
+  transfer; metadata authenticity and update rules; mint, burn, fixed or
+  capped supply, supply accounting and proofs; capability taxonomy,
+  delegation, transfer, revocation, recovery, and destruction; freeze/close/
+  allowance behavior; Standard Asset module code and activation; governed
+  fee-asset admission; and the complete Unique Asset v1 design and
+  implementation all remain future work. Until those slices and their
+  focused delta security review are complete, the names, derivation
+  requirements, and implemented schemas in this decision are a foundation,
+  not a claim that a production asset standard is available.

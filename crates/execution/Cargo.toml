@@ -16,4 +16,5 @@ sha2 = { workspace = true }
 wasmi = { workspace = true }
 
 [dev-dependencies]
+standard-assets = { workspace = true }
 wat = { workspace = true }

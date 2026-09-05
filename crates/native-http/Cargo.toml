@@ -27,5 +27,6 @@ abi.workspace = true
 crypto.workspace = true
 ed25519-zebra.workspace = true
 runtime-sqlite.workspace = true
+standard-assets.workspace = true
 system-modules.workspace = true
 wat.workspace = true

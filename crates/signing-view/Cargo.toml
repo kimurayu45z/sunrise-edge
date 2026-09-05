@@ -14,3 +14,4 @@ protocol-types.workspace = true
 
 [dev-dependencies]
 execution.workspace = true
+standard-assets.workspace = true

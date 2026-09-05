@@ -1013,11 +1013,11 @@ impl From<IndexedOutboxContractError> for DevnetSeedError {
 mod tests {
     use super::*;
     use ed25519_zebra::{SigningKey, VerificationKey};
-    use fees::AssetId;
     use protocol_types::{ChainId, HashAlgorithmId, HashSuite, HashSuiteSchedule, ProtocolVersion};
     use runtime::{
         MemoryBlobStore, MemoryDurableStateStore, StorageCorrelationId, StorageDeadline,
     };
+    use standard_assets::AssetId;
 
     fn resolver() -> HashSuiteResolver {
         HashSuiteResolver::new(

@@ -5,7 +5,7 @@
 use abi::{AccessEntry, AccessManifest, encode_access_manifest};
 use canonical_encoding::{CanonicalDecodingError, CanonicalStruct};
 use crypto::{CryptoError, SignatureDomain, SignatureMessageType, frame_signature_message};
-use fees::{Amount, AssetId, FeePayment, encode_fee_payment};
+use fees::{Amount, FeePayment, encode_fee_payment};
 use objects::{AccessMode, Address, ObjectId, ObjectRef, encode_object_ref};
 use protocol_types::{
     ChainId, Digest32, Epoch, HashAlgorithmId, ProtocolVersion, SignatureSchemeId,
@@ -15,6 +15,7 @@ use signing_view::{
     TransactionSignable, build_clear_signing_view, decode_transaction_signable,
     encode_transaction_signable,
 };
+use standard_assets::AssetId;
 
 const TRANSACTION_TYPE_ID: u16 = 0x6001;
 const ENCODING_VERSION: u16 = 1;

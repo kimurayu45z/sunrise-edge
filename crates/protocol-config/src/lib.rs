@@ -740,12 +740,13 @@ pub fn encode_protocol_config(config: &ProtocolConfig) -> Result<Vec<u8>, Protoc
 mod tests {
     use super::*;
     use bonds::BondAssetConfig;
-    use fees::{Amount, AssetId, FeeAsset};
+    use fees::{Amount, FeeAsset};
     use governance::GovernanceConfig;
     use protocol_types::{Epoch, HashAlgorithmId, HashSuite};
     use protocol_upgrades::{
         CompatibilityPolicy, FeatureFlag, ProtocolUpgrade, ProtocolUpgradeSchedule,
     };
+    use standard_assets::AssetId;
     use system_modules::{ModuleId, ModuleStatus, SystemModule};
 
     fn hex(bytes: &[u8]) -> String {

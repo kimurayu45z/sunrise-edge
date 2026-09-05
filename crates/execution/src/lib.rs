@@ -981,12 +981,13 @@ pub use execution_proof::{
 mod tests {
     use super::*;
     use abi::{AccessEntry, AccessManifest};
-    use fees::{Amount, AssetId, FeePayment};
+    use fees::{Amount, FeePayment};
     use objects::{AccessMode, Address, ObjectId, ObjectRef, Owner};
     use protocol_types::{
         ChainId, Digest32, Epoch, HashAlgorithmId, HashSuite, HashSuiteId, HashSuiteSchedule,
         ProtocolVersion,
     };
+    use standard_assets::AssetId;
 
     fn sample_chain_id() -> ChainId {
         ChainId::new("sunrise-devnet").unwrap()

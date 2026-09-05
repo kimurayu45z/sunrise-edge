@@ -109,8 +109,9 @@ pub use objects::{
 // adds no devnet or other application-specific semantics.
 pub use abi::{AccessEntry, AccessManifest};
 pub use canonical_encoding::{CanonicalEncodingError, CanonicalStruct};
-pub use fees::{Amount, AssetId, FeePayment};
+pub use fees::{Amount, FeePayment};
 pub use protocol_types::{
     AtomicityDomainId, ChainId, Digest32, Epoch, HashAlgorithmId, HashSuiteId, ProtocolVersion,
     SignatureSchemeId, TypeError,
 };
+pub use standard_assets::AssetId;

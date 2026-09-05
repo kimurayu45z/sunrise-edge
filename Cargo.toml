@@ -12,6 +12,7 @@ members = [
     "crates/runtime-postgres",
     "crates/runtime-sqlite",
     "crates/execution",
+    "crates/standard-assets",
     "crates/fees",
     "crates/bonds",
     "crates/governance",
@@ -50,6 +51,7 @@ runtime = { path = "crates/runtime" }
 runtime-postgres = { path = "crates/runtime-postgres" }
 runtime-sqlite = { path = "crates/runtime-sqlite" }
 execution = { path = "crates/execution" }
+standard-assets = { path = "crates/standard-assets" }
 fees = { path = "crates/fees" }
 bonds = { path = "crates/bonds" }
 governance = { path = "crates/governance" }
