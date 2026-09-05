@@ -16,8 +16,8 @@ use native_http::{
 };
 use node_core::{NodeConfig, NodeCoreError};
 use objects::ObjectId;
-use runtime::{MemoryBlobStore, SystemClock, WriterFenceGeneration};
-use runtime_sqlite::SqliteDurableStore;
+use runtime::{SystemClock, WriterFenceGeneration};
+use runtime_sqlite::{SqliteBlobStore, SqliteDurableStore};
 use std::{error::Error, fmt, num::NonZeroUsize, sync::Arc};
 
 const REQUEST_OPERATION_TIMEOUT_MILLIS: u64 = 5_000;
@@ -32,8 +32,16 @@ const OUTBOX_LEASE_MILLIS: u64 = 30_000;
 /// destination account, never request input. Every preinstalled-WASM
 /// invocation is wired through [`AssetAccountFeeComposer`], the devnet's
 /// trusted `FeeEffectComposer` implementation.
+///
+/// `blob_store` is the file-backed `SqliteBlobStore` opened by
+/// [`crate::boot_local_store`] alongside the structured store (DR-0096): a
+/// blob-backed object reference now survives a devnet restart, unlike the
+/// process-local `MemoryBlobStore` DR-0094 wired here previously. Durable
+/// provider (PostgreSQL/Cloudflare/AWS) blob storage and GC/checkpoint
+/// manifest work remain deferred.
 pub fn compose_devnet_router(
     store: Arc<SqliteDurableStore>,
+    blob_store: Arc<SqliteBlobStore>,
     asset_module: DevnetAssetModule,
     boot_generation: WriterFenceGeneration,
     max_concurrent: usize,
@@ -53,15 +61,9 @@ pub fn compose_devnet_router(
         DEVNET_GENERIC_STATE_KEY.to_vec(),
     )
     .map_err(DevnetCompositionError::NodeCore)?;
-    // The devnet's durable object store (`SqliteDurableStore`) has no durable
-    // `BlobStore` implementation yet (DR-0094): blob fetch/verification is
-    // wired As-Is with a process-local `MemoryBlobStore`, so a blob-backed
-    // object reference never survives a restart. Durable provider blob
-    // storage, upload/publication, and GC/checkpoint manifest work remain
-    // deferred; nothing in this devnet composition writes a blob reference.
     let components = StructuredDurableNativeComponents::new(
         store,
-        Arc::new(MemoryBlobStore::default()),
+        blob_store,
         Arc::new(DevnetTransport::new(admission)),
         Arc::new(SystemClock),
         Arc::new(DevnetOutboxIdentitySource::new_after(
@@ -196,9 +198,11 @@ mod tests {
         let context =
             build_devnet_protocol_context(config.chain_id().clone(), config.epoch()).unwrap();
         let module = build_asset_module(context, ASSET_ACCOUNT_WASM.to_vec()).unwrap();
+        let (store, blob_store) = boot.into_parts();
 
         let router = compose_devnet_router(
-            Arc::new(boot.into_store()),
+            Arc::new(store),
+            Arc::new(blob_store),
             module,
             generation,
             config.max_concurrent(),

@@ -1234,9 +1234,10 @@ an execution caller must separately read the exact immutable version, match
 its version/digest to the head, decode the inline Object, and compare its typed
 owner. Node-core's authenticated durable entrypoints now fetch a blob-backed
 version's body from an explicit, separately supplied `BlobStore` component and
-independently verify it before authorization (DR-0094); durable provider blob
-storage and blob upload/publication remain unimplemented, so a blob-backed
-version still cannot be created or persisted durably.
+independently verify it before authorization (DR-0094). DR-0096 additionally
+publishes over-threshold new versions before their structured commit and adds
+local file-backed SQLite blob storage; production/cloud provider blob storage
+remains unimplemented.
 The generation-one SQL `type_id` is the stable
 canonical Object record ID rather than the logical `Object::type_hash` retained
 inside canonical bytes. Memory and PostgreSQL apply object/state/receipt/outbox
@@ -1245,8 +1246,8 @@ state. Node-core now uses the object section for authenticated read-only
 manifest authorization and exact head assertions, plus an additive
 owned-effects path that commits validated signed Address-object Update/Delete
 mutations, both now reading a blob-backed input through an explicit `BlobStore`
-component (DR-0094); Create, Shared/System ownership, and blob upload/
-publication of a new version remain deferred. Indexed outbox
+component (DR-0094); over-threshold new-version publication is implemented by
+DR-0096, while Create and Shared/System ownership remain deferred. Indexed outbox
 repositories now refine the structured store trait so one implementation owns
 initial commit and later delivery state. An additive node-core handler now
 resolves the manifest domain before I/O, checks the typed receipt before state
@@ -1584,8 +1585,8 @@ limitations that
 must stay visible at devnet startup and in documentation once implemented:
 single validator; owned-object only (Create and Shared/System ownership remain
 fail-closed; a blob-backed input is fetched and independently verified through
-an explicit `BlobStore` component (DR-0094), but blob upload/publication of a
-new version is not implemented); one fixed ordinary fee asset and one ordinary
+an explicit `BlobStore` component (DR-0094), and DR-0096 publishes only a new
+version larger than the fixed inline threshold); one fixed ordinary fee asset and one ordinary
 treasury without validator/certificate distribution, gas categories other
 than base/execution pricing, or production economics; only the exact policy-bounded existing Address-owned destination
 may differ from the sender, while literal owner reassignment/gifting remains
@@ -4459,11 +4460,13 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   **Mutation surface unchanged, read surface widened.** A declared
   `Write`/`Consume` access on the owned-effects and preinstalled-WASM
   entrypoints may now read a blob-backed previous version through the
-  identical loader and verification path as a read-only access; every new
-  immutable version either entrypoint commits is still always inline
+  identical loader and verification path as a read-only access. At the time
+  of this decision, every new immutable version either entrypoint committed
+  was still always inline
   (`authenticated_object_effects::translate_update` never constructs a
   `DurableObjectPayload::BlobReference`), so blob upload/publication of a new
-  version remains unimplemented by simple absence of a code path. The bounded
+  version was unimplemented by simple absence of a code path; DR-0096 later
+  added thresholded publication without changing `translate_update`. The bounded
   query API (`node_core::query_object`, §43) is unchanged: it still returns
   only a `CurrentBlobReference` result's explicit head/version metadata and
   digests, and still never fetches or verifies a blob body, preserving the
@@ -4533,3 +4536,205 @@ version 1, and fail closed on zero identity/rule version, empty access, or
   work ordering only. It changes no canonical bytes, identifiers, digests,
   signature payloads, execution effects, object layout, persistence schema,
   runtime API, CLI flag, module/WAT/WASM byte, or implemented capability.
+
+- DR-0096: Publish a new immutable object version an accepted authenticated
+  Create/Update mutation commits to the explicit `BlobStore` from DR-0094
+  when — and only when — its canonical bytes exceed a fixed deterministic
+  threshold, referencing it instead of storing it inline, and add a local
+  file-backed `runtime-sqlite::SqliteBlobStore` so a devnet-composed
+  blob-backed version survives a restart. This is further non-Ledger S5
+  prerequisite work; it changes none of DR-0095's exit criteria, and S4, S5,
+  the `CLI-First Node Production Gate`, production, and mainnet readiness
+  all remain incomplete.
+
+  Only authenticated `Update` is reachable in the current product path;
+  authenticated Create-effect support remains fail-closed and deferred. The
+  staging helper handles both mutation variants so a future accepted Create
+  cannot silently bypass the same persistence policy, but this decision does
+  not make Create reachable.
+
+  **A fixed 64 KiB inline/blob threshold, not unconditional publication.**
+  An initial draft of this DR published every new version unconditionally,
+  which broke the CLI: `apps/cli`'s transfer command requires `CurrentInline`
+  and cannot fetch a blob body, so a second transfer against an
+  already-published account would have failed. `node-core::MAX_INLINE_OBJECT_BODY_BYTES`
+  (64 KiB of exact canonical-encoded bytes) fixes this: a version at or under
+  the threshold stays inline exactly as before this DR, and only a version
+  whose canonical bytes exceed it is published and referenced. Every
+  node applies the identical fixed threshold to the identical canonical bytes.
+  This is a deterministic persistence-layout policy, not transaction input or
+  a protocol-config knob, and it changes neither canonical object bytes nor the
+  logical digest/head. It is set far above ordinary small object bodies — a devnet asset-account body
+  is a few dozen bytes — specifically so small-object callers keep working
+  unchanged; only a body actually large enough to justify separate
+  content-addressed storage crosses it.
+
+  **`BlobStore::put_blob` is atomic insert-if-absent, not a blind
+  overwrite.** Content-addressing means a digest determines its content
+  uniquely, so storing byte-identical bytes under an already-present digest
+  is a defined idempotent no-op success (the ordinary case for a retried or
+  duplicate publication of the same version), while storing different bytes
+  under an already-present digest is a new fail-closed
+  `RuntimeError::BlobDigestConflict`, never a silent overwrite. This defines
+  no delete or garbage-collection operation, but that is not a claim that
+  every publisher retains every blob forever — GC/checkpoint manifest work
+  that would reclaim unreferenced blobs remains deferred, not ruled out.
+  `MemoryBlobStore` implements this by comparing against the existing entry
+  under its lock; a poisoned lock (another caller panicked mid-mutation, so
+  the map's contents are no longer trustworthy) now fails closed with
+  `RuntimeError::DurableStoreUnavailable` rather than recovering a guard
+  over possibly-torn state.
+
+  **Node-core stages the inline/blob decision as a pure, I/O-free pass,
+  separate from where the actual `put_blob` calls run, and `translate_update`
+  stays pure throughout.** `translate_authenticated_object_effects`/
+  `translate_fee_only_object_effects` are unchanged: they still produce
+  inline `DurableObjectMutation::Update` entries exactly as before, and
+  `translate_update` itself performs no I/O and is unaware publication
+  exists. A new pure function in `handle_durable_idempotent_event_with_plan`,
+  `stage_object_mutations_for_blob_store`, runs immediately after those
+  translations (every effect has already been validated, though the
+  complete envelope has not yet — see below) and does no I/O itself: for
+  each `Create`/`Update` mutation whose inline canonical bytes exceed the
+  threshold, it replaces the payload with `DurableObjectPayload::BlobReference`
+  reusing the version's already-computed object `digest` unchanged as the
+  payload's own `blob_digest` — the same value a verified read later
+  re-derives and compares against the identical fetched bytes
+  (`load_and_authorize_objects`), so reusing it is exactly what a correct
+  read already expects, not a shortcut — and collects the exact bytes to
+  publish as a `PendingBlobPublication`, deferred rather than published
+  immediately. A body at or under the threshold, or a mutation that is
+  already blob-backed, is returned unstaged. Iteration order is the
+  mutations' existing deterministic order (the verified manifest's
+  declaration order), so every validator stages the same publications in
+  the same order.
+
+  **The actual `put_blob` calls run only after the complete structured
+  envelope has been built and validated, strictly before `commit_invocation`.**
+  The handler builds `DurableStateTransaction`, `DurableObjectChanges`, and
+  `DurableInvocationTransaction` from the staged mutations exactly as it
+  already did before this DR — that construction is where the complete
+  envelope (state/receipt/outbox/object aggregate bounds, cross-section
+  identity) is actually validated, and it still runs whether or not
+  anything was staged. Only once that construction has succeeded does a new
+  `publish_pending_blobs` step perform every staged `put_blob` call, in
+  order; `commit_invocation` is called only after every one of them
+  succeeds. Staging itself, by contrast, runs before that validation and
+  proves nothing about it — an earlier design published as part of staging,
+  before the envelope was known to be valid, which this ordering corrects.
+
+  **Ordering invariants, each following from where staging and publishing
+  sit in the existing control flow.** Exact request replay already returns
+  from the persisted-receipt short-circuit before the transition, effect
+  translation, staging, or publishing ever run, so replay stages and
+  publishes nothing — proven by an instrumented `BlobStore` asserting zero
+  `put_blob` calls on replay. A `put_blob` failure (a typed `RuntimeError`,
+  including a digest/content collision) is surfaced as the new
+  `NodeCoreError::ObjectBlobPublishFailed { object_id, blob_digest, source }`
+  before `commit_invocation` is ever called, so a publish failure guarantees
+  zero state/receipt/nonce/outbox/object changes for that request — proven
+  by asserting the scripted store's `commit_invocation` was never invoked.
+  If more than one publication was staged, an earlier one that already
+  succeeded before a later one fails is already durably stored: an
+  unreachable content-addressed orphan, not evidence of a partial commit. A
+  later `commit_invocation` rejection (e.g. a concurrent object-head
+  conflict) can likewise only ever leave every already-published blob as an
+  unreachable orphan: harmless, since nothing ever references it, and a
+  retried publish of the identical content is the idempotent-put case
+  above, not a new conflict. `native-http` maps `ObjectBlobPublishFailed` to
+  the existing opaque `503` storage-unavailability group, distinct from the
+  read-side `ObjectBlobMissing`/`ObjectBlobDigestMismatch` groups; no route
+  ever serializes blob bytes or storage details.
+
+  **`runtime-sqlite::SqliteBlobStore` is a separate file, schema, and SQLite
+  `application_id` from both the opaque legacy store and
+  `SqliteDurableStore`.** `application_id`/`user_version` are whole-file
+  SQLite properties, so this store cannot share a database file with either
+  existing one and never creates, reads, or migrates their tables. It opens
+  in WAL journal mode with `synchronous = FULL` (matching both existing
+  local SQLite adapters), verifies a persisted schema-identity string
+  (`SQLITE_BLOB_SCHEMA_IDENTITY`) the same way `SqliteDurableStore` verifies
+  its own, and stores content keyed by `(digest_algorithm, digest_bytes)` in
+  one `WITHOUT ROWID` table. `put_blob` runs inside its own `BEGIN IMMEDIATE`
+  transaction and implements the same insert-if-absent/conflict contract as
+  `MemoryBlobStore`; `get_blob` is a single bounded point query against the
+  connection, not wrapped in a transaction. Unlike `SqliteDurableStore`, it
+  binds no chain/validator/domain namespace at open time: a blob is
+  identified only by its self-describing digest. There is still no delete
+  or garbage-collection operation.
+
+  **`apps/devnet` wires this explicitly, not by a hidden default, kept for
+  future/large-object use even though ordinary devnet traffic never crosses
+  the threshold today.** `boot_local_store` now also opens `blobs.sqlite3`
+  (a sibling file to `structured.sqlite3` under the same `--data-dir`) as a
+  `SqliteBlobStore` and returns it alongside the structured store;
+  `DevnetBoot::into_store` is replaced by `DevnetBoot::into_parts` returning
+  both. `compose_devnet_router` gains an explicit
+  `blob_store: Arc<SqliteBlobStore>` parameter threaded into
+  `StructuredDurableNativeComponents`, replacing the process-local
+  `MemoryBlobStore` DR-0094 wired here. Every devnet asset-account body is a
+  few dozen bytes, always at or under the threshold, so in practice this
+  wiring is not yet exercised by real devnet traffic — it exists so a
+  future large object type (not asset accounts) would already have a
+  durable local `BlobStore` to publish into. Seeding's restart-time
+  verification (`apps/devnet::seed::verify_current_account`) still fetches
+  and independently re-verifies a blob-backed *current* version if one is
+  ever encountered (defensive, matching the read path), while the
+  fail-closed `DevnetSeedError::BlobBackedSeedObject` remains reserved for
+  the *version-one* seed row specifically, which seeding always creates
+  inline and nothing ever republishes under a different representation.
+  Every caller of `seed_asset_accounts`/`compose_devnet_router` (the devnet
+  binary, its own tests, and every CLI/client loopback-TCP E2E test) is
+  updated for the added parameters.
+
+  **Tests.** `runtime` adds `MemoryBlobStore` idempotent-put,
+  conflicting-put, and poisoned-lock-fails-closed tests. `runtime-sqlite`
+  adds a `SqliteBlobStore` suite: put/get, reopen persistence, idempotent
+  put, conflicting put, distinct algorithms over identical bytes,
+  WAL/synchronous pragma verification, application-id/schema-version/
+  unclaimed-database fail-closed cases, and a cross-file-identity check
+  against `SqliteDurableStore`. A paired file-backed integration test publishes
+  a large canonical body, commits only its `BlobReference` to the separate
+  structured database, closes and reopens both files, and verifies the exact
+  reference and bytes survive without an inline fallback. `node-core` adds a test proving an ordinary
+  small update to a blob-backed *previous* version stays inline with zero
+  `put_blob` calls (reading a blob-backed previous version never by itself
+  forces the next version to also be blob-backed), a separate test with a
+  body over the threshold proving publication and reference, exact-
+  replay-publishes-no-blob, publish-failure-aborts-before-commit, and
+  commit-rejection-leaves-a-directly-readable-orphan-blob (the latter three
+  using an over-threshold body so the publish path is actually exercised);
+  the existing HTTP-mapping table test and native-http's real end-to-end
+  preinstalled-WASM write test are updated to expect the small committed
+  body to stay inline. The real file-backed CLI restart/duplicate E2E
+  (`apps/cli/tests/devnet_restart_duplicate_e2e.rs`) — already the
+  repository's evidence for orderly-restart state continuity and exact-replay
+  non-reapplication — now asserts every post-transfer current version is
+  still `CurrentInline` both before and after the real close/reopen of both
+  SQLite files, since an asset-account body never crosses the threshold.
+
+  **Completion boundary.** Only publication into an explicitly supplied
+  `BlobStore` (in-memory or local file-backed SQLite), gated by the fixed
+  64 KiB threshold, is As-Is. A durable production/cloud provider
+  `BlobStore` — PostgreSQL, Cloudflare, AWS, or otherwise — remains
+  unimplemented and unclaimed by this decision: PostgreSQL's
+  `object_versions` write path already accepted a `blob_digest` column pair
+  before this DR and is unchanged by it, but PostgreSQL itself still has no
+  `BlobStore` implementation to publish into. GC/checkpoint manifest work,
+  Create-effect (new-object, as opposed to new-version) support, and
+  Cloudflare/AWS persistence and provider-certification evidence all remain
+  deferred and unimplemented. S4, S5, the `CLI-First Node Production Gate`,
+  production, and mainnet readiness remain incomplete; this DR changes none
+  of their exit criteria.
+
+  **Compatibility.** Canonical `Transaction`/`Object`/receipt/nonce/submit
+  bytes and logical object digest/head semantics are unchanged: a version's
+  `digest` field and a verified read's re-derivation of it are identical
+  whether the payload is inline or blob-backed, exactly as DR-0094 already
+  established for the read side, and the threshold changes only which
+  representation a given version's bytes are stored under, never the
+  bytes themselves. This is an API break in the same family as DR-0094's:
+  `DevnetBoot::into_store` is removed in favor of `into_parts`, and
+  `seed_asset_accounts`/`compose_devnet_router` gain a required parameter,
+  with every call site in this repository updated, not left on a deprecated
+  overload.

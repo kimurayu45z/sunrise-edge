@@ -10,17 +10,18 @@ use crate::{
 };
 use hashing::{HashSuiteResolver, HashingError, verify_digest};
 use objects::{
-    Address, Object, ObjectError, ObjectId, ObjectRef, Owner, encode_object, encode_object_ref,
+    Address, Object, ObjectError, ObjectId, ObjectRef, Owner, decode_object, encode_object,
+    encode_object_ref,
 };
 use protocol_types::{AtomicityDomainId, Digest32, Epoch, HashPurpose};
 use runtime::{
-    DurableCommitOutcome, DurableCommitRejection, DurableInvocationError,
+    BlobStore, DurableCommitOutcome, DurableCommitRejection, DurableInvocationError,
     DurableInvocationTransaction, DurableObjectChanges, DurableObjectHead, DurableObjectHeadRead,
     DurableObjectMutation, DurableObjectMutationEntry, DurableObjectOwnerProjection,
     DurableObjectPayload, DurableObjectProvenance, DurableObjectRoutingProjection,
     DurableObjectVersion, DurableObjectVersionRecord, DurableOperationContext, DurableReadError,
     DurableRequestId, DurableRequestReceipt, IndeterminateCommitReason, IndexedOutboxContractError,
-    StructuredDurableDomainStateStore, WriterFenceGeneration,
+    RuntimeError, StructuredDurableDomainStateStore, WriterFenceGeneration,
 };
 use std::{collections::BTreeSet, error::Error, fmt};
 
@@ -160,6 +161,7 @@ struct ExpectedSeed {
 /// every configured owner must finish with [`verify_seeded_asset_supply`].
 pub fn seed_asset_accounts<S>(
     store: &S,
+    blob_store: &dyn BlobStore,
     resolver: &HashSuiteResolver,
     epoch: Epoch,
     owner: DevOwner,
@@ -189,12 +191,19 @@ where
         .map_err(DevnetSeedError::Read)?;
 
     match (&source_head, &destination_head) {
-        (DurableObjectHead::Absent, DurableObjectHead::Absent) => {
-            create_seed_accounts(store, resolver, owner, boot_generation, context, expected)
-        }
+        (DurableObjectHead::Absent, DurableObjectHead::Absent) => create_seed_accounts(
+            store,
+            blob_store,
+            resolver,
+            owner,
+            boot_generation,
+            context,
+            expected,
+        ),
         (DurableObjectHead::Current { .. }, DurableObjectHead::Current { .. }) => {
             let accounts: SeededAssetAccounts = verify_existing_seed(
                 store,
+                blob_store,
                 resolver,
                 owner,
                 boot_generation,
@@ -307,6 +316,7 @@ fn build_expected_account(
 
 fn create_seed_accounts<S>(
     store: &S,
+    blob_store: &dyn BlobStore,
     resolver: &HashSuiteResolver,
     owner: DevOwner,
     boot_generation: WriterFenceGeneration,
@@ -376,7 +386,15 @@ where
         DurableCommitOutcome::Rejected(
             DurableCommitRejection::ObjectConflict { .. }
             | DurableCommitRejection::RequestAlreadyCommitted,
-        ) => reconcile_existing_seed(store, resolver, owner, boot_generation, context, &expected),
+        ) => reconcile_existing_seed(
+            store,
+            blob_store,
+            resolver,
+            owner,
+            boot_generation,
+            context,
+            &expected,
+        ),
         DurableCommitOutcome::Rejected(rejection) => {
             Err(DevnetSeedError::CommitRejected(rejection))
         }
@@ -387,6 +405,7 @@ where
             match receipt {
                 Some(receipt) if receipt == expected.receipt => reconcile_existing_seed(
                     store,
+                    blob_store,
                     resolver,
                     owner,
                     boot_generation,
@@ -402,6 +421,7 @@ where
 
 fn reconcile_existing_seed<S>(
     store: &S,
+    blob_store: &dyn BlobStore,
     resolver: &HashSuiteResolver,
     owner: DevOwner,
     boot_generation: WriterFenceGeneration,
@@ -423,6 +443,7 @@ where
         .map_err(DevnetSeedError::Read)?;
     let accounts: SeededAssetAccounts = verify_existing_seed(
         store,
+        blob_store,
         resolver,
         owner,
         boot_generation,
@@ -437,6 +458,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn verify_existing_seed<S>(
     store: &S,
+    blob_store: &dyn BlobStore,
     resolver: &HashSuiteResolver,
     owner: DevOwner,
     boot_generation: WriterFenceGeneration,
@@ -459,6 +481,7 @@ where
 
     let source: VerifiedCurrentAccount = verify_current_account(
         store,
+        blob_store,
         resolver,
         boot_generation,
         context,
@@ -469,6 +492,7 @@ where
     )?;
     let destination: VerifiedCurrentAccount = verify_current_account(
         store,
+        blob_store,
         resolver,
         boot_generation,
         context,
@@ -516,6 +540,7 @@ struct VerifiedCurrentAccount {
 #[allow(clippy::too_many_arguments)]
 fn verify_current_account<S>(
     store: &S,
+    blob_store: &dyn BlobStore,
     resolver: &HashSuiteResolver,
     boot_generation: WriterFenceGeneration,
     context: &DurableOperationContext,
@@ -584,15 +609,39 @@ where
         });
     }
     verify_record_context(&record, resolver, boot_generation)?;
-    let inline = match record.payload() {
-        DurableObjectPayload::Inline(inline) => inline,
-        DurableObjectPayload::BlobReference(_) => {
-            return Err(DevnetSeedError::BlobBackedSeedObject(
-                expected.initial_object.id,
-            ));
+    // A current version an authenticated transaction has since advanced may
+    // be blob-backed when its canonical bytes crossed DR-0096's fixed
+    // publication threshold. Both representations verify identically from
+    // here: fetch (or read inline) the exact canonical bytes, then apply the same
+    // identity/canonical-encoding/digest checks regardless of which one this
+    // current version turned out to be.
+    let canonical_bytes: Vec<u8> = match record.payload() {
+        DurableObjectPayload::Inline(inline) => inline.canonical_bytes().to_vec(),
+        DurableObjectPayload::BlobReference(blob_digest) => {
+            let bytes: Vec<u8> = blob_store
+                .get_blob(blob_digest)
+                .map_err(DevnetSeedError::BlobStore)?
+                .ok_or(DevnetSeedError::MissingBlob {
+                    object_id: expected.initial_object.id,
+                    blob_digest: *blob_digest,
+                })?;
+            let blob_digest_valid: bool = verify_digest(
+                blob_digest,
+                HashPurpose::Object,
+                record.provenance().protocol_version(),
+                record.provenance().chain_id(),
+                &bytes,
+            )?;
+            if !blob_digest_valid {
+                return Err(DevnetSeedError::StoredObjectMismatch {
+                    object_id: expected.initial_object.id,
+                    detail: "fetched blob bytes do not hash to their own blob digest",
+                });
+            }
+            bytes
         }
     };
-    let object: &Object = inline.object();
+    let object: Object = decode_object(&canonical_bytes)?;
     if object.id != expected.initial_object.id
         || object.version != object_version.get()
         || object.owner != expected_owner
@@ -604,8 +653,8 @@ where
             detail: "typed object identity, owner, type, or schema differs",
         });
     }
-    let canonical_object: Vec<u8> = encode_object(object)?;
-    if inline.canonical_bytes() != canonical_object {
+    let canonical_object: Vec<u8> = encode_object(&object)?;
+    if canonical_bytes != canonical_object {
         return Err(DevnetSeedError::StoredObjectMismatch {
             object_id: expected.initial_object.id,
             detail: "stored object bytes are not the exact canonical encoding",
@@ -616,7 +665,7 @@ where
         HashPurpose::Object,
         record.provenance().protocol_version(),
         record.provenance().chain_id(),
-        inline.canonical_bytes(),
+        &canonical_bytes,
     )?;
     if !digest_valid {
         return Err(DevnetSeedError::StoredObjectMismatch {
@@ -805,8 +854,22 @@ pub enum DevnetSeedError {
         /// Missing immutable version.
         version: DurableObjectVersion,
     },
-    /// A seed object was blob-backed, which this local profile does not support.
+    /// The genesis (version-one) seed record was blob-backed. Seeding always
+    /// creates version one inline, and nothing ever republishes an existing
+    /// immutable version under a different representation, so this is
+    /// persisted corruption, not a currently-reachable case.
     BlobBackedSeedObject(ObjectId),
+    /// A `BlobStore` operation failed while verifying a blob-backed current
+    /// version (published by a real transaction since seeding, DR-0096).
+    BlobStore(RuntimeError),
+    /// A current version's payload named a digest absent from the supplied
+    /// `BlobStore`.
+    MissingBlob {
+        /// Object identifier.
+        object_id: ObjectId,
+        /// Content digest that could not be found.
+        blob_digest: Digest32,
+    },
     /// Stored object metadata, bytes, digest, or provenance did not match.
     StoredObjectMismatch {
         /// Mismatched object's identity.
@@ -861,7 +924,15 @@ impl fmt::Display for DevnetSeedError {
             ),
             Self::BlobBackedSeedObject(object_id) => write!(
                 f,
-                "seed object {object_id} is blob-backed, unsupported by the local profile"
+                "seed object {object_id} genesis version is blob-backed, expected inline"
+            ),
+            Self::BlobStore(error) => write!(f, "seed blob-store read failed: {error}"),
+            Self::MissingBlob {
+                object_id,
+                blob_digest,
+            } => write!(
+                f,
+                "seed object {object_id} blob payload {blob_digest} is absent from blob storage"
             ),
             Self::StoredObjectMismatch { object_id, detail } => {
                 write!(f, "seed object {object_id} failed verification: {detail}")
@@ -889,6 +960,7 @@ impl Error for DevnetSeedError {
             Self::Hashing(error) => Some(error),
             Self::Invocation(error) => Some(error),
             Self::RequestIdentity(error) => Some(error),
+            Self::BlobStore(error) => Some(error),
             _ => None,
         }
     }
@@ -929,7 +1001,9 @@ mod tests {
     use super::*;
     use fees::AssetId;
     use protocol_types::{ChainId, HashAlgorithmId, HashSuite, HashSuiteSchedule, ProtocolVersion};
-    use runtime::{MemoryDurableStateStore, StorageCorrelationId, StorageDeadline};
+    use runtime::{
+        MemoryBlobStore, MemoryDurableStateStore, StorageCorrelationId, StorageDeadline,
+    };
 
     fn resolver() -> HashSuiteResolver {
         HashSuiteResolver::new(
@@ -1052,9 +1126,11 @@ mod tests {
         store.set_time(0);
         let owner: DevOwner = DevOwner::new([0x61; 32]);
         let resolver: HashSuiteResolver = resolver();
+        let blob_store: MemoryBlobStore = MemoryBlobStore::default();
 
         let created: SeedAssetAccountsOutcome = seed_asset_accounts(
             &store,
+            &blob_store,
             &resolver,
             Epoch::new(0),
             owner,
@@ -1070,6 +1146,7 @@ mod tests {
 
         let existing: SeedAssetAccountsOutcome = seed_asset_accounts(
             &store,
+            &blob_store,
             &resolver,
             Epoch::new(0),
             owner,
@@ -1140,8 +1217,10 @@ mod tests {
             store.set_time(0);
             let owner: DevOwner = DevOwner::new([0x91; 32]);
             let resolver: HashSuiteResolver = resolver();
+            let blob_store: MemoryBlobStore = MemoryBlobStore::default();
             seed_asset_accounts(
                 &store,
+                &blob_store,
                 &resolver,
                 Epoch::new(0),
                 owner,
@@ -1154,6 +1233,7 @@ mod tests {
 
             let result = seed_asset_accounts(
                 &store,
+                &blob_store,
                 &resolver,
                 Epoch::new(0),
                 owner,

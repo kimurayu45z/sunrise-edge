@@ -86,7 +86,9 @@ fn hex32(bytes: &[u8; 32]) -> String {
 
 /// Queries `object_id` directly through `sunrise-edge-client` (independent
 /// of anything the CLI itself printed) and decodes its canonical body as a
-/// devnet asset account.
+/// devnet asset account. Asset-account bodies remain below DR-0096's fixed
+/// blob-publication threshold, so seeing a blob reference here would be a
+/// product-surface regression for the current CLI.
 fn query_asset_account(
     client: &Client<LoopbackHttpTransport>,
     object_id: ObjectId,
@@ -157,6 +159,7 @@ async fn cli_transfer_command_moves_balance_through_the_real_devnet_router_over_
         DurableOperationContext::new(boot_generation, seed_deadline, seed_correlation);
     let seed_outcome = seed_asset_accounts(
         boot.store(),
+        boot.blob_store(),
         module.resolver(),
         config.epoch(),
         dev_owner,
@@ -171,6 +174,7 @@ async fn cli_transfer_command_moves_balance_through_the_real_devnet_router_over_
     );
     let treasury_outcome = seed_asset_accounts(
         boot.store(),
+        boot.blob_store(),
         module.resolver(),
         config.epoch(),
         config.fee_treasury_owner(),
@@ -185,8 +189,10 @@ async fn cli_transfer_command_moves_balance_through_the_real_devnet_router_over_
     let treasury_id = treasury_outcome.accounts().destination().id;
     let module_ref = module.module_ref().clone();
 
+    let (structured_store, blob_store) = boot.into_parts();
     let router = compose_devnet_router(
-        Arc::new(boot.into_store()),
+        Arc::new(structured_store),
+        Arc::new(blob_store),
         module,
         boot_generation,
         config.max_concurrent(),

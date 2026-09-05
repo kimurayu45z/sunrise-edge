@@ -60,8 +60,10 @@ async fn cli_context_and_next_nonce_commands_reach_the_real_devnet_router_over_t
     let protocol_context =
         build_devnet_protocol_context(config.chain_id().clone(), config.epoch()).unwrap();
     let module = build_asset_module(protocol_context, ASSET_ACCOUNT_WASM.to_vec()).unwrap();
+    let (structured_store, blob_store) = boot.into_parts();
     let router = compose_devnet_router(
-        Arc::new(boot.into_store()),
+        Arc::new(structured_store),
+        Arc::new(blob_store),
         module,
         generation,
         config.max_concurrent(),

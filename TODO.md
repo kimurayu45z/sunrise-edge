@@ -2410,7 +2410,7 @@ hard constraintも変更しない。
   両receipt・sender nonce不変、writer-generation fencingを証明する。
   これはS2 As-Isのみでproduction/mainnet readinessではない。S3はDR-0087で後続実装済み。
   TypeScript client/explorer/walletはSoftware Production Gate（S0-S3 + S5）までdeferredであり、
-  S4はincomplete、残存Ledger作業はdeferredである。non-Ledger S5 prerequisiteはDR-0094から先行するが、
+  S4はincomplete、残存Ledger作業はdeferredである。non-Ledger S5 prerequisiteはDR-0094・DR-0096で先行するが、
   S5、completeなCLI-First Node Production Gate、production、mainnet readinessの完了を意味しない。
 - **S3**: **implemented and validated As-Is（2026-09-02、DR-0087）。** committed
   scheduleはbase=1、execution=`gas_used`単価=1、他category=0、fee registryは
@@ -2780,8 +2780,22 @@ Phase 15 As-Is scope:
   inline bytesをSELECTせず、immutable row metadataとinline presence/lengthのみを検証する。headのowner/routing projectionは
   routing hintでありauthorizationではない。executionは別途exact versionを読み、head version/digestとの一致、inline Object decode、
   typed owner一致を検証しなければならない。blob-backed bodyは明示的に分離された`BlobStore`
-  componentからfetchし、独立にverifyしてからdecode/authorizeする(DR-0094, implemented As-Is;
-  blob upload/publication、durable provider `BlobStore`、GC/checkpoint manifestは引き続き未実装)。
+  componentからfetchし、独立にverifyしてからdecode/authorizeする(DR-0094, implemented As-Is)。
+  accepted authenticated Create/Updateがcommitするnewバージョンは、その canonical bytesが固定
+  deterministic threshold（`node_core::MAX_INLINE_OBJECT_BODY_BYTES`、64 KiB）を超える場合のみ
+  同じ`BlobStore`へpublishされblob referenceとなる。threshold以下（devnet asset accountを含む
+  通常の小さいbodyはすべて該当）はこれまで通りinlineのままである。inline/blobの判定はpureな
+  staging passでI/Oを行わず、実際の`put_blob`呼び出しはstate/object/receipt/outboxの完全な
+  envelopeを構築・検証した後、structured commitの直前にのみ実行される（content-addressed
+  insert-if-absent、同一object digestをkeyとして再利用、DR-0096, implemented As-Is;
+  publish失敗はstate/receipt/nonce/outbox/object変更ゼロでabortし、複数put時に先行するpublishが
+  既に成功していれば unreachable orphan として残る。後続のcommit rejectionも同様に
+  publish済みblobをunreachableなcontent-addressed orphanとして残すのみ）。
+  現在到達可能なのはUpdateのみで、Create effectは引き続きfail-closed/deferredである。ただし将来の
+  Create実装が同じpersistence policyを迂回しないようstagingは両mutation variantを処理する。
+  durable provider
+  `BlobStore`（PostgreSQL/Cloudflare/AWS等、local file-backed SQLite blob storeを除く）と
+  GC/checkpoint manifestは引き続き未実装。
   memoryとPostgreSQLはstate/object/receipt/outboxを同一atomic boundaryで実装済みである。authenticated
   structured durable pathはsigned read-only manifestをexact head/immutable inline versionからloadし、verified
   senderに対するtyped owner authorizationと完全なhead assertionを同一commitへ接続した（implemented As-Is）。
@@ -2821,8 +2835,16 @@ Phase 15 As-Is scope:
   （`preinstalled_wasm_structured_durable_router`/`_with_executor`）はこのentrypointへwiring済みである一方、
   generic structured durable routerはread-only entrypointのままである。Shared/System owner、
   arbitrary provider wiring、owned fast path certificateは未実装である。blob-backed bodyのfetch/
-  verificationはDR-0094でimplemented As-Isだが、blob upload/publicationは未実装のままである。devnet/startup composition
-  （`apps/devnet`）とfee debit（S3のuniform ordinary-asset fee slice、DR-0087）はimplemented As-Isである。
+  verificationはDR-0094でimplemented As-Isであり、authenticated commitが生成するnew versionの
+  固定64 KiB threshold超過時のblob publicationもDR-0096でimplemented As-Isである
+  （threshold以下の通常の小さいbodyはinlineのまま）。devnet/startup composition
+  （`apps/devnet`）は`boot_local_store`が同じdata dir下に別ファイル`blobs.sqlite3`（独自schema/
+  application identity、WAL、synchronous FULL）として`runtime-sqlite::SqliteBlobStore`を開き
+  `compose_devnet_router`へ明示的に渡すため、threshold超過のblob-backed versionはdevnet
+  restartを生き残る設計だが、devnet asset accountのbodyは常にthreshold未満のため実際には
+  この経路はまだ行使されていない（durable provider（PostgreSQL/Cloudflare/AWS等）`BlobStore`
+  は引き続き未実装）。fee debit（S3のuniform ordinary-asset fee slice、DR-0087）はimplemented
+  As-Isである。
   node-core additive handlerはmanifest domainをI/O前にresolveし、typed receipt replayをstate readより先に行い、
   read-only assertionを含むstate/receipt/outboxをこのenvelopeへ構築する。definite commitまたはexact replay以外では
   outputを返さない。single-lock memoryとnormalized PostgreSQL conformance storeでatomic publication、object lifecycle/ABA、

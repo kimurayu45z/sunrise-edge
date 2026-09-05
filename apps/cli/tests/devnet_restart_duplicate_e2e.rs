@@ -144,7 +144,9 @@ fn make_client(address: SocketAddr) -> Client<LoopbackHttpTransport> {
 /// Independently queries and decodes `object_id`'s current inline body,
 /// returning a fresh [`ObjectRef`] (for building a follow-up transaction's
 /// access manifest), the decoded asset-account state, and the result's exact
-/// canonical bytes for restart comparisons.
+/// canonical bytes for restart comparisons. Devnet asset accounts remain
+/// below DR-0096's fixed blob-publication threshold, so seeing a blob
+/// reference here would be a product-surface regression for the current CLI.
 fn query_current_account(
     client: &Client<LoopbackHttpTransport>,
     object_id: ObjectId,
@@ -257,6 +259,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
     );
     let seed_outcome = seed_asset_accounts(
         first_boot.store(),
+        first_boot.blob_store(),
         first_module.resolver(),
         config.epoch(),
         dev_owner,
@@ -273,6 +276,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
     );
     let recipient_seed_outcome = seed_asset_accounts(
         first_boot.store(),
+        first_boot.blob_store(),
         first_module.resolver(),
         config.epoch(),
         recipient_dev_owner,
@@ -291,6 +295,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
     );
     let treasury_seed_outcome = seed_asset_accounts(
         first_boot.store(),
+        first_boot.blob_store(),
         first_module.resolver(),
         config.epoch(),
         treasury_dev_owner,
@@ -316,9 +321,12 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
     let module_ref = first_module.module_ref().clone();
 
     // --- Serve on an ephemeral loopback port. ---
-    let first_store = Arc::new(first_boot.into_store());
+    let (first_structured_store, first_blob_store) = first_boot.into_parts();
+    let first_store = Arc::new(first_structured_store);
+    let first_blob_store = Arc::new(first_blob_store);
     let first_router = compose_devnet_router(
         Arc::clone(&first_store),
+        Arc::clone(&first_blob_store),
         first_module,
         first_generation,
         config.max_concurrent(),
@@ -420,6 +428,18 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             OsString::from("5000"),
         ])
         .expect("CLI transfer should succeed against the real seeded devnet router");
+
+        // DR-0096: node-core only publishes a new version to the `BlobStore`
+        // when its canonical bytes exceed the fixed inline threshold. An
+        // asset-account body is a few dozen bytes, so the version the CLI
+        // transfer just committed stays inline, exactly like the genesis
+        // seed row queried above.
+        assert!(matches!(
+            verify_client
+                .query_object(source_id)
+                .expect("post-transfer object query should succeed"),
+            HttpObjectQueryResult::CurrentInline { .. }
+        ));
 
         // Independently capture both decoded account states, the present
         // receipt, and the next nonce after the CLI transfer.
@@ -966,6 +986,9 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
     let closed_store = Arc::try_unwrap(first_store)
         .expect("no other durable-store reference should remain after orderly shutdown");
     drop(closed_store);
+    let closed_blob_store = Arc::try_unwrap(first_blob_store)
+        .expect("no other blob-store reference should remain after orderly shutdown");
+    drop(closed_blob_store);
 
     // --- Reopen through boot_local_store; assert generation N+1. ---
     let second_boot = boot_local_store(&config).unwrap();
@@ -1009,6 +1032,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
     );
     let reseed_outcome = seed_asset_accounts(
         second_boot.store(),
+        second_boot.blob_store(),
         second_module.resolver(),
         config.epoch(),
         dev_owner,
@@ -1027,6 +1051,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
     );
     let recipient_reseed_outcome = seed_asset_accounts(
         second_boot.store(),
+        second_boot.blob_store(),
         second_module.resolver(),
         config.epoch(),
         recipient_dev_owner,
@@ -1045,6 +1070,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
     );
     let treasury_reseed_outcome = seed_asset_accounts(
         second_boot.store(),
+        second_boot.blob_store(),
         second_module.resolver(),
         config.epoch(),
         treasury_dev_owner,
@@ -1111,9 +1137,12 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
     assert_eq!(second_module.module_ref(), &module_ref);
 
     // --- Recompose on a fresh ephemeral port. ---
-    let second_store = Arc::new(second_boot.into_store());
+    let (second_structured_store, second_blob_store) = second_boot.into_parts();
+    let second_store = Arc::new(second_structured_store);
+    let second_blob_store = Arc::new(second_blob_store);
     let second_router = compose_devnet_router(
         Arc::clone(&second_store),
+        Arc::clone(&second_blob_store),
         second_module,
         second_generation,
         config.max_concurrent(),
@@ -1134,6 +1163,16 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
     tokio::task::spawn_blocking(move || {
         let verify_client = make_client(second_address);
         let request_id_r3 = RequestId::new([REQUEST_ID_R3_BYTE; 32]).unwrap();
+
+        // DR-0096: an asset-account body stays under the fixed inline
+        // threshold, so the version committed before restart is still
+        // `CurrentInline` after it, exactly as before restart.
+        assert!(matches!(
+            verify_client
+                .query_object(source_id)
+                .expect("post-restart object query should succeed"),
+            HttpObjectQueryResult::CurrentInline { .. }
+        ));
 
         // Property 3: balances, sequences, receipts, and next nonce are
         // byte-identical to the values captured immediately before restart.
@@ -1446,4 +1485,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
     let closed_second_store = Arc::try_unwrap(second_store)
         .expect("no other durable-store reference should remain after the final shutdown");
     drop(closed_second_store);
+    let closed_second_blob_store = Arc::try_unwrap(second_blob_store)
+        .expect("no other blob-store reference should remain after the final shutdown");
+    drop(closed_second_blob_store);
 }
