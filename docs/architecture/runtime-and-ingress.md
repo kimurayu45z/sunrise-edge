@@ -157,9 +157,11 @@ replays persisted responses without re-running the transition or returning the
 outbox again; the same request ID with different event bytes fails closed.
 Outbox presence makes committed messages recoverable and at-least-once, but no
 production deployment composition relies on this legacy path. The native
-adapter retains it for non-transaction events, while its structured route uses
-the normalized durable equivalent described in
-[persistence.md §41](persistence.md#41-production-persistence-architecture).
+adapter no longer exposes it to non-transaction events: DR-0099 closes every
+native public `POST /v1/events` surface to authenticated `SubmitTransaction`
+only. Node-core retains the generic machinery for internal or future trusted
+composition, while the structured route uses the normalized durable equivalent
+described in [persistence.md §41](persistence.md#41-production-persistence-architecture).
 
 `node-core` carries the Transaction v1 authentication boundary described in
 [core-protocol.md §8](core-protocol.md#8-signature-domain-separation) (`node_core::transaction_auth`). It composes the strict
@@ -178,9 +180,9 @@ invocation. The bounded S3 uniform ordinary-asset fee composition
 ([DR-0087](decisions/0081-0087-cli-first-roadmap.md))
 and additive owned-effects/preinstalled-WASM module-object effects
 entrypoints are implemented As-Is; shared-object ordering, fast-path
-certificates/publication, authorization for every other externally accepted
-event family, S4/S5, and the independent security/release gates remain
-mandatory before live activation.
+certificates/publication, family-specific authentication and authorization
+before any future external re-opening of another event family, S4/S5, and the
+independent security/release gates remain mandatory before live activation.
 
 The outbox delivery cursor (`0xE005`) advances one message at a time. A caller
 supplies a non-zero lease ID, an observed time, and a duration bounded to five
@@ -204,6 +206,33 @@ still enforces its independent canonical and payload bounds. Successful calls
 return a versioned canonical `HttpNodeResult` as
 `application/vnd.sunrise-edge.node-result`. Nested responses retain stable
 request IDs and adapter-neutral canonical `NodeResponse` framing.
+
+External ingress is submit-only (DR-0099). Of the eight known `NodeEventKind`
+values, native HTTP authenticates and authorizes exactly one, `SubmitTransaction`,
+end to end. Once a body decodes into a canonical `NodeEvent`, every one of the
+other seven kinds — `ReceiveVote`, `ReceiveCertificate`,
+`ReceiveConsensusMessage`, `ApplyGovernanceCertificate`,
+`ApplyProtocolUpgrade`, `ApplyValidatorSetChange`, and `Tick` — is rejected by
+a typed private native-http error before identity allocation, any clock read,
+storage I/O, machine `access_plan`/transition, outbox work, or transport send.
+Every one of those seven kinds maps to the same fixed, opaque
+`501 event-family-requires-authenticated-route` response on all four native
+router families (`router`, `resolved_domain_router`, `structured_durable_router`,
+and `preinstalled_wasm_structured_durable_router`, including each
+`_with_executor` constructor), so the response never leaks which specific kind
+was sent. The two legacy routes (`router`, `resolved_domain_router`) authenticate
+no event at all, so they additionally keep rejecting `SubmitTransaction` itself
+with the pre-existing, unchanged `501 submit-transaction-requires-authenticated-route`
+response — both legacy routes are therefore closed for every known kind. The
+structured and preinstalled-WASM routes still accept a validly authenticated
+`SubmitTransaction`; their generic non-`SubmitTransaction` branch is now
+unreachable from HTTP and has been removed from native-http, but node-core's
+generic `TransactionalNodeStateMachine` machinery this branch used is untouched
+and remains available to any future per-family authenticated route. This closes
+the audit-scope criterion that the external surface be limited to the one event
+kind native-http actually authenticates; implementing authenticated ingress for
+the other seven kinds remains open future work, not something this change
+claims.
 
 Malformed events return 400, oversized bodies return 413, unsupported media or
 content encoding returns 415, context/CAS conflicts return 409, deterministic

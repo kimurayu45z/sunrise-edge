@@ -1890,8 +1890,11 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    non-decreasingでなければならず、regressionはfail closedになるとdoc化済み）。新routerの
    `SubmitTransaction`は
    `handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution`を
-   呼び、他のevent kindは既存のgeneric machine pathのままとする。blocking admissionと
-   pre-storage-dispatch cancellationは両routerで同一のsemanticsを保つ（新routerの3つの
+   呼ぶ。他のevent kindに対する既存のgeneric machine pathはnode-core内部の再利用可能な
+   behaviorとして維持する一方、DR-0099によりnative public `POST /v1/events`からは全7 familyを
+   identity/clock/storage/machine/outbox/transportより前にfail closedとした。将来いずれかを外部へ
+   再公開する場合はfamily固有のauthentication/authorizationを別sliceで実装する。blocking
+   admissionとpre-storage-dispatch cancellationは両routerで同一のsemanticsを保つ（新routerの3つの
    pre-storage checkpointすべてで直接cancellation testを追加済み）。coarse HTTP error
    classificationを拡張し、`execution::ExecutionError`をワイルドカードなしで明示的にmatchする。
    malformed/inactive/unknown module reference（`MissingEntrypoint`含む）とargs/gas/
@@ -2225,18 +2228,29 @@ CLI-First Node Production Gate、production readiness、mainnet readinessを意�
 後から追加するprotocol/event/provider surfaceはfocused delta auditを受け、最終release
 gateでは全auditの重大指摘解消を引き続き要求する。
 
-**Current status:** audit scopeの大部分は実装・自動検証済みだが、外部event ingressを
-`SubmitTransaction`だけへ閉じるfail-closed変更と、audit scope/threat model packetの
-固定が未完了であるため、このgateは未通過。これを次の最優先sliceとする。
+**Current status:** criterion 1（外部event ingressを`SubmitTransaction`だけへ閉じるfail-closed
+変更）はnative HTTPの4router family全て（`router`、`resolved_domain_router`、
+`structured_durable_router`、`preinstalled_wasm_structured_durable_router`と各
+`_with_executor`構成関数）でimplemented As-Isとなった
+（docs/architecture/decisions/0099-submit-only-event-ingress.md DR-0099）。
+audit scope/threat model packetの固定（criteria 2-3、`SECURITY.md`相当の作成を含む）が
+未完了であるため、このgateは依然未通過。これを次の最優先sliceとする。
 
 ### 最小completion criteria
 
-1. public/native `POST /v1/events`のaudit対象surfaceを、現在唯一end-to-endで認証・認可
-   される`SubmitTransaction`へ明示的に限定する。`ReceiveVote`、`ReceiveCertificate`、
-   `ReceiveConsensusMessage`、governance/protocol-upgrade/validator-set certificate、
-   `Tick`を含む全non-`SubmitTransaction` kindは、各family固有の認証・認可を実装するまで
-   external ingressでtypedかつopaqueに、identity allocation・clock・storage I/O・state
-   transitionより前にfail closedする。全familyを先に実装することはこのgateの条件ではない。
+1. **実装済み（implemented As-Is、DR-0099）。** public/native `POST /v1/events`のaudit対象
+   surfaceを、現在唯一end-to-endで認証・認可される`SubmitTransaction`へ明示的に限定した。
+   `ReceiveVote`、`ReceiveCertificate`、`ReceiveConsensusMessage`、
+   `ApplyGovernanceCertificate`、`ApplyProtocolUpgrade`、`ApplyValidatorSetChange`、`Tick`の
+   全non-`SubmitTransaction` kindは、native-http外部境界のtyped private errorにより、
+   identity allocation・clock読み取り・storage I/O・machineのaccess_plan/transition・outbox
+   処理・transport sendより前に、4router family全てで同一のopaque
+   `501 event-family-requires-authenticated-route`へfail closedする。legacy `router`と
+   `resolved_domain_router`はどちらも`SubmitTransaction`を認証しないため、既存の
+   `submit-transaction-requires-authenticated-route`応答と合わせて全known kindを閉じている。
+   node-coreのgeneric `TransactionalNodeStateMachine`経路・`validate_generic_event`・
+   `NodeCoreError`の公開variantは変更していない。各family固有の認証・認可を実装するまで、
+   この境界だけがscopeであり、全familyを先に実装することはこのgateの条件ではない。
 2. immutable audit commitとin-scope surfaceを固定する。初回監査対象はcanonical encoding/
    hashing/signature framing、`SubmitTransaction` authentication、nonce/replay/dedup、owned
    object access/effects、preinstalled deterministic WASM、ordinary-asset fee composition、
