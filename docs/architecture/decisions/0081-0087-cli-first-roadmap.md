@@ -10,7 +10,7 @@ fee decisions.
   and `clients/` as each is implemented: `clients/rust` and `clients/typescript`
   (protocol client libraries with no UI of their own), `apps/devnet` (the
   local devnet binary/startup composition; see
-  [product-surfaces.md §42](../product-surfaces.md)), `apps/cli` (a Rust-only developer CLI), and `apps/explorer`/
+  [product-surfaces.md §42](../product-surfaces.md#42-local-devnet-architecture)), `apps/cli` (a Rust-only developer CLI), and `apps/explorer`/
   `apps/wallet` (browser applications). `apps/cli` depends only on
   `clients/rust`: it is never a Node/JS/browser runtime and never talks to the
   protocol through anything but `clients/rust`'s own encode/decode/signing/RPC
@@ -32,7 +32,7 @@ fee decisions.
   `apps/wallet` until real duplication between the two actually exists.
 
   **Developer MVP order.** Developer MVP completion order (see
-  `TODO.md#cli-developer-mvp-gate`) is: local devnet, bounded query API, Rust
+  [CLI Developer MVP Gate](../../../TODO.md#cli-developer-mvp-gate)) is: local devnet, bounded query API, Rust
   client, Rust CLI, TypeScript client, explorer, wallet, restart/duplicate
   E2E, and explicit documented development-only limitations. This replaces
   [DR-0080](0076-0080-developer-mvp-foundation.md)'s earlier "TypeScript client + counter demo UI" pairing; no
@@ -54,7 +54,7 @@ fee decisions.
   no separate transfer or fee-debit code path for a "special" asset. Which
   asset(s) may pay fees, and at what rate, is protocol policy layered over
   ordinary asset accounts, not a second implementation of balances or
-  transfer (see [core-protocol.md §18](../core-protocol.md)). A future fee-debit effect
+  transfer (see [core-protocol.md §18](../core-protocol.md#18-stablecoin-fee-lifecycle)). A future fee-debit effect
   must reuse the same declared object access, the same exact-head assertions,
   and the same atomic object-effect commit as every other asset transfer; it
   may not bypass them with bespoke fee-only state.
@@ -71,7 +71,7 @@ fee decisions.
   mismatch between the two accounts. Because destination-owner
   authorization for a transfer into an account owned by someone else, and any
   change of an object's owner, remain fail-closed on the existing owned-
-  effects path (see [runtime-and-ingress.md §30](../runtime-and-ingress.md) and
+  effects path (see [runtime-and-ingress.md §30](../runtime-and-ingress.md#30-node-core-invocation-boundary) and
   [DR-0077](0076-0080-developer-mvp-foundation.md)), this
   module demonstrates only same-sender balance movement between two of the
   sender's own asset accounts. It does not implement, and must not be
@@ -125,21 +125,21 @@ fee decisions.
   (S4c itself remains incomplete, pending Phase 2b's real hardware
   validation); this is still not production or mainnet readiness.
 - DR-0082: Add the bounded canonical Developer MVP query surface described in
-  [product-surfaces.md §43](../product-surfaces.md). Keep query selectors non-authoritative,
+  [product-surfaces.md §43](../product-surfaces.md#43-bounded-developer-mvp-query-api). Keep query selectors non-authoritative,
   resolve all chain/domain/epoch/storage authority from trusted composition,
   independently verify durable object and receipt content before returning it,
   encode absence and blob-unavailable state explicitly, and exclude scans and
   arbitrary state access. This is a stable client wire contract, not a public
   RPC security or production indexing architecture.
 - DR-0083: Define the Developer MVP Rust client boundary described in
-  [product-surfaces.md §44](../product-surfaces.md). Share canonical result codecs through `node-wire`, keep the
+  [product-surfaces.md §44](../product-surfaces.md#44-rust-client-library). Share canonical result codecs through `node-wire`, keep the
   client independent of `native-http`/Axum and application semantics, provide
   only a bounded loopback HTTP transport initially, require caller-supplied
   request/module/object identities, and defer production networking and full
   protocol-config/hash verification rather than approximating them.
 - DR-0084: Define the Rust-only `apps/cli` Developer MVP boundary and the
   Ledger-ready external signing boundary described in
-  [product-surfaces.md §45](../product-surfaces.md). `apps/cli` has exactly one
+  [product-surfaces.md §45](../product-surfaces.md#45-rust-client-external-signer-boundary-and-developer-mvp-cli). `apps/cli` has exactly one
   non-development/runtime dependency, `sunrise-edge-client` (test-only
   `[dev-dependencies]` exist to compose a real devnet and build fixtures for
   this crate's own tests, and are unreachable from any non-test build),
@@ -259,7 +259,7 @@ fee decisions.
   deliberately never folded into `crypto::SignatureDomain`; it adds no new
   signature-domain binding beyond the existing chain id/protocol
   version/epoch/message type/signature scheme already described in
-  [core-protocol.md §8](../core-protocol.md).
+  [core-protocol.md §8](../core-protocol.md#8-signature-domain-separation).
   No library path panics: every failure is a typed
   `ExpectedProtocolContextError` (construction) or `ProtocolContextMismatch`
   (comparison), wrapped by a new `ClientError::ProtocolContextMismatch`
@@ -439,7 +439,7 @@ fee decisions.
   **Ordered slices, amended by
   [DR-0095](0094-0098-blobs-audit-and-documentation.md).** This decision originally sequenced
   the CLI-First Node Production Gate as S0-S5 (see
-  `TODO.md#cli-first-node-production-gate`).
+  [CLI-First Node Production Gate](../../../TODO.md#cli-first-node-production-gate)).
   [DR-0095](0094-0098-blobs-audit-and-documentation.md) preserves S0-S3 as the
   common baseline but supersedes the strict S4-before-S5 ordering: S4 and S5
   are independent parallel tracks.
@@ -476,7 +476,7 @@ fee decisions.
     deterministic trap fee-only settlement and restart/replay evidence.
   - S4: a secure signer replacing today's development-only `LocalSigner`, and
     a real dedicated Sunrise Edge Ledger integration (see
-    [product-surfaces.md §45](../product-surfaces.md) and DR-0084; existing
+    [product-surfaces.md §45](../product-surfaces.md#45-rust-client-external-signer-boundary-and-developer-mvp-cli) and DR-0084; existing
     Solana/Ethereum Ledger apps are never reused).
   - S5: production persistence, outbox operation, provider deployment
     (Cloudflare Durable Object/AWS), operations (observability, runbooks),
@@ -495,7 +495,7 @@ fee decisions.
   this decision narrows validator-set, bond, or consensus criteria to a
   single-validator design; the devnet's current single-validator posture
   remains an explicit MVP-only limitation (see
-  [product-surfaces.md §42](../product-surfaces.md)), not the production target.
+  [product-surfaces.md §42](../product-surfaces.md#42-local-devnet-architecture)), not the production target.
 - DR-0086: Implement S2 as a bounded committed cross-owner destination policy,
   without introducing literal object-owner reassignment.
 

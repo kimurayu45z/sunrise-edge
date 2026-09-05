@@ -210,3 +210,7 @@ roadmap sequencing, deferred work, and completion gates. Re-check it before
 starting each slice; do not copy changing milestone status into this file or the
 README. Architecture documents record implemented behavior and accepted
 decisions, not the live work queue.
+
+Re-check `main`, the open stacked PR chain, and `TODO.md` before starting each
+slice, because repository state may have advanced since context was last
+loaded.

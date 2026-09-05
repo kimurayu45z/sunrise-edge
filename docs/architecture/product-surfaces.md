@@ -123,9 +123,9 @@ protocol behavior:
 - **No background sweeper.** The devnet runs no resident outbox-recovery loop,
   timer, or scheduler; unattended recovery, when needed, is invoked the same
   way the native binary already exposes it (see
-  [runtime-and-ingress.md §28](runtime-and-ingress.md) and the
+  [runtime-and-ingress.md §28](runtime-and-ingress.md#28-serverless-runtime-constraints) and the
   scheduler-callable recovery API in
-  [persistence.md §41](persistence.md)), consistent with
+  [persistence.md §41](persistence.md#41-production-persistence-architecture)), consistent with
   treating process lifetime as a non-requirement.
   The current generic machine and asset transition produce responses but no
   outbound messages, so the local transport queue does not grow on this route;
@@ -153,7 +153,7 @@ production-strategy pivot (see "Local devnet architecture" above and
 [DR-0095](decisions/0094-0098-blobs-audit-and-documentation.md)), the
 TypeScript client, explorer, and wallet remain deferred until the Software
 Production Gate (S0-S3 + S5) passes
-(`TODO.md#software-and-hardware-release-gates`); no other
+([software and hardware release gates](../../TODO.md#software-and-hardware-release-gates)); no other
 `clients/*`/`apps/*` path from
 [DR-0081](decisions/0081-0087-cli-first-roadmap.md) exists yet. Known current
 limitations that must stay visible at devnet startup and in documentation once
@@ -577,7 +577,8 @@ architecture" above). Under the CLI-first production-strategy pivot
 ([DR-0085](decisions/0081-0087-cli-first-roadmap.md)),
 `clients/typescript`, `apps/explorer`, and `apps/wallet` remain deferred until
 the Software Production Gate (S0-S3 + S5) passes (see
-`TODO.md#cli-developer-mvp-gate` and `TODO.md#cli-first-node-production-gate`).
+[CLI Developer MVP Gate](../../TODO.md#cli-developer-mvp-gate) and
+[CLI-First Node Production Gate](../../TODO.md#cli-first-node-production-gate)).
 
 ## 46. Hardware Signing Profile v1 and external-signer preflight
 

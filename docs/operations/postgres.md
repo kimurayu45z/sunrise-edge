@@ -3,7 +3,7 @@
 Status: accepted implementation design. The runtime structured envelope,
 node-core/native wiring, and explicit generation-one schema migration/bootstrap
 exist As-Is. Generation-one schema identity was redefined in place to `v2`
-(DR-0068) to add `object_versions` provenance columns (`created_chain_id_bytes`,
+([DR-0068](../architecture/decisions/0058-0075-postgres-conformance.md)) to add `object_versions` provenance columns (`created_chain_id_bytes`,
 `created_protocol_version`); this was an authorized pre-production in-place
 redefinition, applied by bootstrap only, not a migration precedent — no
 migration/backfill/verify/activate operation was added, and an existing `v1`
@@ -18,24 +18,25 @@ loss immediately before `COMMIT` dispatch for one state commit and,
 separately, immediately after backend acceptance for a structured invocation
 commit, outbox claim, and acknowledgement, over a plain `NoTls` transport and,
 separately, a strictly authenticated client-to-test-terminator TLS leg
-(DR-0074); see section 5. A separate live test now also SIGKILLs the
+([DR-0074](../architecture/decisions/0058-0075-postgres-conformance.md)); see section 5. A separate live test now also SIGKILLs the
 database-process container immediately after a committed structured
-invocation and verifies recovery after restart (DR-0069 in
-`docs/architecture/decisions/0058-0075-postgres-conformance.md`); see section 5.
+invocation and verifies recovery after restart
+([DR-0069](../architecture/decisions/0058-0075-postgres-conformance.md));
+see section 5.
 Migration operations beyond initial
 bootstrap, cancellation, PostgreSQL-server/provider TLS, mTLS, PKI lifecycle,
-and production certification beyond the bounded DR-0074 client leg, abrupt
+and production certification beyond the bounded [DR-0074](../architecture/decisions/0058-0075-postgres-conformance.md) client leg, abrupt
 host/power loss, and other fault/capacity evidence are not implemented. A
 separate disposable-container test now proves bounded pre-commit
 data-tablespace ENOSPC and recovery after freeing
-space (DR-0070); it deliberately leaves WAL and commit-boundary exhaustion
+space ([DR-0070](../architecture/decisions/0058-0075-postgres-conformance.md)); it deliberately leaves WAL and commit-boundary exhaustion
 open. A separate two-container test now rehearses a bounded `pg_dump`-based
 database-snapshot restore, verifying schema identity and restored namespace
 metadata/state/receipt before fence promotion, an operator-only writer-fence
 advance on the restored namespace, stale pre-backup context fencing, and exact
 reconciliation plus fresh commit under a new context, alongside an atomic
-invalid-dump rollback and a valid missing-state gate rejection (DR-0073 in
-`docs/architecture/decisions/0058-0075-postgres-conformance.md`);
+invalid-dump rollback and a valid missing-state gate rejection
+([DR-0073](../architecture/decisions/0058-0075-postgres-conformance.md));
 see section 5. This is rehearsal evidence for one `pg_dump`/SQL-execute
 snapshot cycle only — it is not a production backup/restore capability and
 does not close the accepted backup/restore evidence criterion in section 9.
@@ -46,8 +47,9 @@ simultaneously open client connections through PgBouncer's own admin
 console, the real adapter pool routed through the proxy getting a definite
 pre-commit `Rejected(UnavailableBeforeCommit)` once PgBouncer's own
 `query_wait_timeout` elapses while its one backend is held by a direct
-proxied client, and exact recovery/replay/claim/ack after release (DR-0075 in
-`docs/architecture/decisions/0058-0075-postgres-conformance.md`); see section 5.
+proxied client, and exact recovery/replay/claim/ack after release
+([DR-0075](../architecture/decisions/0058-0075-postgres-conformance.md));
+see section 5.
 This is a bounded local rehearsal
 only — it is not provider-managed pooler service certification, load/soak
 capacity, PgBouncer high availability, or TLS evidence.
@@ -87,15 +89,18 @@ execution by themselves. An execution caller must separately read the linked
 version, verify exact head version/digest, decode an inline Object, and compare
 its typed owner. Node-core now fetches a blob-backed body from an explicit
 `BlobStore` component and independently verifies it before decode/
-authorization (docs/architecture/decisions/0094-0098-blobs-audit-and-documentation.md DR-0094), and publishes a new version an
+authorization
+([DR-0094](../architecture/decisions/0094-0098-blobs-audit-and-documentation.md)),
+and publishes a new version an
 accepted authenticated Create/Update mutation commits to that same `BlobStore` and
 references it rather than storing it inline only when its canonical bytes
 exceed a fixed deterministic 64 KiB threshold
-(`node_core::MAX_INLINE_OBJECT_BODY_BYTES`, docs/architecture/decisions/0094-0098-blobs-audit-and-documentation.md DR-0096); a body
+(`node_core::MAX_INLINE_OBJECT_BODY_BYTES`,
+[DR-0096](../architecture/decisions/0094-0098-blobs-audit-and-documentation.md)); a body
 at or under the threshold, including every ordinary small object body,
 stays inline exactly as before. This `object_versions` write path (inline
 bytes or a `blob_digest` column pair) already accepts either representation
-unconditionally, unchanged by DR-0096; PostgreSQL itself still has no durable
+unconditionally, unchanged by [DR-0096](../architecture/decisions/0094-0098-blobs-audit-and-documentation.md); PostgreSQL itself still has no durable
 `BlobStore` implementation, so a PostgreSQL-composed node needs some other
 `BlobStore` (currently `runtime::MemoryBlobStore` or the local
 `runtime-sqlite::SqliteBlobStore`) to publish into. The former is process-local;
@@ -189,7 +194,7 @@ upload and digest verification.
 
 `created_chain_id_bytes` (`BYTEA`, 1-128 octets) and `created_protocol_version`
 (`BIGINT`, `0..=4294967295`) are the object version's creating
-`chain_id`/`protocol_version` (`DurableObjectProvenance`, DR-0068), required
+`chain_id`/`protocol_version` (`DurableObjectProvenance`, [DR-0068](../architecture/decisions/0058-0075-postgres-conformance.md)), required
 on every row since generation one was redefined in place rather than
 migrated — there are no legacy rows without them. They are the exact frame
 inputs `node-core` needs to independently recompute the object digest with
@@ -311,7 +316,7 @@ CommitLossFixture`) now exercises the driver's own commit-boundary connection
 loss, not just deadline SQLSTATEs. Its two current implementations are both
 in the live test: a bounded, test-only `NoTls` TCP proxy, and a separate
 bounded, test-only proxy that terminates a strictly authenticated
-client-to-test-terminator TLS leg (DR-0074) and relays plaintext to the
+client-to-test-terminator TLS leg ([DR-0074](../architecture/decisions/0058-0075-postgres-conformance.md)) and relays plaintext to the
 dedicated test database. Both bind port 0, relay the untyped startup message
 and every later `1-byte-type + 4-byte-length` frame, and detect the exact
 simple-query `COMMIT` a durable commit, claim, or acknowledgement dispatches
@@ -608,11 +613,11 @@ before `COMMIT` dispatch for a plain state commit, and immediately after
 backend acceptance for the structured invocation commit, indexed outbox
 claim, and acknowledgement boundaries, over a plain `NoTls` transport and,
 separately, over a strictly authenticated client-to-test-terminator TLS leg
-(DR-0074); it says nothing about PostgreSQL-server/provider TLS, mTLS, PKI
+([DR-0074](../architecture/decisions/0058-0075-postgres-conformance.md)); it says nothing about PostgreSQL-server/provider TLS, mTLS, PKI
 lifecycle, or production certification beyond that one client leg. The
-separate DR-0070 scenario
+separate [DR-0070](../architecture/decisions/0058-0075-postgres-conformance.md) scenario
 now covers bounded pre-commit data-tablespace ENOSPC with exact non-publication
-and recovery evidence. A separate two-container DR-0073 scenario now covers a
+and recovery evidence. A separate two-container [DR-0073](../architecture/decisions/0058-0075-postgres-conformance.md) scenario now covers a
 bounded `pg_dump`-based database-snapshot restore rehearsal, with exact
 schema-identity/namespace-metadata/state/receipt verification before fence
 promotion, operator-only writer-fence advance, stale-context fencing, and post-restore reconciliation
@@ -620,7 +625,7 @@ evidence for one snapshot cycle; this does not close the checkpoint/backup/
 restore-with-blob-manifest-verification criterion above, since point-in-time
 recovery, continuous WAL archiving, hot/concurrent backup, checkpoint
 publication, and blob-manifest/state-root/encryption-key verification remain
-unimplemented. A further two-container DR-0075 scenario now covers a bounded
+unimplemented. A further two-container [DR-0075](../architecture/decisions/0058-0075-postgres-conformance.md) scenario now covers a bounded
 local PgBouncer 1.25.2 transaction-pooling rehearsal on an isolated Docker
 network, with configured-transaction-mode and single-backend-reuse evidence
 asserted directly through PgBouncer's own admin console, the real adapter
@@ -633,7 +638,7 @@ capacity, PgBouncer high availability/connection draining, and TLS on either
 leg remain unimplemented. Duplicate request races, abrupt/process faults, WAL or
 commit-boundary/real-device exhaustion, PostgreSQL-server/provider TLS,
 mTLS, PKI lifecycle, and production certification beyond the bounded
-DR-0074 client leg, migration compatibility across real old and new binaries,
+[DR-0074](../architecture/decisions/0058-0075-postgres-conformance.md) client leg, migration compatibility across real old and new binaries,
 capacity/load/soak, real writer failover, provider-managed pooler
-certification beyond the bounded DR-0075 rehearsal, and operational
+certification beyond the bounded [DR-0075](../architecture/decisions/0058-0075-postgres-conformance.md) rehearsal, and operational
 certification remain open.

@@ -96,7 +96,7 @@ audit-first sequencing and documentation-ownership decisions.
   version was unimplemented by simple absence of a code path; DR-0096 later
   added thresholded publication without changing `translate_update`. The bounded
   query API (`node_core::query_object`,
-  [product-surfaces.md §43](../product-surfaces.md)) is unchanged: it still returns
+  [product-surfaces.md §43](../product-surfaces.md#43-bounded-developer-mvp-query-api)) is unchanged: it still returns
   only a `CurrentBlobReference` result's explicit head/version metadata and
   digests, and still never fetches or verifies a blob body, preserving the
   documented query/write asymmetry.

@@ -15,9 +15,10 @@ servers, edge functions, and cloud functions without making any provider a
 consensus trust root.
 
 > [!WARNING]
-> Treat Sunrise Edge as experimental software. Do not use it to custody real
-> assets. The authoritative readiness status, limitations, and remaining work
-> are tracked in [`TODO.md`](TODO.md).
+> Treat Sunrise Edge as experimental software. It is not production-ready and
+> has not been independently audited. Do not use it to custody real assets.
+> The authoritative readiness status, limitations, and remaining work are
+> tracked in [`TODO.md`](TODO.md).
 
 ## Design goals
 

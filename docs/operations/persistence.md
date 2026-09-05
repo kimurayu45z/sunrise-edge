@@ -157,7 +157,7 @@ operations. Names below describe responsibilities, not yet-stable SQL names.
 | --- | --- | --- |
 | `storage_metadata` | validator and domain | Schema generation, writer fencing generation, migration state, and last verified checkpoint. |
 | `state_records` | domain, record kind, binary key | Small versioned protocol/configuration records with canonical bytes, schema/type version, monotonic revision, and tombstone state. No text-path parsing for correctness. |
-| `object_versions` | domain, object ID, object version | Immutable canonical object version or verified content-addressed blob reference, object digest, creating chain/protocol-version provenance (`DurableObjectProvenance`, DR-0068), and creation checkpoint. |
+| `object_versions` | domain, object ID, object version | Immutable canonical object version or verified content-addressed blob reference, object digest, creating chain/protocol-version provenance (`DurableObjectProvenance`, [DR-0068](../architecture/decisions/0058-0075-postgres-conformance.md)), and creation checkpoint. |
 | `object_heads` | domain, object ID | Current version/digest pointer, ownership/routing projection, revision, and tombstone. Updated atomically with the new immutable version. |
 | `request_receipts` | domain, request ID | Event digest, terminal outcome, canonical response, commit sequence, and retention watermark. Unique request identity rejects conflicting reuse. |
 | `outbox_batches` | domain, request ID | Immutable batch identity and event digest committed with state and receipt. |
@@ -229,7 +229,8 @@ owner/routing projections are routing metadata rather than authorization. An
 execution caller must separately load the linked version, match its
 version/digest to the head, decode an inline Object, and compare typed owner;
 a blob-backed body is now fetched from an explicit `BlobStore` component and
-independently verified before decode/authorization (docs/architecture/decisions/0094-0098-blobs-audit-and-documentation.md DR-0094).
+independently verified before decode/authorization
+([DR-0094](../architecture/decisions/0094-0098-blobs-audit-and-documentation.md)).
 The SQL
 `type_id` is the canonical Object record identifier,
 not the logical type hash retained in canonical Object bytes. Memory and
@@ -241,7 +242,8 @@ accepted authenticated Create/Update mutation commits is published to an explici
 `BlobStore` (content-addressed insert-if-absent, keyed under the same object
 digest) and referenced rather than stored inline only when its canonical
 bytes exceed a fixed deterministic 64 KiB threshold
-(`node_core::MAX_INLINE_OBJECT_BODY_BYTES`, docs/architecture/decisions/0094-0098-blobs-audit-and-documentation.md DR-0096); a
+(`node_core::MAX_INLINE_OBJECT_BODY_BYTES`,
+[DR-0096](../architecture/decisions/0094-0098-blobs-audit-and-documentation.md)); a
 version at or under the threshold stays inline exactly as before, which
 every ordinary small object body (an asset-account update included) always
 does. The staging decision that picks inline vs. blob is a pure function of
@@ -448,7 +450,8 @@ not general state reads:
    state/receipt, an identical `RequestAlreadyCommitted` replay, one exact
    claim and acknowledgement followed by `NoDueWork` for that request, and a
    final unfaulted commit
-   (implemented As-Is; see `docs/architecture/decisions/0058-0075-postgres-conformance.md` DR-0069). This proves PostgreSQL
+   (implemented As-Is; see
+   [DR-0069](../architecture/decisions/0058-0075-postgres-conformance.md)). This proves PostgreSQL
    database-process SIGKILL and WAL recovery on a live host with a live page
    cache; it does not prove abrupt host/power loss, storage write-cache
    flush/torn-write/media/filesystem faults, disk-full/WAL exhaustion,
@@ -459,7 +462,8 @@ not general state reads:
    64 MiB tmpfs, then fills only the latter. It proves direct SQLSTATE `53100`,
    definite `UnavailableBeforeCommit`, no state/receipt/commit-sequence
    publication, and recovery through the same pool/store after freeing space
-   (implemented As-Is; see `docs/architecture/decisions/0058-0075-postgres-conformance.md` DR-0070). This closes only bounded
+   (implemented As-Is; see
+   [DR-0070](../architecture/decisions/0058-0075-postgres-conformance.md)). This closes only bounded
    pre-commit data-tablespace ENOSPC evidence.
    A second required disposable-container scenario relocates `pg_wal` alone
    onto its own bounded 64 MiB tmpfs, distinct from and much smaller than the
@@ -485,8 +489,8 @@ not general state reads:
    after each restart proves two genuine crash/recovery cycles, and the same
    pool/store then prove no state/receipt/commit-sequence publication and
    recovery after freeing space (implemented As-Is; see
-   `docs/architecture/decisions/0058-0075-postgres-conformance.md`
-   DR-0071). This closes bounded pre-commit WAL-filesystem ENOSPC evidence;
+   [DR-0071](../architecture/decisions/0058-0075-postgres-conformance.md)).
+   This closes bounded pre-commit WAL-filesystem ENOSPC evidence;
    literal-`COMMIT` WAL/data ENOSPC remains untested, and no
    ENOSPC-specific classification is claimed for that boundary.
    A third required disposable-container scenario configures a tiny exact
@@ -530,7 +534,7 @@ not general state reads:
    own `application_name`, confirming the adapter pool specifically reclaimed
    it. The identical invocation, exact replay/claim/acknowledgement, and pool
    usability are then proven through the same pool/store (implemented As-Is;
-   see `docs/architecture/decisions/0058-0075-postgres-conformance.md` DR-0072). This closes
+   see [DR-0072](../architecture/decisions/0058-0075-postgres-conformance.md)). This closes
    bounded server connection-slot exhaustion evidence and this adapter's
    resulting deadline-based classification for it; real-device resource
    exhaustion and load/soak capacity remain open. A further required
@@ -569,7 +573,8 @@ not general state reads:
    by the adapter pool's own `application_name` proves specifically that
    the adapter pool reclaimed the freed backend, and exact
    replay/claim/acknowledgement/pool-usability are proven as in the other
-   scenarios (implemented As-Is; see `docs/architecture/decisions/0058-0075-postgres-conformance.md` DR-0075). This
+   scenarios (implemented As-Is; see
+   [DR-0075](../architecture/decisions/0058-0075-postgres-conformance.md)). This
    closes bounded local PgBouncer transaction-pooling rehearsal evidence
    only; provider-managed pooler service certification, load/soak
    capacity, PgBouncer high availability, TLS on either leg, real writer

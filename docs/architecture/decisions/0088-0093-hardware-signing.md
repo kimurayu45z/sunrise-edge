@@ -36,7 +36,7 @@ transport decisions.
   separate `clients/ledger` crate and requires an explicit amendment to the
   CLI's one-runtime-dependency decision.
 
-  **Completion boundary.** `docs/signing/hardware-signing.md` fixes the future APDU state machine,
+  **Completion boundary.** [`docs/signing/hardware-signing.md`](../../signing/hardware-signing.md) fixes the future APDU state machine,
   status words, bounds, clear-signing fields, and a provisional explicitly
   unregistered devnet-only derivation path. S4a has no device app, APDU I/O,
   USB/HID, Speculos, physical-device, registered coin-type, or release evidence;
@@ -47,7 +47,7 @@ transport decisions.
   release/submission evidence. S4 remains incomplete until those criteria and
   the real CLI production signer replacement are satisfied.
 - DR-0089: Make eight S4b Ledger device-contract clarifications for details
-  `docs/signing/hardware-signing.md` left implicit after DR-0088's freeze, and one correction to DR-0088's explicit
+  [`docs/signing/hardware-signing.md`](../../signing/hardware-signing.md) left implicit after DR-0088's freeze, and one correction to DR-0088's explicit
   blanket 230-byte whole-APDU data cap for `sign transaction`: FIRST's
   maximum command data rises from 230 to 255 bytes and its first chunk from
   205 to 230 bytes, while CONTINUE/LAST chunks remain capped at 230 bytes,
@@ -58,7 +58,7 @@ transport decisions.
   this or any other repository yet.
 
   **Scope.** This is a documentation-only clarification and correction of
-  the future S4b APDU/derivation contract in `docs/signing/hardware-signing.md`. It changes no
+  the future S4b APDU/derivation contract in [`docs/signing/hardware-signing.md`](../../signing/hardware-signing.md). It changes no
   code, canonical byte, encoder, or historical vector in this repository,
   and it is not itself S4b device-app or Speculos/physical-device evidence.
 
@@ -236,7 +236,7 @@ transport decisions.
   this workspace that may depend on Ledger/APDU/USB/HID vendor code
   (`hidapi`, confined to its `hid` module, using the `linux-native-basic-udev`
   feature so it builds without any system package). It implements the exact
-  `docs/signing/hardware-signing.md` "Device APDU contract" against an injectable `apdu::Transport`
+  [`docs/signing/hardware-signing.md`](../../signing/hardware-signing.md#device-apdu-contract) "Device APDU contract" against an injectable `apdu::Transport`
   trait: `device::LedgerDevice` drives `get configuration`, `verify public
   key`, `sign transaction`, and `reset signing`; `configuration::Configuration`
   decodes the exact six-byte response and rejects any profile id other than
@@ -248,7 +248,7 @@ transport decisions.
   `6E00`/`6F00`) to a typed variant, with an unrecognized status word a typed
   `UnknownStatus`, never success. `sign transaction`'s host-side chunking
   sends the frame's first ≤230-byte piece as FIRST, every full-size middle
-  piece as CONTINUE, and the final piece as LAST; because `docs/signing/hardware-signing.md` states
+  piece as CONTINUE, and the final piece as LAST; because [`docs/signing/hardware-signing.md`](../../signing/hardware-signing.md) states
   LAST is "valid only while collecting" (never the first APDU) and only
   LAST's response carries the signature, a frame that would otherwise fit
   entirely inside FIRST instead reserves its final byte for a dedicated LAST
@@ -307,7 +307,7 @@ transport decisions.
   while the device is at the dashboard with no application open — a
   distinct, OS-owned use of the same CLA byte `E0` this workspace's own
   Sunrise application uses for its own signing commands once it is the
-  active app (see `docs/signing/hardware-signing.md`, "Device APDU contract"). Verifying both
+  active app (see [`docs/signing/hardware-signing.md`](../../signing/hardware-signing.md#device-apdu-contract), "Device APDU contract"). Verifying both
   therefore requires a staged sequence this phase does not implement: probe
   at the dashboard first, then open (or have the operator open) the Sunrise
   application and reconnect, then send this crate's own `E0` commands.
@@ -447,7 +447,7 @@ transport decisions.
   reporting exactly `BOLOS` over CLA `B0` before it ever sends the OS-owned
   CLA `E0` firmware query — the same CLA byte this app's own frozen `E0`
   contract uses once the Sunrise application is open, reachable only before
-  that happens (see `docs/signing/hardware-signing.md`, "Device APDU contract"). It then requires
+  that happens (see [`docs/signing/hardware-signing.md`](../../signing/hardware-signing.md#device-apdu-contract), "Device APDU contract"). It then requires
   the dashboard-reported target id's top nibble to identify a normal Secure
   Element OS response (USB model recognition remains a separate descriptor
   check) and rejects any reported version (dashboard app or

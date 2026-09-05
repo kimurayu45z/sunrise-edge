@@ -1717,8 +1717,10 @@ production-ready、mainnet-ready、監査済みを意味しない。
   複製するだけのPRを新しいPhaseの完了としてはいけない。
 - mainnet release判断はPhase番号ではなく、cross-phase production release gateと
   security reviewの充足で行う。
-- READMEのcurrent statusとARCHITECTUREのimplemented behaviorはAs-Isを記録し、
-  TODOはTo-Beと未解決のproduction gapを保持する。
+- TODOはcurrent implementation status・roadmap sequencing・未解決のproduction gapの
+  唯一のlive情報源である。docs/architectureはimplemented As-Is behaviorとaccepted
+  decision recordsを記録するが、live work queueではない。READMEはcurrent statusを
+  一切含めない。
 - 各PhaseのPRを完了するときは、TODOのAs-Isと残存production exit criteriaを同時に
   更新する。criteriaを満たしていない項目へ単に`implemented`だけを付けない。
 

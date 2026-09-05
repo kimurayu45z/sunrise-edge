@@ -316,7 +316,7 @@ the read-only policy and still reject Write/Consume before storage I/O; a
 separate additive `native-http` composition,
 `preinstalled_wasm_structured_durable_router`, now accepts signed owned
 Write/Consume through the preinstalled-WASM entrypoint described in
-[runtime-and-ingress.md §30](runtime-and-ingress.md) instead (see
+[runtime-and-ingress.md §30](runtime-and-ingress.md#30-node-core-invocation-boundary) instead (see
 [DR-0080](decisions/0076-0080-developer-mvp-foundation.md)).
 
 An additive trusted preinstalled-WASM composition now captures the exact
