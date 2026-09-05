@@ -10,6 +10,7 @@
 - [DR-0099: submit-only event ingress](0099-submit-only-event-ingress.md)
 - [DR-0100: native HTTP pre-parser admission](0100-native-http-preparser-admission.md)
 - [DR-0101–DR-0103: audit integrity and authentication](0101-audit-integrity-and-authentication.md)
+- [DR-0104: Asset Standards Gate](0104-asset-standards-gate.md)
 
 These records describe accepted decisions and compatibility boundaries. Work
 status and remaining completion criteria belong in [`TODO.md`](../../../TODO.md).

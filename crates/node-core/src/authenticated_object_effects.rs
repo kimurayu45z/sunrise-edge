@@ -9,6 +9,7 @@ use super::{
     MAX_AUTHENTICATED_OBJECT_BODY_BYTES, MAX_AUTHENTICATED_OBJECT_READS,
     MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES, NodeCoreError,
 };
+use crypto::{Ed25519OwnerAddressError, Ed25519OwnerAddressPolicy, validate_ed25519_owner_address};
 use execution::{ObjectEffect, ResolvedObject};
 use hashing::HashSuiteResolver;
 use objects::{AccessMode, Object, ObjectId, Owner, encode_object};
@@ -161,6 +162,40 @@ pub(super) struct TrustedObjectMutationContext<'a> {
     pub(super) protocol_version: ProtocolVersion,
     pub(super) epoch: Epoch,
     pub(super) created_checkpoint: u64,
+}
+
+/// Revalidates every owner-bearing execution output under the authentication
+/// profile that admitted the transaction.
+///
+/// This is a defense-in-depth boundary for every authenticated object-effects
+/// path: input authorization has already checked loaded owners, but neither a
+/// faulty executor nor future effect construction may introduce an
+/// inadmissible Address owner before the atomic durable commit. Historical
+/// profile 1 remains unrestricted. Creation remains separately unsupported;
+/// validating a `Created` effect here does not make it reachable.
+pub(super) fn validate_output_owner_addresses(
+    effects: &[ObjectEffect],
+    policy: Ed25519OwnerAddressPolicy,
+) -> Result<(), NodeCoreError> {
+    for effect in effects {
+        let object: &Object = match effect {
+            ObjectEffect::Created(object) => object,
+            ObjectEffect::Mutated { new_object, .. } => new_object,
+            ObjectEffect::Deleted { .. } => continue,
+        };
+        let Owner::Address(owner_address) = &object.owner else {
+            continue;
+        };
+        validate_ed25519_owner_address(owner_address.as_bytes(), policy).map_err(
+            |source: Ed25519OwnerAddressError| {
+                NodeCoreError::InadmissibleObjectOutputOwnerAddress {
+                    object_id: object.id,
+                    source,
+                }
+            },
+        )?;
+    }
+    Ok(())
 }
 
 /// Validates exact signed-access/effect correspondence and builds durable mutations.
@@ -508,6 +543,7 @@ fn require_mutable_address_owner(input: &VerifiedAuthenticatedObject) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_zebra::{SigningKey, VerificationKey};
     use hashing::verify_digest;
     use objects::Address;
     use protocol_types::{Digest32, HashAlgorithmId, HashSuite, HashSuiteSchedule};
@@ -536,8 +572,77 @@ mod tests {
         }
     }
 
+    fn signer_owner(seed: u8) -> Address {
+        let signing_key: SigningKey = SigningKey::from([seed; 32]);
+        let verification_key: VerificationKey = VerificationKey::from(&signing_key);
+        let mut bytes: [u8; 32] = [0; 32];
+        bytes.copy_from_slice(verification_key.as_ref());
+        Address::new(bytes)
+    }
+
+    fn universal_zip215_owner() -> Address {
+        let mut bytes: [u8; 32] = [0; 32];
+        bytes[0] = 1;
+        bytes[31] = 0x80;
+        Address::new(bytes)
+    }
+
     fn verified(mode: AccessMode, object: Object) -> VerifiedAuthenticatedObject {
         verified_at_checkpoint(mode, object, 0)
+    }
+
+    #[test]
+    fn output_owner_validation_preserves_legacy_profile_behavior() {
+        let created: Object = object(1, Owner::Address(universal_zip215_owner()), vec![0x01]);
+        let mutated: ObjectEffect = ObjectEffect::Mutated {
+            previous_version: 1,
+            new_object: object(2, Owner::Address(universal_zip215_owner()), vec![0x02]),
+        };
+        let effects: Vec<ObjectEffect> = vec![ObjectEffect::Created(created), mutated];
+
+        assert_eq!(
+            validate_output_owner_addresses(
+                effects.as_slice(),
+                Ed25519OwnerAddressPolicy::LegacyZip215,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn strict_output_owner_validation_checks_created_and_mutated_effects() {
+        let invalid_owner: Address = universal_zip215_owner();
+        let valid_owner: Address = signer_owner(0x62);
+        let valid_mutation: ObjectEffect = ObjectEffect::Mutated {
+            previous_version: 1,
+            new_object: object(2, Owner::Address(valid_owner), vec![0x03]),
+        };
+        assert_eq!(
+            validate_output_owner_addresses(
+                &[valid_mutation],
+                Ed25519OwnerAddressPolicy::CanonicalPrimeOrder,
+            ),
+            Ok(())
+        );
+
+        for effect in [
+            ObjectEffect::Created(object(1, Owner::Address(invalid_owner), vec![0x04])),
+            ObjectEffect::Mutated {
+                previous_version: 1,
+                new_object: object(2, Owner::Address(invalid_owner), vec![0x05]),
+            },
+        ] {
+            assert_eq!(
+                validate_output_owner_addresses(
+                    &[effect],
+                    Ed25519OwnerAddressPolicy::CanonicalPrimeOrder,
+                ),
+                Err(NodeCoreError::InadmissibleObjectOutputOwnerAddress {
+                    object_id: ObjectId::new([0x41; 32]),
+                    source: Ed25519OwnerAddressError::NonCanonicalPoint,
+                })
+            );
+        }
     }
 
     fn verified_at_checkpoint(

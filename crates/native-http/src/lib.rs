@@ -3404,6 +3404,7 @@ fn node_error_response(error: &NodeCoreError) -> Response {
         | NodeCoreError::TooManyObjectEffects { .. }
         | NodeCoreError::UndeclaredObjectEffect { .. }
         | NodeCoreError::ObjectMutationContextMissing { .. }
+        | NodeCoreError::InadmissibleObjectOutputOwnerAddress { .. }
         | NodeCoreError::SystemModules(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "invalid-node-output")
         }
@@ -3716,7 +3717,7 @@ mod tests {
         http::Request,
     };
     use canonical_encoding::{CanonicalDecodingError, CanonicalStruct, decode_canonical_frame};
-    use crypto::{SignatureDomain, SignatureMessageType};
+    use crypto::{Ed25519OwnerAddressError, SignatureDomain, SignatureMessageType};
     use execution::{
         Transaction, decode_transaction, encode_transaction, encode_transaction_signable,
     };
@@ -6078,6 +6079,22 @@ mod tests {
                 NodeCoreError::ObjectOwnerMismatch { object_id },
                 StatusCode::FORBIDDEN,
                 "object-owner-mismatch",
+            ),
+            (
+                NodeCoreError::InadmissibleObjectOwnerAddress {
+                    object_id,
+                    source: Ed25519OwnerAddressError::NonCanonicalPoint,
+                },
+                StatusCode::BAD_REQUEST,
+                "invalid-node-event",
+            ),
+            (
+                NodeCoreError::InadmissibleObjectOutputOwnerAddress {
+                    object_id,
+                    source: Ed25519OwnerAddressError::NonCanonicalPoint,
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid-node-output",
             ),
             (
                 NodeCoreError::ObjectAccessModeUnsupported {

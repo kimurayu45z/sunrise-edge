@@ -48,7 +48,7 @@ pub mod transaction_auth;
 
 use authenticated_object_effects::{
     LoadedAuthenticatedObjects, translate_authenticated_object_effects,
-    translate_fee_only_object_effects,
+    translate_fee_only_object_effects, validate_output_owner_addresses,
 };
 use preinstalled_wasm::{
     check_preinstalled_module_gas_limit, normalize_trapped_preinstalled_execution,
@@ -338,6 +338,14 @@ pub enum NodeCoreError {
     /// owner bytes failed that policy.
     InadmissibleObjectOwnerAddress {
         /// Object carrying the rejected owner.
+        object_id: ObjectId,
+        /// Exact admissibility failure.
+        source: Ed25519OwnerAddressError,
+    },
+    /// Authenticated execution returned an Address-owned object whose owner
+    /// violates the profile that admitted the transaction.
+    InadmissibleObjectOutputOwnerAddress {
+        /// Object carrying the rejected output owner.
         object_id: ObjectId,
         /// Exact admissibility failure.
         source: Ed25519OwnerAddressError,
@@ -919,6 +927,10 @@ impl fmt::Display for NodeCoreError {
             Self::InadmissibleObjectOwnerAddress { object_id, source } => {
                 write!(f, "object {object_id} owner is not admissible: {source}")
             }
+            Self::InadmissibleObjectOutputOwnerAddress { object_id, source } => write!(
+                f,
+                "object {object_id} output owner is not admissible: {source}"
+            ),
             Self::ObjectAccessModeUnsupported { object_id, mode } => write!(
                 f,
                 "object {object_id} requested unsupported access mode {mode:?}"
@@ -1199,6 +1211,7 @@ impl Error for NodeCoreError {
             Self::UnsupportedGasScheduleShape(error) => Some(error),
             Self::ObjectBlobPublishFailed { source, .. } => Some(source),
             Self::InadmissibleObjectOwnerAddress { source, .. } => Some(source),
+            Self::InadmissibleObjectOutputOwnerAddress { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -4197,6 +4210,12 @@ where
     };
     let transition = machine.transition(&snapshot, &event)?;
     validate_output_event_context(transition.output(), &event)?;
+    if let Some(dispatch) = &dispatch {
+        validate_output_owner_addresses(
+            transition.object_effects(),
+            dispatch.owner_address_policy,
+        )?;
+    }
     let mutation_context: Option<authenticated_object_effects::TrustedObjectMutationContext<'_>> =
         created_checkpoint.map(|created_checkpoint: u64| {
             authenticated_object_effects::TrustedObjectMutationContext {
@@ -5822,6 +5841,47 @@ mod tests {
     ) -> AuthenticatedSubmitTransaction {
         let payload = signed_transaction_bytes(signing_key, &tx);
         let event = NodeEvent::new(
+            ChainId::new(chain).unwrap(),
+            ProtocolVersion::new(3),
+            epoch,
+            request_id,
+            NodeEventKind::SubmitTransaction,
+            payload,
+        )
+        .unwrap();
+        authenticate_submit_transaction_event(event, config, protocol_config).unwrap()
+    }
+
+    /// Authenticates a test transaction under profile 2's request-bound
+    /// signature envelope.
+    #[allow(clippy::too_many_arguments)]
+    fn authenticated_profile_2_submission_from_transaction(
+        chain: &str,
+        request_id: RequestId,
+        signing_key: &SigningKey,
+        epoch: Epoch,
+        tx: Transaction,
+        config: &NodeConfig,
+        protocol_config: &ProtocolConfig,
+    ) -> AuthenticatedSubmitTransaction {
+        let transaction_signable: Vec<u8> = encode_transaction_signable(&tx).unwrap();
+        let submission_signable: Vec<u8> =
+            encode_submit_transaction_signable(request_id, &transaction_signable).unwrap();
+        let domain: crypto::SignatureDomain = crypto::SignatureDomain {
+            chain_id: tx.chain_id.clone(),
+            protocol_version: ProtocolVersion::new(3),
+            epoch: tx.epoch,
+            message_type: crypto::SignatureMessageType::new(SUBMIT_TRANSACTION_V1_MESSAGE_TYPE)
+                .unwrap(),
+            signature_scheme_id: SignatureSchemeId::Ed25519,
+        };
+        let framed: Vec<u8> =
+            crypto::frame_signature_message(&domain, &submission_signable).unwrap();
+        let signature = signing_key.sign(&framed);
+        let mut signed: Transaction = tx;
+        signed.signature = signature.to_bytes().to_vec();
+        let payload: Vec<u8> = encode_transaction(&signed).unwrap();
+        let event: NodeEvent = NodeEvent::new(
             ChainId::new(chain).unwrap(),
             ProtocolVersion::new(3),
             epoch,
@@ -10927,6 +10987,25 @@ mod tests {
         .unwrap()
     }
 
+    /// A contract that creates an Address-owned object using the historical
+    /// universal ZIP-215 non-canonical identity encoding. Profile 1 admits
+    /// these owner bytes, while profile 2 must reject them before durable
+    /// commit. The separate Create prohibition remains in force either way.
+    fn preinstalled_create_with_inadmissible_owner_wasm_bytes() -> Vec<u8> {
+        wat::parse_str(
+            r#"(module
+                (import "env" "create_object" (func $create_object (param i32 i32 i32 i32 i32 i32)(result i32)))
+                (memory 1)
+                (export "memory" (memory 0))
+                (data (i32.const 0) "\00\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\FF")
+                (data (i32.const 35) "\01")
+                (data (i32.const 66) "\80")
+                (func (export "run")
+                  (drop (call $create_object (i32.const 34) (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 3) (i32.const 35)))))"#,
+        )
+        .unwrap()
+    }
+
     fn preinstalled_manifest(
         module_id: ModuleId,
         max_input_size: u64,
@@ -11198,6 +11277,8 @@ mod tests {
         store.set_time(100);
         let node_config: NodeConfig = config("sunrise-test");
         let mut protocol_config: ProtocolConfig = active_protocol_config(0xFD);
+        protocol_config.transaction_auth_profile =
+            Some(TransactionAuthProfile::ed25519_canonical_prime_order_address_is_public_key());
         let signing_key: SigningKey = dev_signing_key(0xDA);
         let sender: Address = dev_sender_address(&signing_key);
         let context: DurableOperationContext = durable_context();
@@ -11237,15 +11318,16 @@ mod tests {
             module_ref,
             vec![1, 2],
         );
-        let submission: AuthenticatedSubmitTransaction = authenticated_submission_from_transaction(
-            "sunrise-test",
-            request(0xF0),
-            &signing_key,
-            Epoch::new(7),
-            tx,
-            &node_config,
-            &protocol_config,
-        );
+        let submission: AuthenticatedSubmitTransaction =
+            authenticated_profile_2_submission_from_transaction(
+                "sunrise-test",
+                request(0xF0),
+                &signing_key,
+                Epoch::new(7),
+                tx,
+                &node_config,
+                &protocol_config,
+            );
         let engine = WasmExecutionEngine;
         let blob_store: MemoryBlobStore = MemoryBlobStore::default();
 
@@ -11281,10 +11363,9 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(
-            committed_object(&write_v2, &blob_store).data,
-            vec![0xCA, 0xFE]
-        );
+        let committed_write: Object = committed_object(&write_v2, &blob_store);
+        assert_eq!(committed_write.owner, Owner::Address(sender));
+        assert_eq!(committed_write.data, vec![0xCA, 0xFE]);
         let nonce_key: Vec<u8> =
             sender_nonce_key_for("sunrise-test", *sender.as_bytes(), Epoch::new(7));
         let persisted_nonce: VersionedStateValue = store
@@ -12366,6 +12447,116 @@ mod tests {
             NodeCoreError::ObjectCreationUnsupported { .. }
         ));
         assert_eq!(store.commits.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn strict_preinstalled_output_owner_rejects_before_atomic_commit() {
+        let node_config: NodeConfig = config("sunrise-test");
+        let mut protocol_config: ProtocolConfig = active_protocol_config(0xA7);
+        protocol_config.transaction_auth_profile =
+            Some(TransactionAuthProfile::ed25519_canonical_prime_order_address_is_public_key());
+        let signing_key: SigningKey = dev_signing_key(0xA7);
+        let sender: Address = dev_sender_address(&signing_key);
+        let hash_resolver: HashSuiteResolver = resolver("sunrise-test");
+        let module_id: ModuleId = ModuleId::new([0xA8; 32]);
+        let (registry, catalog, module_ref): (
+            SystemModuleRegistry,
+            PreinstalledModuleCatalog,
+            ObjectRef,
+        ) = preinstalled_module_fixture(
+            &hash_resolver,
+            module_id,
+            1,
+            preinstalled_create_with_inadmissible_owner_wasm_bytes(),
+            64,
+            Epoch::new(0),
+            system_modules::ModuleStatus::Active,
+        );
+        protocol_config.system_modules = registry;
+        let store: ScriptedDurableStore =
+            ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let input_id: ObjectId = ObjectId::new([0xA9; 32]);
+        let (object_ref, original_head): (ObjectRef, DurableObjectHead) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            input_id,
+            Owner::Address(sender),
+            0xA9,
+        );
+        let manifest: AccessManifest = manifest_with(vec![AccessEntry {
+            object_ref,
+            mode: AccessMode::Read,
+        }]);
+        let transaction: Transaction = preinstalled_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            0,
+            manifest,
+            module_ref,
+            Vec::new(),
+        );
+        let request_id: RequestId = request(0xAA);
+        let submission: AuthenticatedSubmitTransaction =
+            authenticated_profile_2_submission_from_transaction(
+                "sunrise-test",
+                request_id,
+                &signing_key,
+                Epoch::new(7),
+                transaction,
+                &node_config,
+                &protocol_config,
+            );
+        let context: DurableOperationContext = durable_context();
+
+        let error: NodeCoreError = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
+            &MemoryBlobStore::default(),
+            &store,
+            &context,
+            &hash_resolver,
+            &catalog,
+            &WasmExecutionEngine,
+            submission,
+            9,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                NodeCoreError::InadmissibleObjectOutputOwnerAddress {
+                    source: Ed25519OwnerAddressError::NonCanonicalPoint,
+                    ..
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        // No invocation reached the atomic store, so nonce, receipt, and
+        // outbox remain absent together rather than partially committing.
+        assert!(store.commits.lock().unwrap().is_empty());
+        assert!(store.receipt.lock().unwrap().is_none());
+        let nonce_key: Vec<u8> =
+            sender_nonce_key_for("sunrise-test", *sender.as_bytes(), Epoch::new(7));
+        let nonce: VersionedStateValue = store
+            .get_versioned_durable(&context, domain(0xA7), nonce_key.as_slice())
+            .unwrap();
+        assert!(nonce.value().is_none());
+        let current_head: DurableObjectHead = store
+            .get_object_head(&context, domain(0xA7), input_id)
+            .unwrap();
+        assert_eq!(current_head, original_head);
+        assert!(
+            store
+                .get_object_version(
+                    &context,
+                    domain(0xA7),
+                    input_id,
+                    DurableObjectVersion::new(2).unwrap(),
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

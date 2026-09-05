@@ -2326,6 +2326,69 @@ database-process SIGKILL、pre-commit data/WAL ENOSPC、connection exhaustion、
 TLS commit-loss、PgBouncer rehearsalも既存As-Is evidenceとして監査へ提示し、未実装の
 physical media faultや長期soakを同じ項目として重複実装しない。
 
+## Asset Standards Gate
+
+**目的（2026-09-06、docs/architecture/decisions/0104-asset-standards-gate.md
+DR-0104）:** Initial Code Security Audit Entry Gate後に追加するasset surfaceを、
+builderまたはpublic testnetへ露出する前に固定する。fungible standardは
+**Standard Asset v1**、NFT-like standardは**Unique Asset v1**と呼ぶ。Standard Asset v1は
+Sui-likeのowned `StandardAssetCoinV1` objectとtyped capability authorityを使い、
+definition、coin、capabilityを別objectにする。各coinはexact `AssetId` + integer amountを
+持ち、1 ownerが同じassetの複数coinを所有できる。object identity/versionが
+anti-double-spend/version mechanismであり、coin bodyの別sequenceはv1に入れない。
+
+**Current status:** DR-0104による名称、モデル、互換性、fail-closed activation
+boundaryはaccepted。認証に使ったprofileのowner policyでauthenticated executionの
+Address-owned outputをcommit前に再検証するprerequisiteのみimplemented As-Is。
+`fees::AssetId`とdevnet-local `0xF001`/`0xF010`/`0xF011`は不変で、現在の
+devnet assetをStandard Asset v1とは再解釈しない。以下の残存criteriaはopenであり、
+Standard Asset v1、Unique Asset v1、builder/public-testnet asset surfaceはまだ有効ではない。
+
+### Completion criteria
+
+1. **実装済み（documentation only、DR-0104）。** Standard Asset v1と
+   Unique Asset v1の名称、owned coin + typed capabilityの分離、object-versionによる
+   double-spend防止、devnet/fee compatibility boundaryをarchitecture decisionとして固定した。
+2. **実装済み（prerequisite only）。** authenticated executionが返すCreated/Mutated
+   objectのAddress ownerを、transactionを認証した同じprofile-versioned policyで
+   object mutation構築前にfail closed再検証する。これ自体はCreateを認可しない。
+3. **未実装。** canonicalかつdomain-separatedな`AssetId` derivationを実装する。
+   new coin `ObjectId`はcoin固有formulaを増やさず、exact signed transaction hash context +
+   creation ordinalを使う既存のgeneric versioned created-object derivationを共有し、historical v1
+   behaviorと既存vectorを不変にする。実装前にidentifier namespace全体をauditし、additiveな
+   安定type ID/tag/domain/feature/module/ABIを初めてallocateし、exact bytes、hash-suite
+   migration後の歴史的再現、negative/vectorをpinする。
+4. **未実装。** Standard Asset v1のdefinition、`StandardAssetCoinV1`、typed authority
+   capabilityを別々のbounded canonical schemaとして実装し、unknown version/field/tag、
+   non-canonical bytes、duplicate identityをfail closedにする。
+5. **未実装。** whole-coin transferはcanonical signed recipientへのexact owner change、
+   partial transferはsender remainderのMutate + recipient coinのCreate、mergeはsame-assetの
+   sender-owned coin 1個をchecked sumへMutateし、残りのsender-owned inputsをConsumeする。
+   mergeでnew coinはCreateしない。recipientは
+   signせず、recipient stateはread/writeしない。owned-only operationはglobal total orderを
+   避けるが、validator quorum/certificationは必須とする。CLI/clientはcoin selection、
+   split、merge、dust consolidationを隠蔽しつつexact signed intentを保つ。
+6. **未実装。** future additive protocol version + exact governance-committed preinstalled-module
+   policyの二重gateのみでbounded Create/owner changeを有効化する。module/version/
+   entrypoint、signed recipient、input/output count/aggregate bytes、exact outputs、type/schema/owner/
+   id derivation/atomic conservationをnode-coreが独立検証し、
+   exact absent headを読んでnonce/receipt/fee/outboxとatomic commitする。current/tombstone
+   collisionは拒否し、generic contract Create、unsigned owner change、caller-selected IDは
+   fail closedのままにする。
+7. **未実装。** Standard Asset v1をfee policyが認める場合も、ordinary coin objectと
+   same ownership/exact-version/checked-arithmetic/atomic-effect ruleを使い、native coinやprivileged
+   balanceを追加しない。すべてのfast-path transferが1つのglobally hot treasury balance
+   objectを書く設計は禁止し、fee output/aggregation/certificate-signer distributionは
+   別のbounded deterministic decisionで固定する。
+8. **未実装。** canonical/stable/adversarial/replay/concurrent-create/fee-composition testと
+   complete repository gateを通し、Initial Audit後のprotocol-critical surfaceとしてfocused
+   delta security reviewを完了する。
+
+metadata authenticity、mint/burn/supply accounting、authority capabilityのlifecycle、freeze/close/
+allowance、governed fee-asset admission、Unique Asset v1の実装は後続sliceである。
+これらを完了扱いにせず、このgateはそれぞれの後続実装とdelta reviewを
+追跡し続ける。
+
 ## CLI-First Node Production Gate
 
 CLI Developer MVP Gate（criteria 1-6・10・11）を通過した後、本物のnode自体を
