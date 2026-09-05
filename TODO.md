@@ -2232,9 +2232,14 @@ gateでは全auditの重大指摘解消を引き続き要求する。
 変更）はnative HTTPの4router family全て（`router`、`resolved_domain_router`、
 `structured_durable_router`、`preinstalled_wasm_structured_durable_router`と各
 `_with_executor`構成関数）でimplemented As-Isとなった
-（docs/architecture/decisions/0099-submit-only-event-ingress.md DR-0099）。
-audit scope/threat model packetの固定（criteria 2-3、`SECURITY.md`相当の作成を含む）が
-未完了であるため、このgateは依然未通過。これを次の最優先sliceとする。
+（docs/architecture/decisions/0099-submit-only-event-ingress.md DR-0099）。criteria 2-3の
+audit scope、source-backed threat model、root `SECURITY.md`、private vulnerability reporting
+routeもimplemented As-Isとなった。初回audit revisionはこれらの文書を導入したpull requestの
+final validated head SHAとし、同一SHAに対するclean-tree complete repository gateとrequired
+GitHub checksをpull-request handoffへ記録する。このevidenceをmerge条件とすることで、Initial
+Code Security Audit Entry Gateは通過し、初回第三者code security auditを開始できる。これは
+audit完了、Software Production Gate、CLI-First Node Production Gate、production readiness、
+mainnet readinessのいずれも意味しない。
 
 ### 最小completion criteria
 
@@ -2251,14 +2256,14 @@ audit scope/threat model packetの固定（criteria 2-3、`SECURITY.md`相当の
    node-coreのgeneric `TransactionalNodeStateMachine`経路・`validate_generic_event`・
    `NodeCoreError`の公開variantは変更していない。各family固有の認証・認可を実装するまで、
    この境界だけがscopeであり、全familyを先に実装することはこのgateの条件ではない。
-2. immutable audit commitとin-scope surfaceを固定する。初回監査対象はcanonical encoding/
+2. **実装済み。** immutable audit commitとin-scope surfaceを固定する。初回監査対象はcanonical encoding/
    hashing/signature framing、`SubmitTransaction` authentication、nonce/replay/dedup、owned
    object access/effects、preinstalled deterministic WASM、ordinary-asset fee composition、
    runtime structured transaction、SQLite/PostgreSQLのatomic state/object/receipt/outbox、
    両adapterのblob-reference mapping、runtime publication contractとlocal SQLite blob store、
    native HTTP bounds/error mapping、Rust client/CLIの
    pre-signing context/TLS boundaryとする。
-3. `SECURITY.md`または同等のaudit packetに、trust boundary、attacker capabilities、key/
+3. **実装済み。** `SECURITY.md`または同等のaudit packetに、trust boundary、attacker capabilities、key/
    signer assumptions、supported surface、known limitations、out-of-scope項目、完全な検証
    command、private vulnerability reporting routeを記録する。既存stable vectorsと
    `npm ci --prefix adapters/cloudflare-workers` + `./scripts/check-all.sh`が固定audit commitで

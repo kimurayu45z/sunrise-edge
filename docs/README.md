@@ -19,5 +19,12 @@ detailed design, operator guides, and specialist references live here.
 - [PostgreSQL reference design](operations/postgres.md)
 - [Hardware signing](signing/hardware-signing.md)
 
+## Security
+
+- [Security policy and private reporting](../SECURITY.md)
+- [Security documentation index](security/README.md)
+- [Reusable threat model](security/threat-model.md)
+- [Initial code-security audit scope](security/initial-code-audit-scope.md)
+
 The authoritative implementation status, outstanding work, and completion
 criteria remain in [`TODO.md`](../TODO.md).
