@@ -3,7 +3,7 @@
 /// Strictly bounded parsing and display limits for one hardware signing
 /// device profile.
 ///
-/// See `SIGNING.md`, "Hardware Signing Profile v1", for the normative
+/// See `docs/signing/hardware-signing.md`, "Hardware Signing Profile v1", for the normative
 /// specification these bounds implement. [`crate::view::build_clear_signing_view`]
 /// fails closed — it never truncates, wraps, or partially renders a
 /// value — if any signed field exceeds its bound here; a transaction that
@@ -38,7 +38,7 @@ pub struct DeviceSigningProfile {
 }
 
 impl DeviceSigningProfile {
-    /// Hardware Signing Profile v1 (see `SIGNING.md`).
+    /// Hardware Signing Profile v1 (see `docs/signing/hardware-signing.md`).
     ///
     /// These bounds are sized so every line this crate renders — including
     /// a full 32-byte `ObjectId`/`Address`/`AssetId` or an algorithm-

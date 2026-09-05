@@ -7,7 +7,7 @@
 //! sender, the active signature scheme, and a [`TransactionRequest`], then
 //! either signs it in-process with a [`SignatureSigner`] (for example
 //! [`LocalSigner`]) or exports the exact bytes an out-of-process signer
-//! (see `ARCHITECTURE.md` DR-0084's Ledger-ready external signing boundary)
+//! (see `docs/architecture/README.md` DR-0084's Ledger-ready external signing boundary)
 //! must sign. [`build_signed_transaction`] is the original
 //! single-call convenience entrypoint and is now implemented through this
 //! same path, so its stable output is unchanged.
@@ -33,7 +33,7 @@ use crate::key::LocalSigner;
 /// Every reference here — the access manifest and the module reference — is
 /// exactly what the caller supplies. This builder invents no object
 /// discovery, module lookup, or asset-specific defaults; that is deliberate
-/// (see `ARCHITECTURE.md` §44 / DR-0083).
+/// (see `docs/architecture/README.md` §44 / DR-0083).
 pub struct TransactionRequest {
     /// Chain replay-protection identifier. Must match the trusted
     /// `/v1/context` chain id.
@@ -72,7 +72,7 @@ pub struct TransactionRequest {
 /// always shown the exact bytes it is about to authenticate.
 ///
 /// Only `Ed25519` with the `AddressIsPublicKey` address binding is
-/// implemented anywhere in this workspace today (see `ARCHITECTURE.md`
+/// implemented anywhere in this workspace today (see `docs/architecture/README.md`
 /// DR-0084): [`PreparedTransaction::prepare`] rejects every other signature
 /// scheme before any framing happens, and
 /// [`PreparedTransaction::finalize`] verifies a returned signature directly
@@ -179,7 +179,7 @@ impl PreparedTransaction {
     /// verifier in this workspace uses
     /// ([`crypto::frame_signature_message`]); it exists so an out-of-process
     /// signer — for example a future dedicated hardware-wallet application
-    /// (see `ARCHITECTURE.md` DR-0084) — can be shown the exact bytes it is
+    /// (see `docs/architecture/README.md` DR-0084) — can be shown the exact bytes it is
     /// asked to sign without this client duplicating or re-deriving that
     /// framing.
     pub fn signable_frame(&self) -> Result<Vec<u8>, ClientError> {

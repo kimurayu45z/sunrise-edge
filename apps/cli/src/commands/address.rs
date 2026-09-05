@@ -35,7 +35,7 @@ where
     }
 }
 
-/// Connects a real Ledger device — running `SIGNING.md`'s complete staged
+/// Connects a real Ledger device — running `docs/signing/hardware-signing.md`'s complete staged
 /// dashboard/firmware/open-app/reconnect/active-app sequence before the
 /// existing device-reported configuration/public key/address checks — and
 /// prints the confirmed address.

@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
-//! Sunrise Edge Ledger host client (S4c; see `SIGNING.md` and
-//! `ARCHITECTURE.md`'s Hardware Signing Profile v1 decision records).
+//! Sunrise Edge Ledger host client (S4c; see `docs/signing/hardware-signing.md` and
+//! `docs/architecture/README.md`'s Hardware Signing Profile v1 decision records).
 //!
 //! This crate owns every Ledger/APDU/USB/HID dependency in this workspace
 //! (`hidapi`, confined to [`hid`]) and implements the host side of the
-//! frozen `SIGNING.md` device contract: exact APDU bytes/status words
+//! frozen `docs/signing/hardware-signing.md` device contract: exact APDU bytes/status words
 //! ([`apdu`]), the provisional derivation path ([`path`]), `get
 //! configuration` decoding/validation ([`configuration`]), the FIRST/
 //! CONTINUE/LAST signing state machine ([`device`]), the Ledger OS
@@ -22,7 +22,7 @@
 //! key/address identity, and disconnect/rejection/fail-closed cases —
 //! without any USB/HID hardware, and with no native dependency at all.
 //! Real physical hardware-in-the-loop evidence remains deferred (see
-//! `SIGNING.md`, "Delivery sequence"); [`hid::HidTransport`] is a real, but
+//! `docs/signing/hardware-signing.md`, "Delivery sequence"); [`hid::HidTransport`] is a real, but
 //! not yet hardware-validated, implementation of that same trait.
 //!
 //! [`hid::HidTransport`] and the `hidapi` dependency it wraps are behind the
@@ -36,7 +36,7 @@
 //! `usb-hid` explicitly to build a binary that can reach real hardware.
 //!
 //! No protocol crate and no `clients/rust` may depend on this crate or on
-//! `hidapi` (see `ARCHITECTURE.md`'s "Non-negotiable architecture rules" and
+//! `hidapi` (see `docs/architecture/README.md`'s "Non-negotiable architecture rules" and
 //! DR-0088/DR-0091/DR-0092): this crate depends on `sunrise-edge-client`,
 //! never the reverse.
 

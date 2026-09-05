@@ -1,5 +1,5 @@
 //! S1's mandatory, locally trusted expected-protocol-context verification
-//! boundary (`ARCHITECTURE.md` DR-0085; `TODO.md` CLI-First Node Production
+//! boundary (`docs/architecture/README.md` DR-0085; `TODO.md` CLI-First Node Production
 //! Gate S1a).
 //!
 //! A successful transport connection — including the implemented remote TLS
@@ -47,7 +47,7 @@ use protocol_types::{AtomicityDomainId, ChainId, Epoch, HashSuiteId, ProtocolVer
 /// atomicity domain the caller intends to reach — never an additional
 /// signature-domain binding. It is never combined into
 /// `crypto::SignatureDomain`; domain separation for signing stays exactly as
-/// documented in `ARCHITECTURE.md` §8/§11 (chain id, protocol version,
+/// documented in `docs/architecture/README.md` §8/§11 (chain id, protocol version,
 /// epoch, message type, signature scheme).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpectedProtocolContext {

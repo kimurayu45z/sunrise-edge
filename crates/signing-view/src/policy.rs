@@ -104,7 +104,7 @@ impl std::error::Error for ClearSigningPolicyError {
 /// and `args` — there is no fuzzy, prefix, or best-effort match. This is
 /// deliberate: unlike a module *name* (never part of the signed bytes, and
 /// therefore untrusted host metadata this crate must never display as
-/// though it were signed — see `SIGNING.md`, "Recognized-module policy"), a
+/// though it were signed — see `docs/signing/hardware-signing.md`, "Recognized-module policy"), a
 /// policy keyed to the exact immutable module identity and code digest is
 /// safe to compile into device firmware, because recognition can only
 /// succeed against the exact bytecode this policy was written against.
@@ -292,13 +292,13 @@ impl ClearSigningPolicy {
 /// `TRANSFER_ENTRYPOINT` / `TRANSFER_ARGS_TYPE_ID`).
 ///
 /// This is a provisional, narrow reference-build recognition entry, not a
-/// general module-registration mechanism (see `SIGNING.md`,
+/// general module-registration mechanism (see `docs/signing/hardware-signing.md`,
 /// "Recognized-module policy"). It duplicates those values as data rather
 /// than adding a dependency on `apps/devnet` — an application crate this
 /// protocol/device-view crate must not depend on. The exact code digest
-/// below is valid only for one reference build documented in `SIGNING.md`:
+/// below is valid only for one reference build documented in `docs/signing/hardware-signing.md`:
 /// `chain_id = "sunrise-local-devnet"` (the exact value used by
-/// `DEVNET.md`'s local devnet walkthrough),
+/// `docs/guides/devnet.md`'s local devnet walkthrough),
 /// `protocol_version = 3`, hashing the exact committed
 /// `apps/devnet/src/modules/asset_account.wasm` bytes through the genesis
 /// SHA-256 hash suite. Any other devnet deployment (a different

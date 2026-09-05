@@ -1,6 +1,6 @@
 //! Explicit, all-or-none CLI signer selection between the development-only
-//! local seed signer and a Ledger hardware signer (S4c; see `SIGNING.md`
-//! and `ARCHITECTURE.md`'s Hardware Signing Profile v1 decision records).
+//! local seed signer and a Ledger hardware signer (S4c; see `docs/signing/hardware-signing.md`
+//! and `docs/architecture/README.md`'s Hardware Signing Profile v1 decision records).
 //!
 //! Exactly one signer must be selected: `--seed-file` alone (development-
 //! only, in-memory, never a keystore), or `--ledger-hid-path`,
@@ -143,7 +143,7 @@ where
     CliError::LedgerIdentity(Box::new(error))
 }
 
-/// Runs `SIGNING.md`'s complete staged device-identity sequence before ever
+/// Runs `docs/signing/hardware-signing.md`'s complete staged device-identity sequence before ever
 /// connecting a [`LedgerExternalSigner`]:
 ///
 /// 1. Over `dashboard_transport` (the device at the dashboard, no

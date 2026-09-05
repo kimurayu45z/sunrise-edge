@@ -21,7 +21,7 @@ separately, a strictly authenticated client-to-test-terminator TLS leg
 (DR-0074); see section 5. A separate live test now also SIGKILLs the
 database-process container immediately after a committed structured
 invocation and verifies recovery after restart (DR-0069 in
-`ARCHITECTURE.md`); see section 5. Migration operations beyond initial
+`docs/architecture/README.md`); see section 5. Migration operations beyond initial
 bootstrap, cancellation, PostgreSQL-server/provider TLS, mTLS, PKI lifecycle,
 and production certification beyond the bounded DR-0074 client leg, abrupt
 host/power loss, and other fault/capacity evidence are not implemented. A
@@ -34,7 +34,7 @@ metadata/state/receipt before fence promotion, an operator-only writer-fence
 advance on the restored namespace, stale pre-backup context fencing, and exact
 reconciliation plus fresh commit under a new context, alongside an atomic
 invalid-dump rollback and a valid missing-state gate rejection (DR-0073 in
-`ARCHITECTURE.md`);
+`docs/architecture/README.md`);
 see section 5. This is rehearsal evidence for one `pg_dump`/SQL-execute
 snapshot cycle only — it is not a production backup/restore capability and
 does not close the accepted backup/restore evidence criterion in section 9.
@@ -46,11 +46,11 @@ console, the real adapter pool routed through the proxy getting a definite
 pre-commit `Rejected(UnavailableBeforeCommit)` once PgBouncer's own
 `query_wait_timeout` elapses while its one backend is held by a direct
 proxied client, and exact recovery/replay/claim/ack after release (DR-0075
-in `ARCHITECTURE.md`); see section 5. This is a bounded local rehearsal
+in `docs/architecture/README.md`); see section 5. This is a bounded local rehearsal
 only — it is not provider-managed pooler service certification, load/soak
 capacity, PgBouncer high availability, or TLS evidence.
 
-This document refines [`PERSISTENCE.md`](PERSISTENCE.md) for the first
+This document refines [the production persistence requirements](persistence.md) for the first
 production-oriented PostgreSQL backend. It deliberately does not map the
 current opaque SQLite table or `PersistenceLayout` key prefixes into SQL.
 
@@ -85,11 +85,11 @@ execution by themselves. An execution caller must separately read the linked
 version, verify exact head version/digest, decode an inline Object, and compare
 its typed owner. Node-core now fetches a blob-backed body from an explicit
 `BlobStore` component and independently verifies it before decode/
-authorization (ARCHITECTURE.md DR-0094), and publishes a new version an
+authorization (docs/architecture/README.md DR-0094), and publishes a new version an
 accepted authenticated Create/Update mutation commits to that same `BlobStore` and
 references it rather than storing it inline only when its canonical bytes
 exceed a fixed deterministic 64 KiB threshold
-(`node_core::MAX_INLINE_OBJECT_BODY_BYTES`, ARCHITECTURE.md DR-0096); a body
+(`node_core::MAX_INLINE_OBJECT_BODY_BYTES`, docs/architecture/README.md DR-0096); a body
 at or under the threshold, including every ordinary small object body,
 stays inline exactly as before. This `object_versions` write path (inline
 bytes or a `blob_digest` column pair) already accepts either representation

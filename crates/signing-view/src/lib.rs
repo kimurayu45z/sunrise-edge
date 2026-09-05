@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
 //! Host/device conformance types for Sunrise Edge's Hardware Signing Profile
-//! v1 (see `SIGNING.md`).
+//! v1 (see `docs/signing/hardware-signing.md`).
 //!
 //! This crate implements the *host and device conformance* boundary a
 //! dedicated hardware signer (for example, but not limited to, a future
-//! Sunrise Edge Ledger device application; see `ARCHITECTURE.md` S4a /
+//! Sunrise Edge Ledger device application; see `docs/architecture/README.md` S4a /
 //! DR-0088 and DR-0084) must agree on with this workspace: a strictly
 //! bounded [`profile::DeviceSigningProfile`], a strict, independent decoder
 //! for the exact signed [`transaction::TransactionSignable`] shape, an

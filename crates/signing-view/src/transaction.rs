@@ -12,7 +12,7 @@ use protocol_types::{ChainId, Epoch, ProtocolVersion};
 /// (`execution::encode_transaction`/`decode_transaction`'s `0x6001`).
 ///
 /// Duplicated here as data, not imported: this crate must not depend on
-/// `execution` (see the crate-level documentation and `ARCHITECTURE.md` S4a
+/// `execution` (see the crate-level documentation and `docs/architecture/README.md` S4a
 /// / DR-0088), since that crate pulls in the full deterministic WASM
 /// execution engine. This constant, [`ENCODING_VERSION`], and every field
 /// layout this module decodes are compatibility constraints inherited from

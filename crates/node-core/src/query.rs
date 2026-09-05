@@ -1,5 +1,5 @@
 //! Public read-only query helpers for the bounded Developer MVP query API
-//! (ARCHITECTURE.md §43, DR-0082).
+//! (docs/architecture/README.md §43, DR-0082).
 //!
 //! Every result here is independently loaded and cross-checked by node-core;
 //! the HTTP adapter must not reinterpret storage rows or reimplement these

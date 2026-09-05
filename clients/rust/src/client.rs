@@ -85,7 +85,7 @@ where
 
     /// Queries `GET /v1/context` and requires every field
     /// [`ExpectedProtocolContext`] covers to match before returning it (see
-    /// `ARCHITECTURE.md` DR-0085 / `TODO.md` CLI-First Node Production Gate
+    /// `docs/architecture/README.md` DR-0085 / `TODO.md` CLI-First Node Production Gate
     /// S1). This is the mandatory trusted-context check callers must perform
     /// before any nonce/object query or signing: a successful transport
     /// connection alone — TLS or otherwise — never establishes that the

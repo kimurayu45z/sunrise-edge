@@ -3379,7 +3379,7 @@ impl<'a> PreinstalledWasmMachine<'a> {
     /// neither check ever affects exact-replay short-circuiting. Otherwise
     /// returns the exact declared `fee_payment`, the verified sender-owned
     /// fee object id, and the trusted treasury id, after enforcing every
-    /// invariant in `ARCHITECTURE.md`'s fee lifecycle section: the treasury
+    /// invariant in `docs/architecture/README.md`'s fee lifecycle section: the treasury
     /// is the final declared `Write` access, present exactly when a fee is
     /// due; the fee object is a distinct declared `Write` access owned by
     /// the sender; and the worst-case settlement (at `gas_limit`) succeeds
@@ -3840,7 +3840,7 @@ struct ResolvedPreinstalledAuthorization<'a> {
 /// `authenticated_object_effects::translate_update`).
 ///
 /// An additive `native_http::preinstalled_wasm_structured_durable_router`
-/// wires this entrypoint over HTTP (see `ARCHITECTURE.md` DR-0080);
+/// wires this entrypoint over HTTP (see `docs/architecture/README.md` DR-0080);
 /// `native_http::structured_durable_router` remains on the read-only
 /// entrypoint. A declared access may read a blob-backed previous version
 /// (fetched and verified through `blob_store`). A new version stays inline

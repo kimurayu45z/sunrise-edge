@@ -1754,7 +1754,7 @@ protocol-context validationの両方。詳細は
 S2のcross-owner destination policyはDR-0086、S3のuniform ordinary-asset fee
 composition・actual-gas/trap settlement・real restart/replay E2EはDR-0087のとおり
 implemented As-Isである。S4a hardware-signing profile/host preflightもDR-0088のとおり
-implemented As-Isであり、DR-0089はS4b device contract（`SIGNING.md`のSLIP-0010 derivation・
+implemented As-Isであり、DR-0089はS4b device contract（`docs/signing/hardware-signing.md`のSLIP-0010 derivation・
 public key encoding・status word分離・device-side sender比較・device policy pin・
 duplicate ObjectId rejectionなど）をclarifyし、加えてDR-0088のsign transaction全体
 230-byte APDU capをFIRST最大255-byte・first chunk最大230-byteへ訂正した
@@ -1786,7 +1786,7 @@ deferredなS4 Ledger hardware workの完了は待たない。S4、S5、complete�
 CLI-First Node Production Gate、production、mainnet readinessはいずれもincompleteである。
 
 CLI Developer MVP completion criteria（capability criteria 2-3を満たしながら、product
-surfaceはARCHITECTURE.md DR-0081の順序に従う: local devnet、bounded query API、Rust
+surfaceはdocs/architecture/README.md DR-0081の順序に従う: local devnet、bounded query API、Rust
 client、Rust CLI、TypeScript client、explorer、wallet、restart/duplicate E2E、
 explicit dev limitations）。**pivot後のgateはcriteria 1-6・10・11だけであり、
 criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以下に残すが、
@@ -1931,7 +1931,7 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    treasury ownerのordinary destinationへactual `gas_used`由来feeをatomic settlementする。
    active module/semanticsはv3、historical v1/v2 bytesとWAT/WASM/code hashは不変である。
    S4a hardware-signing profile/host preflightはDR-0088で後続実装済み。DR-0089はS4b device
-   contractを`SIGNING.md`上でclarifyし、DR-0088のAPDU 230-byte capをFIRST最大255-byte・
+   contractを`docs/signing/hardware-signing.md`上でclarifyし、DR-0088のAPDU 230-byte capをFIRST最大255-byte・
    first chunk最大230-byteへ訂正した（continuationは230-byteで不変）。DR-0090はmerge
    済みseparate `sunrise-edge-ledger-app` repositoryのPR #1 host-core milestoneを記録する。
    DR-0091はmerge済みPR #2のdedicated Ledger SDK app、5 target build、fixed-seed Nano S+
@@ -2067,7 +2067,7 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    fixture構築のためだけの`execution`/`objects`/`runtime`/`native-http`/
    `sunrise-edge-devnet`/`tokio`/`rcgen`/`rustls`があるが、いずれもnon-test buildからは
    到達できない。implemented As-Is;
-   ARCHITECTURE.md DR-0084）。Node/browser runtime、独自canonical codec、
+   docs/architecture/README.md DR-0084）。Node/browser runtime、独自canonical codec、
    独自signing/RPC pathは導入していない。引数parsingはclap等を使わない小さな手書きの
    strict `--flag value` parserで、duplicate flag・unknown flag・flag値なし・宣言外の
    positional argumentをすべて拒否する。`address`（明示的に指定したdevelopment seed
@@ -2142,7 +2142,7 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    exact scheme長であることとAddressIsPublicKeyのsender公開鍵に対して暗号学的に
    verifyされることの両方を確認してからのみ出力を生成する（scheme不一致・不正な
    署名長・well-formedだが無効な署名・wrong signerの署名・transaction改ざんは
-   すべてadversarial testでカバー済み）。ARCHITECTURE.md DR-0084が明記する通り、
+   すべてadversarial testでカバー済み）。docs/architecture/README.md DR-0084が明記する通り、
    real Ledger（またはその他のexternal/hardware）署名はこのsliceでは実装しておらず、
    専用のSunrise Edge Ledger device app・APDU/host transport・on-deviceでの正確な
    signature frameのparsingとclear signing・public key/address照合・derivation path
@@ -2189,7 +2189,7 @@ criteria 7-9（TypeScript client、explorer、wallet）はverbatimのまま以�
    `kill -9`、power loss、torn write、load、concurrency、SQLiteのproduction適性は
    証明しない。
 
-**Repository-boundary decision**（ARCHITECTURE.md DR-0081；DR-0080の同名決定のうち
+**Repository-boundary decision**（docs/architecture/README.md DR-0081；DR-0080の同名決定のうち
 repository-boundary/counter-demo deliverableのみを置き換える。DR-0080に記録された
 実装済みのnative-http compositionやerror classificationはhistorical recordとして
 変更しない）: CLI Developer MVP completion criteria 5-9のRust client library
@@ -2213,7 +2213,7 @@ artifactをtargetできるようになるまで、`clients/*`のいずれにつ�
 
 ## Initial Code Security Audit Entry Gate
 
-**目的（2026-09-05、ARCHITECTURE.md DR-0097）:** production/mainnetの全機能と
+**目的（2026-09-05、docs/architecture/README.md DR-0097）:** production/mainnetの全機能と
 運用証跡を揃えてから初めて第三者監査を開始する旧解釈を廃止し、現在すでに動く
 CLI-first nodeのsecurity-critical coreを早期にfreezeして監査へ出す。このgateは
 「監査を開始できる固定scope」を定義するだけであり、Software Production Gate、
@@ -2353,7 +2353,7 @@ hard constraintも変更しない。
   start・transfer・receipt・orderly restart・persisted stateをhandsで再現できる
   documented command列（implemented As-Is；criteria 10、
   `apps/cli/tests/devnet_restart_duplicate_e2e.rs`が
-  raw byte-identical duplicate replayを証明し、`DEVNET.md`の
+  raw byte-identical duplicate replayを証明し、`docs/guides/devnet.md`の
   local devnet/CLIコマンド列がそれとは独立にstart/transfer/receipt/orderly
   restart/persisted stateをhandsで再現する。documented commandはraw byte-identical
   duplicate replay自体を再現するものではない）。
@@ -2487,8 +2487,8 @@ hard constraintも変更しない。
   execution-then-reject、fee distribution/production gas calibrationはdeferred。
 - **S4**: secure signer（`LocalSigner`の development-only in-memory鍵に代わる
   production-oriented signing boundary）と、dedicated Sunrise Edge Ledger device
-  applicationを使った実際のLedger統合（ARCHITECTURE.md DR-0084/DR-0088、
-  `SIGNING.md`参照。既存のSolana/Ethereum Ledger appの転用はしない）。以下を順番に
+  applicationを使った実際のLedger統合（docs/architecture/README.md DR-0084/DR-0088、
+  `docs/signing/hardware-signing.md`参照。既存のSolana/Ethereum Ledger appの転用はしない）。以下を順番に
   完了する。S4cまで通ってもAs-Is host integrationに過ぎず、S4dとCLI replacement前に
   S4完了とはしない。
   - **S4a: implemented and validated As-Is（2026-09-04、DR-0088）。** existing
@@ -2500,7 +2500,7 @@ hard constraintも変更しない。
     blind-signing fallbackはない。`request_id`、destination owner、transferred asset metadata、
     module nameはsigned contentとして表示しない。
   - **S4b: implemented and validated As-Is（2026-09-04、DR-0091）。**
-    `SIGNING.md`のSLIP-0010 Ed25519、RFC 8032 compressed公開鍵、exact 6-byte
+    `docs/signing/hardware-signing.md`のSLIP-0010 Ed25519、RFC 8032 compressed公開鍵、exact 6-byte
     configuration、E0 APDU state machine、device-side sender comparison、exact
     chain/protocol/epoch/module/entrypoint/arguments/access/fee policy、duplicate ObjectId
     rejection、FIRST 255-byte/230-byte chunk boundsを、separate
@@ -2519,7 +2519,7 @@ hard constraintも変更しない。
   - **S4c: Phase 1（2026-09-04、DR-0092）とPhase 2a（2026-09-04、DR-0093）が
     implemented and validated As-Is、S4c全体は
     incomplete。** this repositoryのseparate `clients/ledger`（`sunrise-edge-ledger`）
-    crateが`SIGNING.md`のfrozen host APDU/USB/HID contract（FIRST/CONTINUE/LAST
+    crateが`docs/signing/hardware-signing.md`のfrozen host APDU/USB/HID contract（FIRST/CONTINUE/LAST
     chunking、exact status word、`get configuration` profile/flags検証、provisional
     derivation path encoding、FIRST acceptance後の後続エラーに対するbest-effort
     reset signing）をinjectable `Transport` traitに対して実装し、
@@ -2599,7 +2599,7 @@ hard constraintも変更しない。
     `LocalSigner`をactual production pathで置き換える。Sunrise Edgeにはまだregistered
     BIP44/SLIP-0044 coin typeがなく、S4aのpathはdevnet-only provisionalである。
 - **S5**: Initial Code Security Audit Entry Gateを先行させた後、production persistence
-  （PERSISTENCE.md/POSTGRES.mdのTo-Be）、既に実装済みのtransactional outbox contractを
+  （docs/operations/persistence.md/docs/operations/postgres.mdのTo-Be）、既に実装済みのtransactional outbox contractを
   selected providerの運用へ接続する作業、provider deployment（Cloudflare Durable
   Object/AWS）、operations（observability、runbook）、初回監査後のdelta security review、
   release evidence（migration/backup/disaster recovery rehearsal、reproducible build）を
@@ -2793,7 +2793,7 @@ Phase 15 As-Is scope:
   強制する（implemented As-Is）。page間snapshotではないため各sweepをprefix先頭から再開する必要がある。
   blocking local-disk storeでありproduction-grade componentsを使うdeployment compositionは未実装である。network filesystem、
   kill -9/power-loss、backup/restore、capacity検証なしにprovider production persistence完成とはみなさない。
-- `PERSISTENCE.md`はSQLiteをlocal durable reference/conformance fixtureに限定し、production To-Beを
+- `docs/operations/persistence.md`はSQLiteをlocal durable reference/conformance fixtureに限定し、production To-Beを
   `(chain_id, validator_id, atomicity_domain)`単位のsingle-writer authority、全read-set revision assertion、
   normalized object/request/outbox/checkpoint/migration schema、indexed due-outbox claim、writer fencing、
   content-addressed blob、明示的migration/backup/restoreとして固定する。PostgreSQLを最初の
@@ -3125,7 +3125,7 @@ Phase 15 As-Is scope:
   （元leaseがまだactiveであることをNoDueWorkで証明）、ackでは元leaseでのreclaim probe（LeaseIdReuseとして
   rejectされることを証明）を先に行った上でsame-identity reconciliationを証明し、最後にconnection pool
   recoveryを検証する。TLS版はIP-host negative connection rejectionとcompleted authenticated handshakeも
-  証明してexact same shared casesを実行する（implemented As-Is；ARCHITECTURE.md DR-0074）。ただしTLSは
+  証明してexact same shared casesを実行する（implemented As-Is；docs/architecture/README.md DR-0074）。ただしTLSは
   test proxyで終端してbackend PostgreSQL legはplaintextであり、client/driver-to-test-terminatorの証跡に
   限る。backendがCOMMITへ成功応答を返したことの証跡であり、abrupt process/power lossに対するcrash
   durability、PostgreSQL-server/provider TLS、mTLS、certificate rotation/revocationの証明ではない。
@@ -3134,7 +3134,7 @@ Phase 15 As-Is scope:
   `docker kill --signal=KILL`し、`docker start`と新規connectionでexact state/receipt、
   `RequestAlreadyCommitted` replay、その1 requestへのexact claim/ack 1回に続く`NoDueWork`、
   最終unfaulted commitを検証する
-  （implemented As-Is; ARCHITECTURE.md DR-0069）。これはlive host上のlive page cacheでの
+  （implemented As-Is; docs/architecture/README.md DR-0069）。これはlive host上のlive page cacheでの
   database-process SIGKILLとWAL recoveryの証明であり、abrupt host/power loss、storage
   write-cache flush/torn-write/media/filesystem fault、disk full/WAL exhaustion、connection
   exhaustion、TLS-path connection loss、backup/restore、capacity/load/soak、real writer
@@ -3143,7 +3143,7 @@ Phase 15 As-Is scope:
   512 MiB tmpfs、database default tablespaceを別の64 MiB tmpfsへ置き、後者だけを満杯にする。
   direct SQLSTATE `53100`、pre-commit `UnavailableBeforeCommit`、state/receipt/commit sequence
   非公開、space解放後のsame pool/store recoveryとexact replay/claim/ackを検証する
-  （bounded data-tablespace ENOSPCのみimplemented As-Is; ARCHITECTURE.md DR-0070）。
+  （bounded data-tablespace ENOSPCのみimplemented As-Is; docs/architecture/README.md DR-0070）。
   さらに別のrequired live testはdigest-pinned disposable PostgreSQLで`pg_wal`だけを`initdb --waldir`で
   別の64 MiB tmpfsへ切り離し、未充填の512 MiB tmpfs上のPGDATA/default tablespaceとは明確に区別した上で
   WAL側だけを満杯にする。direct incompressible writeはWAL segment境界を跨ぐと引き続きSQLSTATE `53100`を
@@ -3159,7 +3159,7 @@ Phase 15 As-Is scope:
   restartする。二回のrestartそれぞれでstrictly advanceした`pg_postmaster_start_time()`によりgenuineな
   crash/recoveryを証明した上で、
   同じpool/storeでstate/receipt/commit sequence非公開とrecovery後のexact replay/claim/ackを検証する
-  （bounded WAL-filesystem ENOSPCのみimplemented As-Is; ARCHITECTURE.md DR-0071）。literal `COMMIT`時の
+  （bounded WAL-filesystem ENOSPCのみimplemented As-Is; docs/architecture/README.md DR-0071）。literal `COMMIT`時の
   WAL/data ENOSPCは未検証であり、この境界についてENOSPC固有の分類は主張しない。real-device ENOSPCと
   他のfault/capacity certificationも未実装のままである。
   さらに別のrequired live testはdigest-pinned disposable PostgreSQLをtiny exact `max_connections`、
@@ -3194,7 +3194,7 @@ Phase 15 As-Is scope:
   であり、そのうちちょうど1つがadapter pool自身の`application_name`を持つことを証明することで、
   adapter pool自身が解放されたslotを奪ったことを確定的に証明する。同じinvocationのrecovery、
   exact replay/claim/ack、pool usabilityも同じpool/storeで証明できる（bounded
-  connection-exhaustion evidenceのみimplemented As-Is; ARCHITECTURE.md DR-0072）。real-device
+  connection-exhaustion evidenceのみimplemented As-Is; docs/architecture/README.md DR-0072）。real-device
   resource exhaustion、load/soak capacity、production certificationは未実装のままである
   （provider-managed poolerの挙動はDR-0075のbounded rehearsalとして下記の通り一部implemented
   As-Isだが、production certification/load/failoverは引き続き未実装）。別のrequired live testは
@@ -3216,7 +3216,7 @@ Phase 15 As-Is scope:
   failしschema markerを残さないことと、fixtureの`state_records` insertだけを除いたvalid dumpが
   schema・namespace metadata・receiptをrestoreしながらmissing stateによってdeeper rehearsal
   verification gateを通過しないことを証明する（bounded database-snapshot restore rehearsal evidenceのみ
-  implemented As-Is; ARCHITECTURE.md DR-0073）。これは1回の`pg_dump`/SQL-execute snapshot
+  implemented As-Is; docs/architecture/README.md DR-0073）。これは1回の`pg_dump`/SQL-execute snapshot
   cycleのrehearsalに過ぎずproduction backup/restore機能ではない。point-in-time recovery、
   continuous WAL archiving、concurrent write負荷下でのhot backup、
   `pg_basebackup`/replicationベースのbackup、backup encryption/off-host storage、
@@ -3270,7 +3270,7 @@ Phase 15 As-Is scope:
   adapter pool自身のproxy connectionが解放されたbackendを奪ったことを証明し、同一invocationの
   replayはexact `RequestAlreadyCommitted`を返し、exact outbox messageはclaim/ackを経て
   `NoDueWork`となり、poolはさらなるreadにも使い続けられる（bounded local PgBouncer
-  transaction-pooling rehearsal evidenceのみimplemented As-Is; ARCHITECTURE.md DR-0075）。これは
+  transaction-pooling rehearsal evidenceのみimplemented As-Is; docs/architecture/README.md DR-0075）。これは
   provider-managed pooler service certification、load/soak capacity、PgBouncerのhigh
   availability/connection draining、client/backendいずれのlegのTLS、real writer failover、
   production readinessの証明ではない。
@@ -3391,7 +3391,7 @@ capacity/PITR/HA等のS5 certification項目はS5または明示的なSLOがtrig
 2. indexed due-outbox repository/claim contractを追加し、domain-aware unattended recoveryを接続して
    StateKeyScannerはmaintenance/compatibilityへ戻す（contract/native/PostgreSQL implemented As-Is;
    provider durable adapters pending）。
-3. `POSTGRES.md`のexact namespace、unsigned SQL representation、normalized relation、attempt history、
+3. `docs/operations/postgres.md`のexact namespace、unsigned SQL representation、normalized relation、attempt history、
    transaction order、migration policyを維持する。adapterがopaque PersistenceLayout key prefixをparseせずに済むよう、
    state/object/receipt/outboxを明示的sectionとして持つstructured durable transaction envelopeを先に実装する
    （runtime/node-core/memory/native compositionとgeneration-one normalized schema migration/operator bootstrapは
@@ -3418,12 +3418,12 @@ capacity/PITR/HA等のS5 certification項目はS5または明示的なSLOがtrig
    ため、別lease claim probe（NoDueWork）とoriginal lease reclaim probe（LeaseIdReuse）で先にpersistedを証明した上で
    same-identity reconciliationを証明し、pool recoveryを証明する
    TLS版ではIP-host negative rejectionとauthenticated handshake countも証明する
-   （memory/PostgreSQL/commit-loss capability implemented As-Is；ARCHITECTURE.md DR-0074；backendの
+   （memory/PostgreSQL/commit-loss capability implemented As-Is；docs/architecture/README.md DR-0074；backendの
    成功応答とclient/driver-to-test-terminator TLS lossの証跡でありabrupt process/power lossに対する
    crash durability、PostgreSQL-server/provider TLS・mTLS・certificate lifecycleの証明ではない;
    provider adapters、other fault/capacity certification pending）。別途、serializedなlive testがcommitted structured
    invocationの直後にdatabase-service containerを`docker kill --signal=KILL`し、restart/readiness/
-   fresh connection reconciliationを検証する（implemented As-Is; ARCHITECTURE.md DR-0069）。これは
+   fresh connection reconciliationを検証する（implemented As-Is; docs/architecture/README.md DR-0069）。これは
    database-process SIGKILLとWAL recoveryの証明のみであり、abrupt host/power loss、storage write-cache
    flush/torn-write/media/filesystem fault、PostgreSQL-server/provider TLS、capacity/load/soak、real writer
    failover、backup/restore、provider certificationは未実装である。
@@ -3451,7 +3451,7 @@ capacity/PITR/HA等のS5 certification項目はS5または明示的なSLOがtrig
    commit（recovered commitが同一sole backend PIDで処理されたことを再度証明）、
    `RequestAlreadyCommitted` replay、exact outbox claim/ack、pool usabilityを証明した
    （bounded local PgBouncer transaction-pooling rehearsal evidenceのみimplemented As-Is;
-   ARCHITECTURE.md DR-0075）。これはprovider-managed pooler service certification、load/soak
+   docs/architecture/README.md DR-0075）。これはprovider-managed pooler service certification、load/soak
    capacity、PgBouncerのhigh availability、TLS、real writer failover、production readinessの
    証明ではない。DR-0073は
    digest-pinnedなsourceとtargetの2つの独立したdisposable containerで`pg_dump --inserts`
@@ -3464,7 +3464,7 @@ capacity/PITR/HA等のS5 certification項目はS5または明示的なSLOがtrig
    restored state/receiptをreconcileし、identical invocationで`RequestAlreadyCommitted`を
    観測してからexact pending outbox payloadのclaim/ackを完了して
    新規workをcommitできることを証明した
-   （bounded database-snapshot restore rehearsal evidenceのみimplemented As-Is; ARCHITECTURE.md
+   （bounded database-snapshot restore rehearsal evidenceのみimplemented As-Is; docs/architecture/README.md
    DR-0073）。このtarget側だけのfence advanceは独立して動き続けるsource databaseを停止・
    fenceしないためsingle-writer failoverの証拠ではない。negative pairではrequiredな
    `storage_metadata`の`CREATE TABLE`途中でcutしたdumpがsingle simple-query batchとしてatomicに
@@ -3651,7 +3651,7 @@ Cross-phase production release gate（最後まで延期する単独Phaseでは�
 
 # 66. Architecture Documentation
 
-実装前にARCHITECTURE.mdを作成してください。
+実装前に`docs/architecture/`内の該当architecture文書を作成・更新してください。
 
 最低限以下を明文化する:
 
@@ -3685,7 +3685,7 @@ Cross-phase production release gate（最後まで延期する単独Phaseでは�
 28. serverless runtime constraints
 
 
-ARCHITECTURE.md完成後は停止せず、
+該当architecture文書の更新後は停止せず、
 そのまま実装してください。
 
 各Phaseごとに:
@@ -3698,7 +3698,7 @@ cargo test --all
 
 architecture上の矛盾を発見した場合は、
 場当たり的なhackを入れず、
-ARCHITECTURE.mdへdecision recordを追加してから修正してください。
+`docs/architecture/decisions/`へdecision recordを追加してから修正してください。
 
 
 # 67. Highest Priority

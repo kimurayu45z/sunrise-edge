@@ -1,8 +1,8 @@
-//! The frozen `E0`-CLA APDU byte contract (see `SIGNING.md`, "Device APDU
+//! The frozen `E0`-CLA APDU byte contract (see `docs/signing/hardware-signing.md`, "Device APDU
 //! contract") and the injectable [`Transport`] boundary every host command
 //! is built on.
 //!
-//! This module defines only the exact command/status bytes `SIGNING.md`
+//! This module defines only the exact command/status bytes `docs/signing/hardware-signing.md`
 //! freezes; it performs no I/O itself.
 
 /// This application's fixed instruction class.
@@ -63,7 +63,7 @@ pub const MAX_RESPONSE_DATA_LEN: usize = 258;
 /// One complete APDU command: `CLA || INS || P1 || P2 || Lc || data`.
 ///
 /// `data` must fit the short (single-byte `Lc`) APDU form: at most 255
-/// bytes. Every command this crate builds against the frozen `SIGNING.md`
+/// bytes. Every command this crate builds against the frozen `docs/signing/hardware-signing.md`
 /// contract satisfies that bound by construction (FIRST's own command data
 /// is capped at 255 bytes; every other command is far smaller), so this
 /// type does not itself re-validate the bound — [`crate::device::LedgerDevice`]

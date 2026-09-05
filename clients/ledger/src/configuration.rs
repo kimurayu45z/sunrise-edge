@@ -1,4 +1,4 @@
-//! `get configuration`'s exact six-byte response (see `SIGNING.md`,
+//! `get configuration`'s exact six-byte response (see `docs/signing/hardware-signing.md`,
 //! "Device APDU contract").
 
 use std::fmt;
@@ -16,7 +16,7 @@ pub const SUPPORTED_PATCH: u8 = 0;
 
 /// Every currently defined `flags` bit is `0`. A set bit this host does not
 /// define here is unknown and must be rejected rather than ignored — see
-/// `SIGNING.md`, "Device APDU contract".
+/// `docs/signing/hardware-signing.md`, "Device APDU contract".
 pub const KNOWN_FLAGS_MASK: u8 = 0x00;
 
 /// A decoded `get configuration` response.

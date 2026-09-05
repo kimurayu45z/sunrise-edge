@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Sunrise Edge Developer MVP Rust client (ARCHITECTURE.md §44, DR-0083,
+//! Sunrise Edge Developer MVP Rust client (docs/architecture/README.md §44, DR-0083,
 //! DR-0084).
 //!
 //! This is a runtime-neutral library: seed-based Ed25519 key/address
@@ -16,7 +16,7 @@
 //! [`transport::LoopbackHttpTransport`] is a strict, synchronous,
 //! loopback-only plaintext HTTP/1.1 implementation for local development;
 //! [`transport::RemoteTlsHttpTransport`] is this crate's `CLI-First Node
-//! Production Gate` S1 remote transport slice (see `ARCHITECTURE.md`
+//! Production Gate` S1 remote transport slice (see `docs/architecture/README.md`
 //! DR-0085): a strict, synchronous HTTP/1.1-over-TLS implementation that
 //! shares the identical request/response framing but requires an explicit
 //! DNS server name and CA trust anchor and performs normal TLS
@@ -37,12 +37,12 @@
 //! derives a request id, never recomputes a hash-suite or execution-effects
 //! digest, and adds no asset-specific helpers or CLI policy. Those
 //! capabilities, general-purpose DNS/root-store/mTLS transport expansion, and
-//! blob fetch remain deferred (see `ARCHITECTURE.md` §44 / DR-0083).
+//! blob fetch remain deferred (see `docs/architecture/README.md` §44 / DR-0083).
 //! [`key::LocalSigner`] is
 //! an explicit development-only, in-memory key, never a keystore; real
 //! external/hardware signing remains outside this vendor-neutral crate.
 //! S4c Phase 1's dedicated Ledger host adapter now lives downstream in
-//! `clients/ledger` (see `ARCHITECTURE.md` DR-0092), depending on this crate
+//! `clients/ledger` (see `docs/architecture/README.md` DR-0092), depending on this crate
 //! rather than reversing the dependency. [`transaction::PreparedTransaction`]
 //! exposes exactly the bytes such an external signer needs and independently
 //! verifies whatever signature comes back before producing output, preserving
@@ -100,7 +100,7 @@ pub use objects::{
 // `canonical-encoding` are foundational, dependency-light crates this client
 // already depends on for its own construction/signing path; re-exporting a
 // handful of their generic types here is the "smallest generic client
-// surface" carve-out from `ARCHITECTURE.md` §44 / DR-0083 and DR-0084 — it
+// surface" carve-out from `docs/architecture/README.md` §44 / DR-0083 and DR-0084 — it
 // adds no devnet or other application-specific semantics.
 pub use abi::{AccessEntry, AccessManifest};
 pub use canonical_encoding::{CanonicalEncodingError, CanonicalStruct};

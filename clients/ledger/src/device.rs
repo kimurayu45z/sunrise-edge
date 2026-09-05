@@ -1,5 +1,5 @@
 //! The host side of the frozen Sunrise Ledger device contract (see
-//! `SIGNING.md`, "Device APDU contract").
+//! `docs/signing/hardware-signing.md`, "Device APDU contract").
 //!
 //! [`LedgerDevice`] is generic over [`Transport`] so every test in this
 //! crate exercises this exact protocol logic — APDU chunking, exact
@@ -18,7 +18,7 @@ use crate::error::{DeviceError, status_to_error};
 use crate::path::DerivationPath;
 
 /// Each frame chunk carries at most this many bytes of signed-frame payload
-/// (`SIGNING.md`, "Device APDU contract").
+/// (`docs/signing/hardware-signing.md`, "Device APDU contract").
 pub const MAX_CHUNK_BYTES: usize = 230;
 
 /// `verify public key`'s exact success-data length.
@@ -83,7 +83,7 @@ impl<T: Transport> LedgerDevice<T> {
     ///
     /// # Host-side chunking
     ///
-    /// `SIGNING.md` bounds each chunk at [`MAX_CHUNK_BYTES`] and states that
+    /// `docs/signing/hardware-signing.md` bounds each chunk at [`MAX_CHUNK_BYTES`] and states that
     /// LAST — never FIRST — is the call that triggers review and carries the
     /// signature ("only LAST's success response carries the 64-byte
     /// signature"), and that LAST is "valid only while collecting", i.e.
@@ -131,7 +131,7 @@ impl<T: Transport> LedgerDevice<T> {
         // this function returns that primary error — defense in depth
         // against leaving the device mid-session when this host has already
         // decided to abandon it, on top of the device's own documented
-        // wipe-on-failure behavior (`SIGNING.md`, "Device APDU contract").
+        // wipe-on-failure behavior (`docs/signing/hardware-signing.md`, "Device APDU contract").
         // The reset's own outcome is deliberately discarded: it must never
         // replace or mask the primary error, and a transport that is
         // already unusable is expected to make the reset attempt fail too.
