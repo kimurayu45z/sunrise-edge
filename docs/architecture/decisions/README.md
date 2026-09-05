@@ -8,6 +8,8 @@
 - [DR-0088–DR-0093: hardware signing](0088-0093-hardware-signing.md)
 - [DR-0094–DR-0098: blobs, audit, and documentation](0094-0098-blobs-audit-and-documentation.md)
 - [DR-0099: submit-only event ingress](0099-submit-only-event-ingress.md)
+- [DR-0100: native HTTP pre-parser admission](0100-native-http-preparser-admission.md)
+- [DR-0101–DR-0103: audit integrity and authentication](0101-audit-integrity-and-authentication.md)
 
 These records describe accepted decisions and compatibility boundaries. Work
 status and remaining completion criteria belong in [`TODO.md`](../../../TODO.md).

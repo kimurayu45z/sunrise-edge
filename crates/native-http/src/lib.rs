@@ -7,15 +7,18 @@
 
 use axum::{
     Router,
-    body::Bytes,
+    body::{Body, Bytes, to_bytes},
     extract::{DefaultBodyLimit, Path, State, rejection::BytesRejection},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, Request, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use core::fmt;
 use execution::{ExecutionError, WasmExecutionEngine};
 use hashing::HashSuiteResolver;
+use http_body_util::LengthLimitError;
+use hyper::{body::Incoming, server::conn::http1, service::service_fn};
+use hyper_util::rt::{TokioIo, TokioTimer};
 use node_core::{
     FeeEffectComposer, MAX_NODE_OUTPUT_ITEMS, MAX_NODE_PAYLOAD_BYTES, NodeConfig, NodeCoreError,
     NodeEvent, NodeEventKind, NodeOutboxBatch, NodeOutboxDelivery, OutboxClaim, OutboxLeaseId,
@@ -44,12 +47,23 @@ use runtime::{
     StructuredDurableDomainStateStore, TransactionalStateStore, Transport, WriterFenceGeneration,
 };
 use std::{
+    convert::Infallible,
     error::Error,
     future::Future,
+    io,
     num::{NonZeroU64, NonZeroUsize},
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
 };
-use tokio::sync::{Semaphore, TryAcquireError};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    sync::{Semaphore, TryAcquireError, watch},
+    task::JoinSet,
+    time::{Instant, Sleep, timeout},
+};
+use tower::ServiceExt;
 
 // Canonical HTTP event/query-result codecs and route/media-type constants
 // live in `node-wire` (DR-0083) and are re-exported below so existing
@@ -70,6 +84,141 @@ pub const MAX_HTTP_EVENT_BODY_BYTES: usize = MAX_NODE_PAYLOAD_BYTES + 512;
 pub const NATIVE_OUTBOX_LEASE_MILLIS: u64 = 30_000;
 /// Maximum storage-operation budget accepted by indexed native recovery.
 pub const MAX_INDEXED_OUTBOX_OPERATION_MILLIS: u64 = 30_000;
+/// Hard ceiling for accepted native HTTP connections, including clients that
+/// have not completed request headers.
+pub const MAX_NATIVE_HTTP_CONNECTIONS: usize = 4_096;
+/// Default number of accepted connections permitted before HTTP parsing.
+pub const DEFAULT_NATIVE_HTTP_CONNECTIONS: usize = 256;
+/// Hard ceiling for an HTTP/1 request-header read deadline.
+pub const MAX_NATIVE_HTTP_HEADER_READ_MILLIS: u64 = 30_000;
+/// Hard ceiling for the idle interval between request-body reads.
+pub const MAX_NATIVE_HTTP_BODY_IDLE_MILLIS: u64 = 30_000;
+/// Hard ceiling for reading one complete request body.
+pub const MAX_NATIVE_HTTP_BODY_TOTAL_MILLIS: u64 = 120_000;
+/// Hard ceiling for writing one complete HTTP response.
+pub const MAX_NATIVE_HTTP_RESPONSE_TOTAL_MILLIS: u64 = 300_000;
+/// Default request-header read deadline.
+pub const DEFAULT_NATIVE_HTTP_HEADER_READ_MILLIS: u64 = 5_000;
+/// Default maximum idle interval between request-body reads.
+pub const DEFAULT_NATIVE_HTTP_BODY_IDLE_MILLIS: u64 = 5_000;
+/// Default total request-body read deadline.
+pub const DEFAULT_NATIVE_HTTP_BODY_TOTAL_MILLIS: u64 = 30_000;
+/// Default total HTTP response-write deadline.
+pub const DEFAULT_NATIVE_HTTP_RESPONSE_TOTAL_MILLIS: u64 = 60_000;
+
+/// Pre-parser connection and request-read policy for the native HTTP server.
+///
+/// This policy is independent of [`NativeBlockingPolicy`]. It bounds clients
+/// before Axum has parsed a request or acquired a synchronous-work permit.
+/// HTTP/1 keep-alive is always disabled, so one accepted connection can carry
+/// at most one request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeHttpServePolicy {
+    max_connections: NonZeroUsize,
+    header_read_timeout: Duration,
+    body_idle_timeout: Duration,
+    body_total_timeout: Duration,
+    response_total_timeout: Duration,
+}
+
+impl NativeHttpServePolicy {
+    /// Creates a bounded pre-parser policy from millisecond values.
+    pub fn new(
+        max_connections: usize,
+        header_read_timeout_millis: u64,
+        body_idle_timeout_millis: u64,
+        body_total_timeout_millis: u64,
+        response_total_timeout_millis: u64,
+    ) -> Result<Self, NativeHttpServePolicyError> {
+        let max_connections: NonZeroUsize = NonZeroUsize::new(max_connections)
+            .filter(|value: &NonZeroUsize| value.get() <= MAX_NATIVE_HTTP_CONNECTIONS)
+            .ok_or(NativeHttpServePolicyError::InvalidConnectionLimit)?;
+        let header_read_timeout_millis: NonZeroU64 = NonZeroU64::new(header_read_timeout_millis)
+            .filter(|value: &NonZeroU64| value.get() <= MAX_NATIVE_HTTP_HEADER_READ_MILLIS)
+            .ok_or(NativeHttpServePolicyError::InvalidHeaderReadTimeout)?;
+        let body_idle_timeout_millis: NonZeroU64 = NonZeroU64::new(body_idle_timeout_millis)
+            .filter(|value: &NonZeroU64| value.get() <= MAX_NATIVE_HTTP_BODY_IDLE_MILLIS)
+            .ok_or(NativeHttpServePolicyError::InvalidBodyIdleTimeout)?;
+        let body_total_timeout_millis: NonZeroU64 = NonZeroU64::new(body_total_timeout_millis)
+            .filter(|value: &NonZeroU64| value.get() <= MAX_NATIVE_HTTP_BODY_TOTAL_MILLIS)
+            .ok_or(NativeHttpServePolicyError::InvalidBodyTotalTimeout)?;
+        let response_total_timeout_millis: NonZeroU64 =
+            NonZeroU64::new(response_total_timeout_millis)
+                .filter(|value: &NonZeroU64| value.get() <= MAX_NATIVE_HTTP_RESPONSE_TOTAL_MILLIS)
+                .ok_or(NativeHttpServePolicyError::InvalidResponseTotalTimeout)?;
+        if body_idle_timeout_millis > body_total_timeout_millis {
+            return Err(NativeHttpServePolicyError::BodyIdleExceedsTotal);
+        }
+        Ok(Self {
+            max_connections,
+            header_read_timeout: Duration::from_millis(header_read_timeout_millis.get()),
+            body_idle_timeout: Duration::from_millis(body_idle_timeout_millis.get()),
+            body_total_timeout: Duration::from_millis(body_total_timeout_millis.get()),
+            response_total_timeout: Duration::from_millis(response_total_timeout_millis.get()),
+        })
+    }
+
+    /// Returns the maximum concurrently accepted connections.
+    #[must_use]
+    pub const fn max_connections(self) -> NonZeroUsize {
+        self.max_connections
+    }
+}
+
+impl Default for NativeHttpServePolicy {
+    fn default() -> Self {
+        Self {
+            max_connections: NonZeroUsize::new(DEFAULT_NATIVE_HTTP_CONNECTIONS)
+                .unwrap_or(NonZeroUsize::MIN),
+            header_read_timeout: Duration::from_millis(DEFAULT_NATIVE_HTTP_HEADER_READ_MILLIS),
+            body_idle_timeout: Duration::from_millis(DEFAULT_NATIVE_HTTP_BODY_IDLE_MILLIS),
+            body_total_timeout: Duration::from_millis(DEFAULT_NATIVE_HTTP_BODY_TOTAL_MILLIS),
+            response_total_timeout: Duration::from_millis(
+                DEFAULT_NATIVE_HTTP_RESPONSE_TOTAL_MILLIS,
+            ),
+        }
+    }
+}
+
+/// Invalid native HTTP connection/read admission policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeHttpServePolicyError {
+    /// The connection limit was zero or above the hard ceiling.
+    InvalidConnectionLimit,
+    /// The header-read timeout was zero or above the hard ceiling.
+    InvalidHeaderReadTimeout,
+    /// The body idle timeout was zero or above the hard ceiling.
+    InvalidBodyIdleTimeout,
+    /// The body total timeout was zero or above the hard ceiling.
+    InvalidBodyTotalTimeout,
+    /// The response total timeout was zero or above the hard ceiling.
+    InvalidResponseTotalTimeout,
+    /// The body idle timeout exceeded the total body-read timeout.
+    BodyIdleExceedsTotal,
+}
+
+impl fmt::Display for NativeHttpServePolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConnectionLimit => f.write_str("native HTTP connection limit is invalid"),
+            Self::InvalidHeaderReadTimeout => {
+                f.write_str("native HTTP header-read timeout is invalid")
+            }
+            Self::InvalidBodyIdleTimeout => f.write_str("native HTTP body idle timeout is invalid"),
+            Self::InvalidBodyTotalTimeout => {
+                f.write_str("native HTTP body total timeout is invalid")
+            }
+            Self::InvalidResponseTotalTimeout => {
+                f.write_str("native HTTP response total timeout is invalid")
+            }
+            Self::BodyIdleExceedsTotal => {
+                f.write_str("native HTTP body idle timeout exceeds total timeout")
+            }
+        }
+    }
+}
+
+impl Error for NativeHttpServePolicyError {}
 
 /// Trusted storage authority for one normalized native request.
 ///
@@ -917,22 +1066,257 @@ fn validate_structured_durable_router_authority(
     Ok(())
 }
 
-/// Serves a configured native router until the shutdown future completes.
+/// Serves a configured native router with the default bounded connection and
+/// request-read policy until the shutdown future completes.
 ///
 /// Build `app` with [`router`], [`structured_durable_router`], or
 /// [`preinstalled_wasm_structured_durable_router`] so the blocking admission
-/// policy is explicit at the composition boundary.
-pub async fn serve<F>(
-    listener: tokio::net::TcpListener,
-    app: Router,
-    shutdown: F,
-) -> std::io::Result<()>
+/// policy is explicit at the composition boundary. Use [`serve_with_policy`]
+/// when an embedding host needs a smaller, explicitly validated limit.
+pub async fn serve<F>(listener: tokio::net::TcpListener, app: Router, shutdown: F) -> io::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
+    serve_with_policy(listener, app, NativeHttpServePolicy::default(), shutdown).await
+}
+
+/// Serves a configured native router with explicit pre-parser admission.
+///
+/// A connection permit is acquired immediately after `accept` and before
+/// Hyper parses request bytes. Connections above the limit are closed without
+/// parsing or queueing application work. Header reads have one total deadline,
+/// every socket read has an idle deadline, collecting the one allowed request
+/// body has a separate total deadline, and response writes have idle and total
+/// deadlines. HTTP/1 keep-alive is disabled,
+/// bounding every accepted connection to one request. These controls are
+/// independent of, and preserve, [`NativeBlockingExecutor`] admission for
+/// synchronous state-machine and storage work.
+pub async fn serve_with_policy<F>(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    policy: NativeHttpServePolicy,
+    shutdown: F,
+) -> io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let connection_permits: Arc<Semaphore> = Arc::new(Semaphore::new(policy.max_connections.get()));
+    let (shutdown_sender, _shutdown_receiver) = watch::channel(false);
+    let mut connections: JoinSet<()> = JoinSet::new();
+    let mut shutdown = Box::pin(shutdown);
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => {
+                let (stream, _remote_address) = accepted?;
+                let permit = match Arc::clone(&connection_permits).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
+                        drop(stream);
+                        continue;
+                    }
+                };
+                let connection_app: Router = app.clone();
+                let connection_shutdown = shutdown_sender.subscribe();
+                connections.spawn(async move {
+                    let _permit = permit;
+                    serve_connection(
+                        stream,
+                        connection_app,
+                        policy,
+                        connection_shutdown,
+                    )
+                    .await;
+                });
+            }
+            completed = connections.join_next(), if !connections.is_empty() => {
+                let _completed = completed;
+            }
+        }
+    }
+
+    let _sent = shutdown_sender.send(true);
+    while connections.join_next().await.is_some() {}
+    Ok(())
+}
+
+async fn serve_connection(
+    stream: tokio::net::TcpStream,
+    app: Router,
+    policy: NativeHttpServePolicy,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let stream = IoIdleTimeoutStream::new(
+        stream,
+        policy.body_idle_timeout,
+        policy.response_total_timeout,
+    );
+    let io = TokioIo::new(stream);
+    let service = service_fn(move |request: Request<Incoming>| {
+        dispatch_bounded_request(app.clone(), request, policy.body_total_timeout)
+    });
+    let mut builder = http1::Builder::new();
+    builder
+        .keep_alive(false)
+        .max_headers(64)
+        .max_buf_size(64 * 1024)
+        .timer(TokioTimer::new())
+        .header_read_timeout(policy.header_read_timeout);
+    let connection = builder.serve_connection(io, service);
+    tokio::pin!(connection);
+
+    tokio::select! {
+        _result = &mut connection => {}
+        _changed = shutdown.changed() => {
+            connection.as_mut().graceful_shutdown();
+            let _result = connection.await;
+        }
+    }
+}
+
+async fn dispatch_bounded_request(
+    app: Router,
+    request: Request<Incoming>,
+    body_total_timeout: Duration,
+) -> Result<Response, Infallible> {
+    let (parts, incoming) = request.into_parts();
+    let body = Body::new(incoming);
+    let bytes = match timeout(
+        body_total_timeout,
+        to_bytes(body, MAX_HTTP_EVENT_BODY_BYTES),
+    )
+    .await
+    {
+        Err(_) => {
+            return Ok(error_response(
+                StatusCode::REQUEST_TIMEOUT,
+                "body-read-timeout",
+            ));
+        }
+        Ok(Err(error)) => {
+            let source = error.into_inner();
+            let status = if source.downcast_ref::<LengthLimitError>().is_some() {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return Ok(error_response(status, "body-rejected"));
+        }
+        Ok(Ok(bytes)) => bytes,
+    };
+    let request = Request::from_parts(parts, Body::from(bytes));
+    let response = match app.oneshot(request).await {
+        Ok(response) => response,
+        Err(error) => match error {},
+    };
+    Ok(response)
+}
+
+struct IoIdleTimeoutStream<S> {
+    stream: S,
+    idle_timeout: Duration,
+    response_total_timeout: Duration,
+    read_deadline: Pin<Box<Sleep>>,
+    write_idle_deadline: Option<Pin<Box<Sleep>>>,
+    write_total_deadline: Option<Pin<Box<Sleep>>>,
+}
+
+impl<S> IoIdleTimeoutStream<S> {
+    fn new(stream: S, idle_timeout: Duration, response_total_timeout: Duration) -> Self {
+        Self {
+            stream,
+            idle_timeout,
+            response_total_timeout,
+            read_deadline: Box::pin(tokio::time::sleep(idle_timeout)),
+            write_idle_deadline: None,
+            write_total_deadline: None,
+        }
+    }
+}
+
+impl<S> AsyncRead for IoIdleTimeoutStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let filled_before: usize = buffer.filled().len();
+        match Pin::new(&mut this.stream).poll_read(context, buffer) {
+            Poll::Ready(Ok(())) if buffer.filled().len() > filled_before => {
+                this.read_deadline
+                    .as_mut()
+                    .reset(Instant::now() + this.idle_timeout);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending => match this.read_deadline.as_mut().poll(context) {
+                Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "native HTTP request read idle timeout",
+                ))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+}
+
+impl<S> AsyncWrite for IoIdleTimeoutStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let total_deadline: &mut Pin<Box<Sleep>> = this
+            .write_total_deadline
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(this.response_total_timeout)));
+        if total_deadline.as_mut().poll(context).is_ready() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "native HTTP response write total timeout",
+            )));
+        }
+        match Pin::new(&mut this.stream).poll_write(context, buffer) {
+            Poll::Ready(Ok(written)) if written > 0 => {
+                let idle_deadline: &mut Pin<Box<Sleep>> = this
+                    .write_idle_deadline
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(this.idle_timeout)));
+                idle_deadline
+                    .as_mut()
+                    .reset(Instant::now() + this.idle_timeout);
+                Poll::Ready(Ok(written))
+            }
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending => {
+                let idle_deadline: &mut Pin<Box<Sleep>> = this
+                    .write_idle_deadline
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(this.idle_timeout)));
+                match idle_deadline.as_mut().poll(context) {
+                    Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "native HTTP response write idle timeout",
+                    ))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(context)
+    }
 }
 
 /// Result of one bounded scheduler-triggered recovery invocation.
@@ -3238,7 +3622,9 @@ fn transaction_auth_error_response(error: &TransactionAuthError) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             "transaction-auth-config-unavailable",
         ),
-        TransactionAuthError::Decode(_) => (StatusCode::BAD_REQUEST, "invalid-transaction-bytes"),
+        TransactionAuthError::Decode(_) | TransactionAuthError::SubmissionEnvelope(_) => {
+            (StatusCode::BAD_REQUEST, "invalid-transaction-bytes")
+        }
         TransactionAuthError::ChainMismatch { .. }
         | TransactionAuthError::ProtocolVersionMismatch { .. }
         | TransactionAuthError::EpochMismatch { .. } => {
@@ -3248,7 +3634,10 @@ fn transaction_auth_error_response(error: &TransactionAuthError) -> Response {
             StatusCode::PAYLOAD_TOO_LARGE,
             "transaction-signable-too-large",
         ),
-        TransactionAuthError::Crypto(_) | TransactionAuthError::InvalidTransactionSignature => {
+        TransactionAuthError::MissingSubmissionRequestId
+        | TransactionAuthError::InadmissibleSenderAddress(_)
+        | TransactionAuthError::Crypto(_)
+        | TransactionAuthError::InvalidTransactionSignature => {
             (StatusCode::UNAUTHORIZED, "transaction-signature-invalid")
         }
     };
@@ -3345,7 +3734,10 @@ mod tests {
         GasModel, ModuleId, ModuleStatus, SystemModule, SystemModuleError, SystemModuleManifest,
         SystemModuleRegistry, TypeSchema, encode_system_module_manifest,
     };
-    use tokio::sync::Notify;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::{Notify, oneshot},
+    };
     use tower::ServiceExt;
 
     const TEST_STATE_TYPE_ID: u16 = 0xEF11;
@@ -3606,6 +3998,28 @@ mod tests {
         let signable = encode_transaction_signable(tx).unwrap();
         let domain = production_transaction_domain(tx.chain_id.clone(), tx.epoch);
         let mut signed = tx.clone();
+        signed.signature = sign_under_domain(signing_key, &domain, &signable);
+        encode_transaction(&signed).unwrap()
+    }
+
+    fn signed_submission_transaction_bytes(
+        signing_key: &ed25519_zebra::SigningKey,
+        request_id: RequestId,
+        tx: &Transaction,
+    ) -> Vec<u8> {
+        let transaction_signable: Vec<u8> = encode_transaction_signable(tx).unwrap();
+        let signable: Vec<u8> =
+            node_core::encode_submit_transaction_signable(request_id, &transaction_signable)
+                .unwrap();
+        let domain = SignatureDomain {
+            chain_id: tx.chain_id.clone(),
+            protocol_version: tx.protocol_version,
+            epoch: tx.epoch,
+            message_type: SignatureMessageType::new(node_core::SUBMIT_TRANSACTION_V1_MESSAGE_TYPE)
+                .unwrap(),
+            signature_scheme_id: SignatureSchemeId::Ed25519,
+        };
+        let mut signed: Transaction = tx.clone();
         signed.signature = sign_under_domain(signing_key, &domain, &signable);
         encode_transaction(&signed).unwrap()
     }
@@ -5939,6 +6353,33 @@ mod tests {
         )
         .await;
 
+        let mut strict_protocol_config: ProtocolConfig = protocol_config.clone();
+        strict_protocol_config.transaction_auth_profile =
+            Some(TransactionAuthProfile::ed25519_canonical_prime_order_address_is_public_key());
+        let sender: Address = dev_sender_address(&signing_key);
+        let strict_transaction: Transaction = unsigned_transaction(
+            sender,
+            ChainId::new("sunrise-test").unwrap(),
+            Epoch::new(7),
+            1,
+        );
+        let signed_request_id: RequestId = request_id(0x47);
+        let relabeled_event: NodeEvent = submit_transaction_event(
+            request_id(0x48),
+            signed_submission_transaction_bytes(
+                &signing_key,
+                signed_request_id,
+                &strict_transaction,
+            ),
+        );
+        assert_submit_rejected_before_side_effects(
+            relabeled_event.encode().unwrap(),
+            strict_protocol_config,
+            StatusCode::UNAUTHORIZED,
+            "transaction-signature-invalid",
+        )
+        .await;
+
         let sender = dev_sender_address(&signing_key);
         let mut wrong_chain = unsigned_transaction(
             sender,
@@ -6605,6 +7046,8 @@ mod tests {
                 head_revision: ObjectHeadRevision::new(1).unwrap(),
                 object_version: DurableObjectVersion::new(1).unwrap(),
                 digest: Digest32::new(HashAlgorithmId::Sha2_256, [0x22; 32]),
+                creating_chain_id: ChainId::new("sunrise-test").unwrap(),
+                creating_protocol_version: ProtocolVersion::new(3),
                 canonical_object_bytes: sample_inline_object_bytes(object_id, 1),
             },
             HttpObjectQueryResult::CurrentBlobReference {
@@ -6628,12 +7071,36 @@ mod tests {
     }
 
     #[test]
-    fn object_query_result_current_inline_matches_pinned_stable_vector() {
+    fn unchanged_object_query_statuses_preserve_encoding_v1() {
+        let cases: Vec<HttpObjectQueryResult> = sample_object_query_results();
+        for index in [0_usize, 1_usize, 3_usize] {
+            let encoded: Vec<u8> = cases[index].encode().unwrap();
+            assert_eq!(decode_canonical_frame(&encoded).unwrap().version(), 1);
+        }
+    }
+
+    #[test]
+    fn object_query_result_current_inline_v2_matches_pinned_stable_vector() {
         let result = &sample_object_query_results()[2];
         let encoded = result.encode().unwrap();
 
-        let expected_hex = "534e524503e1010007000100020000000300020020000000202020202020202020202020202020202020202020202020202020202020202003000800000001000000000000000400080000000100000000000000050002000000010006002000000022222222222222222222222222222222222222222222222222222222222222220700ec000000534e5245054001000600010030000000534e524501400100010001002000000020202020202020202020202020202020202020202020202020202020202020200200080000000100000000000000030048000000534e52450340010002000100020000000100020030000000534e52450240010001000100200000002121212121212121212121212121212121212121212121212121212121212121040038000000534e52450301010002000100020000000100020020000000999999999999999999999999999999999999999999999999999999999999999905000400000001000000060002000000ddee";
+        let expected_hex = "534e524503e1020009000100020000000300020020000000202020202020202020202020202020202020202020202020202020202020202003000800000001000000000000000400080000000100000000000000050002000000010006002000000022222222222222222222222222222222222222222222222222222222222222220700ec000000534e5245054001000600010030000000534e524501400100010001002000000020202020202020202020202020202020202020202020202020202020202020200200080000000100000000000000030048000000534e52450340010002000100020000000100020030000000534e52450240010001000100200000002121212121212121212121212121212121212121212121212121212121212121040038000000534e52450301010002000100020000000100020020000000999999999999999999999999999999999999999999999999999999999999999905000400000001000000060002000000ddee0a000c00000073756e726973652d746573740b000400000003000000";
         assert_eq!(hex(&encoded), expected_hex);
+    }
+
+    #[test]
+    fn historical_object_query_v1_vector_decodes_without_digest_context() {
+        let historical_hex = "534e524503e1010007000100020000000300020020000000202020202020202020202020202020202020202020202020202020202020202003000800000001000000000000000400080000000100000000000000050002000000010006002000000022222222222222222222222222222222222222222222222222222222222222220700ec000000534e5245054001000600010030000000534e524501400100010001002000000020202020202020202020202020202020202020202020202020202020202020200200080000000100000000000000030048000000534e52450340010002000100020000000100020030000000534e52450240010001000100200000002121212121212121212121212121212121212121212121212121212121212121040038000000534e52450301010002000100020000000100020020000000999999999999999999999999999999999999999999999999999999999999999905000400000001000000060002000000ddee";
+        let historical_bytes: Vec<u8> = (0..historical_hex.len())
+            .step_by(2)
+            .map(|index: usize| u8::from_str_radix(&historical_hex[index..index + 2], 16).unwrap())
+            .collect();
+        let decoded = HttpObjectQueryResult::decode(&historical_bytes).unwrap();
+        assert!(matches!(
+            &decoded,
+            HttpObjectQueryResult::HistoricalCurrentInline { .. }
+        ));
+        assert_eq!(decoded.encode().unwrap(), historical_bytes);
     }
 
     #[test]
@@ -9113,6 +9580,236 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    fn test_serve_policy(
+        max_connections: usize,
+        header_read_timeout_millis: u64,
+        body_idle_timeout_millis: u64,
+        body_total_timeout_millis: u64,
+    ) -> NativeHttpServePolicy {
+        NativeHttpServePolicy::new(
+            max_connections,
+            header_read_timeout_millis,
+            body_idle_timeout_millis,
+            body_total_timeout_millis,
+            1_000,
+        )
+        .unwrap()
+    }
+
+    async fn start_serve_test(
+        policy: NativeHttpServePolicy,
+    ) -> (
+        std::net::SocketAddr,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        let listener: tokio::net::TcpListener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address: std::net::SocketAddr = listener.local_addr().unwrap();
+        let app: Router = Router::new().route(LIVENESS_PATH, get(liveness));
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn(serve_with_policy(listener, app, policy, async move {
+            let _received = shutdown_receiver.await;
+        }));
+        (address, shutdown_sender, server)
+    }
+
+    async fn read_to_connection_end(stream: &mut tokio::net::TcpStream) -> io::Result<Vec<u8>> {
+        let mut response: Vec<u8> = Vec::new();
+        timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "test connection stayed open")
+            })??;
+        Ok(response)
+    }
+
+    #[test]
+    fn serve_policy_rejects_zero_oversized_and_incoherent_limits() {
+        assert_eq!(
+            NativeHttpServePolicy::new(0, 1, 1, 1, 1),
+            Err(NativeHttpServePolicyError::InvalidConnectionLimit)
+        );
+        assert_eq!(
+            NativeHttpServePolicy::new(MAX_NATIVE_HTTP_CONNECTIONS + 1, 1, 1, 1, 1),
+            Err(NativeHttpServePolicyError::InvalidConnectionLimit)
+        );
+        assert_eq!(
+            NativeHttpServePolicy::new(1, MAX_NATIVE_HTTP_HEADER_READ_MILLIS + 1, 1, 1, 1),
+            Err(NativeHttpServePolicyError::InvalidHeaderReadTimeout)
+        );
+        assert_eq!(
+            NativeHttpServePolicy::new(1, 1, MAX_NATIVE_HTTP_BODY_IDLE_MILLIS + 1, 1, 1),
+            Err(NativeHttpServePolicyError::InvalidBodyIdleTimeout)
+        );
+        assert_eq!(
+            NativeHttpServePolicy::new(1, 1, 1, MAX_NATIVE_HTTP_BODY_TOTAL_MILLIS + 1, 1),
+            Err(NativeHttpServePolicyError::InvalidBodyTotalTimeout)
+        );
+        assert_eq!(
+            NativeHttpServePolicy::new(1, 1, 2, 1, 1),
+            Err(NativeHttpServePolicyError::BodyIdleExceedsTotal)
+        );
+        assert_eq!(
+            NativeHttpServePolicy::new(1, 1, 1, 1, MAX_NATIVE_HTTP_RESPONSE_TOTAL_MILLIS + 1),
+            Err(NativeHttpServePolicyError::InvalidResponseTotalTimeout)
+        );
+    }
+
+    #[tokio::test]
+    async fn io_idle_timeout_bounds_stalled_response_writes() {
+        let (_reader, writer): (tokio::io::DuplexStream, tokio::io::DuplexStream) =
+            tokio::io::duplex(1);
+        let mut stream: IoIdleTimeoutStream<tokio::io::DuplexStream> = IoIdleTimeoutStream::new(
+            writer,
+            Duration::from_millis(20),
+            Duration::from_millis(200),
+        );
+
+        let error: io::Error = timeout(Duration::from_secs(1), stream.write_all(b"ab"))
+            .await
+            .expect("write timeout fixture must finish")
+            .expect_err("a peer that never reads must hit the write idle deadline");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn io_total_timeout_bounds_slow_drip_response_reads() {
+        let (mut reader, writer): (tokio::io::DuplexStream, tokio::io::DuplexStream) =
+            tokio::io::duplex(1);
+        let reader_task: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+            let mut byte: [u8; 1] = [0];
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if reader.read_exact(&mut byte).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut stream: IoIdleTimeoutStream<tokio::io::DuplexStream> = IoIdleTimeoutStream::new(
+            writer,
+            Duration::from_millis(100),
+            Duration::from_millis(50),
+        );
+
+        let error: io::Error = timeout(Duration::from_secs(1), stream.write_all(&[0; 32]))
+            .await
+            .expect("write timeout fixture must finish")
+            .expect_err("slow response progress must not extend the total deadline");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        reader_task.abort();
+    }
+
+    #[tokio::test]
+    async fn serve_bounds_slow_headers_connection_overload_and_recovers() {
+        let (address, shutdown_sender, server) =
+            start_serve_test(test_serve_policy(1, 100, 100, 500)).await;
+        let mut slow: tokio::net::TcpStream =
+            tokio::net::TcpStream::connect(address).await.unwrap();
+        slow.write_all(b"G").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut overloaded: tokio::net::TcpStream =
+            tokio::net::TcpStream::connect(address).await.unwrap();
+        let overloaded_write = overloaded
+            .write_all(b"GET /health/live HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await;
+        if overloaded_write.is_ok() {
+            let mut byte: [u8; 1] = [0];
+            let overloaded_read = timeout(Duration::from_millis(500), overloaded.read(&mut byte))
+                .await
+                .unwrap();
+            assert!(matches!(overloaded_read, Ok(0) | Err(_)));
+        }
+
+        let slow_result = read_to_connection_end(&mut slow).await;
+        assert!(
+            slow_result.is_ok()
+                || slow_result.is_err_and(|error| {
+                    matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
+                    )
+                })
+        );
+
+        let mut legitimate: tokio::net::TcpStream =
+            tokio::net::TcpStream::connect(address).await.unwrap();
+        legitimate
+            .write_all(b"GET /health/live HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let response: Vec<u8> = read_to_connection_end(&mut legitimate).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 204 No Content\r\n"));
+
+        shutdown_sender.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_bounds_body_idle_and_total_time_without_reusing_connections() {
+        let (address, shutdown_sender, server) =
+            start_serve_test(test_serve_policy(2, 200, 120, 300)).await;
+
+        let mut idle: tokio::net::TcpStream =
+            tokio::net::TcpStream::connect(address).await.unwrap();
+        idle.write_all(
+            b"POST /health/live HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nx",
+        )
+        .await
+        .unwrap();
+        let idle_response = read_to_connection_end(&mut idle).await;
+        assert!(
+            idle_response.is_ok()
+                || idle_response.is_err_and(|error| {
+                    matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
+                    )
+                })
+        );
+
+        let mut total: tokio::net::TcpStream =
+            tokio::net::TcpStream::connect(address).await.unwrap();
+        total
+            .write_all(
+                b"POST /health/live HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\na",
+            )
+            .await
+            .unwrap();
+        for byte in *b"bcd" {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            total.write_all(&[byte]).await.unwrap();
+        }
+        let total_response: Vec<u8> = read_to_connection_end(&mut total).await.unwrap();
+        assert!(total_response.starts_with(b"HTTP/1.1 408 Request Timeout\r\n"));
+        assert!(
+            String::from_utf8_lossy(&total_response).contains("body-read-timeout"),
+            "unexpected response: {}",
+            String::from_utf8_lossy(&total_response)
+        );
+
+        let mut one_request: tokio::net::TcpStream =
+            tokio::net::TcpStream::connect(address).await.unwrap();
+        one_request
+            .write_all(
+                b"GET /health/live HTTP/1.1\r\nHost: localhost\r\n\r\nGET /health/live HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let response: Vec<u8> = read_to_connection_end(&mut one_request).await.unwrap();
+        assert_eq!(
+            response
+                .windows(b"HTTP/1.1 204 No Content".len())
+                .filter(|window: &&[u8]| *window == b"HTTP/1.1 204 No Content")
+                .count(),
+            1
+        );
+
+        shutdown_sender.send(()).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]

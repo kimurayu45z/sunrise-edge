@@ -146,6 +146,7 @@ mod tests {
         asset_account::ASSET_ACCOUNT_WASM, boot::boot_local_store, catalog::build_asset_module,
         config::DevnetConfig, genesis::build_devnet_protocol_context,
     };
+    use ed25519_zebra::{SigningKey, VerificationKey};
     use std::{
         ffi::OsString,
         fs,
@@ -156,6 +157,16 @@ mod tests {
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
     struct TestDirectory(PathBuf);
+
+    fn owner_hex(seed: u8) -> String {
+        let signing_key: SigningKey = SigningKey::from([seed; 32]);
+        let verification_key: VerificationKey = VerificationKey::from(&signing_key);
+        verification_key
+            .as_ref()
+            .iter()
+            .map(|byte: &u8| format!("{byte:02x}"))
+            .collect()
+    }
 
     impl TestDirectory {
         fn new() -> Self {
@@ -186,11 +197,11 @@ mod tests {
             OsString::from("--epoch"),
             OsString::from("0"),
             OsString::from("--dev-owner"),
-            OsString::from("2222222222222222222222222222222222222222222222222222222222222222"),
+            OsString::from(owner_hex(0x22)),
             OsString::from("--max-concurrent"),
             OsString::from("4"),
             OsString::from("--fee-treasury-owner"),
-            OsString::from("3333333333333333333333333333333333333333333333333333333333333333"),
+            OsString::from(owner_hex(0x33)),
         ])
         .unwrap();
         let boot = boot_local_store(&config).unwrap();

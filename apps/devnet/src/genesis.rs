@@ -122,7 +122,7 @@ pub fn build_devnet_protocol_context(
     protocol_config.protocol_version = DEVNET_PROTOCOL_VERSION;
     protocol_config.domain_placement = Some(domain_placement);
     protocol_config.transaction_auth_profile =
-        Some(TransactionAuthProfile::ed25519_address_is_public_key());
+        Some(TransactionAuthProfile::ed25519_canonical_prime_order_address_is_public_key());
     protocol_config.gas_schedule = GasSchedule {
         base_fee: DEVNET_BASE_FEE,
         execution_price: DEVNET_EXECUTION_PRICE,
@@ -221,7 +221,9 @@ impl Error for DevnetGenesisError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol_config::{AddressBinding, ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID};
+    use protocol_config::{
+        AddressBinding, ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
+    };
     use protocol_types::{HashPurpose, SignatureSchemeId};
 
     fn test_chain() -> ChainId {
@@ -273,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn devnet_has_ed25519_auth_and_one_enabled_fee_asset() {
+    fn devnet_has_strict_ed25519_owner_auth_and_one_enabled_fee_asset() {
         let context: DevnetProtocolContext =
             build_devnet_protocol_context(test_chain(), Epoch::new(0)).unwrap();
         let config: &ProtocolConfig = context.protocol_config();
@@ -294,12 +296,12 @@ mod tests {
         assert_eq!(config.gas_schedule.system_module_price, 0);
         assert_eq!(
             profile.profile_id(),
-            ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID
         );
         assert_eq!(profile.signature_scheme_id(), SignatureSchemeId::Ed25519);
         assert_eq!(
             profile.address_binding(),
-            AddressBinding::AddressIsPublicKey
+            AddressBinding::CanonicalPrimeOrderAddressIsPublicKey
         );
         assert_eq!(config.validate(), Ok(()));
     }

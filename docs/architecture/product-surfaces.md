@@ -278,7 +278,11 @@ a blob body. `native-http` adds the four canonical
 including strict decode validation of the nested canonical `objects::Object`
 (id/version match, `MAX_AUTHENTICATED_OBJECT_BODY_BYTES`) and nested
 `NodeDedupRecord` (request-id/event-digest match, exact re-encoding) carried
-inside a `CurrentInline`/`Present` result, and rejection of a zero protocol
+inside a `CurrentInline`/`Present` result. Object-query encoding v2 additionally
+carries the immutable version's creating chain id and protocol version; the
+Rust client recomputes the inline body digest before exposing it. Historical
+object-query v1 remains decodable, but its inline form is rejected by the
+generic client as unverifiable. The codecs also reject a zero protocol
 version/hash-suite/profile/scheme/binding id, an over-length chain id, or
 empty canonical `ProtocolConfig` bytes in the context result — and wires
 `GET /v1/context`, `/v1/objects/{object_id}`, `/v1/receipts/{request_id}`,
@@ -396,8 +400,8 @@ exposes the exact centralized-domain-framed bytes
 ([`crypto::frame_signature_message`]) an external signer must produce a raw
 signature over — the same bytes any in-process `SignatureSigner` ultimately
 signs. `finalize` accepts that raw signature and only produces output after
-independently constructing an `Ed25519Verifier` from the sender's 32 bytes
-(the only implemented `AddressIsPublicKey` binding), re-deriving the same
+independently constructing an `Ed25519Verifier` from the sender's 32 bytes,
+re-deriving the same
 framed bytes, and confirming the signature both has the scheme's exact
 supported length and cryptographically verifies; a well-formed but invalid,
 wrong-signer, or tampered (signature or transaction field) signature is
@@ -480,13 +484,13 @@ SignatureSchemeId, TypeError}`, `NODE_RESULT_MEDIA_TYPE`, and three small
 helpers/constants: `current_inline_object_ref` (extracts the exact `ObjectRef`
 from a `CurrentInline` object-query result, `None` for every other status —
 generic over any object, not asset-specific), the
-`ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID` constant (the `AddressBinding::
-AddressIsPublicKey` wire value, duplicated as a plain `u16` so a caller can
+profile-1 and profile-2 address-binding constants, duplicated as plain `u16`
+values so a caller can
 compare it against `HttpContextQueryResult::address_binding_id()` without a
 direct `protocol-config` dependency; `protocol-config` remains a `clients/rust`
 dev-dependency only, and a dedicated test pins the two values together so
-they cannot silently drift), and the `ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`
-constant (the committed `TransactionAuthProfile` id `transfer` checks
+they cannot silently drift), and matching profile-id constants (the committed
+profile-2 `TransactionAuthProfile` id `transfer` checks
 `HttpContextQueryResult::transaction_auth_profile_id()` against before
 signing, duplicated the same way and for the same reason). `objects::{
 ObjectError, Owner, decode_object}` and `execution::ObjectEffect` exist so
@@ -497,15 +501,17 @@ execution effects, without a direct dependency on either lower crate.
 `transfer` queries `/v1/context`, the sender's `/v1/senders/{sender}/next-nonce`,
 and both `/v1/objects/{object_id}` results for the caller's exact
 `--source-object`/`--destination-object` identifiers; validates the
-committed profile is `Ed25519` + `AddressIsPublicKey` and that the context
+committed profile is Ed25519 profile 2 with canonical-prime-order address
+binding and that the context
 and next-nonce queries agree on epoch, all before signing; requires both
 objects to be `CurrentInline` (any other status is a typed, actionable
 rejection); requires the source owner to equal the signer and the destination
 owner to equal the separately required `--destination-owner` Address before
 signing; constructs the exact two-entry `AccessManifest` with `Write`
 access to source then destination, in that order; builds and signs the
-transaction through `PreparedTransaction`/`build_signed_transaction`; and
-submits it with an explicit, caller-supplied non-zero request id. Every
+transaction through `PreparedTransaction::prepare_submission`, which signs
+canonical envelope `0xE009` over the explicit non-zero request id and exact
+Transaction v1 signable bytes; and submits it under that same id. Every
 asset, including this one, uses the same uniform `AssetId`/account/transfer
 path — there is no native-coin or fee special case. Cross-owner destination
 authorization is available only through [DR-0086](decisions/0081-0087-cli-first-roadmap.md)'s exact trusted preinstalled-

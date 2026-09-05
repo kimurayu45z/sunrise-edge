@@ -48,10 +48,11 @@ use std::time::Duration;
 use sunrise_edge_client::ExternalSigner;
 use sunrise_edge_client::{
     AccessEntry, AccessManifest, AccessMode, Address, Amount, AssetId, AtomicityDomainId,
-    CanonicalStruct, ChainId, Client, Digest32, ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
-    ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID, Epoch, ExecutionEffects, ExecutionStatus,
-    ExpectedProtocolContext, FeePayment, HashAlgorithmId, HashSuiteId, LocalSigner,
-    NodeResponseStatus, ObjectEffect, ObjectId, ObjectRef, Owner, PreparedTransaction,
+    CanonicalStruct, ChainId, Client, Digest32,
+    ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+    ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID, Epoch, ExecutionEffects,
+    ExecutionStatus, ExpectedProtocolContext, FeePayment, HashAlgorithmId, HashSuiteId,
+    LocalSigner, NodeResponseStatus, ObjectEffect, ObjectId, ObjectRef, Owner, PreparedTransaction,
     ProtocolVersion, ReceiptPollBounds, RequestId, SignatureSchemeId, SubmitTransactionRequest,
     TransactionRequest, Transport, decode_object,
 };
@@ -369,9 +370,9 @@ fn parse_expected_context(parsed: &ParsedArgs) -> Result<ExpectedProtocolContext
         protocol_version,
         epoch,
         hash_suite_id,
-        ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
+        ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
         SignatureSchemeId::Ed25519.as_u16(),
-        ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+        ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
         domain,
     )?)
 }
@@ -448,7 +449,12 @@ where
         gas_limit: inputs.gas_limit,
         fee_payment,
     };
-    let prepared = PreparedTransaction::prepare(sender, SignatureSchemeId::Ed25519, request)?;
+    let prepared = PreparedTransaction::prepare_submission(
+        inputs.request_id,
+        sender,
+        SignatureSchemeId::Ed25519,
+        request,
+    )?;
     let signed_bytes = sign(prepared)?;
 
     let submit_result = client.submit_transaction(SubmitTransactionRequest {
@@ -664,6 +670,9 @@ fn object_query_status_label(result: &sunrise_edge_client::HttpObjectQueryResult
     match result {
         sunrise_edge_client::HttpObjectQueryResult::Absent { .. } => "absent",
         sunrise_edge_client::HttpObjectQueryResult::Tombstoned { .. } => "tombstoned",
+        sunrise_edge_client::HttpObjectQueryResult::HistoricalCurrentInline { .. } => {
+            "historical_current_inline_unverified"
+        }
         sunrise_edge_client::HttpObjectQueryResult::CurrentInline { .. } => "current_inline",
         sunrise_edge_client::HttpObjectQueryResult::CurrentBlobReference { .. } => {
             "current_blob_reference"
@@ -792,6 +801,8 @@ fn print_receipt(receipt: &sunrise_edge_client::HttpReceiptQueryResult) {
 mod tests {
     use super::*;
     use crate::test_support::{FakeTransport, node_result_ok, query_ok};
+    use hashing::{BuiltinHashFunction, HashFunction};
+    use protocol_types::HashPurpose;
     use sunrise_edge_client::{
         AtomicityDomainId, ChainId, ClientError, Epoch, HashSuiteId, HttpContextQueryResult,
         HttpNextNonceQueryResult, HttpNodeResult, HttpObjectQueryResult, NodeResponse,
@@ -820,9 +831,9 @@ mod tests {
             ProtocolVersion::new(3),
             Epoch::new(5),
             HashSuiteId::new(1),
-            ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
             SignatureSchemeId::Ed25519.as_u16(),
-            ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
             AtomicityDomainId::new([0x44; 32]).unwrap(),
         )
         .unwrap()
@@ -853,9 +864,9 @@ mod tests {
             ProtocolVersion::new(3),
             Epoch::new(5),
             HashSuiteId::new(1),
-            1,
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
             SignatureSchemeId::Ed25519.as_u16(),
-            ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
             AtomicityDomainId::new([0x44; 32]).unwrap(),
             vec![0xAA],
         )
@@ -867,6 +878,8 @@ mod tests {
         version: u64,
         owner: Owner,
     ) -> HttpObjectQueryResult {
+        let creating_chain_id: ChainId = ChainId::new("transfer-test-chain").unwrap();
+        let creating_protocol_version: ProtocolVersion = ProtocolVersion::new(3);
         let object = objects::Object {
             id: object_id,
             version,
@@ -875,13 +888,22 @@ mod tests {
             schema_version: 1,
             data: vec![1, 2, 3],
         };
-        let canonical_object_bytes = objects::encode_object(&object).unwrap();
-        let digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x0A; 32]);
+        let canonical_object_bytes: Vec<u8> = objects::encode_object(&object).unwrap();
+        let digest: Digest32 = BuiltinHashFunction::new(HashAlgorithmId::Sha2_256)
+            .hash(
+                HashPurpose::Object,
+                creating_protocol_version,
+                &creating_chain_id,
+                &canonical_object_bytes,
+            )
+            .unwrap();
         HttpObjectQueryResult::CurrentInline {
             object_id,
             head_revision: runtime::ObjectHeadRevision::new(1).unwrap(),
             object_version: runtime::DurableObjectVersion::new(version).unwrap(),
             digest,
+            creating_chain_id,
+            creating_protocol_version,
             canonical_object_bytes,
         }
     }
@@ -1195,9 +1217,9 @@ mod tests {
             ProtocolVersion::new(3),
             Epoch::new(5),
             HashSuiteId::new(1),
-            1,
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
             SignatureSchemeId::Ed25519.as_u16(),
-            ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
             AtomicityDomainId::new([0x44; 32]).unwrap(),
             vec![0xAA],
         )
@@ -1214,9 +1236,9 @@ mod tests {
             ProtocolVersion::new(4),
             Epoch::new(5),
             HashSuiteId::new(1),
-            1,
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
             SignatureSchemeId::Ed25519.as_u16(),
-            ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
             AtomicityDomainId::new([0x44; 32]).unwrap(),
             vec![0xAA],
         )
@@ -1233,9 +1255,9 @@ mod tests {
             ProtocolVersion::new(3),
             Epoch::new(6),
             HashSuiteId::new(1),
-            1,
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
             SignatureSchemeId::Ed25519.as_u16(),
-            ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
             AtomicityDomainId::new([0x44; 32]).unwrap(),
             vec![0xAA],
         )
@@ -1252,9 +1274,9 @@ mod tests {
             ProtocolVersion::new(3),
             Epoch::new(5),
             HashSuiteId::new(2),
-            1,
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
             SignatureSchemeId::Ed25519.as_u16(),
-            ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
             AtomicityDomainId::new([0x44; 32]).unwrap(),
             vec![0xAA],
         )
@@ -1267,7 +1289,7 @@ mod tests {
     #[test]
     fn execute_rejects_a_mismatched_transaction_auth_profile_id_before_any_later_dispatch() {
         // A profile id other than the one implemented
-        // `ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`, even though the
+        // `ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`, even though the
         // scheme/binding below are otherwise the implemented pair — the
         // profile id itself must still be checked.
         let context = HttpContextQueryResult::new(
@@ -1275,9 +1297,9 @@ mod tests {
             ProtocolVersion::new(3),
             Epoch::new(5),
             HashSuiteId::new(1),
-            2,
+            1,
             SignatureSchemeId::Ed25519.as_u16(),
-            ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
             AtomicityDomainId::new([0x44; 32]).unwrap(),
             vec![0xAA],
         )
@@ -1297,9 +1319,9 @@ mod tests {
             ProtocolVersion::new(3),
             Epoch::new(5),
             HashSuiteId::new(1),
-            1,
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
             SignatureSchemeId::Secp256k1.as_u16(),
-            ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
             AtomicityDomainId::new([0x44; 32]).unwrap(),
             vec![0xAA],
         )
@@ -1316,9 +1338,9 @@ mod tests {
             ProtocolVersion::new(3),
             Epoch::new(5),
             HashSuiteId::new(1),
-            1,
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
             SignatureSchemeId::Ed25519.as_u16(),
-            2,
+            1,
             AtomicityDomainId::new([0x44; 32]).unwrap(),
             vec![0xAA],
         )
@@ -1335,9 +1357,9 @@ mod tests {
             ProtocolVersion::new(3),
             Epoch::new(5),
             HashSuiteId::new(1),
-            1,
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
             SignatureSchemeId::Ed25519.as_u16(),
-            ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
             AtomicityDomainId::new([0x55; 32]).unwrap(),
             vec![0xAA],
         )

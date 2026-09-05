@@ -37,6 +37,8 @@ impl Drop for TestDirectory {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_context_and_next_nonce_commands_reach_the_real_devnet_router_over_tcp() {
+    let dev_owner = sunrise_edge_client::LocalSigner::from_seed([0x33; 32]).address();
+    let treasury_owner = sunrise_edge_client::LocalSigner::from_seed([0x44; 32]).address();
     let directory = TestDirectory::new();
     let config = DevnetConfig::parse_from(vec![
         OsString::from("--data-dir"),
@@ -48,9 +50,9 @@ async fn cli_context_and_next_nonce_commands_reach_the_real_devnet_router_over_t
         OsString::from("--epoch"),
         OsString::from("9"),
         OsString::from("--dev-owner"),
-        OsString::from("3333333333333333333333333333333333333333333333333333333333333333"),
+        OsString::from(dev_owner.to_string()),
         OsString::from("--fee-treasury-owner"),
-        OsString::from("4444444444444444444444444444444444444444444444444444444444444444"),
+        OsString::from(treasury_owner.to_string()),
         OsString::from("--max-concurrent"),
         OsString::from("4"),
     ])

@@ -24,9 +24,11 @@ usb-hid = ["sunrise-edge-ledger/usb-hid"]
 
 [dev-dependencies]
 execution.workspace = true
+hashing.workspace = true
 native-http.workspace = true
 node-core.workspace = true
 objects.workspace = true
+protocol-types.workspace = true
 rcgen.workspace = true
 runtime.workspace = true
 rustls.workspace = true

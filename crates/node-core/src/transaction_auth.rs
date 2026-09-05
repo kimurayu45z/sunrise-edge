@@ -38,14 +38,18 @@
 use core::fmt;
 use std::error::Error;
 
+use canonical_encoding::{CanonicalEncodingError, CanonicalStruct};
 use crypto::{
-    CryptoError, Ed25519Verifier, SignatureDomain, SignatureMessageType, SignatureVerifier,
+    CryptoError, Ed25519OwnerAddressError, Ed25519OwnerAddressPolicy, Ed25519Verifier,
+    SignatureDomain, SignatureMessageType, SignatureVerifier, validate_ed25519_owner_address,
 };
 use execution::{ExecutionError, Transaction, decode_transaction, encode_transaction_signable};
 use protocol_config::{
     AddressBinding, ProtocolConfig, ProtocolConfigError, resolve_transaction_auth_profile,
 };
 use protocol_types::{ChainId, Epoch, ProtocolVersion};
+
+use crate::RequestId;
 
 /// The stable, exact transaction-v1 signature message family.
 ///
@@ -56,6 +60,14 @@ use protocol_types::{ChainId, Epoch, ProtocolVersion};
 /// builds and signs a transaction (see `clients/rust`) uses this exact,
 /// single-sourced value rather than duplicating the literal.
 pub const TRANSACTION_V1_MESSAGE_TYPE: &str = "transaction-v1";
+
+/// Stable message family for profile-2 submission signatures that bind the
+/// durable request identity to the otherwise unchanged Transaction v1 bytes.
+pub const SUBMIT_TRANSACTION_V1_MESSAGE_TYPE: &str = "submit-transaction-v1";
+
+/// Canonical type id for the profile-2 submission-signature envelope.
+pub const SUBMIT_TRANSACTION_SIGNABLE_TYPE_ID: u16 = 0xE009;
+const SUBMIT_TRANSACTION_SIGNABLE_ENCODING_VERSION: u16 = 1;
 
 /// Deterministic upper bound on a transaction's canonical *signable* byte
 /// length (the [`execution::encode_transaction_signable`] output), enforced
@@ -82,6 +94,11 @@ pub enum TransactionAuthError {
     Config(ProtocolConfigError),
     /// Strict canonical decoding of the transaction bytes failed.
     Decode(ExecutionError),
+    /// Canonical encoding of the profile-2 submission envelope failed.
+    SubmissionEnvelope(CanonicalEncodingError),
+    /// Profile 2 was invoked without the outer durable request id that its
+    /// signature envelope is required to authenticate.
+    MissingSubmissionRequestId,
     /// The transaction's `chain_id` does not match the trusted context.
     ChainMismatch {
         /// Chain the trusted context expects.
@@ -104,6 +121,10 @@ pub enum TransactionAuthError {
         /// Epoch carried by the decoded transaction.
         actual: Epoch,
     },
+    /// The active profile requires a canonical, non-identity, prime-order
+    /// Ed25519 sender address, and the transaction's sender failed that
+    /// admissibility rule.
+    InadmissibleSenderAddress(Ed25519OwnerAddressError),
     /// The canonical signable payload exceeded
     /// [`MAX_TRANSACTION_SIGNABLE_BYTES`] before any framing or
     /// cryptographic operation ran.
@@ -128,6 +149,12 @@ impl fmt::Display for TransactionAuthError {
         match self {
             Self::Config(error) => write!(f, "transaction auth profile resolution failed: {error}"),
             Self::Decode(error) => write!(f, "transaction decoding failed: {error}"),
+            Self::SubmissionEnvelope(error) => {
+                write!(f, "submission signature envelope encoding failed: {error}")
+            }
+            Self::MissingSubmissionRequestId => {
+                f.write_str("profile-2 transaction authentication requires a request id")
+            }
             Self::ChainMismatch { expected, actual } => write!(
                 f,
                 "transaction chain {actual} does not match trusted chain {expected}"
@@ -144,6 +171,9 @@ impl fmt::Display for TransactionAuthError {
                 actual.get(),
                 expected.get()
             ),
+            Self::InadmissibleSenderAddress(error) => {
+                write!(f, "transaction sender is not admissible: {error}")
+            }
             Self::SignableTransactionTooLarge { actual, maximum } => write!(
                 f,
                 "transaction signable payload is {actual} bytes, maximum is {maximum}"
@@ -161,14 +191,36 @@ impl Error for TransactionAuthError {
         match self {
             Self::Config(error) => Some(error),
             Self::Decode(error) => Some(error),
+            Self::SubmissionEnvelope(error) => Some(error),
             Self::Crypto(error) => Some(error),
+            Self::InadmissibleSenderAddress(error) => Some(error),
             Self::ChainMismatch { .. }
             | Self::ProtocolVersionMismatch { .. }
             | Self::EpochMismatch { .. }
+            | Self::MissingSubmissionRequestId
             | Self::SignableTransactionTooLarge { .. }
             | Self::InvalidTransactionSignature => None,
         }
     }
+}
+
+/// Encodes the exact profile-2 signature payload without changing the
+/// canonical Transaction v1 schema or bytes.
+///
+/// Field 1 is the caller's durable request id. Field 2 is the exact output of
+/// [`execution::encode_transaction_signable`]. Both are authenticated under
+/// [`SUBMIT_TRANSACTION_V1_MESSAGE_TYPE`].
+pub fn encode_submit_transaction_signable(
+    request_id: RequestId,
+    transaction_signable: &[u8],
+) -> Result<Vec<u8>, CanonicalEncodingError> {
+    let mut canonical: CanonicalStruct = CanonicalStruct::new(
+        SUBMIT_TRANSACTION_SIGNABLE_TYPE_ID,
+        SUBMIT_TRANSACTION_SIGNABLE_ENCODING_VERSION,
+    );
+    canonical.field_bytes(1, request_id.as_bytes().to_vec())?;
+    canonical.field_bytes(2, transaction_signable.to_vec())?;
+    canonical.finish()
 }
 
 /// The explicit, caller-supplied trusted signing/replay context.
@@ -231,10 +283,12 @@ impl<'a> TrustedTransactionContext<'a> {
 ///
 /// The inner transaction is private and has no public constructor: the only
 /// way to obtain a value of this type is a successful
-/// [`authenticate_transaction_bytes`] call.
+/// [`authenticate_transaction_bytes`] or
+/// [`authenticate_submit_transaction_bytes`] call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthenticatedTransaction {
     transaction: Transaction,
+    owner_address_policy: Ed25519OwnerAddressPolicy,
 }
 
 impl AuthenticatedTransaction {
@@ -248,6 +302,12 @@ impl AuthenticatedTransaction {
     #[must_use]
     pub fn into_transaction(self) -> Transaction {
         self.transaction
+    }
+
+    /// Returns the value-owner policy committed by the profile that
+    /// authenticated this transaction.
+    pub(crate) const fn owner_address_policy(&self) -> Ed25519OwnerAddressPolicy {
+        self.owner_address_policy
     }
 }
 
@@ -265,19 +325,20 @@ impl AuthenticatedTransaction {
 ///    `epoch` against the trusted context/config, rejecting any mismatch
 ///    with a typed error before any cryptographic work runs.
 /// 4. Build the [`crypto::SignatureDomain`] solely from the trusted context
-///    and the resolved profile, using the exact stable message family
-///    `"transaction-v1"`.
+///    and the resolved profile. Profile 1 uses its historical
+///    `"transaction-v1"` family. Profile 2 uses
+///    `"submit-transaction-v1"` over a canonical envelope containing the
+///    outer request id and exact Transaction-v1 signable bytes.
 /// 5. Encode the signable transaction payload (the signature field
 ///    excluded) and reject it with
 ///    [`TransactionAuthError::SignableTransactionTooLarge`] if it exceeds
 ///    [`MAX_TRANSACTION_SIGNABLE_BYTES`], before any framing or verifier
 ///    call can allocate or hash it.
-/// 6. Dispatch on the resolved profile's [`AddressBinding`]. Only
-///    [`AddressBinding::AddressIsPublicKey`] is implemented: the
-///    transaction's exact 32-byte `sender` is used directly as the Ed25519
-///    verification key. This match is exhaustive over the closed
-///    `AddressBinding` enum, so an unimplemented future binding fails to
-///    compile rather than silently falling back.
+/// 6. Dispatch on the resolved profile's [`AddressBinding`]. Profile 1 uses
+///    the transaction's exact 32-byte `sender` directly as an Ed25519 key.
+///    Profile 2 first requires that value to be canonical, non-identity, and
+///    torsion-free. This match is exhaustive over the closed enum, so a new
+///    binding cannot silently fall back.
 /// 7. Verify the signature with the committed [`crypto::Ed25519Verifier`].
 ///    A malformed verification key or malformed signature length surfaces as
 ///    a distinct [`TransactionAuthError::Crypto`]; a well-formed but
@@ -287,6 +348,26 @@ impl AuthenticatedTransaction {
 ///    `Ok(true)`.
 pub fn authenticate_transaction_bytes(
     input: &[u8],
+    context: &TrustedTransactionContext<'_>,
+) -> Result<AuthenticatedTransaction, TransactionAuthError> {
+    authenticate_transaction_bytes_internal(input, None, context)
+}
+
+/// Authenticates one canonical Transaction v1 carried by an outer
+/// `SubmitTransaction` event and binds profile-2 signatures to its exact
+/// durable request id. Historical profile 1 keeps its original signature
+/// bytes and message family.
+pub fn authenticate_submit_transaction_bytes(
+    request_id: RequestId,
+    input: &[u8],
+    context: &TrustedTransactionContext<'_>,
+) -> Result<AuthenticatedTransaction, TransactionAuthError> {
+    authenticate_transaction_bytes_internal(input, Some(request_id), context)
+}
+
+fn authenticate_transaction_bytes_internal(
+    input: &[u8],
+    request_id: Option<RequestId>,
     context: &TrustedTransactionContext<'_>,
 ) -> Result<AuthenticatedTransaction, TransactionAuthError> {
     let profile = resolve_transaction_auth_profile(context.protocol_config())
@@ -313,31 +394,59 @@ pub fn authenticate_transaction_bytes(
         });
     }
 
-    let domain = SignatureDomain {
-        chain_id: context.chain_id().clone(),
-        protocol_version: context.protocol_version(),
-        epoch: context.epoch(),
-        message_type: SignatureMessageType::new(TRANSACTION_V1_MESSAGE_TYPE)
-            .map_err(TransactionAuthError::Crypto)?,
-        signature_scheme_id: profile.signature_scheme_id(),
-    };
-
-    let signable =
+    let transaction_signable: Vec<u8> =
         encode_transaction_signable(&transaction).map_err(TransactionAuthError::Decode)?;
-    if signable.len() > MAX_TRANSACTION_SIGNABLE_BYTES {
+    if transaction_signable.len() > MAX_TRANSACTION_SIGNABLE_BYTES {
         return Err(TransactionAuthError::SignableTransactionTooLarge {
-            actual: signable.len(),
+            actual: transaction_signable.len(),
             maximum: MAX_TRANSACTION_SIGNABLE_BYTES,
         });
     }
 
-    let verified = match profile.address_binding() {
+    let (message_type, signable): (&'static str, Vec<u8>) = match profile.address_binding() {
+        AddressBinding::AddressIsPublicKey => (TRANSACTION_V1_MESSAGE_TYPE, transaction_signable),
+        AddressBinding::CanonicalPrimeOrderAddressIsPublicKey => {
+            let request_id: RequestId =
+                request_id.ok_or(TransactionAuthError::MissingSubmissionRequestId)?;
+            let envelope: Vec<u8> =
+                encode_submit_transaction_signable(request_id, &transaction_signable)
+                    .map_err(TransactionAuthError::SubmissionEnvelope)?;
+            (SUBMIT_TRANSACTION_V1_MESSAGE_TYPE, envelope)
+        }
+    };
+
+    let domain = SignatureDomain {
+        chain_id: context.chain_id().clone(),
+        protocol_version: context.protocol_version(),
+        epoch: context.epoch(),
+        message_type: SignatureMessageType::new(message_type)
+            .map_err(TransactionAuthError::Crypto)?,
+        signature_scheme_id: profile.signature_scheme_id(),
+    };
+
+    let (owner_address_policy, verified): (Ed25519OwnerAddressPolicy, bool) = match profile
+        .address_binding()
+    {
         AddressBinding::AddressIsPublicKey => {
             let verifier = Ed25519Verifier::from_verifying_key_bytes(transaction.sender.as_bytes())
                 .map_err(TransactionAuthError::Crypto)?;
-            verifier
+            let verified: bool = verifier
                 .verify_canonical(&domain, &signable, &transaction.signature)
-                .map_err(TransactionAuthError::Crypto)?
+                .map_err(TransactionAuthError::Crypto)?;
+            (Ed25519OwnerAddressPolicy::LegacyZip215, verified)
+        }
+        AddressBinding::CanonicalPrimeOrderAddressIsPublicKey => {
+            validate_ed25519_owner_address(
+                transaction.sender.as_bytes(),
+                Ed25519OwnerAddressPolicy::CanonicalPrimeOrder,
+            )
+            .map_err(TransactionAuthError::InadmissibleSenderAddress)?;
+            let verifier = Ed25519Verifier::from_verifying_key_bytes(transaction.sender.as_bytes())
+                .map_err(TransactionAuthError::Crypto)?;
+            let verified: bool = verifier
+                .verify_canonical(&domain, &signable, &transaction.signature)
+                .map_err(TransactionAuthError::Crypto)?;
+            (Ed25519OwnerAddressPolicy::CanonicalPrimeOrder, verified)
         }
     };
 
@@ -345,7 +454,10 @@ pub fn authenticate_transaction_bytes(
         return Err(TransactionAuthError::InvalidTransactionSignature);
     }
 
-    Ok(AuthenticatedTransaction { transaction })
+    Ok(AuthenticatedTransaction {
+        transaction,
+        owner_address_policy,
+    })
 }
 
 #[cfg(test)]
@@ -393,6 +505,26 @@ mod tests {
         config
     }
 
+    fn active_strict_protocol_config() -> ProtocolConfig {
+        let mut config: ProtocolConfig = active_protocol_config();
+        config.transaction_auth_profile =
+            Some(TransactionAuthProfile::ed25519_canonical_prime_order_address_is_public_key());
+        config
+    }
+
+    fn universal_zip215_sender() -> Address {
+        let mut bytes: [u8; 32] = [0; 32];
+        bytes[0] = 1;
+        bytes[31] = 0x80;
+        Address::new(bytes)
+    }
+
+    fn universal_zip215_signature() -> Vec<u8> {
+        let mut bytes: Vec<u8> = vec![0; 64];
+        bytes[0] = 1;
+        bytes
+    }
+
     fn sample_object_ref(id_byte: u8) -> ObjectRef {
         ObjectRef {
             id: ObjectId::new([id_byte; 32]),
@@ -437,6 +569,26 @@ mod tests {
         let signable = encode_transaction_signable(tx).unwrap();
         let domain = production_domain(tx.chain_id.clone(), tx.epoch);
         let mut signed = tx.clone();
+        signed.signature = sign_under_domain(signing_key, &domain, &signable);
+        encode_transaction(&signed).unwrap()
+    }
+
+    fn signed_submission_transaction_bytes(
+        signing_key: &SigningKey,
+        request_id: RequestId,
+        tx: &Transaction,
+    ) -> Vec<u8> {
+        let transaction_signable: Vec<u8> = encode_transaction_signable(tx).unwrap();
+        let signable: Vec<u8> =
+            encode_submit_transaction_signable(request_id, &transaction_signable).unwrap();
+        let domain = SignatureDomain {
+            chain_id: tx.chain_id.clone(),
+            protocol_version: tx.protocol_version,
+            epoch: tx.epoch,
+            message_type: SignatureMessageType::new(SUBMIT_TRANSACTION_V1_MESSAGE_TYPE).unwrap(),
+            signature_scheme_id: protocol_types::SignatureSchemeId::Ed25519,
+        };
+        let mut signed: Transaction = tx.clone();
         signed.signature = sign_under_domain(signing_key, &domain, &signable);
         encode_transaction(&signed).unwrap()
     }
@@ -488,6 +640,71 @@ mod tests {
 
         assert_eq!(authenticated.transaction().nonce, 7);
         assert_eq!(authenticated.clone().into_transaction().nonce, 7);
+    }
+
+    #[test]
+    fn strict_profile_authenticates_an_ordinary_signer_key() {
+        let config: ProtocolConfig = active_strict_protocol_config();
+        let signing_key: SigningKey = dev_signing_key(0x21);
+        let sender: Address = dev_sender_address(&signing_key);
+        let tx: Transaction = unsigned_transaction(sender, chain_id(), Epoch::new(5));
+        let request_id: RequestId = RequestId::new([0x41; 32]).unwrap();
+        let bytes: Vec<u8> = signed_submission_transaction_bytes(&signing_key, request_id, &tx);
+        let context: TrustedTransactionContext<'_> =
+            TrustedTransactionContext::new(chain_id(), Epoch::new(5), &config);
+
+        assert!(authenticate_submit_transaction_bytes(request_id, &bytes, &context).is_ok());
+    }
+
+    #[test]
+    fn strict_profile_binds_the_exact_submission_request_id() {
+        let config: ProtocolConfig = active_strict_protocol_config();
+        let signing_key: SigningKey = dev_signing_key(0x22);
+        let sender: Address = dev_sender_address(&signing_key);
+        let tx: Transaction = unsigned_transaction(sender, chain_id(), Epoch::new(5));
+        let signed_request_id: RequestId = RequestId::new([0x42; 32]).unwrap();
+        let relabeled_request_id: RequestId = RequestId::new([0x43; 32]).unwrap();
+        let bytes: Vec<u8> =
+            signed_submission_transaction_bytes(&signing_key, signed_request_id, &tx);
+        let context: TrustedTransactionContext<'_> =
+            TrustedTransactionContext::new(chain_id(), Epoch::new(5), &config);
+
+        assert!(authenticate_submit_transaction_bytes(signed_request_id, &bytes, &context).is_ok());
+        assert_eq!(
+            authenticate_submit_transaction_bytes(relabeled_request_id, &bytes, &context),
+            Err(TransactionAuthError::InvalidTransactionSignature)
+        );
+        assert_eq!(
+            authenticate_transaction_bytes(&bytes, &context),
+            Err(TransactionAuthError::MissingSubmissionRequestId)
+        );
+    }
+
+    #[test]
+    fn profile_boundary_preserves_legacy_zip215_and_rejects_it_under_strict_profile() {
+        let mut transaction: Transaction =
+            unsigned_transaction(universal_zip215_sender(), chain_id(), Epoch::new(5));
+        transaction.signature = universal_zip215_signature();
+        let bytes: Vec<u8> = encode_transaction(&transaction).unwrap();
+
+        let legacy_config: ProtocolConfig = active_protocol_config();
+        let legacy_context: TrustedTransactionContext<'_> =
+            TrustedTransactionContext::new(chain_id(), Epoch::new(5), &legacy_config);
+        assert!(authenticate_transaction_bytes(&bytes, &legacy_context).is_ok());
+
+        let strict_config: ProtocolConfig = active_strict_protocol_config();
+        let strict_context: TrustedTransactionContext<'_> =
+            TrustedTransactionContext::new(chain_id(), Epoch::new(5), &strict_config);
+        assert_eq!(
+            authenticate_submit_transaction_bytes(
+                RequestId::new([0x44; 32]).unwrap(),
+                &bytes,
+                &strict_context,
+            ),
+            Err(TransactionAuthError::InadmissibleSenderAddress(
+                Ed25519OwnerAddressError::NonCanonicalPoint
+            ))
+        );
     }
 
     #[test]
@@ -939,6 +1156,8 @@ mod tests {
     /// included).
     const STABLE_VECTOR_SIGNED_TX_HEX: &str = "534e5245016001000b0001000e00000073756e726973652d6465766e6574020004000000030000000300080000000500000000000000040020000000248acbdbaf9e050196de704bea2d68770e519150d103b587dae2d9cad53dd9300500080000000100000000000000060014000000534e52450250010001000100040000000000000007008c000000534e5245044001000300010030000000534e524501400100010001002000000000000000000000000000000000000000000000000000000000000000000000000200080000000100000000000000030038000000534e5245030101000200010002000000010002002000000000000000000000000000000000000000000000000000000000000000000000000800040000006e6f6f700900030000000102030a0008000000e8030000000000000c0040000000480cbb90e331345d311713e86e5b1fc3087e6bd800f3efac6cf47e3486f00f935bd13b5ae5cccc4a00af614a24c7fc045b6754316ea9bbbea65546ad80ad320b";
 
+    const STABLE_SUBMISSION_ENVELOPE_HEX: &str = "534e524509e0010002000100200000005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a020003000000010203";
+
     fn hex_to_bytes(hex: &str) -> Vec<u8> {
         assert_eq!(hex.len() % 2, 0, "hex literal must have an even length");
         (0..hex.len())
@@ -986,6 +1205,14 @@ mod tests {
         let framed = crypto::frame_signature_message(&domain, &signable).unwrap();
 
         assert_eq!(bytes_to_hex(&framed), STABLE_VECTOR_FRAME_HEX);
+    }
+
+    #[test]
+    fn stable_submission_envelope_bytes_match_pinned_hex() {
+        let request_id: RequestId = RequestId::new([0x5A; 32]).unwrap();
+        let envelope: Vec<u8> =
+            encode_submit_transaction_signable(request_id, &[0x01, 0x02, 0x03]).unwrap();
+        assert_eq!(bytes_to_hex(&envelope), STABLE_SUBMISSION_ENVELOPE_HEX);
     }
 
     #[test]

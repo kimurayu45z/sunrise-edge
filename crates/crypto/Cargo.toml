@@ -6,5 +6,6 @@ license.workspace = true
 
 [dependencies]
 canonical-encoding.workspace = true
+curve25519-dalek.workspace = true
 protocol-types.workspace = true
 ed25519-zebra.workspace = true

@@ -39,6 +39,19 @@ pub enum ClientError {
     },
     /// Canonical query-result encoding or decoding failed.
     Wire(node_wire::QueryResultError),
+    /// An inline object response used the historical v1 schema, which lacks
+    /// the immutable digest context required for independent verification.
+    UnverifiableHistoricalObjectResponse {
+        /// Object whose legacy response was rejected.
+        object_id: ObjectId,
+    },
+    /// An inline object response's canonical body did not match its claimed digest.
+    ObjectResponseDigestMismatch {
+        /// Object whose forged or corrupted response was rejected.
+        object_id: ObjectId,
+    },
+    /// Recomputing an inline object's digest failed closed.
+    ObjectResponseHashing(hashing::HashingError),
     /// A remote `/v1/context` result did not match the caller's locally
     /// configured [`crate::context::ExpectedProtocolContext`] (see
     /// `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` DR-0085 / `TODO.md` CLI-First Node Production Gate
@@ -146,6 +159,17 @@ impl fmt::Display for ClientError {
                 "unexpected content type: expected {expected}, got {actual:?}"
             ),
             Self::Wire(error) => write!(f, "query result codec error: {error}"),
+            Self::UnverifiableHistoricalObjectResponse { object_id } => write!(
+                f,
+                "object {object_id} used historical query schema v1 without verifiable digest context"
+            ),
+            Self::ObjectResponseDigestMismatch { object_id } => write!(
+                f,
+                "object {object_id} canonical body does not match its returned digest"
+            ),
+            Self::ObjectResponseHashing(error) => {
+                write!(f, "object response digest verification failed: {error}")
+            }
             Self::ProtocolContextMismatch(error) => write!(f, "{error}"),
             Self::Contract(error) => write!(f, "event result codec error: {error}"),
             Self::NodeCore(error) => write!(f, "node-core validation error: {error}"),
@@ -202,6 +226,7 @@ impl Error for ClientError {
         match self {
             Self::Transport(error) => Some(error),
             Self::Wire(error) => Some(error),
+            Self::ObjectResponseHashing(error) => Some(error),
             Self::ProtocolContextMismatch(error) => Some(error),
             Self::Contract(error) => Some(error),
             Self::NodeCore(error) => Some(error),
@@ -211,6 +236,8 @@ impl Error for ClientError {
             Self::ExternalSigner(error) => Some(error.as_ref()),
             Self::UnexpectedStatus { .. }
             | Self::UnexpectedContentType { .. }
+            | Self::UnverifiableHistoricalObjectResponse { .. }
+            | Self::ObjectResponseDigestMismatch { .. }
             | Self::SubmitResponseRequestIdMismatch { .. }
             | Self::ObjectQuerySelectorMismatch { .. }
             | Self::ReceiptQuerySelectorMismatch { .. }
@@ -234,6 +261,12 @@ impl From<TransportError> for ClientError {
 impl From<node_wire::QueryResultError> for ClientError {
     fn from(value: node_wire::QueryResultError) -> Self {
         Self::Wire(value)
+    }
+}
+
+impl From<hashing::HashingError> for ClientError {
+    fn from(value: hashing::HashingError) -> Self {
+        Self::ObjectResponseHashing(value)
     }
 }
 

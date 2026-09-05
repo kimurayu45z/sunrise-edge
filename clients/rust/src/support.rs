@@ -10,7 +10,7 @@
 use node_wire::HttpObjectQueryResult;
 use objects::ObjectRef;
 
-/// The only implemented address-binding identifier
+/// Historical profile-1 address-binding identifier
 /// (`protocol_config::AddressBinding::AddressIsPublicKey::as_u16()`),
 /// duplicated here as a plain `u16` constant so a caller can compare it
 /// against [`node_wire::HttpContextQueryResult::address_binding_id`]
@@ -20,7 +20,13 @@ use objects::ObjectRef;
 /// drift out of sync.
 pub const ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID: u16 = 1;
 
-/// The only implemented transaction-authentication profile identifier
+/// Strict owner-address binding identifier
+/// (`protocol_config::AddressBinding::CanonicalPrimeOrderAddressIsPublicKey`).
+/// It keeps Ed25519 address-is-public-key signing while requiring sender and
+/// value-owner addresses to be canonical, non-identity, prime-order points.
+pub const ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_BINDING_ID: u16 = 2;
+
+/// Historical transaction-authentication profile identifier
 /// (`protocol_config::ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`), duplicated
 /// here as a plain `u16` constant so a caller can compare it against
 /// [`node_wire::HttpContextQueryResult::transaction_auth_profile_id`]
@@ -31,6 +37,9 @@ pub const ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID: u16 = 1;
 /// `protocol-config` stays a dev-dependency only; a dedicated test pins this
 /// constant against the real value so the two cannot silently drift.
 pub const ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID: u16 = 1;
+
+/// Strict profile identifier used by the current devnet composition.
+pub const ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID: u16 = 2;
 
 /// Extracts the exact `ObjectRef` (identifier, current version, digest)
 /// from a `CurrentInline` object query result.
@@ -61,7 +70,7 @@ pub fn current_inline_object_ref(result: &HttpObjectQueryResult) -> Option<Objec
 mod tests {
     use super::*;
     use objects::ObjectId;
-    use protocol_types::{Digest32, HashAlgorithmId};
+    use protocol_types::{ChainId, Digest32, HashAlgorithmId, ProtocolVersion};
     use runtime::{DurableObjectVersion, ObjectHeadRevision};
 
     #[test]
@@ -73,6 +82,8 @@ mod tests {
             head_revision: ObjectHeadRevision::new(1).unwrap(),
             object_version: DurableObjectVersion::new(3).unwrap(),
             digest,
+            creating_chain_id: ChainId::new("support-test").unwrap(),
+            creating_protocol_version: ProtocolVersion::new(3),
             canonical_object_bytes: vec![1, 2, 3],
         };
         assert_eq!(
@@ -96,6 +107,10 @@ mod tests {
             ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
             protocol_config::AddressBinding::AddressIsPublicKey.as_u16()
         );
+        assert_eq!(
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+            protocol_config::AddressBinding::CanonicalPrimeOrderAddressIsPublicKey.as_u16()
+        );
     }
 
     #[test]
@@ -103,6 +118,10 @@ mod tests {
         assert_eq!(
             ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
             protocol_config::ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID
+        );
+        assert_eq!(
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
+            protocol_config::ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID
         );
     }
 }

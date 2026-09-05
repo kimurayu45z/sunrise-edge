@@ -68,10 +68,12 @@ pub use signing_view::{
 };
 pub use support::{
     ED25519_ADDRESS_IS_PUBLIC_KEY_BINDING_ID, ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
-    current_inline_object_ref,
+    ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_BINDING_ID,
+    ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID, current_inline_object_ref,
 };
 pub use transaction::{
-    ExternalSigner, PreparedTransaction, TransactionRequest, build_signed_transaction,
+    ExternalSigner, PreparedTransaction, TransactionRequest, build_signed_submission_transaction,
+    build_signed_transaction,
 };
 pub use transport::{
     LoopbackHttpTransport, MAX_CA_CERTIFICATE_DER_BYTES, Method, RemoteTlsHttpTransport, Transport,

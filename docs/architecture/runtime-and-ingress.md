@@ -245,6 +245,21 @@ bodies expose stable coarse codes rather than internal state or storage details.
 point requires a shutdown future so the embedding native process can stop
 accepting work cleanly.
 
+DR-0100 adds an independent bound before HTTP parsing. The repository-owned
+`serve` entrypoint acquires one connection permit immediately after TCP
+`accept`, closes excess connections without parsing or application queueing,
+and holds the permit until that connection ends. It applies a total header-read
+deadline, an idle deadline between socket reads, a total deadline while
+collecting the existing bounded body before invoking Axum, plus idle and total
+deadlines while writing the response. HTTP/1 keep-alive is
+disabled, so one accepted connection carries at most one request; header count
+and parser buffer size are fixed as well. `serve_with_policy` exposes smaller
+validated limits under hard ceilings while `serve` preserves its signature and
+uses bounded defaults. Because this wraps the completed `Router`, all four
+native event router families and query routes receive the same pre-parser
+controls. An embedding host that does not use this server entrypoint must
+provide equivalent connection/read/write/lifecycle controls itself.
+
 Canonical event decoding, node-core invocation, synchronous runtime/store
 calls, request-scoped outbox delivery, and canonical result encoding run as one
 `spawn_blocking` job while holding the admission permit. The permit is acquired
@@ -256,8 +271,9 @@ returning a timeout while a database commit may continue would create ambiguous
 client semantics. The structured durable route supplies a storage-aware deadline
 and checks an explicit cooperative cancellation signal before blocking dispatch,
 at blocking-job entry, and immediately before its first storage call. Legacy
-routes, client-disconnect wiring, shutdown budgets, cancellation of started
-transport/storage work, load capacity, and circuit breaking remain required.
+routes, client-disconnect wiring after complete request admission, shutdown
+budgets, cancellation of started transport/storage work, measured load
+capacity, and circuit breaking remain required.
 
 An embedding scheduler may call `recover_outboxes_once` without an active HTTP
 request. It scans one bounded outbox-key page, validates delivery/batch identity

@@ -11,6 +11,7 @@ crypto.workspace = true
 ed25519-zebra.workspace = true
 execution.workspace = true
 fees.workspace = true
+hashing.workspace = true
 node-core.workspace = true
 node-wire.workspace = true
 objects.workspace = true

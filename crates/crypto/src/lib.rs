@@ -10,8 +10,12 @@ use protocol_types::{ChainId, Epoch, ProtocolVersion, SignatureSchemeId, TypeErr
 use std::{error::Error, fmt};
 
 mod ed25519;
+mod owner_address;
 
 pub use ed25519::Ed25519Verifier;
+pub use owner_address::{
+    Ed25519OwnerAddressError, Ed25519OwnerAddressPolicy, validate_ed25519_owner_address,
+};
 
 const SIGNATURE_FRAME_TYPE_ID: u16 = 0x2001;
 const SIGNATURE_FRAME_VERSION: u16 = 1;

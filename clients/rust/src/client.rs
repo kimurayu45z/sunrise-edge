@@ -12,7 +12,7 @@ use node_wire::{
     QUERY_RESULT_MEDIA_TYPE,
 };
 use objects::{Address, ObjectId};
-use protocol_types::{ChainId, Epoch, ProtocolVersion};
+use protocol_types::{ChainId, Epoch, HashPurpose, ProtocolVersion};
 
 use crate::context::ExpectedProtocolContext;
 use crate::error::ClientError;
@@ -32,8 +32,10 @@ pub struct SubmitTransactionRequest {
     pub epoch: Epoch,
     /// Caller-supplied, non-zero request identifier.
     pub request_id: RequestId,
-    /// Exact canonical signed `Transaction` bytes, as produced by
-    /// [`crate::transaction::build_signed_transaction`].
+    /// Exact canonical signed `Transaction` bytes. Active profile-2 callers
+    /// should produce these with
+    /// [`crate::transaction::build_signed_submission_transaction`] so the
+    /// same `request_id` is covered by the signature.
     pub signed_transaction_bytes: Vec<u8>,
 }
 
@@ -113,6 +115,31 @@ where
                 expected: object_id,
                 actual: result.object_id(),
             });
+        }
+        if let HttpObjectQueryResult::CurrentInline {
+            digest,
+            creating_chain_id,
+            creating_protocol_version,
+            canonical_object_bytes,
+            ..
+        } = &result
+        {
+            let verified: bool = hashing::verify_digest(
+                digest,
+                HashPurpose::Object,
+                *creating_protocol_version,
+                creating_chain_id,
+                canonical_object_bytes,
+            )?;
+            if !verified {
+                return Err(ClientError::ObjectResponseDigestMismatch { object_id });
+            }
+        }
+        if matches!(
+            result,
+            HttpObjectQueryResult::HistoricalCurrentInline { .. }
+        ) {
+            return Err(ClientError::UnverifiableHistoricalObjectResponse { object_id });
         }
         Ok(result)
     }
@@ -319,7 +346,8 @@ mod tests {
     use crate::transaction::{TransactionRequest, build_signed_transaction};
     use crate::transport::{TransportError, WireResponse};
     use abi::AccessManifest;
-    use objects::ObjectRef;
+    use hashing::{BuiltinHashFunction, HashFunction};
+    use objects::{Object, ObjectRef, Owner, encode_object};
     use protocol_types::{Digest32, HashAlgorithmId, SignatureSchemeId};
     use std::cell::RefCell;
 
@@ -384,6 +412,46 @@ mod tests {
             fee_payment: None,
         };
         build_signed_transaction(&signer, SignatureSchemeId::Ed25519, request).unwrap()
+    }
+
+    fn inline_object_result(
+        object_id: ObjectId,
+        owner: Address,
+        digest_owner: Address,
+    ) -> HttpObjectQueryResult {
+        let chain_id: ChainId = ChainId::new("sunrise-devnet").unwrap();
+        let protocol_version: ProtocolVersion = ProtocolVersion::new(3);
+        let object_for_body = Object {
+            id: object_id,
+            version: 1,
+            owner: Owner::Address(owner),
+            type_hash: Digest32::new(HashAlgorithmId::Sha2_256, [0x55; 32]),
+            schema_version: 1,
+            data: vec![0xAA],
+        };
+        let object_for_digest = Object {
+            owner: Owner::Address(digest_owner),
+            ..object_for_body.clone()
+        };
+        let canonical_object_bytes: Vec<u8> = encode_object(&object_for_body).unwrap();
+        let canonical_digest_bytes: Vec<u8> = encode_object(&object_for_digest).unwrap();
+        let digest: Digest32 = BuiltinHashFunction::new(HashAlgorithmId::Sha2_256)
+            .hash(
+                HashPurpose::Object,
+                protocol_version,
+                &chain_id,
+                &canonical_digest_bytes,
+            )
+            .unwrap();
+        HttpObjectQueryResult::CurrentInline {
+            object_id,
+            head_revision: runtime::ObjectHeadRevision::new(1).unwrap(),
+            object_version: runtime::DurableObjectVersion::new(1).unwrap(),
+            digest,
+            creating_chain_id: chain_id,
+            creating_protocol_version: protocol_version,
+            canonical_object_bytes,
+        }
     }
 
     #[test]
@@ -463,6 +531,75 @@ mod tests {
             nonce_error,
             ClientError::NextNonceQuerySelectorMismatch { expected, actual }
                 if expected == requested_sender && actual == returned_sender
+        ));
+    }
+
+    #[test]
+    fn query_object_verifies_the_inline_body_digest_before_returning_it() {
+        let object_id: ObjectId = ObjectId::new([0x12; 32]);
+        let owner: Address = Address::new([0x13; 32]);
+        let result: HttpObjectQueryResult = inline_object_result(object_id, owner, owner);
+        let transport: FakeTransport = FakeTransport::new(vec![ok_response(
+            QUERY_RESULT_MEDIA_TYPE,
+            result.encode().unwrap(),
+        )]);
+
+        assert_eq!(
+            Client::new(transport).query_object(object_id).unwrap(),
+            result
+        );
+    }
+
+    #[test]
+    fn query_object_rejects_a_body_whose_owner_does_not_match_the_signed_digest() {
+        let object_id: ObjectId = ObjectId::new([0x14; 32]);
+        let forged_owner: Address = Address::new([0x15; 32]);
+        let committed_owner: Address = Address::new([0x16; 32]);
+        let forged: HttpObjectQueryResult =
+            inline_object_result(object_id, forged_owner, committed_owner);
+        let transport: FakeTransport = FakeTransport::new(vec![ok_response(
+            QUERY_RESULT_MEDIA_TYPE,
+            forged.encode().unwrap(),
+        )]);
+
+        assert!(matches!(
+            Client::new(transport).query_object(object_id),
+            Err(ClientError::ObjectResponseDigestMismatch { object_id: actual })
+                if actual == object_id
+        ));
+    }
+
+    #[test]
+    fn query_object_rejects_historical_v1_inline_responses_as_unverifiable() {
+        let object_id: ObjectId = ObjectId::new([0x17; 32]);
+        let owner: Address = Address::new([0x18; 32]);
+        let current: HttpObjectQueryResult = inline_object_result(object_id, owner, owner);
+        let legacy: HttpObjectQueryResult = match current {
+            HttpObjectQueryResult::CurrentInline {
+                object_id,
+                head_revision,
+                object_version,
+                digest,
+                canonical_object_bytes,
+                ..
+            } => HttpObjectQueryResult::HistoricalCurrentInline {
+                object_id,
+                head_revision,
+                object_version,
+                digest,
+                canonical_object_bytes,
+            },
+            _ => unreachable!("helper always returns CurrentInline"),
+        };
+        let transport: FakeTransport = FakeTransport::new(vec![ok_response(
+            QUERY_RESULT_MEDIA_TYPE,
+            legacy.encode().unwrap(),
+        )]);
+
+        assert!(matches!(
+            Client::new(transport).query_object(object_id),
+            Err(ClientError::UnverifiableHistoricalObjectResponse { object_id: actual })
+                if actual == object_id
         ));
     }
 

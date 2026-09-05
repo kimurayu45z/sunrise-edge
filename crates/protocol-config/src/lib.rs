@@ -69,9 +69,16 @@ pub enum ProtocolConfigError {
     ZeroTransactionAuthProfileId,
     /// The transaction-authentication profile id does not name a profile
     /// this build implements. Profile ids are committed protocol
-    /// identifiers, not arbitrary non-zero labels; only
-    /// [`ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`] currently exists.
+    /// identifiers, not arbitrary non-zero labels.
     UnsupportedTransactionAuthProfileId(u16),
+    /// A known transaction-authentication profile id was paired with the
+    /// wrong address-binding rule.
+    TransactionAuthProfileAddressBindingMismatch {
+        /// The committed profile identifier.
+        profile_id: u16,
+        /// Binding supplied for that profile.
+        address_binding: AddressBinding,
+    },
     /// A transaction-authentication profile requires a signature scheme this
     /// build implements; the profile's declared scheme is unsupported.
     UnsupportedSignatureScheme(SignatureSchemeId),
@@ -147,6 +154,14 @@ impl fmt::Display for ProtocolConfigError {
             Self::UnsupportedTransactionAuthProfileId(profile_id) => write!(
                 f,
                 "transaction-authentication profile id {profile_id} is not implemented"
+            ),
+            Self::TransactionAuthProfileAddressBindingMismatch {
+                profile_id,
+                address_binding,
+            } => write!(
+                f,
+                "transaction-authentication profile id {profile_id} does not support address binding {}",
+                address_binding.as_u16()
             ),
             Self::UnsupportedSignatureScheme(scheme) => {
                 write!(f, "signature scheme {} is not implemented", scheme.as_u16())
@@ -352,6 +367,10 @@ pub enum AddressBinding {
     /// The transaction's 32-byte address is the Ed25519 verification key
     /// that must authenticate it.
     AddressIsPublicKey = 0x0001,
+    /// The transaction's 32-byte address is its Ed25519 verification key and
+    /// must additionally be a canonical, non-identity point in the
+    /// prime-order subgroup before it can authenticate or own value.
+    CanonicalPrimeOrderAddressIsPublicKey = 0x0002,
 }
 
 impl AddressBinding {
@@ -369,14 +388,20 @@ pub fn encode_address_binding(binding: AddressBinding) -> Result<Vec<u8>, Protoc
     Ok(canonical.finish()?)
 }
 
-/// The only implemented transaction-authentication profile id: Ed25519
+/// Historical transaction-authentication profile id: Ed25519 ZIP-215
 /// signatures where the transaction's address is directly the signer's
-/// Ed25519 public key (see [`AddressBinding::AddressIsPublicKey`]).
+/// public key, without a value-owner admissibility restriction (see
+/// [`AddressBinding::AddressIsPublicKey`]).
 ///
 /// Profile ids are committed protocol identifiers, not arbitrary non-zero
 /// labels; [`TransactionAuthProfile::new`] rejects every id other than this
 /// one.
 pub const ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID: u16 = 1;
+
+/// Transaction-authentication profile id that keeps ZIP-215 signature
+/// verification but requires sender and value-owner addresses to use the
+/// unique canonical encoding of a non-identity prime-order Ed25519 point.
+pub const ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID: u16 = 2;
 
 /// Committed transaction-authentication profile, required from protocol
 /// version 3.
@@ -404,12 +429,8 @@ pub struct TransactionAuthProfile {
 impl TransactionAuthProfile {
     /// Creates a transaction-authentication profile.
     ///
-    /// Fails closed for a zero profile id, for any profile id other than
-    /// [`ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`] (the only committed
-    /// profile id this build implements), or for a scheme/binding this
-    /// build does not implement. Ed25519 is currently the only implemented
-    /// signature scheme, and `AddressIsPublicKey` is currently the only
-    /// implemented address binding.
+    /// Fails closed for a zero or unknown profile id, or for a scheme/binding
+    /// combination that the selected profile does not implement.
     pub fn new(
         profile_id: u16,
         signature_scheme_id: SignatureSchemeId,
@@ -439,7 +460,9 @@ impl TransactionAuthProfile {
         if self.profile_id == 0 {
             return Err(ProtocolConfigError::ZeroTransactionAuthProfileId);
         }
-        if self.profile_id != ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID {
+        if self.profile_id != ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID
+            && self.profile_id != ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID
+        {
             return Err(ProtocolConfigError::UnsupportedTransactionAuthProfileId(
                 self.profile_id,
             ));
@@ -449,13 +472,28 @@ impl TransactionAuthProfile {
                 self.signature_scheme_id,
             ));
         }
-        match self.address_binding {
-            AddressBinding::AddressIsPublicKey => {}
+        let binding_matches_profile: bool = matches!(
+            (self.profile_id, self.address_binding),
+            (
+                ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
+                AddressBinding::AddressIsPublicKey
+            ) | (
+                ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
+                AddressBinding::CanonicalPrimeOrderAddressIsPublicKey
+            )
+        );
+        if !binding_matches_profile {
+            return Err(
+                ProtocolConfigError::TransactionAuthProfileAddressBindingMismatch {
+                    profile_id: self.profile_id,
+                    address_binding: self.address_binding,
+                },
+            );
         }
         Ok(())
     }
 
-    /// Creates the only implemented profile
+    /// Creates historical profile 1
     /// ([`ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`]): Ed25519 signatures
     /// over an address that is directly the signer's public key.
     #[must_use]
@@ -464,6 +502,17 @@ impl TransactionAuthProfile {
             profile_id: ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
             signature_scheme_id: SignatureSchemeId::Ed25519,
             address_binding: AddressBinding::AddressIsPublicKey,
+        }
+    }
+
+    /// Creates profile 2: ZIP-215 Ed25519 verification plus canonical,
+    /// non-identity, prime-order sender and value-owner admissibility.
+    #[must_use]
+    pub fn ed25519_canonical_prime_order_address_is_public_key() -> Self {
+        Self {
+            profile_id: ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
+            signature_scheme_id: SignatureSchemeId::Ed25519,
+            address_binding: AddressBinding::CanonicalPrimeOrderAddressIsPublicKey,
         }
     }
 
@@ -817,6 +866,15 @@ mod tests {
         "534e52450d50010001000100020000000100"
     );
 
+    /// The additive profile-2 bytes. Profile 1's stable vector above remains
+    /// unchanged; only the profile and binding values differ in this new
+    /// commitment.
+    const TRANSACTION_AUTH_PROFILE_2_HEX: &str = concat!(
+        "534e52450c500100030001000200000002000200120000",
+        "00534e52450801010001000100020000000100030012000000",
+        "534e52450d50010001000100020000000200"
+    );
+
     #[test]
     fn genesis_config_encodes_stably() {
         let bytes = encode_protocol_config(&ProtocolConfig::genesis()).unwrap();
@@ -976,6 +1034,28 @@ mod tests {
         assert_eq!(
             hex(&encode_transaction_auth_profile(&profile).unwrap()),
             TRANSACTION_AUTH_PROFILE_1_HEX
+        );
+
+        let strict_profile =
+            TransactionAuthProfile::ed25519_canonical_prime_order_address_is_public_key();
+        assert_eq!(
+            strict_profile.profile_id(),
+            ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID
+        );
+        assert_eq!(
+            strict_profile.address_binding(),
+            AddressBinding::CanonicalPrimeOrderAddressIsPublicKey
+        );
+        assert_eq!(
+            hex(
+                &encode_address_binding(AddressBinding::CanonicalPrimeOrderAddressIsPublicKey)
+                    .unwrap()
+            ),
+            "534e52450d50010001000100020000000200"
+        );
+        assert_eq!(
+            hex(&encode_transaction_auth_profile(&strict_profile).unwrap()),
+            TRANSACTION_AUTH_PROFILE_2_HEX
         );
     }
 
@@ -1236,16 +1316,46 @@ mod tests {
     #[test]
     fn transaction_auth_profile_rejects_an_unsupported_profile_id() {
         // Profile ids are committed protocol identifiers, not arbitrary
-        // non-zero labels: only ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID (1)
-        // is implemented, so id 2 must fail closed even though it is
+        // non-zero labels: profile ids 1 and 2 are implemented, so id 3
+        // must fail closed even though it is
         // otherwise well-formed.
         assert_eq!(
             TransactionAuthProfile::new(
-                2,
+                3,
                 SignatureSchemeId::Ed25519,
                 AddressBinding::AddressIsPublicKey,
             ),
-            Err(ProtocolConfigError::UnsupportedTransactionAuthProfileId(2))
+            Err(ProtocolConfigError::UnsupportedTransactionAuthProfileId(3))
+        );
+    }
+
+    #[test]
+    fn transaction_auth_profiles_reject_crossed_address_bindings() {
+        assert_eq!(
+            TransactionAuthProfile::new(
+                ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
+                SignatureSchemeId::Ed25519,
+                AddressBinding::CanonicalPrimeOrderAddressIsPublicKey,
+            ),
+            Err(
+                ProtocolConfigError::TransactionAuthProfileAddressBindingMismatch {
+                    profile_id: ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
+                    address_binding: AddressBinding::CanonicalPrimeOrderAddressIsPublicKey,
+                }
+            )
+        );
+        assert_eq!(
+            TransactionAuthProfile::new(
+                ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
+                SignatureSchemeId::Ed25519,
+                AddressBinding::AddressIsPublicKey,
+            ),
+            Err(
+                ProtocolConfigError::TransactionAuthProfileAddressBindingMismatch {
+                    profile_id: ED25519_CANONICAL_PRIME_ORDER_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID,
+                    address_binding: AddressBinding::AddressIsPublicKey,
+                }
+            )
         );
     }
 
