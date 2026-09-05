@@ -163,6 +163,8 @@ the same state-machine boundary without becoming protocol trust roots.
   normalized PostgreSQL design.
 - [`docs/signing/hardware-signing.md`](docs/signing/hardware-signing.md) defines
   the hardware-signing profile and device contract.
+- [`docs/security/README.md`](docs/security/README.md) indexes the threat model
+  and initial code-security audit scope.
 - [`AGENTS.md`](AGENTS.md) contains repository-wide contributor instructions.
 
 When code and an aspirational roadmap differ, treat implemented wire formats,
@@ -170,10 +172,9 @@ stable tests, and accepted architecture decisions as compatibility constraints.
 
 ## Security
 
-This repository is research-stage software and does not yet provide a formal
-security policy or vulnerability-reporting channel. Do not report exploitable
-issues in a public issue if disclosure would put users or deployments at risk;
-contact the repository owner privately instead.
+See [`SECURITY.md`](SECURITY.md) for the security policy, private vulnerability
+reporting route, threat assumptions, invariants, severity context, and audit
+scope boundaries.
 
 Protocol code forbids Rust `unsafe` by default. The existing contract SDK is the
 exception at its raw WASM host-ABI boundary; contract-facing APIs wrap that
