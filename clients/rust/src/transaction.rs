@@ -33,7 +33,8 @@ use crate::key::LocalSigner;
 /// Every reference here — the access manifest and the module reference — is
 /// exactly what the caller supplies. This builder invents no object
 /// discovery, module lookup, or asset-specific defaults; that is deliberate
-/// (see `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` §44 / DR-0083).
+/// (see `docs/architecture/product-surfaces.md` §44 /
+/// `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` DR-0083).
 pub struct TransactionRequest {
     /// Chain replay-protection identifier. Must match the trusted
     /// `/v1/context` chain id.

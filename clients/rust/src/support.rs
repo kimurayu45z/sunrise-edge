@@ -3,8 +3,9 @@
 //! Everything here is deliberately generic over any object or protocol
 //! value — never devnet or asset-specific — so a consumer such as `apps/cli`
 //! never needs a direct dependency on a lower protocol crate just to finish
-//! a query/transaction round trip (see `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` §44 / DR-0083 and
-//! the `apps/cli` MVP boundary in DR-0084).
+//! a query/transaction round trip (see `docs/architecture/product-surfaces.md` §44 and
+//! `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` DR-0083 and the `apps/cli`
+//! MVP boundary in DR-0084).
 
 use node_wire::HttpObjectQueryResult;
 use objects::ObjectRef;

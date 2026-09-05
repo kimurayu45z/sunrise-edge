@@ -4,8 +4,9 @@
 //! the `sunrise.devnet.asset_account.v1` module: its fixed `transfer`
 //! entrypoint name and its exact `CanonicalStruct(0xF002, v1){1: u64
 //! amount}` argument frame. `clients/rust` stays application-agnostic (see
-//! `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` §44 / DR-0083); this file only uses the small, generic
-//! canonical-struct and access-manifest surface `clients/rust` re-exports
+//! `docs/architecture/product-surfaces.md` §44 /
+//! `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` DR-0083); this file only uses
+//! the small, generic canonical-struct and access-manifest surface `clients/rust` re-exports
 //! (DR-0084).
 //!
 //! It queries authoritative context first and, before any nonce/object

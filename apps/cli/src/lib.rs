@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! Sunrise Edge Developer MVP Rust CLI (`apps/cli`, docs/architecture/product-surfaces.md §44,
-//! DR-0084, and DR-0092).
+//! Sunrise Edge Developer MVP Rust CLI (`apps/cli`, docs/architecture/product-surfaces.md §44;
+//! docs/architecture/decisions/0081-0087-cli-first-roadmap.md DR-0084;
+//! docs/architecture/decisions/0088-0093-hardware-signing.md DR-0092).
 //!
 //! Rust-only, with exactly two non-development/runtime dependencies:
 //! `sunrise-edge-client` and, as of S4c (DR-0092, amending DR-0084's

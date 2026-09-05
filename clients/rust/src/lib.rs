@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
-//! Sunrise Edge Developer MVP Rust client (docs/architecture/decisions/0081-0087-cli-first-roadmap.md §44, DR-0083,
-//! DR-0084).
+//! Sunrise Edge Developer MVP Rust client (docs/architecture/product-surfaces.md §44;
+//! docs/architecture/decisions/0081-0087-cli-first-roadmap.md DR-0083, DR-0084).
 //!
 //! This is a runtime-neutral library: seed-based Ed25519 key/address
 //! handling, canonical Transaction v1 construction and signing through a
@@ -38,7 +38,8 @@
 //! derives a request id, never recomputes a hash-suite or execution-effects
 //! digest, and adds no asset-specific helpers or CLI policy. Those
 //! capabilities, general-purpose DNS/root-store/mTLS transport expansion, and
-//! blob fetch remain deferred (see `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` §44 / DR-0083).
+//! blob fetch remain deferred (see `docs/architecture/product-surfaces.md` §44 /
+//! `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` DR-0083).
 //! [`key::LocalSigner`] is
 //! an explicit development-only, in-memory key, never a keystore; real
 //! external/hardware signing remains outside this vendor-neutral crate.
@@ -101,7 +102,8 @@ pub use objects::{
 // `canonical-encoding` are foundational, dependency-light crates this client
 // already depends on for its own construction/signing path; re-exporting a
 // handful of their generic types here is the "smallest generic client
-// surface" carve-out from `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` §44 / DR-0083 and DR-0084 — it
+// surface" carve-out from `docs/architecture/product-surfaces.md` §44 and
+// `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` DR-0083 and DR-0084 — it
 // adds no devnet or other application-specific semantics.
 pub use abi::{AccessEntry, AccessManifest};
 pub use canonical_encoding::{CanonicalEncodingError, CanonicalStruct};

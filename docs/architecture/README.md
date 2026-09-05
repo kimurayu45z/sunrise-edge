@@ -17,7 +17,9 @@ roadmap describes a later target state.
   decisions grouped into bounded ranges.
 
 Production-oriented persistence requirements and the PostgreSQL mapping are
-separate operational references under [`docs/operations`](../operations/).
+separate operational references:
+[persistence](../operations/persistence.md) and
+[PostgreSQL](../operations/postgres.md).
 Current work queues, gate summaries, and roadmap sequencing belong only in
 [`TODO.md`](../../TODO.md). Architecture documents may describe implemented
 behavior and preserve historical evidence inside accepted decision records.

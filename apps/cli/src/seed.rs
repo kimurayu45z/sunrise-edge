@@ -22,7 +22,7 @@
 //! preserve the same device/inode, which is not possible for a distinct
 //! file — but it does close the specific symlink/replacement race described
 //! above. On non-Unix platforms (none of which this workspace currently
-//! targets; see `docs/architecture/product-surfaces.md`/`README.md` for the supported Linux/macOS
+//! targets; see `README.md` for the supported Linux/macOS
 //! platforms) neither the permission check nor this identity check runs, so
 //! this protection is Unix-only.
 
