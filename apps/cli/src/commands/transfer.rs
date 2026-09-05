@@ -4,14 +4,15 @@
 //! the `sunrise.devnet.asset_account.v1` module: its fixed `transfer`
 //! entrypoint name and its exact `CanonicalStruct(0xF002, v1){1: u64
 //! amount}` argument frame. `clients/rust` stays application-agnostic (see
-//! `ARCHITECTURE.md` §44 / DR-0083); this file only uses the small, generic
-//! canonical-struct and access-manifest surface `clients/rust` re-exports
+//! `docs/architecture/product-surfaces.md` §44 /
+//! `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` DR-0083); this file only uses
+//! the small, generic canonical-struct and access-manifest surface `clients/rust` re-exports
 //! (DR-0084).
 //!
 //! It queries authoritative context first and, before any nonce/object
 //! query or signing, requires the trusted `/v1/context` result to exactly
 //! match a locally configured [`sunrise_edge_client::ExpectedProtocolContext`]
-//! (see `ARCHITECTURE.md` DR-0085 / `TODO.md` CLI-First Node Production Gate
+//! (see `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` DR-0085 / `TODO.md` CLI-First Node Production Gate
 //! S1a): the caller-supplied `--expected-chain-id`, `--expected-protocol-
 //! version`, `--expected-epoch`, `--expected-hash-suite-id`, and
 //! `--expected-domain` flags, plus the transaction-auth profile id,
@@ -30,7 +31,8 @@
 //! object's canonical body. The source owner must be the local signer's own
 //! address, while the destination owner must exactly match the caller's
 //! required `--destination-owner` address. These are defense-in-depth checks
-//! alongside the server's committed module policy (see `ARCHITECTURE.md`
+//! alongside the server's committed module policy (see
+//! `docs/architecture/decisions/0081-0087-cli-first-roadmap.md`
 //! DR-0086). It then builds the source/destination `Write` accesses and, when
 //! the all-or-none fee flags are present, appends the treasury as the final
 //! `Write` while naming source as `fee_object`; it builds and
@@ -91,7 +93,7 @@ const WAIT_MAX_BACKOFF_MS: &str = "--wait-max-backoff-ms";
 const WAIT_MAX_ELAPSED_MS: &str = "--wait-max-elapsed-ms";
 
 /// The devnet `sunrise.devnet.asset_account.v1` module's `transfer`
-/// entrypoint name (see `ARCHITECTURE.md` §"Local devnet architecture").
+/// entrypoint name (see `docs/architecture/product-surfaces.md` §"Local devnet architecture").
 const TRANSFER_ENTRYPOINT: &str = "transfer";
 /// Canonical type identifier for the devnet module's transfer arguments
 /// (`0xF002`, reserved by DR-0081; devnet-local, not a base-protocol id).
@@ -172,12 +174,12 @@ where
     }
 }
 
-/// Connects a real Ledger device — running `SIGNING.md`'s complete staged
+/// Connects a real Ledger device — running `docs/signing/hardware-signing.md`'s complete staged
 /// dashboard/firmware/open-app/reconnect/active-app sequence and the
 /// existing device-reported configuration/public key/address checks, all
 /// strictly before this function ever constructs a network [`Client`] — and
-/// completes `transfer` using it as the external signer (see `SIGNING.md`
-/// and `ARCHITECTURE.md`'s Hardware Signing Profile v1 decision records).
+/// completes `transfer` using it as the external signer (see `docs/signing/hardware-signing.md`
+/// and `docs/architecture/decisions/0088-0093-hardware-signing.md`).
 #[cfg(feature = "usb-hid")]
 fn run_with_ledger(
     endpoint: &str,
@@ -341,7 +343,7 @@ fn parse_fee_inputs(
 }
 
 /// Parses the required `--expected-*` flags into a locally trusted
-/// [`ExpectedProtocolContext`] (see `ARCHITECTURE.md` DR-0085), rejecting a
+/// [`ExpectedProtocolContext`] (see `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` DR-0085), rejecting a
 /// missing, zero, or malformed value before any network dispatch. The
 /// transaction-auth profile id, signature scheme, and address binding
 /// expectations come from this client's own implemented constants, not from
@@ -564,7 +566,7 @@ fn parse_wait_bounds(parsed: &ParsedArgs) -> Result<Option<ReceiptPollBounds>, C
 /// This is a client-side, defense-in-depth check: the server's own owned-
 /// effects path independently and authoritatively rejects a transaction
 /// whose source owner or committed destination policy is invalid (see
-/// `ARCHITECTURE.md` DR-0086). Checking here too only saves a round trip and
+/// `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` DR-0086). Checking here too only saves a round trip and
 /// gives an actionable local error; it never weakens or substitutes for that
 /// server-side check.
 fn require_owned_current_inline<T>(

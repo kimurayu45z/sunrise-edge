@@ -15,78 +15,10 @@ servers, edge functions, and cloud functions without making any provider a
 consensus trust root.
 
 > [!WARNING]
-> Sunrise Edge is under active development. It is not production-ready, has not
-> been independently audited, and must not be used to custody real assets.
-
-## Current status
-
-The **CLI Developer MVP Gate is complete As-Is**. The repository provides a
-loopback-only local devnet, authenticated owned-object execution through a
-preinstalled deterministic WASM module, a bounded query API, a Rust client, a
-Rust CLI, ordinary asset-account transfers and fees, and automated
-restart/duplicate-request evidence.
-
-The current product path is CLI-first:
-
-- S0-S3 of the node-production program are implemented and validated As-Is:
-  restart/replay evidence, remote TLS plus a separate pre-signing protocol-
-  context check, the exact cross-owner destination policy, and uniform
-  ordinary-asset fee settlement.
-- Blob-backed immutable object bodies can be fetched, independently verified,
-  and now published: a new version an authenticated transaction commits is
-  written to an explicit `BlobStore` and referenced, not stored inline, only
-  when its canonical bytes exceed a fixed 64 KiB threshold. Ordinary small
-  bodies — every devnet asset-account update included — stay inline
-  unchanged. The local devnet wires a separate, file-backed SQLite blob
-  store for this, so a large blob-backed version would survive a devnet
-  restart, though ordinary devnet traffic never crosses the threshold today.
-  A durable production/cloud provider `BlobStore` (PostgreSQL/Cloudflare/AWS),
-  garbage collection, and checkpoint manifests remain unimplemented.
-- The next milestone is the **Initial Code Security Audit Entry Gate**: close public
-  event ingress to the currently authenticated `SubmitTransaction` surface,
-  freeze the audit scope and threat model, then start an external audit. It
-  does not wait for FastCertificate, PITR/HA, provider operations, or the other
-  production-only work; later surfaces require focused delta review.
-- The **Software Production Gate** consists of S0-S3 plus S5. S5 persistence,
-  provider deployment, operations, security-audit, and release evidence remain
-  incomplete.
-- The separate **Hardware Signing Release Gate** is S4. Its profile, dedicated
-  Ledger app, and software-side host integration are implemented As-Is, but
-  physical-device validation and release evidence are explicitly deferred.
-  **S4c remains incomplete pending Phase 2b physical-hardware validation.**
-  The CLI default signer is still `LocalSigner`, a development-only,
-  non-keystore in-memory key with no zeroization; replacing it remains part of
-  S4.
-- The complete **CLI-First Node Production Gate** requires both the Software
-  Production Gate and Hardware Signing Release Gate, plus the referenced
-  independent security/release criteria. It has not passed.
-- The TypeScript client, explorer, and wallet remain required future work.
-  Their implementation starts after the Software Production Gate; they do not
-  wait for the deferred Ledger hardware track.
-
-Create, Shared/System ownership, arbitrary module upload, FastCertificate and
-certificate publication, production provider certification, disaster-recovery
-rehearsal, capacity evidence, and independent security review remain
-unfinished. Nothing in this status is a production or mainnet-readiness claim.
-
-For the authoritative roadmap and completion criteria, see
-[`TODO.md`](TODO.md#cli-first-node-production-gate). For the implemented
-architecture and dated decisions, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
-
-### Disclosed MVP constraints
-
-The CLI Developer MVP Gate operates under fixed, disclosed constraints:
-
-- Single validator; owned-object execution only.
-- One fixed ordinary fee asset and one distinct ordinary treasury, with no
-  validator or certificate distribution.
-- Local SQLite only.
-- Cross-owner movement is limited to the exact, policy-bounded existing
-  destination; literal owner reassignment remains fail-closed.
-- The four `GET` query routes are an unauthenticated, bounded public-read API.
-- Query and submission share one `--max-concurrent` admission budget, so
-  either can starve the other.
-- Security and operations remain non-production.
+> Treat Sunrise Edge as experimental software. It is not production-ready and
+> has not been independently audited. Do not use it to custody real assets.
+> The authoritative readiness status, limitations, and remaining work are
+> tracked in [`TODO.md`](TODO.md).
 
 ## Design goals
 
@@ -169,7 +101,8 @@ cd adapters/deno && deno task check
 
 ### Run the local devnet and CLI
 
-[`DEVNET.md`](DEVNET.md) contains the complete reproducible walkthrough for:
+[`docs/guides/devnet.md`](docs/guides/devnet.md) contains the complete
+reproducible walkthrough for:
 
 - creating development-only sender, recipient, and treasury keys;
 - starting the loopback-only single-validator devnet;
@@ -219,16 +152,17 @@ the same state-machine boundary without becoming protocol trust roots.
 
 ## Documentation
 
-- [`DEVNET.md`](DEVNET.md) is the local devnet and CLI operator walkthrough.
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) records the implemented architecture and
-  decision records.
+- [`docs/README.md`](docs/README.md) is the documentation index.
+- [`docs/architecture/`](docs/architecture/README.md) records the implemented
+  architecture and decision records by subsystem.
 - [`TODO.md`](TODO.md) is the detailed design brief, completion criteria, and
   roadmap.
-- [`PERSISTENCE.md`](PERSISTENCE.md) defines provider-neutral production
-  persistence requirements.
-- [`POSTGRES.md`](POSTGRES.md) defines the normalized PostgreSQL design.
-- [`SIGNING.md`](SIGNING.md) defines the hardware-signing profile and device
-  contract.
+- [`docs/operations/persistence.md`](docs/operations/persistence.md) defines
+  provider-neutral production persistence requirements.
+- [`docs/operations/postgres.md`](docs/operations/postgres.md) defines the
+  normalized PostgreSQL design.
+- [`docs/signing/hardware-signing.md`](docs/signing/hardware-signing.md) defines
+  the hardware-signing profile and device contract.
 - [`AGENTS.md`](AGENTS.md) contains repository-wide contributor instructions.
 
 When code and an aspirational roadmap differ, treat implemented wire formats,

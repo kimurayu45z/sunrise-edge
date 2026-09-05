@@ -2,7 +2,7 @@
 //! application's name/version (CLA `B0` `INS 01`, "get app and version"),
 //! the dashboard's own firmware identity (CLA `E0` `INS 01`, reachable only
 //! while the device is at the dashboard with no application open), and
-//! opening an application (CLA `E0` `INS D8`, "open app"). See `SIGNING.md`,
+//! opening an application (CLA `E0` `INS D8`, "open app"). See `docs/signing/hardware-signing.md`,
 //! "Device APDU contract", the CLA `B0`/dashboard `E0` bullets.
 //!
 //! These are Ledger OS-owned commands, not this app's own frozen `E0`
@@ -501,7 +501,7 @@ fn open_app<T: Transport>(transport: &mut T, name: &str) -> Result<(), IdentityE
 /// (which an operator could otherwise mistake for "wrong pinned version,"
 /// masking the more serious device-state problem).
 ///
-/// Must be called strictly before [`verify_active_app`], per `SIGNING.md`'s
+/// Must be called strictly before [`verify_active_app`], per `docs/signing/hardware-signing.md`'s
 /// staged dashboard-probe-then-reconnect sequence: dashboard identity (CLA
 /// `B0`) first, then dashboard firmware (CLA `E0`, dashboard context), then
 /// `open app`.
@@ -548,7 +548,7 @@ pub fn verify_dashboard_and_open<T: Transport>(
 /// at exactly [`EXPECTED_APP_VERSION`].
 ///
 /// Must be called only after reconnecting once [`verify_dashboard_and_open`]
-/// has opened the Sunrise application (`SIGNING.md`'s staged sequence).
+/// has opened the Sunrise application (`docs/signing/hardware-signing.md`'s staged sequence).
 pub fn verify_active_app<T: Transport>(
     transport: &mut T,
 ) -> Result<AppIdentity, IdentityError<T::Error>> {

@@ -359,8 +359,9 @@ impl BoundedTransportIo for TcpStream {
 /// uses a proxy, never reuses a connection across requests, and does no
 /// work after returning: there is no background thread, retry, or async
 /// runtime anywhere in this type. These are deliberate limits, not gaps —
-/// remote transport is [`RemoteTlsHttpTransport`] (see `ARCHITECTURE.md`
-/// §44 / DR-0083, DR-0085).
+/// remote transport is [`RemoteTlsHttpTransport`] (see
+/// `docs/architecture/product-surfaces.md` §44 /
+/// `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` DR-0083, DR-0085).
 ///
 /// The hard complete-request budget is
 /// `connect_timeout + write_timeout + read_timeout`. A
@@ -470,7 +471,8 @@ pub const MAX_CA_CERTIFICATE_DER_BYTES: usize = 16 * 1024;
 /// insecure/no-op verifier, and never follows a redirect, retries, uses a
 /// proxy, reuses a connection across requests, or does any work after
 /// returning: there is no background thread or async runtime anywhere in
-/// this type (see `ARCHITECTURE.md` §44 / DR-0083, DR-0085).
+/// this type (see `docs/architecture/product-surfaces.md` §44 /
+/// `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` DR-0083, DR-0085).
 ///
 /// The hard complete-request budget is
 /// `connect_timeout + handshake_read_timeout + handshake_write_timeout +

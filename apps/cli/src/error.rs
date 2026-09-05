@@ -101,7 +101,7 @@ pub enum CliError {
     /// domain).
     InvalidExpectedProtocolType(TypeError),
     /// The locally constructed S1 expected protocol context (see
-    /// `ARCHITECTURE.md` DR-0085) had a missing/zero/malformed field.
+    /// `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` DR-0085) had a missing/zero/malformed field.
     InvalidExpectedContext(ExpectedProtocolContextError),
     /// The next-nonce query result's epoch disagreed with the context
     /// query's epoch.

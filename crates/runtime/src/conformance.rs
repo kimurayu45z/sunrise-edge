@@ -2158,7 +2158,7 @@ pub fn run_schema_skew_conformance<F: SchemaSkewFixture>(fixture: &F) -> Conform
 /// PostgreSQL-server/provider TLS, mTLS, PKI lifecycle, or production
 /// certification beyond the fixture's own client/driver-to-terminator leg,
 /// capacity/load/soak, real writer failover, or client disconnect/in-flight
-/// cancellation; those remain open per `POSTGRES.md`.
+/// cancellation; those remain open per `docs/operations/postgres.md`.
 pub fn run_commit_loss_conformance<F: CommitLossFixture>(fixture: &F) -> ConformanceResult {
     let store: Arc<F::Store> = fixture.store();
     let domain: AtomicityDomainId = fixture.domain();

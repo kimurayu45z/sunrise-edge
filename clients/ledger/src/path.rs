@@ -1,4 +1,4 @@
-//! The frozen provisional devnet-only derivation path (see `SIGNING.md`,
+//! The frozen provisional devnet-only derivation path (see `docs/signing/hardware-signing.md`,
 //! "Provisional derivation policy").
 
 use std::fmt;
@@ -8,7 +8,7 @@ const HARDENED_BIT: u32 = 0x8000_0000;
 /// Fixed `purpose` path component (BIP44), hardened.
 const PURPOSE: u32 = 44;
 /// Explicitly unregistered provisional coin-type marker, hardened. This is
-/// not a claim on SLIP-0044 number 21333; see `SIGNING.md`.
+/// not a claim on SLIP-0044 number 21333; see `docs/signing/hardware-signing.md`.
 const COIN_TYPE: u32 = 21333;
 /// Fixed `change` path component, hardened.
 const CHANGE: u32 = 0;
@@ -44,7 +44,7 @@ impl fmt::Display for DerivationPathError {
 impl std::error::Error for DerivationPathError {}
 
 /// The frozen provisional path `m/44'/21333'/account'/0'/0'` (every
-/// component hardened; see `SIGNING.md`, "Provisional derivation policy").
+/// component hardened; see `docs/signing/hardware-signing.md`, "Provisional derivation policy").
 ///
 /// `account` is a caller-selected non-hardened value; this type sets the
 /// hardened bit for the wire encoding itself.

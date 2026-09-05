@@ -102,8 +102,8 @@ REQUEST_ID="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 The expected values below are the operator's own locally trusted expectation,
 not values copied from the untrusted server response. They must equal the
 devnet configuration used in step 3 and this profile's fixed protocol values.
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) DR-0085 and
-[`TODO.md`](TODO.md#cli-first-node-production-gate) S1.
+See [DR-0085](../architecture/decisions/0081-0087-cli-first-roadmap.md) and
+[`TODO.md`](../../TODO.md#cli-first-node-production-gate) S1.
 
 ```bash
 EXPECTED_CHAIN_ID="sunrise-local-devnet"

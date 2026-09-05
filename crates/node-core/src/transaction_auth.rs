@@ -32,7 +32,8 @@
 //! module loading, mutating/consuming object effects, shared-object ordering,
 //! blob verification, and certificate publication remain unimplemented; do
 //! not activate protocol version 3 on any live chain until those are also in
-//! place. See `ARCHITECTURE.md` for the accepted decision record.
+//! place. See `docs/architecture/decisions/0058-0075-postgres-conformance.md`
+//! for the accepted decision record.
 
 use core::fmt;
 use std::error::Error;
@@ -360,7 +361,7 @@ mod tests {
     /// A dev-only deterministic signer built directly on the exact-pinned
     /// workspace `ed25519-zebra` `SigningKey`. This is test infrastructure
     /// only: no production signer exists in this workspace, matching
-    /// `crypto`'s and `ARCHITECTURE.md`'s documented invariant.
+    /// `crypto`'s and `docs/architecture/core-protocol.md`'s documented invariant.
     fn dev_signing_key(seed: u8) -> SigningKey {
         SigningKey::from([seed; 32])
     }
