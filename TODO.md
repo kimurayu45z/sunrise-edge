@@ -2241,6 +2241,38 @@ Code Security Audit Entry Gateは通過し、初回第三者code security audit�
 audit完了、Software Production Gate、CLI-First Node Production Gate、production readiness、
 mainnet readinessのいずれも意味しない。
 
+初回監査のobject-query integrity指摘（High）はDR-0101でremediation As-Isとした。
+`CurrentInline` v2はimmutable versionのcreating chain/protocolを返し、Rust clientがbody digestを
+再計算してから結果を公開する。v1 vectorは不変でdecode可能だが、digest contextを欠くinline
+responseはgeneric clientがrejectする。profile-2署名はDR-0103のcanonical `0xE009` envelopeで
+outer `request_id`とexact Transaction-v1 signable bytesを束縛し、relabelはidentity/clock/storage前に
+失敗する。Transaction v1 bytes、profile 1、historical `transaction-v1` vectorは不変である。
+
+初回監査のnon-exclusive Ed25519 value-owner指摘（Medium）はDR-0102でremediation As-Isとした。
+historical profile 1のZIP-215 verificationは変更せず、active devnet profile 2ではsender、読み込んだ
+address owner、cross-owner destination、fee treasury、devnet funded ownerをcanonical、non-identity、
+prime-order subgroupへ制限する。profile 2からprofile 1へのdowngradeはない。
+
+初回監査で確認されたnative HTTP slow-connection resource exhaustion（Medium）はDR-0100で
+remediation As-Isとした。repository-owned `serve`はHTTP parse前のbounded connection permit、
+header total timeout、socket-read idle timeout、body total timeout、response-write idle/total timeout、
+one-request connectionを全router familyへ一律適用し、既存body-size boundと
+`NativeBlockingExecutor`を独立して維持する。raw TCPのadversarial testはincomplete header/body、
+connection overload後のrecovery、slow-drip body total timeout、stalled/slow-drip response write、legitimate
+livenessを検証する。
+
+**Initial audit remediation re-review完了（2026-09-05）。** PR #130 head
+`cdf438c51b1609eb4886d8edcddc22af183f48c0`に対するfresh GPT Daybreak Blue Standard
+single-pass static source audit（scan id
+`034f9d08-2613-402d-868e-0fce48bb6bfc`）は、declared scope内でstatus `completed`、
+coverage `complete`、reportable findings 0となり、上記High 1件・Medium 3件を全てfixedと
+dispositionした。canonical evidenceは
+`docs/security/audits/2026-09-05-pr-130-daybreak/`に保存する。これはsource-only auditであり、
+production proxy/kernel/TLS、PostgreSQL deployment/operations、HA、backup、load/soak、physical
+hardware、Software Production Gate、CLI-First Node Production Gate、production readiness、
+mainnet readinessの完了またはcertificationを意味しない。初回audit後のsecurity-critical変更は
+引き続き`docs/security/initial-code-audit-scope.md`のfocused delta-audit ruleへ従う。
+
 ### 最小completion criteria
 
 1. **実装済み（implemented As-Is、DR-0099）。** public/native `POST /v1/events`のaudit対象
@@ -2968,12 +3000,11 @@ Phase 15 As-Is scope:
   新設の`TransactionAuthProfile::validate`（`new`および
   `ProtocolConfig::validate`から、zero idの再検証だけでなく呼ばれる）は
   同じrulesを適用する: zeroを`ZeroTransactionAuthProfileId`でreject、
-  public定数`ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`（値1）以外の
-  全てのidを型付き`UnsupportedTransactionAuthProfileId(u16)`でreject
-  してからscheme/binding組み合わせを検証する。`ed25519_address_is_public_key()`
-  は引数を取らず常にこの1つのprofileだけを構築する。`SignatureSchemeId`
-  （Ed25519のみ実装、Secp256k1は予約でfail closed）、closed
-  `AddressBinding`（実装済みは`AddressIsPublicKey`のみ）を持つ。
+  committed profile id 1/2以外を型付き
+  `UnsupportedTransactionAuthProfileId(u16)`でrejectしてからexactな
+  scheme/binding組み合わせを検証する。profile 1はhistorical
+  `AddressIsPublicKey`、profile 2はcanonical-prime-order address bindingを持つ。
+  `SignatureSchemeId`はEd25519のみ実装し、Secp256k1は予約でfail closedする。
   `resolve_transaction_auth_profile`はcommitment/resolution層であり、
   返す前に`ProtocolConfig::validate()`を必ず呼ぶため不正な設定は
   activation判定より先にfail closedする。`protocol-config`は`crypto`にも
@@ -3023,15 +3054,17 @@ Phase 15 As-Is scope:
   厳密にdecodeし、(3) decode済みtransactionの`chain_id`/`protocol_version`/
   `epoch`をtrusted context/configと比較し、鍵や署名が不正な場合でも
   暗号処理より前に型付きmismatch errorでrejectし、(4) trusted contextと
-  resolved profileのみから、正確なstable message family文字列
-  `"transaction-v1"`を用いて`crypto::SignatureDomain`を構築し、
+  resolved profileのみから`crypto::SignatureDomain`を構築する。profile 1は
+  historical `"transaction-v1"`、profile 2はouter `request_id`とexact
+  Transaction-v1 signable bytesを含む`0xE009` envelopeを
+  `"submit-transaction-v1"` familyで署名し、
   (5) signature fieldを除いたsignable payloadをencodeし、明示的で
   deterministicな`node_core::MAX_TRANSACTION_SIGNABLE_BYTES` boundを
   `crypto::frame_signature_message`やverifierがallocate/hashする前に適用して
   oversizedなsignable bytesを型付きerrorでrejectし、(6) 委任profileの
-  closed `AddressBinding`のうちimplemented済みの`AddressIsPublicKey`のみを
-  実装し、transaction senderの正確な32 bytesをEd25519 verification keyとして
-  使い（未実装のfuture binding/schemeはconfig/profile validationにより
+  closed `AddressBinding`に従い、profile 2ではtransaction senderをcanonical、
+  non-identity、prime-order subgroupへ制限してからEd25519 verification keyとして
+  使う（未実装のfuture binding/schemeはconfig/profile validationにより
   fail closedし、fallbackしない）、(7) committed
   `crypto::Ed25519Verifier`で検証し、malformed key/malformed signature
   lengthの型付き`CryptoError`と、well-formedだが暗号学的に不正な署名
@@ -3074,11 +3107,11 @@ Phase 15 As-Is scope:
   **Hard activation constraint:** `SubmitTransaction`以外の
   externally acceptedなnode-event family(特にcertificate、protocol upgrade、
   validator-set change)も、live activationの前に同等のauthenticated/authorized
-  ingressを持たなければならない。generic node-core handlerが`SubmitTransaction`を
-  rejectすることは、それらの他のfamilyをunauthenticatedで受理してよいことを意味
-  しない。outer `NodeEvent`の`request_id`はunsignedのidempotency identityの
-  ままであり、fresh request IDのreplay protectionは下記のsigned persistent
-  nonceが担う。
+  ingressを持たなければならない。DR-0099のpublic native ingressは現在
+  `SubmitTransaction`以外をside effect前にrejectする。profile 2ではouter
+  `NodeEvent`の`request_id`もcanonical submission envelopeでexact
+  Transaction-v1 signable bytesとともに署名され、relabelは認証で失敗する。
+  profile 1のhistorical signed bytesは不変である。
 - authenticated structured durable `SubmitTransaction` pathは、verified inner
   transactionからのみprivateな`(sender, epoch, nonce)` reservationを導出し、
   `PersistenceLayout`のchain/protocol-version/sender/epoch namespaceにcanonical

@@ -121,12 +121,14 @@ identifiers, not arbitrary non-zero labels: the profile carries an explicit
 non-zero `u16 profile_id` that `TransactionAuthProfile::new` and
 `TransactionAuthProfile::validate` (the same rules, so any profile obtained
 from elsewhere in the crate can be re-checked, not merely trusted) check
-against the public `protocol_config::ED25519_ADDRESS_IS_PUBLIC_KEY_PROFILE_ID`
-constant (value 1) and reject every other id, a `SignatureSchemeId` (only
+against the public profile identifiers 1 and 2 and reject every other id, a
+`SignatureSchemeId` (only
 `Ed25519` is implemented; `Secp256k1` is a reserved identifier that fails
-closed), and a closed `AddressBinding` enum whose only implemented variant,
+closed), and a closed `AddressBinding` enum. Historical binding 1,
 `AddressIsPublicKey`, treats a transaction's 32-byte address as its Ed25519
-verification key directly. `ProtocolConfig::validate` calls
+verification key directly. Binding 2 additionally requires the canonical,
+non-identity encoding of a point in the prime-order Ed25519 subgroup.
+`ProtocolConfig::validate` calls
 `TransactionAuthProfile::validate` on any committed profile rather than only
 rechecking a zero id, so a config carrying a structurally-invalid profile
 fails closed the same way a freshly constructed one would.
@@ -144,10 +146,10 @@ does not match that constructed domain. That boundary must also bound the
 canonical signable byte length before hashing or verifying it: an unbounded
 transaction body is an attacker-controlled input, and framing/verification
 must reject an oversized payload rather than hash or verify it, per the
-resource-bounding rule in `AGENTS.md`. A new profile id, and any
-address-binding scheme beyond `AddressIsPublicKey`, requires a new
-protocol/transaction version and an explicit accepted decision, not a
-silently added identifier or enum variant. This closes the
+resource-bounding rule in `AGENTS.md`. A new profile id or address-binding
+scheme requires an explicit accepted decision, stable identifier, additive
+vector, and fail-closed activation; it must not reinterpret an existing
+profile. This closes the
 signature-verification and committed-scheme-resolution primitives; strict
 `execution::Transaction` dispatch against this profile and the owned
 fast-path certificate flow remain separate follow-up work.
@@ -188,17 +190,20 @@ drift from it):
    typed error before any cryptographic work runs, even against a
    malformed key or signature;
 4. builds `crypto::SignatureDomain` solely from the trusted context and the
-   resolved profile, using the exact stable message family
-   `"transaction-v1"`;
+   resolved profile: profile 1 uses the historical `"transaction-v1"`
+   family, while profile 2 uses `"submit-transaction-v1"` over canonical
+   envelope `0xE009` containing the outer `request_id` and exact existing
+   Transaction v1 signable bytes;
 5. encodes the signable payload (`execution::encode_transaction_signable`,
    which already excludes the signature field) and rejects it with a typed
    error if it exceeds the explicit, deterministic
    `node_core::MAX_TRANSACTION_SIGNABLE_BYTES` bound, before
    `crypto::frame_signature_message` or the verifier can allocate or hash it;
-6. dispatches on the resolved profile's closed `AddressBinding` — only
-   `AddressIsPublicKey` is implemented, treating the transaction's exact
-   32-byte `sender` as the Ed25519 verification key directly; an
-   unimplemented binding fails to compile rather than silently falling back;
+6. dispatches on the resolved profile's closed `AddressBinding`: profile 1
+   preserves historical ZIP-215 address behavior, while profile 2 first
+   requires the sender to satisfy the canonical, non-identity, prime-order
+   owner predicate; an unimplemented binding fails to compile rather than
+   silently falling back;
 7. verifies with the committed `crypto::Ed25519Verifier`, distinguishing a
    malformed key or malformed signature length (`CryptoError`) from a
    well-formed but cryptographically invalid signature
@@ -214,28 +219,18 @@ boundary alone; `protocol-config` itself continues to depend on neither and
 performs no verification. Signature-algorithm agility remains committed
 configuration resolved at a protocol-version/profile boundary, never a
 per-transaction choice: the boundary always builds the verifier from the
-resolved profile, and today that profile can only ever resolve to Ed25519
-profile 1 (`AddressIsPublicKey`).
+resolved profile. The active devnet composition resolves to Ed25519 profile 2;
+profile 1 remains readable and verifiable only with its historical semantics.
 
-Two admissibility questions stay explicitly open for future work rather than
-being decided by this PR. First, a future `TransactionAuthProfile` that keeps
-`SignatureSchemeId::Ed25519` but changes any other signed input this boundary
-treats as implicit and stable (the `"transaction-v1"` message family, the
-canonical `encode_transaction_signable` layout, or how the address binds to
-the key) must introduce an explicit transaction/signature-domain version
-boundary rather than silently reinterpreting bytes an old profile already
-committed to signing; profile identity alone is not that boundary. Second,
-`crypto::Ed25519Verifier` uses ZIP-215 semantics (see Section 8's own
-signature-domain discussion above), which by design also accepts small-order
-and other non-canonical verification-key encodings; combined with
-`AddressIsPublicKey` binding a transaction's address directly to its
-verification key, this means some addresses accepted by this boundary as
-*authenticable* are not necessarily *safe to hold value at*. This PR does not
-change `Ed25519Verifier`'s verification semantics, and does not add a
-key/address admissibility policy (for example rejecting small-order or
-identity-point addresses at the object/asset layer); that decision belongs to
-whichever object/asset layer first lets an address hold value, and must be
-made explicitly before it does.
+Profile 2 resolves the value-owner admissibility boundary without changing
+`crypto::Ed25519Verifier`'s ZIP-215 consensus behavior. Its centralized crypto
+predicate requires successful point decompression, byte-for-byte canonical
+recompression, a non-identity point, and `is_torsion_free()`. Node-core applies
+that predicate to the authenticated sender and every loaded `Owner::Address`
+that can participate in value movement, including an exact policy-authorized
+destination and the trusted fee treasury. Devnet parsing and seeding enforce
+the same rule before funding. Profile 1 remains unchanged for historical
+verification; no current path may downgrade profile 2 to profile 1.
 
 The production-oriented structured durable native route now supplies the
 first authenticated `SubmitTransaction` processing seam. Router composition
@@ -382,15 +377,19 @@ transaction, loads exact heads and immutable inline versions, authorizes typed
 owners, and commits complete head assertions. The generic application machine
 still consumes the outer event and cannot inspect or influence those object
 reads; effects composition remains a separate boundary.
-This constraint is not limited to `SubmitTransaction`: every externally
+This constraint is not limited to `SubmitTransaction`: every future externally
 accepted non-`SubmitTransaction` node-event family — especially certificate,
 protocol-upgrade, and validator-set-change events — needs an equivalent
-authenticated/authorized ingress boundary before live activation. Generic
-node-core handlers failing closed on `SubmitTransaction` says nothing about
-those other families, which remain accepted from untrusted ingress today.
-Separately, the outer `NodeEvent`'s `request_id` remains unsigned and serves
-only as the receipt-reconciliation identity. A fresh identifier cannot bypass
-the signed persistent nonce sequence.
+authenticated/authorized ingress boundary before activation. DR-0099's public
+native ingress currently accepts only `SubmitTransaction` and rejects every
+other family before side effects; adding a public family requires its own
+decision and authorization boundary.
+For profile 2 the outer `NodeEvent`'s `request_id` is authenticated by the
+`0xE009` submission envelope before any receipt reconciliation, identity,
+clock, module resolution, or storage work. Relabeling an otherwise valid
+transaction therefore invalidates its signature. Profile 1 retains its exact
+historical unsigned-request-id signature layout and is not the active devnet
+profile.
 
 ## 9. Object lifecycle
 Objects are not implemented in Phase 1. Future object versions will reference self-describing digests so historical versions remain readable after hash-suite migration.

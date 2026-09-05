@@ -305,6 +305,7 @@ name = "crypto"
 version = "0.1.0"
 dependencies = [
  "canonical-encoding",
+ "curve25519-dalek",
  "ed25519-zebra",
  "protocol-types",
 ]
@@ -901,6 +902,9 @@ dependencies = [
  "execution",
  "fees",
  "hashing",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "node-core",
  "node-wire",
  "objects",
@@ -1602,9 +1606,11 @@ name = "sunrise-edge-cli"
 version = "0.1.0"
 dependencies = [
  "execution",
+ "hashing",
  "native-http",
  "node-core",
  "objects",
+ "protocol-types",
  "rcgen",
  "runtime",
  "rustls",
@@ -1624,6 +1630,7 @@ dependencies = [
  "ed25519-zebra",
  "execution",
  "fees",
+ "hashing",
  "native-http",
  "node-core",
  "node-wire",
@@ -1644,6 +1651,8 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "canonical-encoding",
+ "crypto",
+ "ed25519-zebra",
  "execution",
  "fees",
  "hashing",

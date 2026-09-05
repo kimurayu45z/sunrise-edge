@@ -66,6 +66,11 @@ where
             println!("object_bytes_truncated={truncated}");
             println!("object_bytes={hex}");
         }
+        HttpObjectQueryResult::HistoricalCurrentInline { .. } => {
+            // `Client::query_object` rejects this before returning. Keep the
+            // match exhaustive if another in-process caller supplies it.
+            println!("status=historical_current_inline_unverified");
+        }
         HttpObjectQueryResult::CurrentBlobReference {
             head_revision,
             object_version,

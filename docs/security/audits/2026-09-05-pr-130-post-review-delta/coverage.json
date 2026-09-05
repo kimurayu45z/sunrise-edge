@@ -1,0 +1,39 @@
+{
+  "completeness": "complete",
+  "deferred": [],
+  "documentType": "codex-security.coverage",
+  "excludePaths": [],
+  "explicitExclusions": [],
+  "includePaths": [
+    "."
+  ],
+  "inventoryStrategy": "diff",
+  "mode": "branch_diff",
+  "openQuestions": [],
+  "scanId": "68406e55-9a84-4cc3-ba28-c6908e10d992",
+  "schemaVersion": "1.0",
+  "surfaces": [
+    {
+      "disposition": "no_issue_found",
+      "evidence": [
+        "crates/native-http/src/lib.rs:1083-1174",
+        "crates/native-http/src/lib.rs:9768-9789"
+      ],
+      "id": "surface_native-http-listener-accept-error-retry-and-shutdown",
+      "label": "native HTTP listener accept-error retry and shutdown",
+      "notes": "Nonzero capped saturating backoff prevents tight looping; success resets the streak; shutdown races backoff.",
+      "receiptRefs": []
+    },
+    {
+      "disposition": "no_issue_found",
+      "evidence": [
+        "crates/node-wire/src/lib.rs:909-1023",
+        "crates/native-http/src/lib.rs:7202-7275"
+      ],
+      "id": "surface_node-wire-object-query-status/version-canonicality",
+      "label": "node-wire object-query status/version canonicality",
+      "notes": "Encoder emits v1 for unchanged statuses and decoder rejects v2 before variant interpretation.",
+      "receiptRefs": []
+    }
+  ]
+}

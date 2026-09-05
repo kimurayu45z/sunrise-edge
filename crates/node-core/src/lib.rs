@@ -12,6 +12,7 @@ use canonical_encoding::{
     CanonicalDecodingError, CanonicalEncodingError, CanonicalStruct, decode_canonical_frame,
 };
 use core::fmt;
+use crypto::{Ed25519OwnerAddressError, Ed25519OwnerAddressPolicy, validate_ed25519_owner_address};
 use execution::{
     ExecutionEngine, ExecutionError, ExecutionStatus, Transaction, WasmExecutionEngine,
     encode_execution_effects, hash_transaction,
@@ -72,8 +73,10 @@ pub use query::{
     query_sender_next_nonce,
 };
 pub use transaction_auth::{
-    AuthenticatedTransaction, MAX_TRANSACTION_SIGNABLE_BYTES, TRANSACTION_V1_MESSAGE_TYPE,
-    TransactionAuthError, TrustedTransactionContext, authenticate_transaction_bytes,
+    AuthenticatedTransaction, MAX_TRANSACTION_SIGNABLE_BYTES, SUBMIT_TRANSACTION_SIGNABLE_TYPE_ID,
+    SUBMIT_TRANSACTION_V1_MESSAGE_TYPE, TRANSACTION_V1_MESSAGE_TYPE, TransactionAuthError,
+    TrustedTransactionContext, authenticate_submit_transaction_bytes,
+    authenticate_transaction_bytes, encode_submit_transaction_signable,
 };
 
 const NODE_EVENT_TYPE_ID: u16 = 0xE001;
@@ -329,6 +332,15 @@ pub enum NodeCoreError {
     ObjectOwnerMismatch {
         /// Object identifier.
         object_id: ObjectId,
+    },
+    /// An Address-owned object was loaded under a profile that requires a
+    /// canonical, non-identity, prime-order Ed25519 value owner, and its
+    /// owner bytes failed that policy.
+    InadmissibleObjectOwnerAddress {
+        /// Object carrying the rejected owner.
+        object_id: ObjectId,
+        /// Exact admissibility failure.
+        source: Ed25519OwnerAddressError,
     },
     /// A manifest entry requested an access mode this slice cannot honor.
     ObjectAccessModeUnsupported {
@@ -904,6 +916,9 @@ impl fmt::Display for NodeCoreError {
             Self::ObjectOwnerMismatch { object_id } => {
                 write!(f, "object {object_id} owner did not authorize the sender")
             }
+            Self::InadmissibleObjectOwnerAddress { object_id, source } => {
+                write!(f, "object {object_id} owner is not admissible: {source}")
+            }
             Self::ObjectAccessModeUnsupported { object_id, mode } => write!(
                 f,
                 "object {object_id} requested unsupported access mode {mode:?}"
@@ -1183,6 +1198,7 @@ impl Error for NodeCoreError {
             Self::FeeCompositionFailed(error) => Some(error),
             Self::UnsupportedGasScheduleShape(error) => Some(error),
             Self::ObjectBlobPublishFailed { source, .. } => Some(source),
+            Self::InadmissibleObjectOwnerAddress { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -1586,7 +1602,11 @@ pub fn authenticate_submit_transaction_event(
 
     let trusted_context =
         TrustedTransactionContext::new(config.chain_id().clone(), config.epoch(), protocol_config);
-    let transaction = authenticate_transaction_bytes(event.payload(), &trusted_context)?;
+    let transaction = authenticate_submit_transaction_bytes(
+        event.request_id(),
+        event.payload(),
+        &trusted_context,
+    )?;
     let module_ref: &ObjectRef = &transaction.transaction().module_ref;
     let module_id: ModuleId = ModuleId::new(*module_ref.id.as_bytes());
     let committed_system_module: Option<SystemModule> = protocol_config
@@ -1658,6 +1678,7 @@ struct AuthenticatedObjectAccess {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AuthenticatedObjectDispatch {
     authority: Address,
+    owner_address_policy: Ed25519OwnerAddressPolicy,
     accesses: Vec<AuthenticatedObjectAccess>,
 }
 
@@ -1686,6 +1707,7 @@ impl AuthenticatedObjectDispatch {
         let accesses = validate_object_entries(inner.access_manifest.entries.as_slice(), policy)?;
         Ok(Self {
             authority,
+            owner_address_policy: transaction.owner_address_policy(),
             accesses,
         })
     }
@@ -4713,6 +4735,13 @@ where
 
         match &object.owner {
             Owner::Address(owner_address) => {
+                validate_ed25519_owner_address(
+                    owner_address.as_bytes(),
+                    dispatch.owner_address_policy,
+                )
+                .map_err(|source: Ed25519OwnerAddressError| {
+                    NodeCoreError::InadmissibleObjectOwnerAddress { object_id, source }
+                })?;
                 if is_treasury_access {
                     // Trusted-composition exception: any Address owner.
                 } else if *owner_address != dispatch.authority {
@@ -11059,6 +11088,7 @@ mod tests {
         );
         let dispatch = AuthenticatedObjectDispatch {
             authority: sender,
+            owner_address_policy: Ed25519OwnerAddressPolicy::LegacyZip215,
             accesses: vec![
                 AuthenticatedObjectAccess {
                     object_ref: source_ref,
@@ -11087,6 +11117,78 @@ mod tests {
             Some(&authorization),
             None,
         )
+    }
+
+    #[test]
+    fn strict_profile_rejects_inadmissible_destination_and_treasury_owners() {
+        let store: ScriptedDurableStore =
+            ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let sender: Address = dev_sender_address(&dev_signing_key(0x41));
+        let mut universal_owner_bytes: [u8; 32] = [0; 32];
+        universal_owner_bytes[0] = 1;
+        universal_owner_bytes[31] = 0x80;
+        let universal_owner: Address = Address::new(universal_owner_bytes);
+        let (source_ref, _source_head) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            ObjectId::new([0x42; 32]),
+            Owner::Address(sender),
+            0x30,
+        );
+        let destination_id: ObjectId = ObjectId::new([0x43; 32]);
+        let (destination_ref, _destination_head) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            destination_id,
+            Owner::Address(universal_owner),
+            0x31,
+        );
+        let dispatch = AuthenticatedObjectDispatch {
+            authority: sender,
+            owner_address_policy: Ed25519OwnerAddressPolicy::CanonicalPrimeOrder,
+            accesses: vec![
+                AuthenticatedObjectAccess {
+                    object_ref: source_ref,
+                    mode: AccessMode::Write,
+                },
+                AuthenticatedObjectAccess {
+                    object_ref: destination_ref,
+                    mode: AccessMode::Write,
+                },
+            ],
+        };
+        let policy: PreinstalledObjectAccessPolicy = PreinstalledObjectAccessPolicy::new(
+            1,
+            "run".to_string(),
+            AccessMode::Write,
+            Digest32::new(HashAlgorithmId::Sha2_256, [0x32; 32]),
+            0x31,
+        )
+        .unwrap();
+        let envelope: PreinstalledModuleSemanticsEnvelope =
+            PreinstalledModuleSemanticsEnvelope::new(b"test".to_vec(), vec![policy]).unwrap();
+        let authorization = ResolvedPreinstalledAuthorization {
+            entrypoint: "run",
+            envelope: &envelope,
+        };
+        for treasury_object_id in [None, Some(destination_id)] {
+            assert_eq!(
+                load_and_authorize_objects(
+                    &store,
+                    &MemoryBlobStore::default(),
+                    &durable_context(),
+                    domain(0x44),
+                    &ChainId::new("sunrise-test").unwrap(),
+                    &dispatch,
+                    Some(&authorization),
+                    treasury_object_id,
+                ),
+                Err(NodeCoreError::InadmissibleObjectOwnerAddress {
+                    object_id: destination_id,
+                    source: Ed25519OwnerAddressError::NonCanonicalPoint,
+                })
+            );
+        }
     }
 
     #[test]
@@ -14521,12 +14623,16 @@ mod tests {
                 head_revision,
                 object_version,
                 digest,
+                creating_chain_id,
+                protocol_version,
                 canonical_object_bytes,
             } => {
                 assert_eq!(*result_object_id, object_id);
                 assert_eq!(*head_revision, runtime::ObjectHeadRevision::FIRST);
                 assert_eq!(*object_version, DurableObjectVersion::FIRST);
                 assert_eq!(*digest, object_ref.digest);
+                assert_eq!(creating_chain_id.as_str(), "sunrise-test");
+                assert_eq!(*protocol_version, ProtocolVersion::new(3));
                 let decoded = objects::decode_object(canonical_object_bytes).unwrap();
                 assert_eq!(decoded.id, object_id);
                 assert_eq!(decoded.version, 1);

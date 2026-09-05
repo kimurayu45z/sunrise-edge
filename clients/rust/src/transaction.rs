@@ -1,7 +1,8 @@
 //! Canonical Transaction v1 construction and signing.
 //!
 //! Construction is a safe two-stage external-signer API
-//! ([`PreparedTransaction::prepare`] /
+//! ([`PreparedTransaction::prepare`] or profile-2
+//! [`PreparedTransaction::prepare_submission`] /
 //! [`PreparedTransaction::finalize`]/[`PreparedTransaction::sign_and_finalize_with`]):
 //! a caller first prepares an immutable transaction from an explicit
 //! sender, the active signature scheme, and a [`TransactionRequest`], then
@@ -17,7 +18,10 @@ use crypto::{
     frame_signature_message,
 };
 use execution::{Transaction, encode_transaction, encode_transaction_signable};
-use node_core::TRANSACTION_V1_MESSAGE_TYPE;
+use node_core::{
+    NodeCoreError, RequestId, SUBMIT_TRANSACTION_V1_MESSAGE_TYPE, TRANSACTION_V1_MESSAGE_TYPE,
+    encode_submit_transaction_signable,
+};
 use objects::{Address, ObjectRef};
 use protocol_types::{ChainId, Epoch, ProtocolVersion, SignatureSchemeId};
 use signing_view::{
@@ -66,8 +70,9 @@ pub struct TransactionRequest {
 
 /// An immutable, fully framed Transaction v1 awaiting a signature.
 ///
-/// Built by [`PreparedTransaction::prepare`] from an explicit sender, the
-/// active signature scheme, and a [`TransactionRequest`]. Every field the
+/// Built by [`PreparedTransaction::prepare`] or
+/// [`PreparedTransaction::prepare_submission`] from explicit signing inputs.
+/// Every field the
 /// signature covers is fixed the moment this value exists; nothing about it
 /// can be mutated before signing, so a signer (in-process or external) is
 /// always shown the exact bytes it is about to authenticate.
@@ -116,6 +121,28 @@ impl PreparedTransaction {
         signature_scheme_id: SignatureSchemeId,
         request: TransactionRequest,
     ) -> Result<Self, ClientError> {
+        Self::prepare_with_request_id(sender, signature_scheme_id, request, None)
+    }
+
+    /// Prepares a profile-2 submission signature that binds the exact durable
+    /// request id to the otherwise unchanged Transaction v1 signable bytes.
+    /// The resulting signed transaction must be submitted under the same
+    /// request id; relabeling the outer event invalidates its signature.
+    pub fn prepare_submission(
+        request_id: RequestId,
+        sender: Address,
+        signature_scheme_id: SignatureSchemeId,
+        request: TransactionRequest,
+    ) -> Result<Self, ClientError> {
+        Self::prepare_with_request_id(sender, signature_scheme_id, request, Some(request_id))
+    }
+
+    fn prepare_with_request_id(
+        sender: Address,
+        signature_scheme_id: SignatureSchemeId,
+        request: TransactionRequest,
+        request_id: Option<RequestId>,
+    ) -> Result<Self, ClientError> {
         reject_unsupported_scheme(signature_scheme_id)?;
 
         let TransactionRequest {
@@ -146,12 +173,22 @@ impl PreparedTransaction {
             signature: Vec::new(),
         };
 
-        let signable = encode_transaction_signable(&unsigned)?;
+        let transaction_signable: Vec<u8> = encode_transaction_signable(&unsigned)?;
+        let (message_type, signable): (&'static str, Vec<u8>) = match request_id {
+            Some(request_id) => {
+                let envelope: Vec<u8> =
+                    encode_submit_transaction_signable(request_id, &transaction_signable).map_err(
+                        |error| ClientError::NodeCore(NodeCoreError::CanonicalEncoding(error)),
+                    )?;
+                (SUBMIT_TRANSACTION_V1_MESSAGE_TYPE, envelope)
+            }
+            None => (TRANSACTION_V1_MESSAGE_TYPE, transaction_signable),
+        };
         let domain = SignatureDomain {
             chain_id,
             protocol_version,
             epoch,
-            message_type: SignatureMessageType::new(TRANSACTION_V1_MESSAGE_TYPE)?,
+            message_type: SignatureMessageType::new(message_type)?,
             signature_scheme_id,
         };
 
@@ -310,10 +347,29 @@ fn reject_unsupported_scheme(scheme: SignatureSchemeId) -> Result<(), ClientErro
     }
 }
 
-/// Builds and signs one canonical Transaction v1 under the exact stable
-/// `"transaction-v1"` message family
-/// ([`node_core::TRANSACTION_V1_MESSAGE_TYPE`]) and returns its exact
-/// canonical wire bytes, ready to submit as a `SubmitTransaction` event.
+/// Builds and signs one active profile-2 Transaction v1 while binding its
+/// exact durable `request_id` in the canonical submission envelope.
+///
+/// The returned Transaction v1 wire bytes retain the existing transaction
+/// schema; only the signature commits to the profile-2 envelope and distinct
+/// message family. The caller must submit the bytes under the same request id.
+pub fn build_signed_submission_transaction(
+    signer: &LocalSigner,
+    signature_scheme_id: SignatureSchemeId,
+    request_id: RequestId,
+    request: TransactionRequest,
+) -> Result<Vec<u8>, ClientError> {
+    let sender: Address = signer.address();
+    let prepared: PreparedTransaction =
+        PreparedTransaction::prepare_submission(request_id, sender, signature_scheme_id, request)?;
+    prepared.sign_and_finalize_with(signer)
+}
+
+/// Builds and signs one historical profile-1 canonical Transaction v1 under
+/// the exact stable `"transaction-v1"` message family
+/// ([`node_core::TRANSACTION_V1_MESSAGE_TYPE`]). Active profile-2 submission
+/// callers must use [`PreparedTransaction::prepare_submission`] so the outer
+/// request id is authenticated; profile 2 rejects this legacy signature.
 ///
 /// `signature_scheme_id` must come from a trusted `/v1/context` query
 /// result; this function never guesses or defaults the active scheme. It is
@@ -512,6 +568,61 @@ mod tests {
         let second =
             build_signed_transaction(&signer, SignatureSchemeId::Ed25519, second_request).unwrap();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn submission_preparation_binds_the_exact_request_id() {
+        let signer = LocalSigner::from_seed([0xD1; 32]);
+        let first_request_id: RequestId = RequestId::new([0x31; 32]).unwrap();
+        let second_request_id: RequestId = RequestId::new([0x32; 32]).unwrap();
+        let first = PreparedTransaction::prepare_submission(
+            first_request_id,
+            signer.address(),
+            SignatureSchemeId::Ed25519,
+            base_request(),
+        )
+        .unwrap();
+        let second = PreparedTransaction::prepare_submission(
+            second_request_id,
+            signer.address(),
+            SignatureSchemeId::Ed25519,
+            base_request(),
+        )
+        .unwrap();
+
+        assert_ne!(
+            first.signable_frame().unwrap(),
+            second.signable_frame().unwrap()
+        );
+        let first_bytes: Vec<u8> = first.sign_and_finalize_with(&signer).unwrap();
+        let second_bytes: Vec<u8> = second.sign_and_finalize_with(&signer).unwrap();
+        assert_ne!(first_bytes, second_bytes);
+    }
+
+    #[test]
+    fn submission_builder_matches_the_two_stage_profile_2_api() {
+        let signer: LocalSigner = LocalSigner::from_seed([0xD2; 32]);
+        let request_id: RequestId = RequestId::new([0x33; 32]).unwrap();
+        let expected: Vec<u8> = PreparedTransaction::prepare_submission(
+            request_id,
+            signer.address(),
+            SignatureSchemeId::Ed25519,
+            base_request(),
+        )
+        .unwrap()
+        .sign_and_finalize_with(&signer)
+        .unwrap();
+
+        assert_eq!(
+            build_signed_submission_transaction(
+                &signer,
+                SignatureSchemeId::Ed25519,
+                request_id,
+                base_request(),
+            )
+            .unwrap(),
+            expected
+        );
     }
 
     #[test]

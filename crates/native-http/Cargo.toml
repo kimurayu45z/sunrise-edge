@@ -10,6 +10,9 @@ canonical-encoding.workspace = true
 execution.workspace = true
 fees.workspace = true
 hashing.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
 node-core.workspace = true
 node-wire.workspace = true
 objects.workspace = true
@@ -17,6 +20,7 @@ protocol-config.workspace = true
 protocol-types.workspace = true
 runtime.workspace = true
 tokio.workspace = true
+tower.workspace = true
 
 [dev-dependencies]
 abi.workspace = true
@@ -24,5 +28,4 @@ crypto.workspace = true
 ed25519-zebra.workspace = true
 runtime-sqlite.workspace = true
 system-modules.workspace = true
-tower.workspace = true
 wat.workspace = true

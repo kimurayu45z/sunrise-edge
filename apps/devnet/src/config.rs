@@ -1,5 +1,6 @@
 //! Strict command-line configuration for the local devnet.
 
+use crypto::{Ed25519OwnerAddressError, Ed25519OwnerAddressPolicy, validate_ed25519_owner_address};
 use node_core::MAX_CHAIN_ID_BYTES;
 use protocol_types::{ChainId, Epoch};
 use std::{
@@ -165,6 +166,16 @@ impl DevnetConfig {
                     let value: String = required_utf8_value(&mut iterator, "--fee-treasury-owner")?;
                     let bytes: [u8; 32] = parse_hex_owner(&value)
                         .ok_or_else(|| DevnetConfigError::InvalidFeeTreasuryOwner(value.clone()))?;
+                    validate_ed25519_owner_address(
+                        &bytes,
+                        Ed25519OwnerAddressPolicy::CanonicalPrimeOrder,
+                    )
+                    .map_err(|source: Ed25519OwnerAddressError| {
+                        DevnetConfigError::InadmissibleFeeTreasuryOwner {
+                            value: value.clone(),
+                            source,
+                        }
+                    })?;
                     fee_treasury_owner = Some(DevOwner::new(bytes));
                 }
                 "--max-concurrent" => {
@@ -277,9 +288,16 @@ where
 }
 
 fn parse_dev_owner(value: &str) -> Result<DevOwner, DevnetConfigError> {
-    parse_hex_owner(value)
-        .map(DevOwner::new)
-        .ok_or_else(|| DevnetConfigError::InvalidDevOwner(value.to_owned()))
+    let bytes: [u8; 32] = parse_hex_owner(value)
+        .ok_or_else(|| DevnetConfigError::InvalidDevOwner(value.to_owned()))?;
+    validate_ed25519_owner_address(&bytes, Ed25519OwnerAddressPolicy::CanonicalPrimeOrder)
+        .map_err(
+            |source: Ed25519OwnerAddressError| DevnetConfigError::InadmissibleDevOwner {
+                value: value.to_owned(),
+                source,
+            },
+        )?;
+    Ok(DevOwner::new(bytes))
 }
 
 fn parse_hex_owner(value: &str) -> Option<[u8; 32]> {
@@ -359,10 +377,26 @@ pub enum DevnetConfigError {
     },
     /// A development owner was not exactly 32 bytes of hexadecimal.
     InvalidDevOwner(String),
+    /// A syntactically valid development owner was not a canonical,
+    /// non-identity, prime-order Ed25519 public key.
+    InadmissibleDevOwner {
+        /// Rejected hexadecimal input.
+        value: String,
+        /// Exact cryptographic admissibility failure.
+        source: Ed25519OwnerAddressError,
+    },
     /// A development owner appeared more than once.
     DuplicateDevOwner(DevOwner),
     /// The fee-treasury owner was not exactly 32 bytes of hexadecimal.
     InvalidFeeTreasuryOwner(String),
+    /// A syntactically valid fee-treasury owner was not a canonical,
+    /// non-identity, prime-order Ed25519 public key.
+    InadmissibleFeeTreasuryOwner {
+        /// Rejected hexadecimal input.
+        value: String,
+        /// Exact cryptographic admissibility failure.
+        source: Ed25519OwnerAddressError,
+    },
     /// The fee-treasury owner equaled a `--dev-owner`.
     FeeTreasuryOwnerDuplicatesDevOwner(DevOwner),
 }
@@ -401,12 +435,19 @@ impl fmt::Display for DevnetConfigError {
                 f,
                 "--dev-owner must be exactly 64 hexadecimal characters, got {value:?}"
             ),
+            Self::InadmissibleDevOwner { value, source } => {
+                write!(f, "--dev-owner {value:?} is not admissible: {source}")
+            }
             Self::DuplicateDevOwner(owner) => {
                 write!(f, "--dev-owner must be unique, duplicate {owner}")
             }
             Self::InvalidFeeTreasuryOwner(value) => write!(
                 f,
                 "--fee-treasury-owner must be exactly 64 hexadecimal characters, got {value:?}"
+            ),
+            Self::InadmissibleFeeTreasuryOwner { value, source } => write!(
+                f,
+                "--fee-treasury-owner {value:?} is not admissible: {source}"
             ),
             Self::FeeTreasuryOwnerDuplicatesDevOwner(owner) => write!(
                 f,
@@ -421,6 +462,8 @@ impl Error for DevnetConfigError {
         match self {
             Self::InvalidListen { source, .. } => Some(source),
             Self::InvalidInteger { source, .. } => Some(source),
+            Self::InadmissibleDevOwner { source, .. }
+            | Self::InadmissibleFeeTreasuryOwner { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -429,6 +472,17 @@ impl Error for DevnetConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_zebra::{SigningKey, VerificationKey};
+
+    fn owner_hex(seed: u8) -> String {
+        let signing_key: SigningKey = SigningKey::from([seed; 32]);
+        let verification_key: VerificationKey = VerificationKey::from(&signing_key);
+        verification_key
+            .as_ref()
+            .iter()
+            .map(|byte: &u8| format!("{byte:02x}"))
+            .collect()
+    }
 
     fn valid_args() -> Vec<OsString> {
         vec![
@@ -441,11 +495,11 @@ mod tests {
             "--epoch".into(),
             "7".into(),
             "--dev-owner".into(),
-            "1111111111111111111111111111111111111111111111111111111111111111".into(),
+            owner_hex(0x11).into(),
             "--max-concurrent".into(),
             "16".into(),
             "--fee-treasury-owner".into(),
-            "2222222222222222222222222222222222222222222222222222222222222222".into(),
+            owner_hex(0x22).into(),
         ]
     }
 
@@ -455,9 +509,9 @@ mod tests {
         assert_eq!(config.listen(), "127.0.0.1:7400".parse().unwrap());
         assert_eq!(config.chain_id().as_str(), "sunrise-dev");
         assert_eq!(config.epoch(), Epoch::new(7));
-        assert_eq!(config.dev_owners(), &[DevOwner::new([0x11; 32])]);
+        assert_eq!(config.dev_owners()[0].to_string(), owner_hex(0x11));
         assert_eq!(config.max_concurrent(), 16);
-        assert_eq!(config.fee_treasury_owner(), DevOwner::new([0x22; 32]));
+        assert_eq!(config.fee_treasury_owner().to_string(), owner_hex(0x22));
     }
 
     #[test]
@@ -477,10 +531,7 @@ mod tests {
         ));
 
         let mut duplicated_flag = valid_args();
-        duplicated_flag.extend([
-            "--fee-treasury-owner".into(),
-            "3333333333333333333333333333333333333333333333333333333333333333".into(),
-        ]);
+        duplicated_flag.extend(["--fee-treasury-owner".into(), owner_hex(0x33).into()]);
         assert!(matches!(
             DevnetConfig::parse_from(duplicated_flag),
             Err(DevnetConfigError::DuplicateFlag("--fee-treasury-owner"))
@@ -537,12 +588,37 @@ mod tests {
             10..10,
             [
                 OsString::from("--dev-owner"),
-                OsString::from("1111111111111111111111111111111111111111111111111111111111111111"),
+                OsString::from(owner_hex(0x11)),
             ],
         );
         assert!(matches!(
             DevnetConfig::parse_from(duplicate),
             Err(DevnetConfigError::DuplicateDevOwner(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_universal_zip215_owner_for_dev_and_treasury_configuration() {
+        let universal_owner: OsString = OsString::from(format!("01{}80", "00".repeat(30)));
+
+        let mut dev_owner_args: Vec<OsString> = valid_args();
+        dev_owner_args[9] = universal_owner.clone();
+        assert!(matches!(
+            DevnetConfig::parse_from(dev_owner_args),
+            Err(DevnetConfigError::InadmissibleDevOwner {
+                source: Ed25519OwnerAddressError::NonCanonicalPoint,
+                ..
+            })
+        ));
+
+        let mut treasury_args: Vec<OsString> = valid_args();
+        treasury_args[13] = universal_owner;
+        assert!(matches!(
+            DevnetConfig::parse_from(treasury_args),
+            Err(DevnetConfigError::InadmissibleFeeTreasuryOwner {
+                source: Ed25519OwnerAddressError::NonCanonicalPoint,
+                ..
+            })
         ));
     }
 
@@ -553,7 +629,8 @@ mod tests {
         let max_concurrent: Vec<OsString> = args.split_off(8);
         for value in 1..=MAX_DEVNET_OWNERS {
             args.push(OsString::from("--dev-owner"));
-            args.push(OsString::from(format!("{value:064x}")));
+            let seed: u8 = 0x80_u8.checked_add(u8::try_from(value).unwrap()).unwrap();
+            args.push(OsString::from(owner_hex(seed)));
         }
         args.extend(max_concurrent);
 
@@ -572,7 +649,8 @@ mod tests {
         let suffix: Vec<OsString> = args.split_off(8);
         for value in 1..=MAX_CONFIGURED_DEV_OWNERS {
             args.push(OsString::from("--dev-owner"));
-            args.push(OsString::from(format!("{value:064x}")));
+            let seed: u8 = 0x80_u8.checked_add(u8::try_from(value).unwrap()).unwrap();
+            args.push(OsString::from(owner_hex(seed)));
         }
         args.extend(suffix);
 

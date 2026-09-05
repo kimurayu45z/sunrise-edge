@@ -1,0 +1,75 @@
+{
+  "documentType": "codex-security.scan-manifest",
+  "scan": {
+    "artifacts": [
+      {
+        "mediaType": "application/json",
+        "path": "findings.json",
+        "sha256": "ef4bccdd96a109708f1767d921ef7ffe27c563438dab160d719b82062467da71"
+      },
+      {
+        "mediaType": "application/json",
+        "path": "coverage.json",
+        "sha256": "e413167e2c135aba62788b6989077db10eada1db2589d0bed750f19b30b6b7bb"
+      }
+    ],
+    "completedAt": "2026-09-05T15:05:22.521959Z",
+    "coverageRef": "coverage.json",
+    "findingsRef": "findings.json",
+    "id": "68406e55-9a84-4cc3-ba28-c6908e10d992",
+    "preservedSources": {
+      "checkpoints/962d73dc8cc4c0545a4a61d36093396eda551a216dceba530f72e0cc74cafe19.json": "b8d81baf0b0480a0105657f594ddf4e228661660b46fdc716b4aba2dd2716430",
+      "checkpoints/daf613c7218be653a90ff2924da43e165ea74b8f15713f359ebca09c4f6e63fe.json": "daf613c7218be653a90ff2924da43e165ea74b8f15713f359ebca09c4f6e63fe",
+      "checkpoints/f8e69fe1128daf0a38ac8ef826d146dbac68772ab1246cfe2cff1ef455c629e8.json": "eb61ed74017a23c8271a8ac46c36d56d5e045ccf9f548bbd5bece28088f9359f"
+    },
+    "producer": {
+      "name": "codex-security-plugin",
+      "version": "0.1.23"
+    },
+    "scope": {
+      "excludePaths": [],
+      "includePaths": [
+        "."
+      ],
+      "limitations": [
+        "No OS-level injected TcpListener::accept failure integration test."
+      ],
+      "summary": "Exact commit b74c1ae1d12a2ce7d5c691b613457933c998defe against 4db26d470901cb7895e7c32444be072029932013.",
+      "validationMode": "static source review plus targeted unit tests and complete repository gate"
+    },
+    "sealedAt": "2026-09-05T15:05:22.521959Z",
+    "startedAt": "2026-09-05T15:04:03.349049Z",
+    "status": "completed",
+    "target": {
+      "baseRevision": "4db26d470901cb7895e7c32444be072029932013",
+      "displayName": "sunrise-edge",
+      "headRevision": "b74c1ae1d12a2ce7d5c691b613457933c998defe",
+      "kind": "git_diff",
+      "snapshotDigest": "codex-security-snapshot/v1:sha256:68b869b170554225e71a4cbea60ba420e80ac8f18ce71c69b3bf4878294f89bd",
+      "targetId": "target_sha256_6908c4c9e567ddaca40a429ff38210147729e713dc6eb6509c2e6d821bdb49a4"
+    },
+    "threatModel": {
+      "assets": [
+        "Native server availability, executor fairness, prompt shutdown, and canonical object-query representation."
+      ],
+      "assumptions": [
+        "A permanent listener fault yields bounded polling and is not classified in this delta.",
+        "No OS-level injected TcpListener::accept failure integration test exists; source and helper tests cover the change."
+      ],
+      "attackerCapabilities": [
+        "A reachable unauthenticated peer may connect, abort, stall within deadlines, and consume admission capacity.",
+        "A malicious node or mutated transport response may supply noncanonical object-query frames."
+      ],
+      "securityObjectives": [
+        "Accept retry must be nonzero, bounded, recovery-reset, and shutdown responsive.",
+        "Encoding v2 must fail closed for unchanged object-query statuses while historical v1 remains distinct."
+      ],
+      "summary": "Exact-commit focused delta: native HTTP retries listener accept errors with bounded nonzero backoff while preserving shutdown selection, and node-wire rejects encoding v2 for object-query statuses whose canonical representation remains v1.",
+      "trustBoundaries": [
+        "Unauthenticated peer to kernel listener and native-http accept loop (crates/native-http/src/lib.rs:1083-1198).",
+        "Untrusted response producer or transport to node-wire and Rust client (crates/node-wire/src/lib.rs:985-1114; clients/rust/src/client.rs:104-144)."
+      ]
+    }
+  },
+  "schemaVersion": "1.0"
+}

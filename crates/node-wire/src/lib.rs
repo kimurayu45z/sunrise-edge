@@ -35,6 +35,8 @@ use std::error::Error;
 const HTTP_RESULT_TYPE_ID: u16 = 0xE101;
 const HTTP_RESULT_ENCODING_VERSION: u16 = 1;
 const QUERY_RESULT_ENCODING_VERSION: u16 = 1;
+const OBJECT_QUERY_RESULT_ENCODING_VERSION_V1: u16 = 1;
+const OBJECT_QUERY_RESULT_ENCODING_VERSION_V2: u16 = 2;
 
 /// Canonical type identifier for [`HttpContextQueryResult`] (DR-0082).
 pub const CONTEXT_QUERY_RESULT_TYPE_ID: u16 = 0xE102;
@@ -513,7 +515,8 @@ pub enum ObjectQueryStatus {
     Absent = 1,
     /// A delete retained the last immutable version and head revision.
     Tombstoned = 2,
-    /// A current, independently verified inline object.
+    /// A current inline object carrying the context a client needs for
+    /// independent digest verification.
     CurrentInline = 3,
     /// A current version whose body is stored externally as a blob.
     CurrentBlobReference = 4,
@@ -784,6 +787,20 @@ pub enum HttpObjectQueryResult {
         /// Last immutable version reconstructed from retained history.
         last_object_version: DurableObjectVersion,
     },
+    /// Historical encoding-v1 inline result. It lacks the immutable digest
+    /// context and must never be treated as independently verified.
+    HistoricalCurrentInline {
+        /// The exact object identifier this result answers.
+        object_id: ObjectId,
+        /// ABA-safe revision installed by the latest write.
+        head_revision: ObjectHeadRevision,
+        /// Current immutable object version.
+        object_version: DurableObjectVersion,
+        /// Recorded self-describing digest, not independently verified here.
+        digest: Digest32,
+        /// Exact canonical object bytes with id/version validation only.
+        canonical_object_bytes: Vec<u8>,
+    },
     /// A current, independently verified inline object.
     CurrentInline {
         /// The exact object identifier this result answers.
@@ -792,10 +809,17 @@ pub enum HttpObjectQueryResult {
         head_revision: ObjectHeadRevision,
         /// Current immutable object version.
         object_version: DurableObjectVersion,
-        /// Self-describing digest of the current object version, independently
-        /// recomputed and verified against the returned canonical body.
+        /// Self-describing digest of the current object version. The generic
+        /// Rust client recomputes it before exposing this result.
         digest: Digest32,
-        /// Exact canonical `objects::Object` bytes, digest-verified.
+        /// Creating chain identifier needed to independently recompute `digest`.
+        creating_chain_id: ChainId,
+        /// Creating protocol version needed to independently recompute `digest`.
+        ///
+        creating_protocol_version: ProtocolVersion,
+        /// Exact canonical `objects::Object` bytes. Canonical decoding and
+        /// nested id/version are checked here; digest verification is a client
+        /// consumption responsibility using the accompanying context.
         canonical_object_bytes: Vec<u8>,
     },
     /// A current version whose body is stored externally as a blob.
@@ -828,6 +852,7 @@ impl HttpObjectQueryResult {
         match self {
             Self::Absent { object_id }
             | Self::Tombstoned { object_id, .. }
+            | Self::HistoricalCurrentInline { object_id, .. }
             | Self::CurrentInline { object_id, .. }
             | Self::CurrentBlobReference { object_id, .. } => *object_id,
         }
@@ -852,12 +877,16 @@ impl From<NodeObjectQueryResult> for HttpObjectQueryResult {
                 head_revision,
                 object_version,
                 digest,
+                creating_chain_id,
+                protocol_version,
                 canonical_object_bytes,
             } => Self::CurrentInline {
                 object_id,
                 head_revision,
                 object_version,
                 digest,
+                creating_chain_id,
+                creating_protocol_version: protocol_version,
                 canonical_object_bytes,
             },
             NodeObjectQueryResult::CurrentBlobReference {
@@ -880,8 +909,14 @@ impl From<NodeObjectQueryResult> for HttpObjectQueryResult {
 impl HttpObjectQueryResult {
     /// Encodes the canonical `0xE103` object query result.
     pub fn encode(&self) -> Result<Vec<u8>, QueryResultError> {
-        let mut frame =
-            CanonicalStruct::new(OBJECT_QUERY_RESULT_TYPE_ID, QUERY_RESULT_ENCODING_VERSION);
+        let encoding_version: u16 = match self {
+            Self::HistoricalCurrentInline { .. }
+            | Self::Absent { .. }
+            | Self::Tombstoned { .. }
+            | Self::CurrentBlobReference { .. } => OBJECT_QUERY_RESULT_ENCODING_VERSION_V1,
+            Self::CurrentInline { .. } => OBJECT_QUERY_RESULT_ENCODING_VERSION_V2,
+        };
+        let mut frame = CanonicalStruct::new(OBJECT_QUERY_RESULT_TYPE_ID, encoding_version);
         match self {
             Self::Absent { object_id } => {
                 frame.field_u16(1, ObjectQueryStatus::Absent.as_u16())?;
@@ -898,6 +933,24 @@ impl HttpObjectQueryResult {
                 frame.field_u64(4, last_object_version.get())?;
             }
             Self::CurrentInline {
+                object_id,
+                head_revision,
+                object_version,
+                digest,
+                creating_chain_id,
+                creating_protocol_version,
+                canonical_object_bytes,
+            } => {
+                frame.field_u16(1, ObjectQueryStatus::CurrentInline.as_u16())?;
+                frame.field_bytes(2, object_id.as_bytes().to_vec())?;
+                frame.field_u64(3, head_revision.get())?;
+                frame.field_u64(4, object_version.get())?;
+                encode_digest_fields(&mut frame, 5, 6, *digest)?;
+                frame.field_bytes(7, canonical_object_bytes.clone())?;
+                frame.field_str(10, creating_chain_id.as_str())?;
+                frame.field_u32(11, creating_protocol_version.get())?;
+            }
+            Self::HistoricalCurrentInline {
                 object_id,
                 head_revision,
                 object_version,
@@ -935,13 +988,38 @@ impl HttpObjectQueryResult {
     /// node-core's `MAX_AUTHENTICATED_OBJECT_BODY_BYTES`, fails to decode as
     /// a canonical `objects::Object`, or decodes to an id/version other than
     /// the outer `object_id`/`object_version` fields.
+    ///
+    /// Encoding version 2 is valid only for the `CurrentInline` status; a
+    /// frame declaring version 2 for `Absent`, `Tombstoned`, or
+    /// `CurrentBlobReference` is rejected rather than silently decoded as if
+    /// it were version 1.
     pub fn decode(bytes: &[u8]) -> Result<Self, QueryResultError> {
         let frame = decode_canonical_frame(bytes)?;
         frame.require_type(OBJECT_QUERY_RESULT_TYPE_ID)?;
-        frame.require_version(QUERY_RESULT_ENCODING_VERSION)?;
-        frame.require_only_fields(&[1, 2, 3, 4, 5, 6, 7, 8, 9])?;
+        let encoding_version: u16 = frame.version();
+        if encoding_version != OBJECT_QUERY_RESULT_ENCODING_VERSION_V1
+            && encoding_version != OBJECT_QUERY_RESULT_ENCODING_VERSION_V2
+        {
+            return Err(QueryResultError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedVersion {
+                    expected: OBJECT_QUERY_RESULT_ENCODING_VERSION_V2,
+                    actual: encoding_version,
+                },
+            ));
+        }
+        frame.require_only_fields(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])?;
 
         let status = ObjectQueryStatus::try_from(frame.required_u16(1)?)?;
+        if encoding_version == OBJECT_QUERY_RESULT_ENCODING_VERSION_V2
+            && status != ObjectQueryStatus::CurrentInline
+        {
+            return Err(QueryResultError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedVersion {
+                    expected: OBJECT_QUERY_RESULT_ENCODING_VERSION_V1,
+                    actual: encoding_version,
+                },
+            ));
+        }
         let object_id = decode_object_id_field(&frame, 2)?;
         match status {
             ObjectQueryStatus::Absent => {
@@ -959,7 +1037,11 @@ impl HttpObjectQueryResult {
                 })
             }
             ObjectQueryStatus::CurrentInline => {
-                frame.require_only_fields(&[1, 2, 3, 4, 5, 6, 7])?;
+                if encoding_version == OBJECT_QUERY_RESULT_ENCODING_VERSION_V1 {
+                    frame.require_only_fields(&[1, 2, 3, 4, 5, 6, 7])?;
+                } else {
+                    frame.require_only_fields(&[1, 2, 3, 4, 5, 6, 7, 10, 11])?;
+                }
                 let head_revision = decode_head_revision(frame.required_u64(3)?)?;
                 let object_version = decode_object_version(frame.required_u64(4)?)?;
                 let digest = decode_digest_fields(&frame, 5, 6)?;
@@ -984,11 +1066,33 @@ impl HttpObjectQueryResult {
                         actual: nested.version,
                     });
                 }
+                if encoding_version == OBJECT_QUERY_RESULT_ENCODING_VERSION_V1 {
+                    return Ok(Self::HistoricalCurrentInline {
+                        object_id,
+                        head_revision,
+                        object_version,
+                        digest,
+                        canonical_object_bytes,
+                    });
+                }
+                let chain_id_str: &str = frame.required_str(10)?;
+                if chain_id_str.len() > MAX_CHAIN_ID_BYTES {
+                    return Err(QueryResultError::ChainIdTooLong(chain_id_str.len()));
+                }
+                let creating_chain_id: ChainId =
+                    ChainId::new(chain_id_str).map_err(QueryResultError::InvalidChainId)?;
+                let creating_protocol_version: ProtocolVersion =
+                    ProtocolVersion::new(frame.required_u32(11)?);
+                if creating_protocol_version.get() == 0 {
+                    return Err(QueryResultError::ZeroProtocolVersion);
+                }
                 Ok(Self::CurrentInline {
                     object_id,
                     head_revision,
                     object_version,
                     digest,
+                    creating_chain_id,
+                    creating_protocol_version,
                     canonical_object_bytes,
                 })
             }

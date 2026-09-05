@@ -52,9 +52,9 @@ use runtime::{
 use sunrise_edge_client::{
     AccessEntry, AccessManifest, AccessMode, Amount, AtomicityDomainId, Client, ClientError,
     ExecutionStatus, FeePayment, HttpNodeResult, HttpObjectQueryResult, HttpReceiptQueryResult,
-    LocalSigner, LoopbackHttpTransport, NodeResponseStatus, ObjectId, ObjectRef, Owner, RequestId,
-    SignatureSchemeId, SubmitTransactionRequest, TransactionRequest, build_signed_transaction,
-    decode_execution_effects, decode_object,
+    LocalSigner, LoopbackHttpTransport, NodeResponseStatus, ObjectId, ObjectRef, Owner,
+    PreparedTransaction, RequestId, SignatureSchemeId, SubmitTransactionRequest,
+    TransactionRequest, decode_execution_effects, decode_object,
 };
 use sunrise_edge_devnet::{
     ASSET_ACCOUNT_WASM, AssetAccount, DEVNET_ASSET_ID, DevOwner, DevnetConfig,
@@ -216,10 +216,11 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
     let owner_address = owner_signer.address();
     let recipient_signer = LocalSigner::from_seed([0x6B; 32]);
     let recipient_address = recipient_signer.address();
+    let treasury_address = LocalSigner::from_seed([0x7B; 32]).address();
     let seed_file = TempSeedFile::new([0x5B; 32]);
     let dev_owner = DevOwner::new(*owner_address.as_bytes());
     let recipient_dev_owner = DevOwner::new(*recipient_address.as_bytes());
-    let treasury_dev_owner = DevOwner::new([0x7B; 32]);
+    let treasury_dev_owner = DevOwner::new(*treasury_address.as_bytes());
 
     let directory = TestDirectory::new("restart-duplicate-e2e");
     let config = DevnetConfig::parse_from(vec![
@@ -236,7 +237,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         OsString::from("--dev-owner"),
         OsString::from(recipient_address.to_string()),
         OsString::from("--fee-treasury-owner"),
-        OsString::from("7b".repeat(32)),
+        OsString::from(treasury_address.to_string()),
         OsString::from("--max-concurrent"),
         OsString::from("4"),
     ])
@@ -349,6 +350,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
     let endpoint = first_address.to_string();
     let seed_path = seed_file.0.clone();
     let module_ref_for_blocking = module_ref.clone();
+    let owner_signer_after_restart = owner_signer.clone();
     let pre_restart: PreRestartState = tokio::task::spawn_blocking(move || {
         let module_ref = module_ref_for_blocking;
         let verify_client = make_client(first_address);
@@ -368,10 +370,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             Owner::Address(recipient_address)
         );
         assert_eq!(treasury_baseline.balance, 0);
-        assert_eq!(
-            treasury_owner_baseline,
-            Owner::Address(sunrise_edge_client::Address::new([0x7B; 32]))
-        );
+        assert_eq!(treasury_owner_baseline, Owner::Address(treasury_address));
 
         // Property 1: user-facing transfer leg through the real CLI binary
         // entrypoint, amount 250, with a bounded wait for the receipt.
@@ -463,10 +462,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             destination_owner_after_cli,
             Owner::Address(recipient_address)
         );
-        assert_eq!(
-            treasury_owner_after_cli,
-            Owner::Address(sunrise_edge_client::Address::new([0x7B; 32]))
-        );
+        assert_eq!(treasury_owner_after_cli, Owner::Address(treasury_address));
 
         let cli_receipt = verify_client
             .query_receipt(request_id_r1)
@@ -519,11 +515,14 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
                 fee_object: source_ref_after_cli.clone(),
             }),
         };
-        let signed_transaction_bytes_r2 = build_signed_transaction(
-            &owner_signer,
+        let signed_transaction_bytes_r2 = PreparedTransaction::prepare_submission(
+            request_id_r2,
+            owner_signer.address(),
             SignatureSchemeId::Ed25519,
             transaction_request,
         )
+        .unwrap()
+        .sign_and_finalize_with(&owner_signer)
         .unwrap();
 
         let submit_result_r2 = verify_client
@@ -581,10 +580,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             destination_owner_after_r2,
             Owner::Address(recipient_address)
         );
-        assert_eq!(
-            treasury_owner_after_r2,
-            Owner::Address(sunrise_edge_client::Address::new([0x7B; 32]))
-        );
+        assert_eq!(treasury_owner_after_r2, Owner::Address(treasury_address));
         assert_eq!(source_after_r2.sequence, source_after_cli.sequence + 2);
         assert_eq!(
             source_ref_after_r2.version,
@@ -618,8 +614,10 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             object_ref: treasury_ref_after_r2,
             mode: AccessMode::Write,
         });
-        let trapped_signed_bytes = build_signed_transaction(
-            &owner_signer,
+        let request_id_r3 = RequestId::new([REQUEST_ID_R3_BYTE; 32]).unwrap();
+        let trapped_signed_bytes = PreparedTransaction::prepare_submission(
+            request_id_r3,
+            owner_signer.address(),
             SignatureSchemeId::Ed25519,
             TransactionRequest {
                 chain_id: context.chain_id().clone(),
@@ -638,8 +636,9 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
                 }),
             },
         )
+        .unwrap()
+        .sign_and_finalize_with(&owner_signer)
         .unwrap();
-        let request_id_r3 = RequestId::new([REQUEST_ID_R3_BYTE; 32]).unwrap();
         let trapped_result = verify_client
             .submit_transaction(SubmitTransactionRequest {
                 chain_id: context.chain_id().clone(),
@@ -706,10 +705,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             destination_owner_after_r2,
             Owner::Address(recipient_address)
         );
-        assert_eq!(
-            treasury_owner_after_r2,
-            Owner::Address(sunrise_edge_client::Address::new([0x7B; 32]))
-        );
+        assert_eq!(treasury_owner_after_r2, Owner::Address(treasury_address));
 
         let second_transfer_receipt = verify_client
             .query_receipt(request_id_r2)
@@ -801,7 +797,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         );
         assert_eq!(
             treasury_owner_after_same_boot_duplicate,
-            Owner::Address(sunrise_edge_client::Address::new([0x7B; 32]))
+            Owner::Address(treasury_address)
         );
         assert_eq!(source_bytes_after_same_boot_duplicate, source_query_bytes);
         assert_eq!(
@@ -905,7 +901,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         );
         assert_eq!(
             treasury_owner_after_same_boot_trap_duplicate,
-            Owner::Address(sunrise_edge_client::Address::new([0x7B; 32]))
+            Owner::Address(treasury_address)
         );
         assert_eq!(
             source_bytes_after_same_boot_trap_duplicate,
@@ -1201,7 +1197,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         );
         assert_eq!(
             treasury_owner_after_restart,
-            Owner::Address(sunrise_edge_client::Address::new([0x7B; 32]))
+            Owner::Address(treasury_address)
         );
         assert_eq!(
             source_query_bytes_after_restart,
@@ -1304,16 +1300,16 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
             pre_restart.submit_result_r3_bytes
         );
 
-        let (_, source_after_duplicate, source_owner_after_duplicate, source_query_bytes_after_duplicate) =
+        let (source_ref_after_duplicate, source_after_duplicate, source_owner_after_duplicate, source_query_bytes_after_duplicate) =
             query_current_account(&verify_client, source_id);
         let (
-            _,
+            destination_ref_after_duplicate,
             destination_after_duplicate,
             destination_owner_after_duplicate,
             destination_query_bytes_after_duplicate,
         ) = query_current_account(&verify_client, destination_id);
         let (
-            _,
+            treasury_ref_after_duplicate,
             treasury_after_duplicate,
             treasury_owner_after_duplicate,
             treasury_query_bytes_after_duplicate,
@@ -1328,7 +1324,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         );
         assert_eq!(
             treasury_owner_after_duplicate,
-            Owner::Address(sunrise_edge_client::Address::new([0x7B; 32]))
+            Owner::Address(treasury_address)
         );
         assert_eq!(
             source_query_bytes_after_duplicate,
@@ -1374,14 +1370,52 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         // different transaction/event is a typed, nonzero, fail-closed
         // result, with no state change. `request_id_r1` was already
         // committed by the CLI transfer above; resubmitting it with the
-        // second transaction's different signed bytes must be rejected.
+        // a freshly signed, otherwise valid transaction with different bytes
+        // must be rejected by the durable request-id conflict check.
+        let mut reused_id_manifest = AccessManifest::new();
+        reused_id_manifest.push(AccessEntry {
+            object_ref: source_ref_after_duplicate.clone(),
+            mode: AccessMode::Write,
+        });
+        reused_id_manifest.push(AccessEntry {
+            object_ref: destination_ref_after_duplicate,
+            mode: AccessMode::Write,
+        });
+        reused_id_manifest.push(AccessEntry {
+            object_ref: treasury_ref_after_duplicate,
+            mode: AccessMode::Write,
+        });
+        let reused_id_signed_bytes = PreparedTransaction::prepare_submission(
+            request_id_r1,
+            owner_signer_after_restart.address(),
+            SignatureSchemeId::Ed25519,
+            TransactionRequest {
+                chain_id: context.chain_id().clone(),
+                protocol_version: context.protocol_version(),
+                epoch: context.epoch(),
+                nonce: next_nonce_after_duplicate,
+                access_manifest: reused_id_manifest,
+                module_ref: module_ref.clone(),
+                entrypoint: TRANSFER_ENTRYPOINT.to_string(),
+                args: encode_transfer_args(TransferArgs::new(1).unwrap()).unwrap(),
+                gas_limit: GAS_LIMIT,
+                fee_payment: Some(FeePayment {
+                    asset_id: DEVNET_ASSET_ID,
+                    max_fee: Amount::new(GAS_LIMIT + 1),
+                    fee_object: source_ref_after_duplicate,
+                }),
+            },
+        )
+        .unwrap()
+        .sign_and_finalize_with(&owner_signer_after_restart)
+        .unwrap();
         let reused_id_error = verify_client
             .submit_transaction(SubmitTransactionRequest {
                 chain_id: context.chain_id().clone(),
                 protocol_version: context.protocol_version(),
                 epoch: context.epoch(),
                 request_id: request_id_r1,
-                signed_transaction_bytes: pre_restart.signed_transaction_bytes_r2.clone(),
+                signed_transaction_bytes: reused_id_signed_bytes,
             })
             .expect_err("reusing a committed request id for a different transaction must fail");
         match reused_id_error {
@@ -1422,7 +1456,7 @@ async fn devnet_survives_orderly_restart_and_rejects_duplicate_and_reused_reques
         );
         assert_eq!(
             treasury_owner_after_reuse_attempt,
-            Owner::Address(sunrise_edge_client::Address::new([0x7B; 32]))
+            Owner::Address(treasury_address)
         );
         assert_eq!(
             source_query_bytes_after_reuse_attempt,

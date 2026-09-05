@@ -136,6 +136,10 @@ pub enum ObjectQueryResult {
         /// Self-describing digest of the current object version, independently
         /// recomputed and verified against the returned canonical body.
         digest: Digest32,
+        /// Chain identifier recorded when this immutable object version was created.
+        creating_chain_id: ChainId,
+        /// Protocol version recorded when this immutable object version was created.
+        protocol_version: ProtocolVersion,
         /// Exact canonical `objects::Object` bytes, digest-verified.
         canonical_object_bytes: Vec<u8>,
     },
@@ -306,6 +310,8 @@ where
                 head_revision,
                 object_version,
                 digest,
+                creating_chain_id: record.provenance().chain_id().clone(),
+                protocol_version: record.provenance().protocol_version(),
                 canonical_object_bytes: inline.canonical_bytes().to_vec(),
             })
         }

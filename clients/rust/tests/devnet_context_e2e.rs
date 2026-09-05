@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use sunrise_edge_client::{
-    Address, Client, HttpObjectQueryResult, HttpReceiptQueryResult, LoopbackHttpTransport,
-    ObjectId, RequestId,
+    Address, Client, HttpObjectQueryResult, HttpReceiptQueryResult, LocalSigner,
+    LoopbackHttpTransport, ObjectId, RequestId,
 };
 use sunrise_edge_devnet::{
     ASSET_ACCOUNT_WASM, DevnetConfig, boot_local_store, build_asset_module,
@@ -41,6 +41,8 @@ impl Drop for TestDirectory {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_queries_all_four_routes_from_the_real_devnet_router_over_tcp() {
+    let dev_owner = LocalSigner::from_seed([0x22; 32]).address();
+    let treasury_owner = LocalSigner::from_seed([0x33; 32]).address();
     let directory = TestDirectory::new();
     let config = DevnetConfig::parse_from(vec![
         OsString::from("--data-dir"),
@@ -52,9 +54,9 @@ async fn client_queries_all_four_routes_from_the_real_devnet_router_over_tcp() {
         OsString::from("--epoch"),
         OsString::from("7"),
         OsString::from("--dev-owner"),
-        OsString::from("2222222222222222222222222222222222222222222222222222222222222222"),
+        OsString::from(dev_owner.to_string()),
         OsString::from("--fee-treasury-owner"),
-        OsString::from("3333333333333333333333333333333333333333333333333333333333333333"),
+        OsString::from(treasury_owner.to_string()),
         OsString::from("--max-concurrent"),
         OsString::from("4"),
     ])

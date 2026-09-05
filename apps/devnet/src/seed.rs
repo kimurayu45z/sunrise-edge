@@ -8,6 +8,7 @@ use crate::{
     config::{DevOwner, MAX_DEVNET_OWNERS},
     genesis::DEVNET_DOMAIN_BYTES,
 };
+use crypto::{Ed25519OwnerAddressError, Ed25519OwnerAddressPolicy, validate_ed25519_owner_address};
 use hashing::{HashSuiteResolver, HashingError, verify_digest};
 use objects::{
     Address, Object, ObjectError, ObjectId, ObjectRef, Owner, decode_object, encode_object,
@@ -171,6 +172,11 @@ pub fn seed_asset_accounts<S>(
 where
     S: StructuredDurableDomainStateStore + ?Sized,
 {
+    validate_ed25519_owner_address(
+        owner.as_bytes(),
+        Ed25519OwnerAddressPolicy::CanonicalPrimeOrder,
+    )
+    .map_err(DevnetSeedError::InadmissibleOwner)?;
     if context.writer_fence() != boot_generation {
         return Err(DevnetSeedError::ContextFenceMismatch {
             context: context.writer_fence(),
@@ -817,6 +823,9 @@ fn head_kind(head: &DurableObjectHead) -> &'static str {
 /// Fail-closed errors while deriving, creating, or verifying devnet seed objects.
 #[derive(Debug)]
 pub enum DevnetSeedError {
+    /// The owner was not a canonical, non-identity, prime-order Ed25519
+    /// public key and therefore cannot safely receive seeded value.
+    InadmissibleOwner(Ed25519OwnerAddressError),
     /// The hard-coded devnet atomicity domain unexpectedly violated its invariant.
     InvalidStaticDomain,
     /// The supplied operation context does not carry this boot's writer fence.
@@ -892,6 +901,9 @@ pub enum DevnetSeedError {
 impl fmt::Display for DevnetSeedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InadmissibleOwner(error) => {
+                write!(f, "devnet seed owner is not admissible: {error}")
+            }
             Self::InvalidStaticDomain => f.write_str("devnet's fixed atomicity domain is invalid"),
             Self::ContextFenceMismatch { context, boot } => write!(
                 f,
@@ -955,6 +967,7 @@ impl fmt::Display for DevnetSeedError {
 impl Error for DevnetSeedError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::InadmissibleOwner(error) => Some(error),
             Self::AssetCodec(error) => Some(error),
             Self::Object(error) => Some(error),
             Self::Hashing(error) => Some(error),
@@ -999,6 +1012,7 @@ impl From<IndexedOutboxContractError> for DevnetSeedError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_zebra::{SigningKey, VerificationKey};
     use fees::AssetId;
     use protocol_types::{ChainId, HashAlgorithmId, HashSuite, HashSuiteSchedule, ProtocolVersion};
     use runtime::{
@@ -1015,6 +1029,14 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    fn dev_owner(seed: u8) -> DevOwner {
+        let signing_key: SigningKey = SigningKey::from([seed; 32]);
+        let verification_key: VerificationKey = VerificationKey::from(&signing_key);
+        let mut bytes: [u8; 32] = [0; 32];
+        bytes.copy_from_slice(verification_key.as_ref());
+        DevOwner::new(bytes)
     }
 
     fn generation() -> WriterFenceGeneration {
@@ -1124,7 +1146,7 @@ mod tests {
         let store: MemoryDurableStateStore =
             MemoryDurableStateStore::new_bound(domain(), generation());
         store.set_time(0);
-        let owner: DevOwner = DevOwner::new([0x61; 32]);
+        let owner: DevOwner = dev_owner(0x61);
         let resolver: HashSuiteResolver = resolver();
         let blob_store: MemoryBlobStore = MemoryBlobStore::default();
 
@@ -1156,6 +1178,32 @@ mod tests {
         .unwrap();
         assert!(matches!(existing, SeedAssetAccountsOutcome::Existing(_)));
         assert_eq!(created.accounts(), existing.accounts());
+    }
+
+    #[test]
+    fn seed_rejects_universal_zip215_owner_before_storage_work() {
+        let store: MemoryDurableStateStore =
+            MemoryDurableStateStore::new_bound(domain(), generation());
+        store.set_time(0);
+        let mut bytes: [u8; 32] = [0; 32];
+        bytes[0] = 1;
+        bytes[31] = 0x80;
+        let result = seed_asset_accounts(
+            &store,
+            &MemoryBlobStore::default(),
+            &resolver(),
+            Epoch::new(0),
+            DevOwner::new(bytes),
+            generation(),
+            &context(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(DevnetSeedError::InadmissibleOwner(
+                Ed25519OwnerAddressError::NonCanonicalPoint
+            ))
+        ));
     }
 
     #[test]
@@ -1215,7 +1263,7 @@ mod tests {
             let store: MemoryDurableStateStore =
                 MemoryDurableStateStore::new_bound(domain(), generation());
             store.set_time(0);
-            let owner: DevOwner = DevOwner::new([0x91; 32]);
+            let owner: DevOwner = dev_owner(0x91);
             let resolver: HashSuiteResolver = resolver();
             let blob_store: MemoryBlobStore = MemoryBlobStore::default();
             seed_asset_accounts(

@@ -124,6 +124,7 @@ fn query_asset_account(
 async fn cli_transfer_command_moves_balance_through_the_real_devnet_router_over_tcp() {
     let owner_signer = sunrise_edge_client::LocalSigner::from_seed([0x5A; 32]);
     let owner_address = owner_signer.address();
+    let treasury_address = sunrise_edge_client::LocalSigner::from_seed([0x6A; 32]).address();
     let seed_file = TempSeedFile::new([0x5A; 32]);
 
     let directory = TestDirectory::new("transfer-e2e");
@@ -139,7 +140,7 @@ async fn cli_transfer_command_moves_balance_through_the_real_devnet_router_over_
         OsString::from("--dev-owner"),
         OsString::from(owner_address.to_string()),
         OsString::from("--fee-treasury-owner"),
-        OsString::from("6b".repeat(32)),
+        OsString::from(treasury_address.to_string()),
         OsString::from("--max-concurrent"),
         OsString::from("4"),
     ])

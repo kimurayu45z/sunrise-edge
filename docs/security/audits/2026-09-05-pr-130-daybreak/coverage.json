@@ -1,0 +1,125 @@
+{
+  "completeness": "complete",
+  "deferred": [],
+  "documentType": "codex-security.coverage",
+  "excludePaths": [],
+  "explicitExclusions": [
+    {
+      "pattern": "crates/{bonds,governance,protocol-upgrades,validator-set,consensus}/** except directly reached configuration types",
+      "reason": "Explicitly excluded by docs/security/initial-code-audit-scope.md; externally accepted non-Submit families remain rejected and that rejection boundary was reviewed."
+    },
+    {
+      "pattern": "crates/{chain-ir,contract-sdk}/** and clients/ledger/** plus Ledger-only branches",
+      "reason": "Explicit first-audit exclusions, including raw WASM host ABI and hardware/HIL/release work."
+    },
+    {
+      "pattern": "adapters/**, provider deployments, checkpoint/restore, browser applications, backup/HA/PKI, and long-running or physical campaigns",
+      "reason": "Explicit scope exclusions and absent concrete source/deployment prerequisites; not treated as findings."
+    },
+    {
+      "pattern": "runtime execution, builds, tests, dependency downloads, network calls, and external service validation",
+      "reason": "Explicit user instruction required an offline, source-read-only audit."
+    }
+  ],
+  "includePaths": [
+    "."
+  ],
+  "inventoryStrategy": "repository",
+  "mode": "repository",
+  "openQuestions": [],
+  "scanId": "034f9d08-2613-402d-868e-0fce48bb6bfc",
+  "schemaVersion": "1.0",
+  "surfaces": [
+    {
+      "disposition": "no_issue_found",
+      "id": "threat-model",
+      "label": "Architecture and effective-resource threat model",
+      "notes": "Mapped the loopback devnet, reusable Router/server boundary, authenticated submit path, CLI transports/context, local persistence, and conditional PostgreSQL seam without inferring production readiness.",
+      "receiptRefs": [],
+      "riskArea": "Concrete startup paths, trust boundaries, resource values, public queries, trusted composition, and absent deployment prerequisites."
+    },
+    {
+      "disposition": "no_issue_found",
+      "id": "baseline",
+      "label": "Independent baseline security review",
+      "notes": "The independent baseline reported no candidate findings and independently agreed with all four remediation dispositions.",
+      "receiptRefs": [],
+      "riskArea": "Canonical framing, authentication, replay, object effects, execution, fees, persistence, ingress, clients, and devnet composition."
+    },
+    {
+      "disposition": "no_issue_found",
+      "id": "oq-1",
+      "label": "Object-query integrity and historical compatibility",
+      "notes": "csf_e77c8313ca0a303cedfa981b is fixed. Server state/provenance/body checks, additive v2 digest context, generic-client recomputation, and explicit HistoricalCurrentInline rejection close the reported redirect path. Unchanged non-inline statuses retain v1.",
+      "receiptRefs": [],
+      "riskArea": "Forged CurrentInline bodies, selector rebinding, v1/v2 compatibility, digest context, and transaction-reference consumption."
+    },
+    {
+      "disposition": "no_issue_found",
+      "id": "own-2",
+      "label": "Profile-2 Ed25519 funded-owner admissibility",
+      "notes": "csf_f989f2782c1a74ecb3f1c63b is fixed for committed profile 2. Strict canonical non-identity prime-order validation precedes sender, destination, and treasury authorization. Profile 1 remains intentionally historical with no request-controlled profile-2 downgrade found.",
+      "receiptRefs": [],
+      "riskArea": "Noncanonical/identity/low-order senders, every loaded Address owner, destination, treasury, devnet configuration, and seed reconciliation."
+    },
+    {
+      "disposition": "no_issue_found",
+      "id": "rid-3",
+      "label": "Profile-2 request-ID and message-family binding",
+      "notes": "csf_0def7e2c09e504c51dc13d81 is fixed for committed profile 2. Envelope 0xE009 signs exact request ID plus Transaction-v1 bytes under submit-transaction-v1; native ingress authenticates before identity, clock, module, or storage. The no-ID public authenticator fails closed for profile 2.",
+      "receiptRefs": [],
+      "riskArea": "Unsigned request relabeling, canonical submission envelope, public authentication APIs, historical Transaction-v1, and pre-side-effect ordering."
+    },
+    {
+      "disposition": "no_issue_found",
+      "id": "http-4",
+      "label": "Native HTTP pre-parser admission and deadlines",
+      "notes": "csf_6b9af57d0e0e5c5425e690db is fixed for repository-owned native entrypoints. serve acquires a bounded permit immediately after accept and applies finite parsing/body/response limits; every in-scope concrete host uses it. Raw Router embeddings require equivalent controls, and no in-scope bypass was found.",
+      "receiptRefs": [],
+      "riskArea": "Connection permits, headers, body idle/total, response writes, keep-alive, all four Router families, and concrete startup consumers."
+    },
+    {
+      "disposition": "no_issue_found",
+      "id": "persist-5",
+      "label": "Durable replay, atomicity, blobs, SQLite, and PostgreSQL",
+      "notes": "No duplication, partial structured commit, cross-domain mapping, unsafe serialization retry, or blind indeterminate retry path was found. PostgreSQL deployment behavior remains unverified rather than inferred.",
+      "receiptRefs": [],
+      "riskArea": "Receipt-first replay, nonce and state/object/receipt/outbox atomicity, namespaces, writer fences, deadlines, retries, leases, and indeterminate outcomes."
+    },
+    {
+      "disposition": "no_issue_found",
+      "id": "exec-6",
+      "label": "WASM, transports, expected context, seed handling, and fees",
+      "notes": "No current reportable bypass was found. Current code is catalog-trusted and fixed-size; transports and polling are bounded; endpoint authentication and protocol context are separate; fee payer/treasury and arithmetic are checked and committed atomically.",
+      "receiptRefs": [],
+      "riskArea": "Execution fuel/byte/count bounds, trusted code selection, strict HTTP/TLS framing, context verification, local seed loading, and checked fee composition."
+    },
+    {
+      "candidateId": "csf_4c8b0f97a2d5e1a3",
+      "disposition": "rejected",
+      "id": "blob-orphan-candidate",
+      "label": "Conditional unreachable-blob storage exhaustion",
+      "notes": "Rejected as a current finding: the only concrete trusted module emits fixed 76-byte bodies below the 64 KiB threshold, so a request cannot reach blob publication. A future over-threshold attacker-varying module plus repeated post-publication rejection and absent capacity controls is a focused-review change condition.",
+      "receiptRefs": [],
+      "riskArea": "Pre-commit content-addressed publication without GC."
+    },
+    {
+      "candidateId": "csf_81f4c2d7aa9e560b",
+      "disposition": "rejected",
+      "id": "wasmi-memory-candidate",
+      "label": "Conditional WASM linear-memory exhaustion",
+      "notes": "Rejected as a current finding: transactions cannot upload code, and the sole active trusted WAT declares one memory page and no memory.grow. A future memory-growing catalog module is a focused-review change condition.",
+      "receiptRefs": [],
+      "riskArea": "Missing explicit wasmi Store memory limiter."
+    },
+    {
+      "candidateId": "csf_7d1a4e90c3f862bb",
+      "disposition": "rejected",
+      "id": "api-docs-candidate",
+      "label": "Rust security API and documentation drift",
+      "notes": "Several comments are inaccurate, but executable paths remain stricter and fail closed and SECURITY.md controls readiness. No attacker-controlled authorization, integrity, confidentiality, or availability consequence was established; documentation should still be corrected.",
+      "receiptRefs": [],
+      "riskArea": "Stale authentication, fee, owner-binding, and production-transport prose."
+    }
+  ]
+}
