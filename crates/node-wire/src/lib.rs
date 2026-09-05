@@ -988,6 +988,11 @@ impl HttpObjectQueryResult {
     /// node-core's `MAX_AUTHENTICATED_OBJECT_BODY_BYTES`, fails to decode as
     /// a canonical `objects::Object`, or decodes to an id/version other than
     /// the outer `object_id`/`object_version` fields.
+    ///
+    /// Encoding version 2 is valid only for the `CurrentInline` status; a
+    /// frame declaring version 2 for `Absent`, `Tombstoned`, or
+    /// `CurrentBlobReference` is rejected rather than silently decoded as if
+    /// it were version 1.
     pub fn decode(bytes: &[u8]) -> Result<Self, QueryResultError> {
         let frame = decode_canonical_frame(bytes)?;
         frame.require_type(OBJECT_QUERY_RESULT_TYPE_ID)?;
@@ -1005,6 +1010,16 @@ impl HttpObjectQueryResult {
         frame.require_only_fields(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])?;
 
         let status = ObjectQueryStatus::try_from(frame.required_u16(1)?)?;
+        if encoding_version == OBJECT_QUERY_RESULT_ENCODING_VERSION_V2
+            && status != ObjectQueryStatus::CurrentInline
+        {
+            return Err(QueryResultError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedVersion {
+                    expected: OBJECT_QUERY_RESULT_ENCODING_VERSION_V1,
+                    actual: encoding_version,
+                },
+            ));
+        }
         let object_id = decode_object_id_field(&frame, 2)?;
         match status {
             ObjectQueryStatus::Absent => {

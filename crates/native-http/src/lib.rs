@@ -61,7 +61,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::{Semaphore, TryAcquireError, watch},
     task::JoinSet,
-    time::{Instant, Sleep, timeout},
+    time::{Instant, Sleep, sleep, timeout},
 };
 use tower::ServiceExt;
 
@@ -1104,12 +1104,25 @@ where
     let (shutdown_sender, _shutdown_receiver) = watch::channel(false);
     let mut connections: JoinSet<()> = JoinSet::new();
     let mut shutdown = Box::pin(shutdown);
+    let mut consecutive_accept_errors: u32 = 0;
 
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
             accepted = listener.accept() => {
-                let (stream, _remote_address) = accepted?;
+                let (stream, _remote_address) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(_error) => {
+                        consecutive_accept_errors = consecutive_accept_errors.saturating_add(1);
+                        let backoff = accept_error_backoff(consecutive_accept_errors);
+                        tokio::select! {
+                            _ = &mut shutdown => break,
+                            () = sleep(backoff) => {}
+                        }
+                        continue;
+                    }
+                };
+                consecutive_accept_errors = 0;
                 let permit = match Arc::clone(&connection_permits).try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
@@ -1140,6 +1153,25 @@ where
     while connections.join_next().await.is_some() {}
     Ok(())
 }
+
+/// Bounded, non-spinning backoff for a run of consecutive [`TcpListener::accept`]
+/// errors (for example transient `EMFILE`/`ENFILE` resource exhaustion or
+/// `ECONNABORTED`). Never returns zero, so a tight accept-fail loop cannot
+/// spin the executor, and growth is capped so recovery after a burst of
+/// errors is bounded by [`ACCEPT_ERROR_BACKOFF_CEILING`].
+///
+/// [`TcpListener::accept`]: tokio::net::TcpListener::accept
+fn accept_error_backoff(consecutive_errors: u32) -> Duration {
+    const MAX_DOUBLINGS: u32 = 8;
+    let doublings = consecutive_errors.saturating_sub(1).min(MAX_DOUBLINGS);
+    let multiplier = 1u32.checked_shl(doublings).unwrap_or(u32::MAX);
+    ACCEPT_ERROR_BACKOFF_FLOOR
+        .saturating_mul(multiplier)
+        .min(ACCEPT_ERROR_BACKOFF_CEILING)
+}
+
+const ACCEPT_ERROR_BACKOFF_FLOOR: Duration = Duration::from_millis(5);
+const ACCEPT_ERROR_BACKOFF_CEILING: Duration = Duration::from_secs(1);
 
 async fn serve_connection(
     stream: tokio::net::TcpStream,
@@ -7168,6 +7200,81 @@ mod tests {
     }
 
     #[test]
+    fn object_query_result_rejects_encoding_v2_for_absent() {
+        let object_id = ObjectId::new([0x33; 32]);
+        let mut frame = CanonicalStruct::new(OBJECT_QUERY_RESULT_TYPE_ID, 2);
+        frame
+            .field_u16(1, ObjectQueryStatus::Absent.as_u16())
+            .unwrap();
+        frame.field_bytes(2, object_id.as_bytes().to_vec()).unwrap();
+        let bytes = frame.finish().unwrap();
+
+        assert!(matches!(
+            HttpObjectQueryResult::decode(&bytes),
+            Err(QueryResultError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedVersion {
+                    expected: 1,
+                    actual: 2,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn object_query_result_rejects_encoding_v2_for_tombstoned() {
+        let object_id = ObjectId::new([0x34; 32]);
+        let mut frame = CanonicalStruct::new(OBJECT_QUERY_RESULT_TYPE_ID, 2);
+        frame
+            .field_u16(1, ObjectQueryStatus::Tombstoned.as_u16())
+            .unwrap();
+        frame.field_bytes(2, object_id.as_bytes().to_vec()).unwrap();
+        frame.field_u64(3, 2).unwrap();
+        frame.field_u64(4, 1).unwrap();
+        let bytes = frame.finish().unwrap();
+
+        assert!(matches!(
+            HttpObjectQueryResult::decode(&bytes),
+            Err(QueryResultError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedVersion {
+                    expected: 1,
+                    actual: 2,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn object_query_result_rejects_encoding_v2_for_current_blob_reference() {
+        let object_id = ObjectId::new([0x35; 32]);
+        let mut frame = CanonicalStruct::new(OBJECT_QUERY_RESULT_TYPE_ID, 2);
+        frame
+            .field_u16(1, ObjectQueryStatus::CurrentBlobReference.as_u16())
+            .unwrap();
+        frame.field_bytes(2, object_id.as_bytes().to_vec()).unwrap();
+        frame.field_u64(3, 3).unwrap();
+        frame.field_u64(4, 2).unwrap();
+        frame
+            .field_u16(5, HashAlgorithmId::Sha2_256.as_u16())
+            .unwrap();
+        frame.field_bytes(6, vec![0x23; 32]).unwrap();
+        frame
+            .field_u16(8, HashAlgorithmId::Sha3_256.as_u16())
+            .unwrap();
+        frame.field_bytes(9, vec![0x24; 32]).unwrap();
+        let bytes = frame.finish().unwrap();
+
+        assert!(matches!(
+            HttpObjectQueryResult::decode(&bytes),
+            Err(QueryResultError::CanonicalDecoding(
+                CanonicalDecodingError::UnexpectedVersion {
+                    expected: 1,
+                    actual: 2,
+                }
+            ))
+        ));
+    }
+
+    #[test]
     fn object_query_result_rejects_mismatched_canonical_type_id() {
         let request_id = request_id(0x01);
         let receipt_bytes = HttpReceiptQueryResult::Absent { request_id }
@@ -9656,6 +9763,29 @@ mod tests {
             NativeHttpServePolicy::new(1, 1, 1, 1, MAX_NATIVE_HTTP_RESPONSE_TOTAL_MILLIS + 1),
             Err(NativeHttpServePolicyError::InvalidResponseTotalTimeout)
         );
+    }
+
+    #[test]
+    fn accept_error_backoff_is_bounded_non_spinning_and_monotonic() {
+        let mut previous = Duration::ZERO;
+        for consecutive_errors in 1..=64_u32 {
+            let backoff = accept_error_backoff(consecutive_errors);
+            assert!(
+                backoff >= ACCEPT_ERROR_BACKOFF_FLOOR,
+                "backoff must never be short enough to spin: {backoff:?}"
+            );
+            assert!(
+                backoff <= ACCEPT_ERROR_BACKOFF_CEILING,
+                "backoff must stay bounded: {backoff:?}"
+            );
+            assert!(
+                backoff >= previous,
+                "backoff must not shrink as consecutive errors accumulate"
+            );
+            previous = backoff;
+        }
+        assert_eq!(accept_error_backoff(1), ACCEPT_ERROR_BACKOFF_FLOOR);
+        assert_eq!(accept_error_backoff(64), ACCEPT_ERROR_BACKOFF_CEILING);
     }
 
     #[tokio::test]
