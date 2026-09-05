@@ -2,7 +2,7 @@
 //!
 //! This is a local, in-memory development key, not a keystore, hardware
 //! wallet, or production key-management surface. Production key generation
-//! and storage remain deferred (see `docs/architecture/README.md` §44 / DR-0083).
+//! and storage remain deferred (see `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` §44 / DR-0083).
 
 use crypto::{CryptoError, SignatureSigner};
 use ed25519_zebra::{SigningKey, VerificationKey};

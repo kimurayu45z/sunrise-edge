@@ -217,7 +217,8 @@ value is the raw Ed25519 public key; it is also usable directly as the
 Sunrise on-chain address only because the chain's committed
 `protocol_config::TransactionAuthProfile` — which Hardware Signing Profile
 v1 relies on rather than itself commits — selects the `AddressIsPublicKey`
-address binding (see `docs/architecture/README.md`). This document does not claim public key and address
+address binding (see [`core-protocol.md`](../architecture/core-protocol.md)).
+This document does not claim public key and address
 are equal in general — a future signature scheme or address binding would
 require an explicit amendment rather than reusing "public key/address" as
 one value.

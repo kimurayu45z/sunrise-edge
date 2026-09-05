@@ -48,7 +48,7 @@ pub const INITIAL_MIGRATION_SQL: &str = include_str!("../migrations/0001_initial
 ///
 /// This is `v2`: generation one is redefined in place (not advanced) to add
 /// object-version provenance columns, an authorized pre-production bootstrap-
-/// only change (see `docs/architecture/README.md` DR-0068). An existing `v1` database
+/// only change (see `docs/architecture/decisions/0058-0075-postgres-conformance.md` DR-0068). An existing `v1` database
 /// fails closed with `SchemaMismatch` rather than being silently accepted.
 pub const POSTGRES_SCHEMA_IDENTITY: [u8; 32] = *b"sunrise-edge/postgres/schema/v2\0";
 
@@ -3540,7 +3540,7 @@ mod tests {
         }
     }
 
-    /// Pins the deliberate non-change described in `docs/architecture/README.md` DR-0070:
+    /// Pins the deliberate non-change described in `docs/architecture/decisions/0058-0075-postgres-conformance.md` DR-0070:
     /// PR86 has no live evidence for a `53100` at the commit boundary, so the
     /// commit-boundary classifiers remain conservative and unchanged.
     #[test]

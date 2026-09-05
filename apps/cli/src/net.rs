@@ -11,7 +11,8 @@
 //! its own) and this binary instead dials [`RemoteTlsHttpTransport`] using
 //! only the caller-supplied DNS name and bounded CA trust anchor — never a
 //! system trust store, never IP-address hostname fallback, never
-//! mTLS/redirects/retries/a proxy/background work (see `docs/architecture/README.md`
+//! mTLS/redirects/retries/a proxy/background work (see
+//! `docs/architecture/product-surfaces.md`
 //! DR-0085). Supplying exactly one of the two flags is a local configuration
 //! error and fails closed before any network dispatch.
 //!

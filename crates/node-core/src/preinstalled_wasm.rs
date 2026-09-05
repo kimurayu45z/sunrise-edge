@@ -11,10 +11,11 @@
 //! `native_http::preinstalled_wasm_structured_durable_router` now wires this
 //! module's entrypoint over HTTP; `native_http::structured_durable_router`
 //! remains on the read-only entrypoint and is unaffected. JIT/AOT execution
-//! and production gas metering remain deferred; see `docs/architecture/README.md` and
+//! and production gas metering remain deferred; see
+//! `docs/architecture/decisions/0076-0080-developer-mvp-foundation.md` and
 //! `TODO.md` (Developer MVP Gate, step 3). See also DR-0078 (historical:
 //! written before native HTTP wiring existed) and DR-0080 in
-//! `docs/architecture/README.md`.
+//! that decision-record file.
 //!
 //! # `Transaction.module_ref` mapping (MVP)
 //!

@@ -16,7 +16,7 @@
 //! published, widely-used Zondax `ledger-go` host library's `ledger_hid.go`;
 //! the recognized product-id model family list matches this workspace's own
 //! documented S4b five-target build list — Nano X, Nano S Plus, Stax, Flex,
-//! and Apex P — see `docs/architecture/README.md` DR-0091 — with the underlying per-model
+//! and Apex P — see `docs/architecture/decisions/0088-0093-hardware-signing.md` DR-0091 — with the underlying per-model
 //! USB product-id values themselves sourced from Ledger's own current
 //! official model data, the `ledger-device-sdk`/`ledger-secure-sdk`
 //! device-target definitions and the
@@ -124,7 +124,8 @@ const MAX_APDU_RESPONSE_LEN: usize = MAX_RESPONSE_DATA_LEN + 2;
 /// (the product id's most-significant byte).
 ///
 /// This exact five-model set matches the separate `sunrise-edge-ledger-app`
-/// repository's own documented S4b build targets (see `docs/architecture/README.md`
+/// repository's own documented S4b build targets (see
+/// `docs/architecture/decisions/0088-0093-hardware-signing.md`
 /// DR-0091: "Nano S+, Nano X, Stax, Flex, and Apex P" — this repository's
 /// own record of which models that dedicated Sunrise device application
 /// actually builds for). The underlying per-model USB product-id values
@@ -930,7 +931,7 @@ mod tests {
     #[test]
     fn identify_ledger_device_classifies_every_s4b_build_target_by_product_id_family() {
         // Matches this workspace's own documented S4b five-target build
-        // list exactly (`docs/architecture/README.md` DR-0091): Nano X, Nano S Plus,
+        // list exactly (`docs/architecture/decisions/0088-0093-hardware-signing.md` DR-0091): Nano X, Nano S Plus,
         // Stax, Flex, and Apex P.
         let cases = [
             (0x4001_u16, LedgerProductModel::NanoX),

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Sunrise Edge Developer MVP Rust CLI (`apps/cli`, docs/architecture/README.md §44,
+//! Sunrise Edge Developer MVP Rust CLI (`apps/cli`, docs/architecture/product-surfaces.md §44,
 //! DR-0084, and DR-0092).
 //!
 //! Rust-only, with exactly two non-development/runtime dependencies:

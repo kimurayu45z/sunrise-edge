@@ -33,7 +33,7 @@
 //!
 //! This intentionally proves only orderly stop/reopen: it says nothing about
 //! `kill -9`, power loss, torn writes, load, concurrency, or SQLite's
-//! suitability for production use (see `docs/architecture/README.md` "Local devnet
+//! suitability for production use (see `docs/architecture/product-surfaces.md` "Local devnet
 //! architecture" and `TODO.md`'s persistence notes).
 
 use std::ffi::OsString;

@@ -1,6 +1,6 @@
 //! Explicit, all-or-none CLI signer selection between the development-only
 //! local seed signer and a Ledger hardware signer (S4c; see `docs/signing/hardware-signing.md`
-//! and `docs/architecture/README.md`'s Hardware Signing Profile v1 decision records).
+//! and `docs/architecture/decisions/0088-0093-hardware-signing.md`).
 //!
 //! Exactly one signer must be selected: `--seed-file` alone (development-
 //! only, in-memory, never a keystore), or `--ledger-hid-path`,

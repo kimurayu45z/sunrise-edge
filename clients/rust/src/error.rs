@@ -41,7 +41,7 @@ pub enum ClientError {
     Wire(node_wire::QueryResultError),
     /// A remote `/v1/context` result did not match the caller's locally
     /// configured [`crate::context::ExpectedProtocolContext`] (see
-    /// `docs/architecture/README.md` DR-0085 / `TODO.md` CLI-First Node Production Gate
+    /// `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` DR-0085 / `TODO.md` CLI-First Node Production Gate
     /// S1). This is the mandatory pre-signing trusted-context check: a
     /// successful transport connection alone never establishes this.
     ProtocolContextMismatch(ProtocolContextMismatch),
@@ -121,7 +121,7 @@ pub enum ClientError {
     /// [`crate::transaction::PreparedTransaction::finalize`] was asked to
     /// use a signature scheme this client does not implement. Only
     /// `Ed25519` is implemented anywhere in this workspace today (see
-    /// `docs/architecture/README.md` DR-0084).
+    /// `docs/architecture/decisions/0081-0087-cli-first-roadmap.md` DR-0084).
     UnsupportedSignatureScheme(SignatureSchemeId),
     /// A signature presented to
     /// [`crate::transaction::PreparedTransaction::finalize`] had the exact
