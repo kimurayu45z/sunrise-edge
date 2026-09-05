@@ -5,7 +5,7 @@ hardware-signing host boundaries.
 
 ## 42. Local devnet architecture
 
-DR-0081 fixed the local devnet's architecture ahead of its implementation so
+[DR-0081](decisions/0081-0087-cli-first-roadmap.md) fixed the local devnet's architecture ahead of its implementation so
 the client/app work that depends on it can target a stable contract. The
 devnet composes the existing `preinstalled_wasm_structured_durable_router`
 around a dedicated startup binary in `apps/devnet` rather than introducing new
@@ -25,7 +25,8 @@ protocol behavior:
   non-decreasing across restarts
   and fences stale request contexts from a prior process.
 - **SQLite structured store.** State, object, receipt, and outbox data use the
-  additive, local-only, non-production `SqliteDurableStore` (DR-0079), never
+  additive, local-only, non-production `SqliteDurableStore`
+  ([DR-0079](decisions/0076-0080-developer-mvp-foundation.md)), never
   the opaque legacy `SqliteStateStore`; the two require separate files because
   `PRAGMA application_id` is a whole-file SQLite property.
 - **Registry/catalog reconciliation at startup.** Before serving any request,
@@ -121,8 +122,10 @@ protocol behavior:
   never as production asset metadata.
 - **No background sweeper.** The devnet runs no resident outbox-recovery loop,
   timer, or scheduler; unattended recovery, when needed, is invoked the same
-  way the native binary already exposes it (see "Serverless runtime
-  constraints" and the scheduler-callable recovery API above), consistent with
+  way the native binary already exposes it (see
+  [runtime-and-ingress.md §28](runtime-and-ingress.md) and the
+  scheduler-callable recovery API in
+  [persistence.md §41](persistence.md)), consistent with
   treating process lifetime as a non-requirement.
   The current generic machine and asset transition produce responses but no
   outbound messages, so the local transport queue does not grow on this route;
@@ -146,20 +149,26 @@ cross-owner duplicate-transfer restart/duplicate HTTP E2E
 the designs defined below and in "Rust client library" / "Rust client
 external-signer boundary and Developer MVP CLI". Under the CLI-first
 production-strategy pivot (see "Local devnet architecture" above and
-DR-0085, amended by DR-0095), the TypeScript client, explorer, and wallet
-remain deferred until the Software Production Gate (S0-S3 + S5) passes
-(`TODO.md#software-and-hardware-release-gates`);
-no other `clients/*`/`apps/*` path from DR-0081 exists yet. Known current
-limitations that
-must stay visible at devnet startup and in documentation once implemented:
+[DR-0085](decisions/0081-0087-cli-first-roadmap.md), amended by
+[DR-0095](decisions/0094-0098-blobs-audit-and-documentation.md)), the
+TypeScript client, explorer, and wallet remain deferred until the Software
+Production Gate (S0-S3 + S5) passes
+(`TODO.md#software-and-hardware-release-gates`); no other
+`clients/*`/`apps/*` path from
+[DR-0081](decisions/0081-0087-cli-first-roadmap.md) exists yet. Known current
+limitations that must stay visible at devnet startup and in documentation once
+implemented:
 single validator; owned-object only (Create and Shared/System ownership remain
 fail-closed; a blob-backed input is fetched and independently verified through
-an explicit `BlobStore` component (DR-0094), and DR-0096 publishes only a new
-version larger than the fixed inline threshold); one fixed ordinary fee asset and one ordinary
-treasury without validator/certificate distribution, gas categories other
-than base/execution pricing, or production economics; only the exact policy-bounded existing Address-owned destination
-may differ from the sender, while literal owner reassignment/gifting remains
-fail-closed; local SQLite only; the four bounded query routes are an
+an explicit `BlobStore` component
+[DR-0094](decisions/0094-0098-blobs-audit-and-documentation.md)), and
+[DR-0096](decisions/0094-0098-blobs-audit-and-documentation.md) publishes only
+a new version larger than the fixed inline threshold); one fixed ordinary fee
+asset and one ordinary treasury without validator/certificate distribution,
+gas categories other than base/execution pricing, or production economics;
+only the exact policy-bounded existing Address-owned destination may differ
+from the sender, while literal owner reassignment/gifting remains fail-closed;
+local SQLite only; the four bounded query routes are an
 unauthenticated public-read API (any caller can read any object/receipt/
 next-nonce/context — the address in `/v1/senders/{sender}/next-nonce` is a
 public lookup selector, not authorization); query and submission share one
@@ -319,7 +328,7 @@ unexpected content types, and non-loopback targets. It provides no TLS,
 authentication, proxy, redirect, persistent connection, async runtime, or
 production remote-node claim. (A separate, later-added `RemoteTlsHttpTransport`
 lifts the loopback-only and no-TLS restrictions within S1's documented
-bounds — see DR-0085 below — without changing this transport's own scope.)
+bounds — see [DR-0085](decisions/0081-0087-cli-first-roadmap.md) — without changing this transport's own scope.)
 
 `/v1/context` remains authoritative for chain, epoch, protocol-version, hash-
 suite, authentication-profile, signature-scheme, binding, and atomicity-domain
@@ -499,7 +508,7 @@ transaction through `PreparedTransaction`/`build_signed_transaction`; and
 submits it with an explicit, caller-supplied non-zero request id. Every
 asset, including this one, uses the same uniform `AssetId`/account/transfer
 path — there is no native-coin or fee special case. Cross-owner destination
-authorization is available only through DR-0086's exact trusted preinstalled-
+authorization is available only through [DR-0086](decisions/0081-0087-cli-first-roadmap.md)'s exact trusted preinstalled-
 module policy; the general owned-effects path remains sender-only.
 `transfer` treats the submission itself as fail-closed, not merely the
 queries that precede it: an empty submit-result `responses()` list, any
@@ -538,13 +547,15 @@ non-current-inline-object adversarial paths; and two real loopback-TCP tests
 against a composed local devnet router — one exercising `context`/
 `next-nonce`/`object`, and one exercising a complete signed `transfer`
 against freshly seeded accounts through to a waited, present receipt.
-DR-0088 subsequently implements S4a's strict host-side profile, exact
-signed-byte clear-signing fixture, and external-signer preflight. DR-0091
+[DR-0088](decisions/0088-0093-hardware-signing.md) subsequently implements S4a's strict host-side profile, exact
+signed-byte clear-signing fixture, and external-signer preflight.
+[DR-0091](decisions/0088-0093-hardware-signing.md)
 records the separate repository's S4b Ledger SDK application and Nano S+
-Speculos evidence As-Is. DR-0092 subsequently implements S4c Phase 1's host
+Speculos evidence As-Is. [DR-0092](decisions/0088-0093-hardware-signing.md) subsequently implements S4c Phase 1's host
 APDU/USB/HID transport and CLI signer selection in this repository's own
 `clients/ledger` crate — the profile/address checks and USB-descriptor-level
-device recognition only, not the active-app/firmware checks — and DR-0093
+device recognition only, not the active-app/firmware checks — and
+[DR-0093](decisions/0088-0093-hardware-signing.md)
 implements S4c Phase 2a's strict Ledger OS identity/dashboard parsing and
 staged dashboard/firmware/open-app/reconnect/active-app sequence, closing
 that gap strictly in software. S4c itself, physical-device HIL, and release
@@ -562,7 +573,8 @@ explicit, non-keystore, development-only conveniences — not production key
 handling — and is called out here rather than silently assumed.
 The restart/duplicate E2E is implemented As-Is (see
 `apps/cli/tests/devnet_restart_duplicate_e2e.rs` and "Local devnet
-architecture" above). Under the CLI-first production-strategy pivot (DR-0085),
+architecture" above). Under the CLI-first production-strategy pivot
+([DR-0085](decisions/0081-0087-cli-first-roadmap.md)),
 `clients/typescript`, `apps/explorer`, and `apps/wallet` remain deferred until
 the Software Production Gate (S0-S3 + S5) passes (see
 `TODO.md#cli-developer-mvp-gate` and `TODO.md#cli-first-node-production-gate`).
@@ -573,10 +585,10 @@ S4 is split into four ordered boundaries so a host library cannot become a
 surrogate for device-side authorization. S4a is implemented As-Is in this
 repository; S4b's separate dedicated Ledger application and Nano S+ Speculos
 evidence are implemented As-Is in `sunriselayer/sunrise-edge-ledger-app` by
-DR-0091. S4c Phase 1's host APDU/USB and CLI signer selection (profile/address checks
+[DR-0091](decisions/0088-0093-hardware-signing.md). S4c Phase 1's host APDU/USB and CLI signer selection (profile/address checks
 and USB-descriptor-level device recognition) are implemented As-Is in this
-repository by DR-0092, and S4c Phase 2a's active-app/firmware identity check
-is implemented As-Is by DR-0093 — strictly in software, against
+repository by [DR-0092](decisions/0088-0093-hardware-signing.md), and S4c Phase 2a's active-app/firmware identity check
+is implemented As-Is by [DR-0093](decisions/0088-0093-hardware-signing.md) — strictly in software, against
 `FakeTransport` only. S4c itself is still not complete: it still needs
 Phase 2b's real hardware validation. S4d
 completes the remaining physical-device, reproducibility, and
@@ -619,11 +631,12 @@ provisional explicitly unregistered development derivation path, and bounded
 APDU state machine/status words. The dedicated device app lives in the separate
 `sunrise-edge-ledger-app` repository because its custom targets, Rust SDK/C
 bindings, Speculos workflow, device matrix, and Ledger release lifecycle cannot
-pass or be hidden from this workspace's host-target gate. DR-0091 records that
-device-side S4b boundary. DR-0092 places every vendor host dependency in the
+pass or be hidden from this workspace's host-target gate.
+[DR-0091](decisions/0088-0093-hardware-signing.md) records that
+device-side S4b boundary. [DR-0092](decisions/0088-0093-hardware-signing.md) places every vendor host dependency in the
 new `clients/ledger` crate, never a protocol crate or `clients/rust`, and
 explicitly amends the CLI's original one-runtime-dependency invariant
-(DR-0084) to two: `sunrise-edge-client` and `sunrise-edge-ledger`. No
+([DR-0084](decisions/0081-0087-cli-first-roadmap.md)) to two: `sunrise-edge-client` and `sunrise-edge-ledger`. No
 physical-device evidence, registered SLIP-0044 allocation, or release
 artifact exists yet; `clients/ledger`'s real USB/HID transport is itself
-unvalidated against physical hardware (see DR-0092).
+unvalidated against physical hardware (see [DR-0092](decisions/0088-0093-hardware-signing.md)).

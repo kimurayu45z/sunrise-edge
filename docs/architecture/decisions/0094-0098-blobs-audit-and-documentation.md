@@ -10,7 +10,7 @@ audit-first sequencing and documentation-ownership decisions.
   GC/checkpoint manifest work remain deferred. This is non-Ledger S5
   prerequisite work; per the user's explicit roadmap reorder (2026-09-04),
   all remaining Ledger S4c Phase 2b/S4d physical-hardware/HIL/release work
-  (see DR-0093 above) is deferred while this proceeds, and S4, S5, the
+  (see [DR-0093](0088-0093-hardware-signing.md)) is deferred while this proceeds, and S4, S5, the
   `CLI-First Node Production Gate`, production, and mainnet readiness all
   remain incomplete.
 
@@ -95,7 +95,8 @@ audit-first sequencing and documentation-ownership decisions.
   `DurableObjectPayload::BlobReference`), so blob upload/publication of a new
   version was unimplemented by simple absence of a code path; DR-0096 later
   added thresholded publication without changing `translate_update`. The bounded
-  query API (`node_core::query_object`, §43) is unchanged: it still returns
+  query API (`node_core::query_object`,
+  [product-surfaces.md §43](../product-surfaces.md)) is unchanged: it still returns
   only a `CurrentBlobReference` result's explicit head/version metadata and
   digests, and still never fetches or verifies a blob body, preserving the
   documented query/write asymmetry.

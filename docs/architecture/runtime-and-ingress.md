@@ -33,7 +33,8 @@ contract, but it does not provide the normalized object, receipt, outbox,
 checkpoint, migration, retention, or operational indexes required by the
 accepted production persistence architecture.
 
-`runtime-sqlite` additionally exposes `SqliteDurableStore` (DR-0079): an
+`runtime-sqlite` additionally exposes `SqliteDurableStore`
+([DR-0079](decisions/0076-0080-developer-mvp-foundation.md)): an
 additive, local-only, non-production implementation of
 `StructuredDurableDomainStateStore`/`IndexedOutboxRepository` in a separate
 module, its own `PRAGMA application_id`, and separate SQLite tables from the
@@ -157,10 +158,11 @@ outbox again; the same request ID with different event bytes fails closed.
 Outbox presence makes committed messages recoverable and at-least-once, but no
 production deployment composition relies on this legacy path. The native
 adapter retains it for non-transaction events, while its structured route uses
-the normalized durable equivalent described below.
+the normalized durable equivalent described in
+[persistence.md §41](persistence.md).
 
 `node-core` carries the Transaction v1 authentication boundary described in
-Section 8 (`node_core::transaction_auth`). It composes the strict
+[core-protocol.md §8](core-protocol.md) (`node_core::transaction_auth`). It composes the strict
 `execution::decode_transaction` decoder, the committed
 `protocol_config::TransactionAuthProfile`, and the concrete
 `crypto::Ed25519Verifier`. `authenticate_submit_transaction_event` now wires it
@@ -172,7 +174,8 @@ derives the private sender-nonce reservation. Exact next-nonce equality and its
 checked increment now commit atomically with the structured invocation. Signed
 read-only object manifests are loaded from exact heads and immutable inline
 versions, authorized against the verified sender, and asserted in that same
-invocation. The bounded S3 uniform ordinary-asset fee composition (DR-0087)
+invocation. The bounded S3 uniform ordinary-asset fee composition
+([DR-0087](decisions/0081-0087-cli-first-roadmap.md))
 and additive owned-effects/preinstalled-WASM module-object effects
 entrypoints are implemented As-Is; shared-object ordering, fast-path
 certificates/publication, authorization for every other externally accepted

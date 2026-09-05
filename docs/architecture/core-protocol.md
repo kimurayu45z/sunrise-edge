@@ -315,8 +315,9 @@ it. The existing read-only entrypoint (and `native-http`'s
 the read-only policy and still reject Write/Consume before storage I/O; a
 separate additive `native-http` composition,
 `preinstalled_wasm_structured_durable_router`, now accepts signed owned
-Write/Consume through the preinstalled-WASM entrypoint below instead (see
-DR-0080).
+Write/Consume through the preinstalled-WASM entrypoint described in
+[runtime-and-ingress.md §30](runtime-and-ingress.md) instead (see
+[DR-0080](decisions/0076-0080-developer-mvp-foundation.md)).
 
 An additive trusted preinstalled-WASM composition now captures the exact
 matching `SystemModule` record (or its committed absence) from the same
@@ -339,8 +340,10 @@ itself, plus the resolver's trusted chain/protocol-version context — rather
 than the hash suite active at the transaction's epoch, so an epoch-only
 hash-suite rotation does not require governance to recommit already-installed
 modules; a `protocol_version` bump does, since it changes the hash frame
-itself (see DR-0078). The transaction's `gas_limit` is rejected before the
-engine ever runs if it exceeds a conservative pre-activation ceiling. Only
+itself (see
+[DR-0078](decisions/0076-0080-developer-mvp-foundation.md)). The transaction's
+`gas_limit` is rejected before the engine ever runs if it exceeds a
+conservative pre-activation ceiling. Only
 then does the bounded deterministic WASM engine run over the already verified
 objects. Canonical `ExecutionEffects` are returned in the response; successful
 owned effects use the existing atomic translator, while a trapped execution is
@@ -352,9 +355,11 @@ and nonce with exact object head assertions but no mutation. Exact receipt
 replay returns before module resolution, object reads, or execution. The
 composition is object-only and uses the signed object-access count for
 logical-domain placement without a dummy application key. This entrypoint was
-initially added to node-core only (DR-0078, historical: at that point native
-HTTP activation was still deferred); a later additive `native-http` router
-now wires it up (see DR-0080). Arbitrary uploads, JIT/AOT, and production
+initially added to node-core only
+([DR-0078](decisions/0076-0080-developer-mvp-foundation.md), historical: at
+that point native HTTP activation was still deferred); a later additive
+`native-http` router
+now wires it up (see [DR-0080](decisions/0076-0080-developer-mvp-foundation.md)). Arbitrary uploads, JIT/AOT, and production
 metering remain deferred.
 
 Protocol version 3 MUST NOT be activated on any live chain until shared-object
@@ -363,7 +368,8 @@ externally accepted event family's authenticated/authorized ingress are
 implemented and atomically composed with the authenticated transaction where
 protocol semantics require it; independently, the CLI-First Node Production
 Gate's remaining S4/S5 and the independent security/release gates must also be
-completed. The bounded S3 uniform ordinary-asset fee composition (DR-0087) and
+completed. The bounded S3 uniform ordinary-asset fee composition
+([DR-0087](decisions/0081-0087-cli-first-roadmap.md)) and
 the additive owned-effects/preinstalled-WASM module-object effects entrypoints
 are implemented As-Is, but implementing them alone does not satisfy this
 constraint. The structured durable
@@ -432,7 +438,8 @@ Bond assets and bond lifecycle are deferred.
 Slashing is deferred, but the architecture already separates message families for future equivocation evidence signatures.
 
 ## 18. Stablecoin fee lifecycle
-The S3 local-devnet fee slice is implemented As-Is by DR-0087; validator/
+The S3 local-devnet fee slice is implemented As-Is by
+[DR-0087](decisions/0081-0087-cli-first-roadmap.md); validator/
 certificate distribution and production stablecoin economics remain deferred.
 A fee asset is an ordinary
 `fees::AssetId`-tagged asset account using the same single account/transfer

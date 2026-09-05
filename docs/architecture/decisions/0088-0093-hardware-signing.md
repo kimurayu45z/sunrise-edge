@@ -350,7 +350,7 @@ transport decisions.
 
   **CLI signer selection amends the one-runtime-dependency invariant.**
   `apps/cli` now depends on `sunrise-edge-ledger` in addition to
-  `sunrise-edge-client` — DR-0084's original "exactly one non-development/
+  `sunrise-edge-client` — [DR-0084](0081-0087-cli-first-roadmap.md)'s original "exactly one non-development/
   runtime dependency" is revised to exactly these two, both still owning no
   application-specific (devnet) semantics. A new `apps/cli::signer` module
   adds `--seed-file`, `--ledger-hid-path`, and `--ledger-account` flags to

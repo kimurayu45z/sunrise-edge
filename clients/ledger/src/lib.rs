@@ -36,7 +36,7 @@
 //! `usb-hid` explicitly to build a binary that can reach real hardware.
 //!
 //! No protocol crate and no `clients/rust` may depend on this crate or on
-//! `hidapi` (see `AGENTS.md`'s "Non-negotiable architecture rules" and
+//! `hidapi` (see `AGENTS.md`'s "Crate boundaries" and
 //! DR-0088/DR-0091/DR-0092): this crate depends on `sunrise-edge-client`,
 //! never the reverse.
 

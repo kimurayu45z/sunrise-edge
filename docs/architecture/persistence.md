@@ -160,7 +160,9 @@ an execution caller must separately read the exact immutable version, match
 its version/digest to the head, decode the inline Object, and compare its typed
 owner. Node-core's authenticated durable entrypoints now fetch a blob-backed
 version's body from an explicit, separately supplied `BlobStore` component and
-independently verify it before authorization (DR-0094). DR-0096 additionally
+independently verify it before authorization
+([DR-0094](decisions/0094-0098-blobs-audit-and-documentation.md)).
+[DR-0096](decisions/0094-0098-blobs-audit-and-documentation.md) additionally
 publishes over-threshold new versions before their structured commit and adds
 local file-backed SQLite blob storage; production/cloud provider blob storage
 remains unimplemented.
@@ -172,8 +174,10 @@ state. Node-core now uses the object section for authenticated read-only
 manifest authorization and exact head assertions, plus an additive
 owned-effects path that commits validated signed Address-object Update/Delete
 mutations, both now reading a blob-backed input through an explicit `BlobStore`
-component (DR-0094); over-threshold new-version publication is implemented by
-DR-0096, while Create and Shared/System ownership remain deferred. Indexed outbox
+component ([DR-0094](decisions/0094-0098-blobs-audit-and-documentation.md));
+over-threshold new-version publication is implemented by
+[DR-0096](decisions/0094-0098-blobs-audit-and-documentation.md), while Create
+and Shared/System ownership remain deferred. Indexed outbox
 repositories now refine the structured store trait so one implementation owns
 initial commit and later delivery state. An additive node-core handler now
 resolves the manifest domain before I/O, checks the typed receipt before state
@@ -226,26 +230,33 @@ serializing unrelated delivery rows; `SKIP LOCKED` is confined to due delivery
 selection. Request traffic does not run DDL or bootstrap. An optional shared
 commit-loss capability now covers commit-boundary connection loss over the
 plain `NoTls` transport and a separately authenticated TLS client leg that
-terminates at a bounded test proxy (DR-0074; see below), and a separate serialized live test now
+terminates at a bounded test proxy
+([DR-0074](decisions/0058-0075-postgres-conformance.md); see below), and a
+separate serialized live test now
 covers database-process SIGKILL and WAL recovery on a live host with a live
-page cache (DR-0069). Separate bounded disposable-container tests cover
-pre-commit data-tablespace ENOSPC (DR-0070) and pre-commit WAL-filesystem
-ENOSPC (DR-0071); the latter shows the same SQLSTATE `53100` at `PANIC`
+page cache ([DR-0069](decisions/0058-0075-postgres-conformance.md)). Separate
+bounded disposable-container tests cover pre-commit data-tablespace ENOSPC
+([DR-0070](decisions/0058-0075-postgres-conformance.md)) and pre-commit
+WAL-filesystem ENOSPC
+([DR-0071](decisions/0058-0075-postgres-conformance.md)); the latter shows the
+same SQLSTATE `53100` at `PANIC`
 severity crashes the whole server, not just the connection. A further bounded
 disposable-container test covers real server connection-slot exhaustion
-(DR-0072), showing this adapter classifies it as the definite pre-commit
+([DR-0072](decisions/0058-0075-postgres-conformance.md)), showing this adapter classifies it as the definite pre-commit
 `Rejected(DeadlineExceededBeforeCommit)`, not `UnavailableBeforeCommit`,
 because its pool-acquisition wait and the caller's own operation deadline
 are, by construction, exhausted together. A further bounded two-container
-test (DR-0073) covers a `pg_dump`-based database-snapshot restore rehearsal:
+test ([DR-0073](decisions/0058-0075-postgres-conformance.md)) covers a
+`pg_dump`-based database-snapshot restore rehearsal:
 schema identity and restored namespace metadata/state/receipt verified
 before fence promotion, operator-only writer-fence advance on the restored
 namespace, stale pre-backup context fencing, and exact reconciliation plus
 fresh commit under a new context, alongside an atomic invalid-dump rollback
 and a valid missing-state gate rejection; this is rehearsal evidence for one
 `pg_dump`/SQL-execute snapshot cycle only, not a production backup/restore capability, and it does
-not close the backup/restore evidence criterion below. A further bounded
-rehearsal (DR-0075) runs the real adapter (a genuine `r2d2` pool plus
+not close the backup/restore evidence criterion in
+[../operations/persistence.md](../operations/persistence.md). A further bounded
+rehearsal ([DR-0075](decisions/0058-0075-postgres-conformance.md)) runs the real adapter (a genuine `r2d2` pool plus
 `PostgresDurableStore`) through a real, digest-pinned `pgbouncer` 1.25.2 proxy
 in transaction-pooling mode with exactly one backend connection for the
 tested database/user pool, on an isolated generated Docker network: PgBouncer
@@ -262,11 +273,13 @@ transaction-pooling rehearsal only, not provider-managed pooler service
 certification, load/soak, failover, or TLS evidence. In-flight
 cancellation, abrupt host/power loss, storage write-cache
 flush/torn-write/media/filesystem faults, commit-boundary or real-device
-ENOSPC, PostgreSQL-server/provider TLS beyond the bounded DR-0074 client leg,
+ENOSPC, PostgreSQL-server/provider TLS beyond the bounded
+[DR-0074](decisions/0058-0075-postgres-conformance.md) client leg,
 point-in-time recovery, continuous WAL
 archiving, hot/concurrent backup, checkpoint publication, blob-manifest/
 state-root/encryption-key verification, capacity/load/soak, provider-managed
-pooler production certification/load/failover beyond the bounded DR-0075
+pooler production certification/load/failover beyond the bounded
+[DR-0075](decisions/0058-0075-postgres-conformance.md)
 rehearsal, real writer failover, and
 production certification evidence remain open, so this is still As-Is
 adapter evidence rather than production readiness.
@@ -311,23 +324,23 @@ only client/driver-to-test-terminator TLS loss behavior, not server-terminated
 TLS, provider PKI/mTLS/rotation/revocation, or production readiness. A
 separate serialized live test now
 proves database-process SIGKILL and WAL recovery on a live host with a live
-page cache (DR-0069). Separate disposable-container scenarios prove bounded
+page cache ([DR-0069](decisions/0058-0075-postgres-conformance.md)). Separate disposable-container scenarios prove bounded
 data-tablespace ENOSPC before `COMMIT` and exact recovery after space is
-freed (DR-0070), bounded WAL-filesystem ENOSPC before `COMMIT`, which
+freed ([DR-0070](decisions/0058-0075-postgres-conformance.md)), bounded WAL-filesystem ENOSPC before `COMMIT`, which
 crashes and in-place restarts the whole server rather than just the
-connection, with exact recovery after space is freed (DR-0071), and bounded
+connection, with exact recovery after space is freed ([DR-0071](decisions/0058-0075-postgres-conformance.md)), and bounded
 real server connection-slot exhaustion, which this adapter classifies as the
 definite pre-commit `Rejected(DeadlineExceededBeforeCommit)` rather than
 `UnavailableBeforeCommit` because its own pool-acquisition wait cannot
 outlast the caller's operation deadline, with exact recovery after one
-blocking connection is released (DR-0072), and a bounded two-container
+blocking connection is released ([DR-0072](decisions/0058-0075-postgres-conformance.md)), and a bounded two-container
 `pg_dump`-based database-snapshot restore rehearsal, proving schema identity
 and restored namespace metadata/state/receipt before fence promotion, an
 operator-only writer-fence advance on the restored namespace, stale
 pre-backup context fencing, and exact reconciliation plus fresh commit under
 a new context, alongside an atomic invalid-dump rollback and a valid
 missing-state gate rejection
-(DR-0073), and a bounded PgBouncer transaction-pooling rehearsal: PgBouncer
+([DR-0073](decisions/0058-0075-postgres-conformance.md)), and a bounded PgBouncer transaction-pooling rehearsal: PgBouncer
 admin-console evidence proving configured transaction mode and exactly one
 PostgreSQL backend reused across two simultaneously open client connections'
 sequential transactions, the real adapter (`r2d2` pool plus
@@ -335,15 +348,16 @@ sequential transactions, the real adapter (`r2d2` pool plus
 definitely rejected (`UnavailableBeforeCommit`) once PgBouncer's own
 `query_wait_timeout` elapses while a direct proxied client holds the pool's
 one backend, no publication, and exact recovery/replay/claim/ack after
-release (DR-0075); none of these
+release ([DR-0075](decisions/0058-0075-postgres-conformance.md)); none of these
 tests prove abrupt host/power loss, storage write-cache
 flush/torn-write/media/filesystem faults, commit-boundary or
-real-device ENOSPC, PostgreSQL-server/provider TLS beyond DR-0074,
+real-device ENOSPC, PostgreSQL-server/provider TLS beyond
+[DR-0074](decisions/0058-0075-postgres-conformance.md),
 point-in-time recovery, continuous WAL
 archiving, hot/concurrent backup, checkpoint publication, blob-manifest/
 state-root/encryption-key verification, capacity/load/soak,
 provider-managed pooler production certification/load/failover beyond the
-bounded DR-0075 rehearsal, real writer
+bounded [DR-0075](decisions/0058-0075-postgres-conformance.md) rehearsal, real writer
 failover, provider certification, or production readiness, all of which
 remain backend-specific evidence. Passing this suite is As-Is contract
 evidence, not production certification.

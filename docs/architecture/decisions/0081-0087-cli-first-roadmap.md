@@ -9,8 +9,8 @@ fee decisions.
   **Monorepo layout.** The repository gains six product paths under `apps/`
   and `clients/` as each is implemented: `clients/rust` and `clients/typescript`
   (protocol client libraries with no UI of their own), `apps/devnet` (the
-  local devnet binary/startup composition; see "Local devnet architecture"
-  above), `apps/cli` (a Rust-only developer CLI), and `apps/explorer`/
+  local devnet binary/startup composition; see
+  [product-surfaces.md §42](../product-surfaces.md)), `apps/cli` (a Rust-only developer CLI), and `apps/explorer`/
   `apps/wallet` (browser applications). `apps/cli` depends only on
   `clients/rust`: it is never a Node/JS/browser runtime and never talks to the
   protocol through anything but `clients/rust`'s own encode/decode/signing/RPC
@@ -35,7 +35,7 @@ fee decisions.
   `TODO.md#cli-developer-mvp-gate`) is: local devnet, bounded query API, Rust
   client, Rust CLI, TypeScript client, explorer, wallet, restart/duplicate
   E2E, and explicit documented development-only limitations. This replaces
-  DR-0080's earlier "TypeScript client + counter demo UI" pairing; no
+  [DR-0080](0076-0080-developer-mvp-foundation.md)'s earlier "TypeScript client + counter demo UI" pairing; no
   `demo/counter` directory is created.
 
   **Amendment: gate renamed and resequenced by DR-0085.** The monorepo
@@ -54,7 +54,7 @@ fee decisions.
   no separate transfer or fee-debit code path for a "special" asset. Which
   asset(s) may pay fees, and at what rate, is protocol policy layered over
   ordinary asset accounts, not a second implementation of balances or
-  transfer (see "Stablecoin fee lifecycle" above). A future fee-debit effect
+  transfer (see [core-protocol.md §18](../core-protocol.md)). A future fee-debit effect
   must reuse the same declared object access, the same exact-head assertions,
   and the same atomic object-effect commit as every other asset transfer; it
   may not bypass them with bespoke fee-only state.
@@ -71,7 +71,8 @@ fee decisions.
   mismatch between the two accounts. Because destination-owner
   authorization for a transfer into an account owned by someone else, and any
   change of an object's owner, remain fail-closed on the existing owned-
-  effects path (see "Node-core invocation boundary" above and DR-0077), this
+  effects path (see [runtime-and-ingress.md §30](../runtime-and-ingress.md) and
+  [DR-0077](0076-0080-developer-mvp-foundation.md)), this
   module demonstrates only same-sender balance movement between two of the
   sender's own asset accounts. It does not implement, and must not be
   described as, user-to-user transfer. The devnet's fee registry stays empty
@@ -91,7 +92,8 @@ fee decisions.
   registry management; fee charging, gas accounting, and any fee-debit
   effect; freeze, close, delegate, and allowance/approval semantics; Shared/
   System object ownership; blob-backed object bodies and arbitrary module
-  upload; and all other production-hardening work already frozen by DR-0076.
+  upload; and all other production-hardening work already frozen by
+  [DR-0076](0076-0080-developer-mvp-foundation.md).
 
   **DR-0086 amendment (current status).** The same-sender-only and deferred
   cross-owner statements immediately above record DR-0081's original MVP
@@ -115,29 +117,29 @@ fee decisions.
   and commits trap fee-only effects as described by DR-0087. The active
   module/semantics declaration is version 3; historical v1/v2 declarations,
   the `0xF001`/`0xF002`/`0xF003` schemas, and WAT/WASM/code hash remain pinned.
-  DR-0088 subsequently implements S4a's hardware-signing profile/host
-  preflight, DR-0091 records S4b's separate device application and Nano S+
-  Speculos evidence As-Is, DR-0092 implements S4c Phase 1's host
-  APDU/USB/HID and CLI signer selection As-Is, and DR-0093 implements S4c
+  [DR-0088](0088-0093-hardware-signing.md) subsequently implements S4a's hardware-signing profile/host
+  preflight, [DR-0091](0088-0093-hardware-signing.md) records S4b's separate device application and Nano S+
+  Speculos evidence As-Is, [DR-0092](0088-0093-hardware-signing.md) implements S4c Phase 1's host
+  APDU/USB/HID and CLI signer selection As-Is, and [DR-0093](0088-0093-hardware-signing.md) implements S4c
   Phase 2a's active-app/firmware identity check As-Is, strictly in software
   (S4c itself remains incomplete, pending Phase 2b's real hardware
   validation); this is still not production or mainnet readiness.
 - DR-0082: Add the bounded canonical Developer MVP query surface described in
-  "Bounded Developer MVP query API". Keep query selectors non-authoritative,
+  [product-surfaces.md §43](../product-surfaces.md). Keep query selectors non-authoritative,
   resolve all chain/domain/epoch/storage authority from trusted composition,
   independently verify durable object and receipt content before returning it,
   encode absence and blob-unavailable state explicitly, and exclude scans and
   arbitrary state access. This is a stable client wire contract, not a public
   RPC security or production indexing architecture.
-- DR-0083: Define the Developer MVP Rust client boundary described in "Rust
-  client library". Share canonical result codecs through `node-wire`, keep the
+- DR-0083: Define the Developer MVP Rust client boundary described in
+  [product-surfaces.md §44](../product-surfaces.md). Share canonical result codecs through `node-wire`, keep the
   client independent of `native-http`/Axum and application semantics, provide
   only a bounded loopback HTTP transport initially, require caller-supplied
   request/module/object identities, and defer production networking and full
   protocol-config/hash verification rather than approximating them.
 - DR-0084: Define the Rust-only `apps/cli` Developer MVP boundary and the
-  Ledger-ready external signing boundary described in "Rust client
-  external-signer boundary and Developer MVP CLI". `apps/cli` has exactly one
+  Ledger-ready external signing boundary described in
+  [product-surfaces.md §45](../product-surfaces.md). `apps/cli` has exactly one
   non-development/runtime dependency, `sunrise-edge-client` (test-only
   `[dev-dependencies]` exist to compose a real devnet and build fixtures for
   this crate's own tests, and are unreachable from any non-test build),
@@ -169,7 +171,7 @@ fee decisions.
   reinterpret any existing production criterion anywhere in `TODO.md`,
   `docs/operations/persistence.md`, or `docs/operations/postgres.md`.
 
-  **Rationale.** The Developer MVP Gate (DR-0076, resequenced by DR-0081) put
+  **Rationale.** The Developer MVP Gate ([DR-0076](0076-0080-developer-mvp-foundation.md), resequenced by DR-0081) put
   a browser-facing product surface (TypeScript client, explorer, wallet) in
   the same near-term gate as the node's own core capabilities (local devnet,
   owned-object execution, bounded query API, Rust client, Rust CLI,
@@ -200,24 +202,26 @@ fee decisions.
   implemented As-Is. S1 below is now also implemented and tested As-Is (see
   "S1 implementation status" immediately below), and S2 is implemented and
   validated As-Is by DR-0086. S3 is implemented and validated As-Is by
-  DR-0087. S4a is implemented and validated As-Is by DR-0088, and DR-0089
+  DR-0087. S4a is implemented and validated As-Is by
+  [DR-0088](0088-0093-hardware-signing.md), and
+  [DR-0089](0088-0093-hardware-signing.md)
   subsequently makes eight S4b device-contract clarifications in `docs/signing/hardware-signing.md`
   and one correction to DR-0088's blanket 230-byte whole-APDU data cap (FIRST rises
   230→255 bytes, first chunk 205→230 bytes, CONTINUE/LAST unchanged at
-  230). DR-0090 records the separate
+  230). [DR-0090](0088-0093-hardware-signing.md) records the separate
   `sunriselayer/sunrise-edge-ledger-app` repository's earlier host-validated
-  `no_std` core milestone. DR-0091 records its merged PR #2 device application,
+  `no_std` core milestone. [DR-0091](0088-0093-hardware-signing.md) records its merged PR #2 device application,
   five-target builds, and fixed-seed Nano S+ Speculos evidence; S4b is complete
-  As-Is. DR-0092 implements S4c Phase 1's host APDU/USB/HID crate and CLI
+  As-Is. [DR-0092](0088-0093-hardware-signing.md) implements S4c Phase 1's host APDU/USB/HID crate and CLI
   signer selection As-Is (profile/address checks and USB-descriptor-level
-  device recognition), and DR-0093 subsequently implements S4c Phase 2a's
+  device recognition), and [DR-0093](0088-0093-hardware-signing.md) subsequently implements S4c Phase 2a's
   active-app/firmware identity check As-Is (strict Ledger OS identity/
   dashboard response parsing and bounds, a staged dashboard/firmware/
   open-app/reconnect/active-app sequence, and a required
   `--ledger-expected-firmware-version` CLI flag) — strictly in software,
   against `FakeTransport` only; S4c itself is still not complete, since it
   still needs Phase 2b's real hardware validation. S4
-  remains incomplete. DR-0095 supersedes the old strict ordering: S4c Phase
+  remains incomplete. [DR-0095](0094-0098-blobs-audit-and-documentation.md) supersedes the old strict ordering: S4c Phase
   2b and S4d's physical-device HIL/release evidence are deferred, while S5 is
   an independent parallel software-production track. The TypeScript client,
   explorer, and wallet remain deferred until the Software Production Gate
@@ -254,7 +258,8 @@ fee decisions.
   which logical atomicity domain the caller intends to reach — and is
   deliberately never folded into `crypto::SignatureDomain`; it adds no new
   signature-domain binding beyond the existing chain id/protocol
-  version/epoch/message type/signature scheme already described in Section 8.
+  version/epoch/message type/signature scheme already described in
+  [core-protocol.md §8](../core-protocol.md).
   No library path panics: every failure is a typed
   `ExpectedProtocolContextError` (construction) or `ProtocolContextMismatch`
   (comparison), wrapped by a new `ClientError::ProtocolContextMismatch`
@@ -431,9 +436,11 @@ fee decisions.
   production exit criteria and an independent security audit remain required
   afterward, unchanged.
 
-  **Ordered slices, amended by DR-0095.** This decision originally sequenced
+  **Ordered slices, amended by
+  [DR-0095](0094-0098-blobs-audit-and-documentation.md).** This decision originally sequenced
   the CLI-First Node Production Gate as S0-S5 (see
-  `TODO.md#cli-first-node-production-gate`). DR-0095 preserves S0-S3 as the
+  `TODO.md#cli-first-node-production-gate`).
+  [DR-0095](0094-0098-blobs-audit-and-documentation.md) preserves S0-S3 as the
   common baseline but supersedes the strict S4-before-S5 ordering: S4 and S5
   are independent parallel tracks.
 
@@ -468,8 +475,8 @@ fee decisions.
     gas metering on the local preinstalled-WASM devnet path, including
     deterministic trap fee-only settlement and restart/replay evidence.
   - S4: a secure signer replacing today's development-only `LocalSigner`, and
-    a real dedicated Sunrise Edge Ledger integration (see "Rust client
-    external-signer boundary and Developer MVP CLI" and DR-0084; existing
+    a real dedicated Sunrise Edge Ledger integration (see
+    [product-surfaces.md §45](../product-surfaces.md) and DR-0084; existing
     Solana/Ethereum Ledger apps are never reused).
   - S5: production persistence, outbox operation, provider deployment
     (Cloudflare Durable Object/AWS), operations (observability, runbooks),
@@ -487,8 +494,8 @@ fee decisions.
   multi-validator L1, not a permanently single-operator service. Nothing in
   this decision narrows validator-set, bond, or consensus criteria to a
   single-validator design; the devnet's current single-validator posture
-  remains an explicit MVP-only limitation (see "Local devnet architecture"
-  above), not the production target.
+  remains an explicit MVP-only limitation (see
+  [product-surfaces.md §42](../product-surfaces.md)), not the production target.
 - DR-0086: Implement S2 as a bounded committed cross-owner destination policy,
   without introducing literal object-owner reassignment.
 
@@ -642,10 +649,10 @@ fee decisions.
   distribution through `FastCertificate`, multiple governed fee assets,
   production gas calibration, sufficient-balance preflight, treasury sharding,
   Shared/System/blob objects, or crash/power-loss durability. TypeScript,
-  explorer, and wallet stay deferred. DR-0088 implements S4a's hardware
-  profile/host preflight, DR-0091 records S4b's dedicated device application
-  and Nano S+ Speculos evidence As-Is, DR-0092 implements S4c Phase 1's
-  host/CLI integration As-Is, and DR-0093 implements S4c Phase 2a's
+  explorer, and wallet stay deferred. [DR-0088](0088-0093-hardware-signing.md) implements S4a's hardware
+  profile/host preflight, [DR-0091](0088-0093-hardware-signing.md) records S4b's dedicated device application
+  and Nano S+ Speculos evidence As-Is, [DR-0092](0088-0093-hardware-signing.md) implements S4c Phase 1's
+  host/CLI integration As-Is, and [DR-0093](0088-0093-hardware-signing.md) implements S4c Phase 2a's
   active-app/firmware identity check As-Is, strictly in software (S4c itself
   remains incomplete). S4c Phase 2b's physical-device evidence and S4d are
   next. S5, Phase 16/17 exit criteria, and independent audit remain

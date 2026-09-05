@@ -18,9 +18,10 @@ HTTP composition decisions.
   explicit single-validator, owned-only, fee-free, local-SQLite,
   non-production limitations.
 
-  **Amendment: product-surface deliverables superseded by DR-0081.** The
+  **Amendment: product-surface deliverables superseded by
+  [DR-0081](0081-0087-cli-first-roadmap.md).** The
   Developer MVP priority and production-hardening freeze above remain in
-  force. DR-0081 replaces only this entry's earlier TypeScript-client/counter-
+  force. [DR-0081](0081-0087-cli-first-roadmap.md) replaces only this entry's earlier TypeScript-client/counter-
   UI completion shape with the ordered local-devnet/query/Rust-client/Rust-
   CLI/TypeScript-client/explorer/wallet surface and its uniform asset-account
   demonstration; the counter UI is cancelled, not merely deferred.
@@ -256,7 +257,7 @@ HTTP composition decisions.
   object-access surface — their fail-closed rejections
   (`ObjectOwnerKindUnsupported`/the then-existing `ObjectBodyUnavailable`,
   later removed once blob fetch/verification made it unreachable — see
-  DR-0094) already originate in
+  [DR-0094](0094-0098-blobs-audit-and-documentation.md)) already originate in
   shared node-core code, and the native HTTP boundary mapped those errors to
   `501`, so duplicating the same
   node-core tests at HTTP would add no discrimination. The two axum handlers (`submit_structured_durable_event`
@@ -288,11 +289,13 @@ HTTP composition decisions.
   them out would only add release/versioning coordination overhead without a
   concrete consumer to justify it.
 
-  **Amendment: repository-boundary deliverable superseded by DR-0081.** The
+  **Amendment: repository-boundary deliverable superseded by
+  [DR-0081](0081-0087-cli-first-roadmap.md).** The
   rest of this entry (the additive `native-http` composition, shared private
   core, error classification, and test evidence) remains the accepted,
   implemented history of what DR-0080 shipped and is not rewritten. Only the
-  repository-boundary decision immediately above is superseded: DR-0081
+  repository-boundary decision immediately above is superseded:
+  [DR-0081](0081-0087-cli-first-roadmap.md)
   replaces the planned `clients/typescript`/`demo/counter` pairing with a
   six-directory monorepo layout (`clients/rust`, `clients/typescript`,
   `apps/devnet`, `apps/cli`, `apps/explorer`, `apps/wallet`) and a longer
@@ -302,4 +305,4 @@ HTTP composition decisions.
   The extraction-timing reasoning stated above — wait for stable wire
   contracts/vectors, a real independent consumer or release cadence, and a
   released devnet artifact for E2E — is unchanged and still applies to every
-  `clients/*` directory under DR-0081.
+  `clients/*` directory under [DR-0081](0081-0087-cli-first-roadmap.md).

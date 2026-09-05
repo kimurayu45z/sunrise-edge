@@ -180,7 +180,7 @@ fault-conformance decisions.
   `execution::Transaction` v1 decoding. The owned fast-path certificate flow
   is likewise deferred, and protocol version 3 MUST NOT activate on any live
   chain before that decoding/enforcement boundary lands (see the hard
-  activation constraint in §8). `Ed25519Verifier` test evidence includes a
+  activation constraint in [core-protocol.md §8](../core-protocol.md)). `Ed25519Verifier` test evidence includes a
   fixed-bytes negative case for a 64-byte signature whose `S` component is
   non-canonical (`S >= l`), rejected as `Ok(false)` per RFC 8032 §5.1.7's and
   ZIP-215's shared, explicit `S < l` rule, alongside the existing RFC 8032
