@@ -10,20 +10,21 @@ use runtime::conformance::{
 };
 use runtime::{
     AtomicStateMutationSet, AtomicStateReadSet, AtomicStateTransaction, AtomicityDomainId,
-    DueOutboxClaimRequest, DurableCommitOutcome, DurableCommitRejection, DurableDomainStateStore,
-    DurableInvocationTransaction, DurableObjectChanges, DurableObjectHead, DurableObjectHeadRead,
-    DurableObjectMutation, DurableObjectMutationEntry, DurableObjectOwnerProjection,
-    DurableObjectPayload, DurableObjectProvenance, DurableObjectRoutingProjection,
-    DurableObjectVersion, DurableObjectVersionRecord, DurableOperationContext,
-    DurableOutboxAcknowledgement, DurableOutboxBatch, DurableOutboxClaimOutcome,
-    DurableOutboxClaimRejection, DurableOutboxLeaseId, DurableOutboxMessage, DurableReadError,
-    DurableRequestReceipt, DurableStateTransaction, IndexedOutboxRepository, ObjectId,
-    OutboxRequestId, RequestOutboxClaimRequest, StateMutation, StateMutationEntry,
-    StateReadAssertion, StateRevision, StorageCorrelationId, StorageDeadline,
+    BlobStore, DueOutboxClaimRequest, DurableCommitOutcome, DurableCommitRejection,
+    DurableDomainStateStore, DurableInvocationTransaction, DurableObjectChanges, DurableObjectHead,
+    DurableObjectHeadRead, DurableObjectMutation, DurableObjectMutationEntry,
+    DurableObjectOwnerProjection, DurableObjectPayload, DurableObjectProvenance,
+    DurableObjectRoutingProjection, DurableObjectVersion, DurableObjectVersionRecord,
+    DurableOperationContext, DurableOutboxAcknowledgement, DurableOutboxBatch,
+    DurableOutboxClaimOutcome, DurableOutboxClaimRejection, DurableOutboxLeaseId,
+    DurableOutboxMessage, DurableReadError, DurableRequestReceipt, DurableStateTransaction,
+    IndexedOutboxRepository, ObjectId, OutboxRequestId, RequestOutboxClaimRequest, StateMutation,
+    StateMutationEntry, StateReadAssertion, StateRevision, StorageCorrelationId, StorageDeadline,
     StructuredDurableDomainStateStore, WriterFenceGeneration,
 };
 use runtime_sqlite::{
-    SQLITE_STRUCTURED_SCHEMA_IDENTITY, SqliteDurableStore, SqliteDurableStoreError, SqliteNamespace,
+    SQLITE_STRUCTURED_SCHEMA_IDENTITY, SqliteBlobStore, SqliteDurableStore,
+    SqliteDurableStoreError, SqliteNamespace,
 };
 use rusqlite::{Connection, params};
 use std::{
@@ -502,6 +503,118 @@ fn sqlite_structured_restart_persists_state_objects_receipts_and_outbox() {
         .get_object_head(&fresh_context, namespace.domain(), object_id)
         .unwrap();
     assert!(matches!(refreshed_head, DurableObjectHead::Current { .. }));
+}
+
+/// Publishes one canonical object body to the separate blob database, commits
+/// only its immutable `BlobReference` into the structured database, closes
+/// both files, and reopens both. This is the paired file-backed persistence
+/// evidence needed by the devnet composition: neither a process-local blob
+/// map nor an inline fallback can make the assertions pass.
+#[test]
+fn sqlite_blob_reference_and_content_survive_paired_close_and_reopen() {
+    let structured_database = TestDatabase::new();
+    let blob_database = TestDatabase::new();
+    let namespace = namespace("sqlite-blob-restart", 0xC0, 0xC1);
+    let chain_id: ChainId = namespace.chain_id().clone();
+    let fence = WriterFenceGeneration::new(5).unwrap();
+    let context = live_context(fence, 0x21);
+    let object_id = ObjectId::new([0xC2; 32]);
+    let owner = Owner::Address(Address::new([0xC3; 32]));
+    let object = Object {
+        id: object_id,
+        version: 1,
+        owner: owner.clone(),
+        type_hash: protocol_types::Digest32::new(
+            protocol_types::HashAlgorithmId::Sha2_256,
+            [0xC4; 32],
+        ),
+        schema_version: 7,
+        data: vec![0xC5; 70 * 1024],
+    };
+    let canonical_bytes: Vec<u8> = objects::encode_object(&object).unwrap();
+    let protocol_version = ProtocolVersion::new(3);
+    let digest = BuiltinHashFunction::new(protocol_types::HashAlgorithmId::Sha2_256)
+        .hash(
+            protocol_types::HashPurpose::Object,
+            protocol_version,
+            &chain_id,
+            &canonical_bytes,
+        )
+        .unwrap();
+    let version = DurableObjectVersionRecord::from_blob_reference(
+        object_id,
+        DurableObjectVersion::new(1).unwrap(),
+        digest,
+        object.schema_version,
+        DurableObjectProvenance::new(chain_id, protocol_version),
+        50,
+        digest,
+    );
+    let object_changes = DurableObjectChanges::new(
+        vec![DurableObjectHeadRead::new(
+            object_id,
+            DurableObjectHead::Absent,
+        )],
+        vec![DurableObjectMutationEntry::new(
+            object_id,
+            DurableObjectMutation::Create {
+                version,
+                owner_projection: DurableObjectOwnerProjection::from_owner(owner).unwrap(),
+                routing_projection: DurableObjectRoutingProjection::new(None).unwrap(),
+            },
+        )],
+    )
+    .unwrap();
+    let request_id = OutboxRequestId::new([0xC6; 32]).unwrap();
+    let receipt = DurableRequestReceipt::new(request_id, digest, vec![0xC7]).unwrap();
+    let invocation =
+        DurableInvocationTransaction::new(namespace.domain(), None, object_changes, receipt, None)
+            .unwrap();
+
+    {
+        let blob_store = SqliteBlobStore::open(&blob_database.path).unwrap();
+        blob_store
+            .put_blob(digest, canonical_bytes.clone())
+            .unwrap();
+        let store =
+            SqliteDurableStore::open(&structured_database.path, namespace.clone(), fence).unwrap();
+        assert_eq!(
+            store.commit_invocation(&context, invocation),
+            DurableCommitOutcome::Committed
+        );
+    }
+
+    let reopened_store =
+        SqliteDurableStore::open(&structured_database.path, namespace.clone(), fence).unwrap();
+    let reopened_blob_store = SqliteBlobStore::open(&blob_database.path).unwrap();
+    let head = reopened_store
+        .get_object_head(&context, namespace.domain(), object_id)
+        .unwrap();
+    assert!(matches!(
+        head,
+        DurableObjectHead::Current {
+            object_version,
+            digest: head_digest,
+            ..
+        } if object_version == DurableObjectVersion::new(1).unwrap() && head_digest == digest
+    ));
+    let record = reopened_store
+        .get_object_version(
+            &context,
+            namespace.domain(),
+            object_id,
+            DurableObjectVersion::new(1).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.payload(),
+        &DurableObjectPayload::BlobReference(digest)
+    );
+    assert_eq!(
+        reopened_blob_store.get_blob(&digest).unwrap(),
+        Some(canonical_bytes)
+    );
 }
 
 /// The operator-only [`SqliteDurableStore::writer_fence`] accessor must

@@ -101,6 +101,14 @@ pub enum RuntimeError {
     StateScanCursorOutsidePrefix,
     /// A store returned an invalid, unordered, or out-of-range scan page.
     InvalidStateScanPage,
+    /// A `BlobStore::put_blob` call named a digest already stored under
+    /// different content. Content-addressed storage requires the digest to
+    /// determine the content uniquely, so this is a fail-closed content
+    /// collision, never a silent overwrite.
+    BlobDigestConflict {
+        /// The digest whose stored content disagreed with the attempted put.
+        digest: Digest32,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -164,6 +172,12 @@ impl fmt::Display for RuntimeError {
             }
             Self::InvalidStateScanPage => {
                 write!(f, "state store returned an invalid key scan page")
+            }
+            Self::BlobDigestConflict { digest } => {
+                write!(
+                    f,
+                    "blob digest {digest} is already stored under different content"
+                )
             }
         }
     }
@@ -3081,8 +3095,27 @@ pub trait StateKeyScanner: StateStore {
 }
 
 /// Content-addressed blob storage interface.
+///
+/// `put_blob` is atomic insert-if-absent, not a blind overwrite: a digest
+/// determines its content uniquely, so storing byte-identical content under
+/// an already-present digest is an idempotent no-op success (the ordinary
+/// case for a retried or duplicate publication of the same immutable
+/// version), while storing different content under an already-present digest
+/// is a fail-closed [`RuntimeError::BlobDigestConflict`] that never
+/// overwrites the existing bytes. This contract defines no delete or
+/// garbage-collection operation: a conforming implementation never removes a
+/// blob on its own initiative, but that is not a claim that every publisher
+/// retains every blob forever — GC/checkpoint manifest work that would
+/// reclaim unreferenced blobs remains deferred, not ruled out.
 pub trait BlobStore {
     /// Stores a blob under its digest key.
+    ///
+    /// Returns `Ok(())` when `digest` was absent (the bytes are now stored)
+    /// or already present with byte-identical content (idempotent no-op).
+    /// Returns [`RuntimeError::BlobDigestConflict`] when `digest` is already
+    /// present with different content; the existing bytes are left
+    /// untouched. Any other failure is a typed [`RuntimeError`] distinct from
+    /// both of the above, and must not be interpreted as a successful store.
     fn put_blob(&self, digest: Digest32, bytes: Vec<u8>) -> Result<(), RuntimeError>;
 
     /// Loads a blob by digest key.
@@ -4433,13 +4466,29 @@ pub struct MemoryBlobStore {
 
 impl BlobStore for MemoryBlobStore {
     fn put_blob(&self, digest: Digest32, bytes: Vec<u8>) -> Result<(), RuntimeError> {
-        let mut guard = self.inner.write().expect("blob store lock poisoned");
-        guard.insert(digest, bytes);
-        Ok(())
+        // A poisoned lock means some other caller panicked while holding it,
+        // mid-mutation: the map's contents are no longer trustworthy, so this
+        // fails closed as a typed storage-unavailability error rather than
+        // silently recovering a guard over possibly-torn state.
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| RuntimeError::DurableStoreUnavailable)?;
+        match guard.get(&digest) {
+            Some(existing) if *existing == bytes => Ok(()),
+            Some(_) => Err(RuntimeError::BlobDigestConflict { digest }),
+            None => {
+                guard.insert(digest, bytes);
+                Ok(())
+            }
+        }
     }
 
     fn get_blob(&self, digest: &Digest32) -> Result<Option<Vec<u8>>, RuntimeError> {
-        let guard = self.inner.read().expect("blob store lock poisoned");
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| RuntimeError::DurableStoreUnavailable)?;
         Ok(guard.get(digest).cloned())
     }
 }
@@ -6628,6 +6677,57 @@ mod tests {
         assert_eq!(
             runtime.transport().drain_outbound().unwrap(),
             vec![vec![1, 2, 3]]
+        );
+    }
+
+    /// Storing byte-identical content under a digest already present is an
+    /// idempotent no-op success, matching a retried or duplicate publication
+    /// of the same immutable version.
+    #[test]
+    fn memory_blob_store_put_is_idempotent_for_identical_content() {
+        let store = MemoryBlobStore::default();
+        let digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x02; 32]);
+        store.put_blob(digest, vec![1, 2, 3]).unwrap();
+        store.put_blob(digest, vec![1, 2, 3]).unwrap();
+        assert_eq!(store.get_blob(&digest).unwrap(), Some(vec![1, 2, 3]));
+    }
+
+    /// Storing different content under an already-present digest fails
+    /// closed rather than silently overwriting the existing bytes.
+    #[test]
+    fn memory_blob_store_put_rejects_conflicting_content() {
+        let store = MemoryBlobStore::default();
+        let digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x03; 32]);
+        store.put_blob(digest, vec![1, 2, 3]).unwrap();
+        assert_eq!(
+            store.put_blob(digest, vec![9, 9, 9]),
+            Err(RuntimeError::BlobDigestConflict { digest })
+        );
+        assert_eq!(store.get_blob(&digest).unwrap(), Some(vec![1, 2, 3]));
+    }
+
+    /// A poisoned lock means the map's contents are no longer trustworthy:
+    /// both operations fail closed with a typed storage-unavailability error
+    /// rather than silently recovering a guard over possibly-torn state.
+    #[test]
+    fn memory_blob_store_fails_closed_on_poisoned_lock() {
+        let store = Arc::new(MemoryBlobStore::default());
+        let digest = Digest32::new(HashAlgorithmId::Sha2_256, [0x04; 32]);
+        let poison_store = Arc::clone(&store);
+        let result = std::thread::spawn(move || {
+            let _guard = poison_store.inner.write().unwrap();
+            panic!("intentionally poison the blob store lock");
+        })
+        .join();
+        assert!(result.is_err());
+
+        assert_eq!(
+            store.put_blob(digest, vec![5, 6]),
+            Err(RuntimeError::DurableStoreUnavailable)
+        );
+        assert_eq!(
+            store.get_blob(&digest),
+            Err(RuntimeError::DurableStoreUnavailable)
         );
     }
 }

@@ -2918,6 +2918,13 @@ fn node_error_response(error: &NodeCoreError) -> Response {
         NodeCoreError::ObjectBlobDigestMismatch { .. } => {
             (StatusCode::INTERNAL_SERVER_ERROR, "invalid-node-output")
         }
+        // A `BlobStore::put_blob` failure while publishing a new version is
+        // host/storage unavailability, distinct from a caller fault or from
+        // corruption discovered on read: it never exposes blob bytes or
+        // storage details.
+        NodeCoreError::ObjectBlobPublishFailed { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, "object-blob-publish-failed")
+        }
         NodeCoreError::ObjectManifestTooLarge { .. } => (
             StatusCode::UNPROCESSABLE_ENTITY,
             "object-manifest-too-large",
@@ -3275,7 +3282,9 @@ mod tests {
         OutboundMessage, PreinstalledModuleCatalogEntry, PreinstalledModuleSemanticsEnvelope,
         TransactionalNodeTransition, encode_preinstalled_semantics_envelope,
     };
-    use objects::{AccessMode, Address, Object, ObjectId, ObjectRef, Owner, encode_object};
+    use objects::{
+        AccessMode, Address, Object, ObjectId, ObjectRef, Owner, decode_object, encode_object,
+    };
     use protocol_config::TransactionAuthProfile;
     use protocol_types::{
         ChainId, Digest32, Epoch, HashAlgorithmId, HashPurpose, HashSuite, HashSuiteId,
@@ -3286,14 +3295,15 @@ mod tests {
         ComposedRuntime, DurableCommitOutcome, DurableCommitRejection, DurableDomainStateStore,
         DurableInvocationTransaction, DurableObjectChanges, DurableObjectHead,
         DurableObjectHeadRead, DurableObjectMutation, DurableObjectMutationEntry,
-        DurableObjectOwnerProjection, DurableObjectProvenance, DurableObjectRoutingProjection,
-        DurableObjectVersion, DurableObjectVersionRecord, DurableOutboxClaim, DurableReadError,
-        DurableRequestId, DurableRequestReceipt, IndexedOutboxRepository, ManualClock,
-        MemoryBlobStore, MemoryDurableStateStore, MemoryRuntime, MemoryScheduler, MemorySigner,
-        MemoryStateStore, MemoryTransport, ObjectHeadRevision, OutboxRequestId,
-        RequestOutboxClaimRequest, RuntimeError, StateMutation, StateMutationEntry,
-        StateReadAssertion, StateRevision, StateStore, StructuredDurableDomainStateStore,
-        SystemClock, TransactionalStateStore, VersionedStateValue,
+        DurableObjectOwnerProjection, DurableObjectPayload, DurableObjectProvenance,
+        DurableObjectRoutingProjection, DurableObjectVersion, DurableObjectVersionRecord,
+        DurableOutboxClaim, DurableReadError, DurableRequestId, DurableRequestReceipt,
+        IndexedOutboxRepository, ManualClock, MemoryBlobStore, MemoryDurableStateStore,
+        MemoryRuntime, MemoryScheduler, MemorySigner, MemoryStateStore, MemoryTransport,
+        ObjectHeadRevision, OutboxRequestId, RequestOutboxClaimRequest, RuntimeError,
+        StateMutation, StateMutationEntry, StateReadAssertion, StateRevision, StateStore,
+        StructuredDurableDomainStateStore, SystemClock, TransactionalStateStore,
+        VersionedStateValue,
     };
     use runtime_sqlite::{SqliteDurableStore, SqliteNamespace, SqliteStateStore};
     use std::{
@@ -4052,6 +4062,23 @@ mod tests {
             NativeBlockingPolicy::new(NonZeroUsize::new(4).unwrap()),
         )
         .unwrap()
+    }
+
+    /// Decodes a committed version's typed object regardless of whether its
+    /// payload is inline or blob-backed, so tests written against either
+    /// shape can assert on the same decoded `Object` without caring which
+    /// storage representation a given commit chose.
+    fn committed_object(
+        version: &DurableObjectVersionRecord,
+        blob_store: &impl BlobStore,
+    ) -> Object {
+        match version.payload() {
+            DurableObjectPayload::Inline(inline) => inline.object().clone(),
+            DurableObjectPayload::BlobReference(blob_digest) => {
+                let bytes = blob_store.get_blob(blob_digest).unwrap().unwrap();
+                decode_object(&bytes).unwrap()
+            }
+        }
     }
 
     fn owned_object(id: ObjectId, owner: Address, byte: u8) -> Object {
@@ -5377,6 +5404,15 @@ mod tests {
                 },
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "invalid-node-output",
+            ),
+            (
+                NodeCoreError::ObjectBlobPublishFailed {
+                    object_id,
+                    blob_digest: digest,
+                    source: RuntimeError::BlobDigestConflict { digest },
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "object-blob-publish-failed",
             ),
             (
                 NodeCoreError::ObjectManifestTooLarge {
@@ -7000,8 +7036,10 @@ mod tests {
         );
         let write_object_id = write_ref.id;
         let catalog = Arc::new(catalog);
-        let app = preinstalled_app(
+        let blob_store = Arc::new(MemoryBlobStore::default());
+        let app = preinstalled_app_with_blob_store(
             Arc::clone(&store),
+            Arc::clone(&blob_store),
             Arc::clone(&transport),
             Arc::new(ManualClock::new(10_000)),
             protocol_config,
@@ -7057,8 +7095,12 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+        assert!(
+            matches!(write_v2.payload(), DurableObjectPayload::Inline(_)),
+            "a body at or under the threshold must stay inline"
+        );
         assert_eq!(
-            write_v2.payload().inline().unwrap().object().data,
+            committed_object(&write_v2, blob_store.as_ref()).data,
             vec![0xCA, 0xFE]
         );
         assert!(
@@ -7102,8 +7144,9 @@ mod tests {
     /// blob-backed previous version is only readable at all because the
     /// router dispatches through the exact `BlobStore` supplied to
     /// [`StructuredDurableNativeComponents::new`], not a hidden default. The
-    /// counting double proves it was called, and the committed new version
-    /// (always inline) carries the fetched blob's own data.
+    /// counting double proves the fetch was dispatched through it, and the
+    /// committed new version — an ordinary small body, so it stays inline
+    /// rather than being republished — carries the fetched blob's own data.
     #[tokio::test]
     async fn preinstalled_route_reads_blob_backed_object_through_supplied_blob_store() {
         let fence = WriterFenceGeneration::new(3).unwrap();
@@ -7198,8 +7241,12 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+        assert!(
+            matches!(write_v2.payload(), DurableObjectPayload::Inline(_)),
+            "a body at or under the threshold must stay inline"
+        );
         assert_eq!(
-            write_v2.payload().inline().unwrap().object().data,
+            committed_object(&write_v2, blob_store.as_ref()).data,
             vec![0xCA, 0xFE]
         );
     }

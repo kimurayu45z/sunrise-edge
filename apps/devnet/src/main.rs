@@ -5,10 +5,10 @@ use objects::ObjectId;
 use runtime::{Clock, DurableOperationContext, StorageCorrelationId, StorageDeadline, SystemClock};
 use std::{error::Error, process::ExitCode, sync::Arc};
 use sunrise_edge_devnet::{
-    ASSET_ACCOUNT_WASM, DEVNET_ASSET_ID, DEVNET_DATABASE_FILE, DEVNET_STARTUP_LIMITATIONS_BANNER,
-    DevOwner, DevnetConfig, SeedAssetAccountsOutcome, asset_account_type_hash, boot_local_store,
-    build_asset_module, build_devnet_protocol_context, compose_devnet_router, seed_asset_accounts,
-    verify_seeded_asset_supply,
+    ASSET_ACCOUNT_WASM, DEVNET_ASSET_ID, DEVNET_BLOB_DATABASE_FILE, DEVNET_DATABASE_FILE,
+    DEVNET_STARTUP_LIMITATIONS_BANNER, DevOwner, DevnetConfig, SeedAssetAccountsOutcome,
+    asset_account_type_hash, boot_local_store, build_asset_module, build_devnet_protocol_context,
+    compose_devnet_router, seed_asset_accounts, verify_seeded_asset_supply,
 };
 
 const SEED_OPERATION_TIMEOUT_MILLIS: u64 = 30_000;
@@ -18,6 +18,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let boot = boot_local_store(&config)?;
     let boot_generation = boot.boot_generation();
     let database_path = boot.database_path().to_path_buf();
+    let blob_database_path = boot.blob_database_path().to_path_buf();
     let protocol_context =
         build_devnet_protocol_context(config.chain_id().clone(), config.epoch())?;
     let asset_module = build_asset_module(protocol_context, ASSET_ACCOUNT_WASM.to_vec())?;
@@ -48,6 +49,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             DurableOperationContext::new(boot_generation, seed_deadline, correlation_id);
         let outcome = seed_asset_accounts(
             boot.store(),
+            boot.blob_store(),
             asset_module.resolver(),
             config.epoch(),
             owner,
@@ -81,9 +83,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .destination()
         .id;
 
-    let store = Arc::new(boot.into_store());
+    let (store, blob_store) = boot.into_parts();
+    let store = Arc::new(store);
+    let blob_store = Arc::new(blob_store);
     let router = compose_devnet_router(
         store,
+        blob_store,
         asset_module,
         boot_generation,
         config.max_concurrent(),
@@ -98,6 +103,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
     println!("listen={}", listener.local_addr()?);
     println!("database={}", database_path.display());
     println!("database_file={DEVNET_DATABASE_FILE}");
+    println!("blob_database={}", blob_database_path.display());
+    println!("blob_database_file={DEVNET_BLOB_DATABASE_FILE}");
     println!("boot_generation={}", boot_generation.get());
     println!(
         "asset_id={} asset_account_type={} module_id={} module_version={} module_digest={}",

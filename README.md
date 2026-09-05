@@ -32,10 +32,16 @@ The current product path is CLI-first:
   restart/replay evidence, remote TLS plus a separate pre-signing protocol-
   context check, the exact cross-owner destination policy, and uniform
   ordinary-asset fee settlement.
-- Blob-backed immutable object bodies can be fetched and independently
-  verified by authenticated durable entrypoints. Blob upload/publication,
-  durable provider blob storage, garbage collection, and checkpoint manifests
-  are not implemented.
+- Blob-backed immutable object bodies can be fetched, independently verified,
+  and now published: a new version an authenticated transaction commits is
+  written to an explicit `BlobStore` and referenced, not stored inline, only
+  when its canonical bytes exceed a fixed 64 KiB threshold. Ordinary small
+  bodies — every devnet asset-account update included — stay inline
+  unchanged. The local devnet wires a separate, file-backed SQLite blob
+  store for this, so a large blob-backed version would survive a devnet
+  restart, though ordinary devnet traffic never crosses the threshold today.
+  A durable production/cloud provider `BlobStore` (PostgreSQL/Cloudflare/AWS),
+  garbage collection, and checkpoint manifests remain unimplemented.
 - The **Software Production Gate** consists of S0-S3 plus S5. S5 persistence,
   provider deployment, operations, security-audit, and release evidence remain
   incomplete.

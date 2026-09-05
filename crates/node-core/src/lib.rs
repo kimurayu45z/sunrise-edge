@@ -26,7 +26,7 @@ use runtime::{
     AtomicStateMutationSet, AtomicStateReadSet, AtomicStateTransaction, AtomicStateWriteResult,
     AtomicStateWriteSet, AtomicityDomainId, BlobStore, DomainTransactionalStateStore,
     DurableCommitOutcome, DurableCommitRejection, DurableInlineObject, DurableInvocationError,
-    DurableInvocationTransaction, DurableObjectChanges, DurableObjectHead,
+    DurableInvocationTransaction, DurableObjectChanges, DurableObjectHead, DurableObjectMutation,
     DurableObjectMutationEntry, DurableObjectOwnerProjection, DurableObjectPayload,
     DurableObjectVersion, DurableObjectVersionRecord, DurableOperationContext, DurableOutboxBatch,
     DurableOutboxMessage, DurableReadError, DurableRequestId, DurableRequestReceipt,
@@ -118,6 +118,21 @@ pub const MAX_AUTHENTICATED_OBJECT_BODY_BYTES: usize = 1024 * 1024;
 /// `native-http`. Raising this bound requires capacity evidence and a
 /// decision record.
 pub const MAX_AUTHENTICATED_OBJECT_TOTAL_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// Fixed deterministic threshold, in exact canonical-encoded bytes, at or
+/// under which a newly committed immutable object version stays inline; a
+/// version whose canonical bytes exceed this threshold is instead published
+/// to the supplied `BlobStore` and referenced.
+///
+/// This is a fixed node persistence-layout policy, not transaction input or a
+/// protocol-config knob. Applying it to exact canonical bytes keeps the
+/// choice deterministic without changing the object's canonical bytes,
+/// digest, or logical head. It is deliberately far above ordinary small
+/// object bodies (the devnet's `AssetAccount` body is a few dozen bytes) so
+/// clients that require the bounded query API's inline body keep working
+/// unchanged; only an object body actually large enough to justify separate
+/// content-addressed storage crosses it. Raising or lowering this bound
+/// requires a decision record.
+pub const MAX_INLINE_OBJECT_BODY_BYTES: usize = 64 * 1024;
 
 /// Errors returned by node-core validation, transition, and persistence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,6 +358,24 @@ pub enum NodeCoreError {
         object_id: ObjectId,
         /// Content digest the fetched bytes disagreed with.
         blob_digest: Digest32,
+    },
+    /// A `BlobStore::put_blob` call failed while publishing a new immutable
+    /// object version's canonical bytes, staged for a request that has not
+    /// yet reached `commit_invocation`. This runs strictly before
+    /// `commit_invocation`, so this error means zero
+    /// state/receipt/nonce/outbox/object changes were made for this
+    /// request, distinct from a commit-time rejection. If more than one
+    /// publication was staged, an earlier one that already succeeded is an
+    /// unreachable orphan, not evidence that this request partially
+    /// committed.
+    ObjectBlobPublishFailed {
+        /// Object identifier whose new version failed to publish.
+        object_id: ObjectId,
+        /// Content digest the publish attempt was keyed under.
+        blob_digest: Digest32,
+        /// The underlying `BlobStore` failure, including a digest/content
+        /// collision, preserved rather than discarded.
+        source: RuntimeError,
     },
     /// An authenticated transaction declared more object accesses than the
     /// pre-activation resource bound.
@@ -893,6 +926,14 @@ impl fmt::Display for NodeCoreError {
                 f,
                 "object {object_id} fetched blob bytes do not hash to {blob_digest}"
             ),
+            Self::ObjectBlobPublishFailed {
+                object_id,
+                blob_digest,
+                source,
+            } => write!(
+                f,
+                "object {object_id} blob publication {blob_digest} failed: {source}"
+            ),
             Self::ObjectManifestTooLarge { count, maximum } => write!(
                 f,
                 "authenticated object manifest has {count} entries, maximum is {maximum}"
@@ -1141,6 +1182,7 @@ impl Error for NodeCoreError {
             Self::FeePaymentRejected(error) => Some(error),
             Self::FeeCompositionFailed(error) => Some(error),
             Self::UnsupportedGasScheduleShape(error) => Some(error),
+            Self::ObjectBlobPublishFailed { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -3219,9 +3261,10 @@ where
 /// Create, shared/system ownership, and immutable mutations remain unsupported
 /// and fail closed. A declared `Write`/`Consume` access may read a
 /// blob-backed previous version (fetched and verified through `blob_store`
-/// exactly like the read-only entrypoint), but every new immutable version
-/// this entrypoint commits is always inline: blob upload/publication of a new
-/// version remains unsupported and fail closed.
+/// exactly like the read-only entrypoint). A new version stays inline through
+/// [`MAX_INLINE_OBJECT_BODY_BYTES`] and is published to `blob_store` before
+/// the structured commit only when its canonical body exceeds that fixed
+/// threshold.
 pub fn handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects<S, B, M>(
     blob_store: &B,
     store: &S,
@@ -3800,9 +3843,10 @@ struct ResolvedPreinstalledAuthorization<'a> {
 /// wires this entrypoint over HTTP (see `ARCHITECTURE.md` DR-0080);
 /// `native_http::structured_durable_router` remains on the read-only
 /// entrypoint. A declared access may read a blob-backed previous version
-/// (fetched and verified through `blob_store`), but every new immutable
-/// version this entrypoint commits is always inline: blob upload/publication
-/// of a new version remains unsupported and fail closed. Create,
+/// (fetched and verified through `blob_store`). A new version stays inline
+/// through [`MAX_INLINE_OBJECT_BODY_BYTES`] and is published before the
+/// structured commit only when its canonical body exceeds that fixed
+/// threshold. Create,
 /// Shared/System ownership, validator/certificate fee distribution,
 /// production gas calibration, and production economics remain unimplemented
 /// and fail closed or are simply not reachable from this MVP slice.
@@ -4166,6 +4210,15 @@ where
             )?
         }
     };
+    // Every effect these mutations represent has already passed
+    // `translate_authenticated_object_effects`/
+    // `translate_fee_only_object_effects` validation, but staging is pure
+    // and does no I/O: the complete envelope below (state/receipt/outbox/
+    // object aggregate bounds) is validated afterward, not here. Exact
+    // replay already returned above, before this point is ever reached, so
+    // a replay never stages or publishes anything.
+    let (object_mutations, pending_blob_publications) =
+        stage_object_mutations_for_blob_store(object_mutations);
 
     let dedup_record = NodeDedupRecord::new(
         event.request_id(),
@@ -4212,6 +4265,11 @@ where
     let invocation =
         DurableInvocationTransaction::new(domain, Some(state), objects, receipt, outbox)?;
 
+    // Only now that the complete envelope above has been built and
+    // validated are the publications staged earlier actually performed,
+    // strictly before `commit_invocation`.
+    publish_pending_blobs(blob_store, pending_blob_publications)?;
+
     match store.commit_invocation(context, invocation) {
         DurableCommitOutcome::Committed => Ok(transition.output),
         DurableCommitOutcome::Rejected(
@@ -4227,6 +4285,151 @@ where
             Err(NodeCoreError::DurableCommitIndeterminate(reason))
         }
     }
+}
+
+/// One deferred `BlobStore::put_blob` call staged by
+/// `stage_object_mutations_for_blob_store`, to be performed only after the
+/// caller has built and validated the complete structured envelope
+/// (state/receipt/outbox/object) those staged mutations belong to.
+struct PendingBlobPublication {
+    object_id: ObjectId,
+    blob_digest: Digest32,
+    canonical_bytes: Vec<u8>,
+}
+
+/// Pure, I/O-free staging pass over mutations
+/// `translate_authenticated_object_effects`/
+/// `translate_fee_only_object_effects` already validated: a `Create`/
+/// `Update` mutation whose inline canonical bytes exceed
+/// `MAX_INLINE_OBJECT_BODY_BYTES` has its payload replaced with a
+/// `BlobReference` keyed under the version's already-computed object digest
+/// and provenance, and the exact bytes to publish are collected as a
+/// `PendingBlobPublication` rather than published immediately. A body at or
+/// under the threshold — every ordinary small object body, including every
+/// devnet asset account — is returned unchanged with nothing staged and no
+/// bytes cloned. A mutation that is already blob-backed (never produced by
+/// `translate_update` today, but not assumed impossible) also passes
+/// through unstaged.
+///
+/// This function does no I/O and is not the point at which the complete
+/// envelope is validated: the caller still builds and validates
+/// `DurableObjectChanges`/`DurableInvocationTransaction` from this
+/// function's returned mutations afterward, and must not perform any staged
+/// publication until that construction has succeeded.
+///
+/// Iterates in the mutations' existing deterministic order (the verified
+/// manifest's declaration order) and applies the identical fixed threshold
+/// to the identical canonical bytes, so every validator that reaches this
+/// point stages the same publications in the same order.
+fn stage_object_mutations_for_blob_store(
+    mutations: Vec<DurableObjectMutationEntry>,
+) -> (Vec<DurableObjectMutationEntry>, Vec<PendingBlobPublication>) {
+    let mut pending: Vec<PendingBlobPublication> = Vec::new();
+    let mutations = mutations
+        .into_iter()
+        .map(|entry| {
+            let object_id = entry.object_id();
+            let mutation = match entry.mutation().clone() {
+                DurableObjectMutation::Create {
+                    version,
+                    owner_projection,
+                    routing_projection,
+                } => DurableObjectMutation::Create {
+                    version: stage_inline_version_for_blob_store(version, &mut pending),
+                    owner_projection,
+                    routing_projection,
+                },
+                DurableObjectMutation::Update {
+                    version,
+                    owner_projection,
+                    routing_projection,
+                } => DurableObjectMutation::Update {
+                    version: stage_inline_version_for_blob_store(version, &mut pending),
+                    owner_projection,
+                    routing_projection,
+                },
+                DurableObjectMutation::Delete => DurableObjectMutation::Delete,
+            };
+            DurableObjectMutationEntry::new(object_id, mutation)
+        })
+        .collect();
+    (mutations, pending)
+}
+
+/// Stages one inline version for publication only when its canonical bytes
+/// exceed `MAX_INLINE_OBJECT_BODY_BYTES`, reusing the version's own
+/// already-computed `digest` unchanged as the staged payload's
+/// `blob_digest`: both are independently reverified against the identical
+/// fetched bytes on read (`load_and_authorize_objects`), so reusing the same
+/// value is exactly what a later verified read expects, not a shortcut. A
+/// body at or under the threshold is returned unchanged.
+fn stage_inline_version_for_blob_store(
+    version: DurableObjectVersionRecord,
+    pending: &mut Vec<PendingBlobPublication>,
+) -> DurableObjectVersionRecord {
+    let DurableObjectPayload::Inline(inline) = version.payload() else {
+        return version;
+    };
+    if inline.canonical_bytes().len() <= MAX_INLINE_OBJECT_BODY_BYTES {
+        return version;
+    }
+    let object_id = version.object_id();
+    let digest = version.digest();
+    pending.push(PendingBlobPublication {
+        object_id,
+        blob_digest: digest,
+        canonical_bytes: inline.canonical_bytes().to_vec(),
+    });
+    DurableObjectVersionRecord::from_blob_reference(
+        object_id,
+        version.object_version(),
+        digest,
+        version.schema_version(),
+        version.provenance().clone(),
+        version.created_checkpoint(),
+        digest,
+    )
+}
+
+/// Performs every publication staged by
+/// `stage_object_mutations_for_blob_store`, in order, and only after the
+/// caller has already built and validated the complete
+/// `DurableInvocationTransaction` those staged mutations belong to.
+///
+/// A failure here (a typed `BlobStore` error, including a digest/content
+/// collision) means `commit_invocation` is never called for this request:
+/// zero state/receipt/nonce/outbox/object changes. If more than one
+/// publication was staged, an earlier one that already succeeded before a
+/// later one fails is already durably stored — an unreachable
+/// content-addressed orphan, exactly like one a later `commit_invocation`
+/// rejection can leave behind, never a partial commit.
+fn publish_pending_blobs(
+    blob_store: Option<&dyn BlobStore>,
+    pending: Vec<PendingBlobPublication>,
+) -> Result<(), NodeCoreError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    // Every caller that ever constructs a mutation with an inline payload
+    // also supplies a blob store (see
+    // `handle_authenticated_submit_transaction_with_policy` and the
+    // preinstalled-WASM entrypoint); the fully generic, never-dispatching
+    // idempotent path never produces object mutations at all, so it never
+    // stages a publication. Absence here is an internal composition bug,
+    // not reachable external input.
+    let blob_store = blob_store.ok_or(NodeCoreError::PersistenceInvariant(
+        "a staged blob publication requires a blob store",
+    ))?;
+    for publication in pending {
+        blob_store
+            .put_blob(publication.blob_digest, publication.canonical_bytes)
+            .map_err(|error| NodeCoreError::ObjectBlobPublishFailed {
+                object_id: publication.object_id,
+                blob_digest: publication.blob_digest,
+                source: error,
+            })?;
+    }
+    Ok(())
 }
 
 /// One object version's canonical body and typed object, either already
@@ -5419,6 +5622,63 @@ mod tests {
                 .unwrap(),
             digest,
         )
+    }
+
+    /// Decodes a committed version's typed object regardless of whether its
+    /// payload is inline or blob-backed, so tests written against either
+    /// shape can assert on the same decoded `Object` without caring which
+    /// storage representation a given commit chose.
+    fn committed_object(
+        version: &DurableObjectVersionRecord,
+        blob_store: &impl BlobStore,
+    ) -> Object {
+        match version.payload() {
+            DurableObjectPayload::Inline(inline) => inline.object().clone(),
+            DurableObjectPayload::BlobReference(blob_digest) => {
+                let bytes = blob_store.get_blob(blob_digest).unwrap().unwrap();
+                decode_object(&bytes).unwrap()
+            }
+        }
+    }
+
+    #[test]
+    fn inline_blob_threshold_uses_exact_canonical_length() {
+        let object_id: ObjectId = ObjectId::new([0x6F; 32]);
+        let owner: Owner = Owner::Address(Address::new([0x6E; 32]));
+        let mut boundary_object: Object = test_object(object_id, 2, owner.clone(), 0x00);
+        boundary_object.data = Vec::new();
+        let empty_length: usize = encode_object(&boundary_object).unwrap().len();
+        assert!(empty_length < MAX_INLINE_OBJECT_BODY_BYTES);
+        boundary_object.data = vec![0x6F; MAX_INLINE_OBJECT_BODY_BYTES - empty_length];
+        let boundary_bytes: Vec<u8> = encode_object(&boundary_object).unwrap();
+        assert_eq!(boundary_bytes.len(), MAX_INLINE_OBJECT_BODY_BYTES);
+        let (boundary_record, _): (DurableObjectVersionRecord, Digest32) =
+            hashed_object_version(boundary_object, "sunrise-test", 2);
+        let mut boundary_pending: Vec<PendingBlobPublication> = Vec::new();
+        let boundary_record: DurableObjectVersionRecord =
+            stage_inline_version_for_blob_store(boundary_record, &mut boundary_pending);
+        assert!(matches!(
+            boundary_record.payload(),
+            DurableObjectPayload::Inline(_)
+        ));
+        assert!(boundary_pending.is_empty());
+
+        let mut over_object: Object = test_object(object_id, 2, owner, 0x00);
+        over_object.data = Vec::new();
+        over_object.data = vec![0x70; MAX_INLINE_OBJECT_BODY_BYTES + 1 - empty_length];
+        let over_bytes: Vec<u8> = encode_object(&over_object).unwrap();
+        assert_eq!(over_bytes.len(), MAX_INLINE_OBJECT_BODY_BYTES + 1);
+        let (over_record, _): (DurableObjectVersionRecord, Digest32) =
+            hashed_object_version(over_object, "sunrise-test", 2);
+        let mut over_pending: Vec<PendingBlobPublication> = Vec::new();
+        let over_record: DurableObjectVersionRecord =
+            stage_inline_version_for_blob_store(over_record, &mut over_pending);
+        assert!(matches!(
+            over_record.payload(),
+            DurableObjectPayload::BlobReference(_)
+        ));
+        assert_eq!(over_pending.len(), 1);
+        assert_eq!(over_pending[0].canonical_bytes, over_bytes);
     }
 
     fn manifest_with(entries: Vec<AccessEntry>) -> AccessManifest {
@@ -7526,7 +7786,9 @@ mod tests {
     struct InstrumentedBlobStore {
         blobs: Arc<Mutex<BTreeMap<Digest32, Vec<u8>>>>,
         get_calls: Arc<AtomicUsize>,
+        put_calls: Arc<AtomicUsize>,
         fail_with: Arc<Mutex<Option<RuntimeError>>>,
+        fail_put_with: Arc<Mutex<Option<RuntimeError>>>,
     }
 
     impl InstrumentedBlobStore {
@@ -7538,13 +7800,25 @@ mod tests {
             *self.fail_with.lock().unwrap() = Some(error);
         }
 
+        fn fail_put_with(&self, error: RuntimeError) {
+            *self.fail_put_with.lock().unwrap() = Some(error);
+        }
+
         fn get_calls(&self) -> usize {
             self.get_calls.load(Ordering::SeqCst)
+        }
+
+        fn put_calls(&self) -> usize {
+            self.put_calls.load(Ordering::SeqCst)
         }
     }
 
     impl BlobStore for InstrumentedBlobStore {
         fn put_blob(&self, digest: Digest32, bytes: Vec<u8>) -> Result<(), RuntimeError> {
+            self.put_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = self.fail_put_with.lock().unwrap().clone() {
+                return Err(error);
+            }
             self.insert(digest, bytes);
             Ok(())
         }
@@ -7670,7 +7944,7 @@ mod tests {
 
     struct OwnedObjectEffectMachine {
         expected_inputs: Vec<(ObjectId, AccessMode)>,
-        replacement_byte: u8,
+        replacement_data: Vec<u8>,
         calls: AtomicUsize,
     }
 
@@ -7702,7 +7976,7 @@ mod tests {
                     AccessMode::Write => {
                         let mut new_object: Object = input.object.clone();
                         new_object.version = new_object.version.checked_add(1).unwrap();
-                        new_object.data = vec![self.replacement_byte];
+                        new_object.data = self.replacement_data.clone();
                         effects.push(ObjectEffect::Mutated {
                             previous_version: input.object.version,
                             new_object,
@@ -8637,13 +8911,16 @@ mod tests {
 
     /// A declared `Write` access may read a blob-backed previous version: the
     /// owned-effects entrypoint fetches and verifies it exactly like the
-    /// read-only entrypoint, and the new immutable version it commits is
-    /// always inline (blob upload/publication of a new version is not
-    /// implemented). The preinstalled-WASM entrypoint shares the identical
+    /// read-only entrypoint. The new immutable version it commits here is an
+    /// ordinary small body (well under `MAX_INLINE_OBJECT_BODY_BYTES`, like
+    /// every devnet asset account), so it stays inline and zero blobs are
+    /// published for it — reading a blob-backed previous version never by
+    /// itself forces the next version to also be blob-backed. The
+    /// preinstalled-WASM entrypoint shares the identical
     /// `load_and_authorize_objects` loader and is not separately exercised
     /// here.
     #[test]
-    fn authenticated_owned_write_updates_blob_backed_previous_version_to_inline() {
+    fn authenticated_owned_write_updates_blob_backed_previous_version_stays_inline_when_small() {
         let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
         let blob_store = InstrumentedBlobStore::default();
         let node_config = config("sunrise-test");
@@ -8675,7 +8952,7 @@ mod tests {
         );
         let machine = OwnedObjectEffectMachine {
             expected_inputs: vec![(object_id, AccessMode::Write)],
-            replacement_byte: 0x72,
+            replacement_data: vec![0x72],
             calls: AtomicUsize::new(0),
         };
 
@@ -8691,7 +8968,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(blob_store.get_calls(), 1);
+        assert_eq!(
+            blob_store.get_calls(),
+            1,
+            "the blob-backed previous version is still fetched"
+        );
+        assert_eq!(
+            blob_store.put_calls(),
+            0,
+            "a body at or under the threshold must publish nothing"
+        );
         let commits = store.commits.lock().unwrap();
         let object_changes: &DurableObjectChanges = commits[0].object_changes();
         assert_eq!(object_changes.mutations().len(), 1);
@@ -8699,9 +8985,330 @@ mod tests {
             runtime::DurableObjectMutation::Update { version, .. } => {
                 assert!(matches!(version.payload(), DurableObjectPayload::Inline(_)));
                 assert_eq!(version.object_version().get(), 2);
+                assert_eq!(committed_object(version, &blob_store).data, vec![0x72]);
             }
             other => panic!("expected an inline Update mutation, got {other:?}"),
         }
+    }
+
+    /// A new version whose canonical bytes exceed `MAX_INLINE_OBJECT_BODY_BYTES`
+    /// is published to the supplied `BlobStore` and stored as a
+    /// `BlobReference` keyed under its own object digest, unlike the small
+    /// body proven inline above.
+    #[test]
+    fn authenticated_owned_write_large_update_publishes_and_references_blob() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let blob_store = InstrumentedBlobStore::default();
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0xB5);
+        let signing_key = dev_signing_key(0xB5);
+        let sender: Address = dev_sender_address(&signing_key);
+        let object_id = ObjectId::new([0x75; 32]);
+        let (object_ref, _head) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            object_id,
+            Owner::Address(sender),
+            0x75,
+        );
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref,
+            mode: AccessMode::Write,
+        }]);
+        let submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0xB5),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        let large_body = vec![0x76; MAX_INLINE_OBJECT_BODY_BYTES + 1];
+        let machine = OwnedObjectEffectMachine {
+            expected_inputs: vec![(object_id, AccessMode::Write)],
+            replacement_data: large_body.clone(),
+            calls: AtomicUsize::new(0),
+        };
+
+        handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+            &blob_store,
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            submission,
+            2,
+            &machine,
+        )
+        .unwrap();
+
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            blob_store.put_calls(),
+            1,
+            "a body over the threshold must publish exactly once"
+        );
+        let commits = store.commits.lock().unwrap();
+        let object_changes: &DurableObjectChanges = commits[0].object_changes();
+        assert_eq!(object_changes.mutations().len(), 1);
+        match object_changes.mutations()[0].mutation() {
+            runtime::DurableObjectMutation::Update { version, .. } => {
+                assert!(matches!(
+                    version.payload(),
+                    DurableObjectPayload::BlobReference(_)
+                ));
+                assert_eq!(version.object_version().get(), 2);
+                assert_eq!(committed_object(version, &blob_store).data, large_body);
+            }
+            other => panic!("expected a blob-referenced Update mutation, got {other:?}"),
+        }
+    }
+
+    /// Exact request replay returns the persisted receipt before the
+    /// transition, effect translation, or blob publication ever run, even for
+    /// an owned `Write` that would otherwise publish a new version.
+    #[test]
+    fn authenticated_owned_write_exact_replay_publishes_no_blob() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0x77);
+        let signing_key = dev_signing_key(0x77);
+        let sender: Address = dev_sender_address(&signing_key);
+        let object_id = ObjectId::new([0x77; 32]);
+        let (object_ref, _head) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            object_id,
+            Owner::Address(sender),
+            0x77,
+        );
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref,
+            mode: AccessMode::Write,
+        }]);
+        let machine = OwnedObjectEffectMachine {
+            expected_inputs: vec![(object_id, AccessMode::Write)],
+            replacement_data: vec![0x78; MAX_INLINE_OBJECT_BODY_BYTES + 1],
+            calls: AtomicUsize::new(0),
+        };
+
+        let first_blob_store = InstrumentedBlobStore::default();
+        let first_submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0x77),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest.clone(),
+            &node_config,
+            &protocol_config,
+        );
+        handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+            &first_blob_store,
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            first_submission,
+            2,
+            &machine,
+        )
+        .unwrap();
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first_blob_store.put_calls(), 1);
+
+        // The scripted store's `commit_invocation` does not itself persist
+        // the receipt for later `get_request_receipt` reads, unlike a real
+        // durable adapter; wire the exact committed receipt through so the
+        // second call is a genuine exact replay.
+        let commits = store.commits.lock().unwrap();
+        let committed_receipt = commits[0].receipt().clone();
+        drop(commits);
+        *store.receipt.lock().unwrap() = Some(committed_receipt);
+
+        let replay_blob_store = InstrumentedBlobStore::default();
+        let replay_submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0x77),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+            &replay_blob_store,
+            &store,
+            &durable_context(),
+            &resolver("sunrise-test"),
+            replay_submission,
+            999,
+            &machine,
+        )
+        .unwrap();
+
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            replay_blob_store.put_calls(),
+            0,
+            "exact replay must publish no blob"
+        );
+        assert_eq!(
+            replay_blob_store.get_calls(),
+            0,
+            "exact replay must return before any blob-store I/O"
+        );
+    }
+
+    /// A `BlobStore::put_blob` failure while publishing a new version aborts
+    /// the request before `commit_invocation` is ever called: zero
+    /// state/receipt/nonce/outbox/object changes, distinct from a later
+    /// commit-time rejection.
+    #[test]
+    fn authenticated_owned_write_blob_publish_failure_aborts_before_commit() {
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
+        let blob_store = InstrumentedBlobStore::default();
+        blob_store.fail_put_with(RuntimeError::DurableStoreUnavailable);
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0x78);
+        let signing_key = dev_signing_key(0x78);
+        let sender: Address = dev_sender_address(&signing_key);
+        let object_id = ObjectId::new([0x78; 32]);
+        let (object_ref, _head) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            object_id,
+            Owner::Address(sender),
+            0x78,
+        );
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref,
+            mode: AccessMode::Write,
+        }]);
+        let submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0x78),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        let machine = OwnedObjectEffectMachine {
+            expected_inputs: vec![(object_id, AccessMode::Write)],
+            replacement_data: vec![0x79; MAX_INLINE_OBJECT_BODY_BYTES + 1],
+            calls: AtomicUsize::new(0),
+        };
+
+        let error =
+            handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+                &blob_store,
+                &store,
+                &durable_context(),
+                &resolver("sunrise-test"),
+                submission,
+                2,
+                &machine,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NodeCoreError::ObjectBlobPublishFailed {
+                object_id: id,
+                source: RuntimeError::DurableStoreUnavailable,
+                ..
+            } if id == object_id
+        ));
+        assert_eq!(machine.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(blob_store.put_calls(), 1);
+        assert!(
+            store.commits.lock().unwrap().is_empty(),
+            "a publish failure must never reach commit_invocation"
+        );
+        assert!(store.receipt.lock().unwrap().is_none());
+    }
+
+    /// A later `commit_invocation` rejection (e.g. a concurrent object head
+    /// conflict) can only ever leave an already-published blob as an
+    /// unreachable content-addressed orphan: the blob was published before
+    /// the rejected commit attempt and remains directly readable from the
+    /// `BlobStore`, but no head or receipt ever came to reference it.
+    #[test]
+    fn authenticated_owned_write_commit_rejection_leaves_only_an_orphan_blob() {
+        let object_id = ObjectId::new([0x7A; 32]);
+        let conflict = DurableCommitRejection::ObjectConflict {
+            object_id,
+            current: runtime::DurableObjectHeadSummary::Absent,
+        };
+        let store = ScriptedDurableStore::new(DurableCommitOutcome::Rejected(conflict));
+        let blob_store = InstrumentedBlobStore::default();
+        let node_config = config("sunrise-test");
+        let protocol_config = active_protocol_config(0x7A);
+        let signing_key = dev_signing_key(0x7A);
+        let sender: Address = dev_sender_address(&signing_key);
+        let (object_ref, _head) = preload_inline_object(
+            &store,
+            "sunrise-test",
+            object_id,
+            Owner::Address(sender),
+            0x7A,
+        );
+        let manifest = manifest_with(vec![AccessEntry {
+            object_ref,
+            mode: AccessMode::Write,
+        }]);
+        let submission = authenticated_submission_with_manifest(
+            "sunrise-test",
+            request(0x7A),
+            &signing_key,
+            Epoch::new(7),
+            0,
+            manifest,
+            &node_config,
+            &protocol_config,
+        );
+        let large_body = vec![0x7B; MAX_INLINE_OBJECT_BODY_BYTES + 1];
+        let machine = OwnedObjectEffectMachine {
+            expected_inputs: vec![(object_id, AccessMode::Write)],
+            replacement_data: large_body.clone(),
+            calls: AtomicUsize::new(0),
+        };
+
+        let error =
+            handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
+                &blob_store,
+                &store,
+                &durable_context(),
+                &resolver("sunrise-test"),
+                submission,
+                2,
+                &machine,
+            )
+            .unwrap_err();
+
+        assert_eq!(error, NodeCoreError::ObjectConflict { object_id });
+        // `commit_invocation` was attempted (and scripted to reject),
+        // strictly after the blob was already published.
+        assert_eq!(blob_store.put_calls(), 1);
+        let commits = store.commits.lock().unwrap();
+        assert_eq!(commits.len(), 1);
+        let version = match commits[0].object_changes().mutations()[0].mutation() {
+            runtime::DurableObjectMutation::Update { version, .. } => version.clone(),
+            other => panic!("expected an Update mutation, got {other:?}"),
+        };
+        drop(commits);
+        assert!(matches!(
+            version.payload(),
+            DurableObjectPayload::BlobReference(_)
+        ));
+        assert_eq!(
+            committed_object(&version, &blob_store).data,
+            large_body,
+            "the orphaned blob remains directly readable from the BlobStore"
+        );
     }
 
     /// A [`RuntimeError`] surfaced by the supplied `BlobStore` is a typed
@@ -10093,13 +10700,14 @@ mod tests {
         let replay_submission: AuthenticatedSubmitTransaction = submission.clone();
         let machine: OwnedObjectEffectMachine = OwnedObjectEffectMachine {
             expected_inputs: vec![(write_id, AccessMode::Write), (read_id, AccessMode::Read)],
-            replacement_byte: 0xA4,
+            replacement_data: vec![0xA4],
             calls: AtomicUsize::new(0),
         };
 
+        let blob_store: MemoryBlobStore = MemoryBlobStore::default();
         let first: ResolvedNodeOutput =
             handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
-                &MemoryBlobStore::default(),
+                &blob_store,
                 &store,
                 &context,
                 &hash_resolver,
@@ -10110,7 +10718,7 @@ mod tests {
             .unwrap();
         let replay: ResolvedNodeOutput =
             handle_authenticated_resolved_durable_submit_transaction_with_owned_object_effects(
-                &MemoryBlobStore::default(),
+                &blob_store,
                 &store,
                 &context,
                 &hash_resolver,
@@ -10136,10 +10744,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(write_v2.created_checkpoint(), 6);
-        assert_eq!(
-            write_v2.payload().inline().unwrap().object().data,
-            vec![0xA4]
+        assert!(
+            matches!(write_v2.payload(), DurableObjectPayload::Inline(_)),
+            "a body at or under the threshold must stay inline"
         );
+        assert_eq!(committed_object(&write_v2, &blob_store).data, vec![0xA4]);
         let read_head: DurableObjectHead = store
             .get_object_head(&context, object_domain, read_id)
             .unwrap();
@@ -10536,9 +11145,10 @@ mod tests {
             &protocol_config,
         );
         let engine = WasmExecutionEngine;
+        let blob_store: MemoryBlobStore = MemoryBlobStore::default();
 
         let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
-&MemoryBlobStore::default(),
+&blob_store,
             &store,
             &context,
             &hash_resolver,
@@ -10570,7 +11180,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            write_v2.payload().inline().unwrap().object().data,
+            committed_object(&write_v2, &blob_store).data,
             vec![0xCA, 0xFE]
         );
         let nonce_key: Vec<u8> =
@@ -10681,8 +11291,9 @@ mod tests {
             &protocol_config,
         );
 
+        let blob_store: MemoryBlobStore = MemoryBlobStore::default();
         let resolved: ResolvedNodeOutput = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
-&MemoryBlobStore::default(),
+&blob_store,
             &store,
             &context,
             &hash_resolver,
@@ -10708,7 +11319,7 @@ mod tests {
                 )
                 .unwrap()
                 .unwrap();
-            let object: &Object = record.payload().inline().unwrap().object();
+            let object: Object = committed_object(&record, &blob_store);
             assert_eq!(object.owner, Owner::Address(expected_owner));
             assert_eq!(object.data, vec![0xCA, 0xFE]);
         }
@@ -12084,7 +12695,7 @@ mod tests {
         );
         let machine: OwnedObjectEffectMachine = OwnedObjectEffectMachine {
             expected_inputs: vec![(object_id, AccessMode::Consume)],
-            replacement_byte: 0,
+            replacement_data: vec![0],
             calls: AtomicUsize::new(0),
         };
 
@@ -12308,7 +12919,7 @@ mod tests {
         );
         let machine: OwnedObjectEffectMachine = OwnedObjectEffectMachine {
             expected_inputs: vec![(object_id, AccessMode::Write)],
-            replacement_byte: 0xA7,
+            replacement_data: vec![0xA7],
             calls: AtomicUsize::new(0),
         };
 
@@ -14358,9 +14969,10 @@ mod tests {
         let engine = WasmExecutionEngine;
         let composer = RecordingFeeComposer::new();
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+        let blob_store: MemoryBlobStore = MemoryBlobStore::default();
 
         let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
-&MemoryBlobStore::default(),
+&blob_store,
             &store,
             &context,
             &hash_resolver,
@@ -14393,7 +15005,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            payer_v2.payload().inline().unwrap().object().data,
+            committed_object(&payer_v2, &blob_store).data,
             vec![0x10, 0xF0]
         );
         let treasury_v2 = store
@@ -14406,7 +15018,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            treasury_v2.payload().inline().unwrap().object().data,
+            committed_object(&treasury_v2, &blob_store).data,
             vec![0x00, 0xF1]
         );
     }
@@ -14497,9 +15109,10 @@ mod tests {
         let engine = WasmExecutionEngine;
         let composer = RecordingFeeComposer::new();
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+        let blob_store: MemoryBlobStore = MemoryBlobStore::default();
 
         let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
-&MemoryBlobStore::default(),
+&blob_store,
             &store,
             &context,
             &hash_resolver,
@@ -14533,7 +15146,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            payer_v2.payload().inline().unwrap().object().data,
+            committed_object(&payer_v2, &blob_store).data,
             vec![0xCA, 0xFE, 0xF0]
         );
         let treasury_v2 = store
@@ -14546,7 +15159,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            treasury_v2.payload().inline().unwrap().object().data,
+            committed_object(&treasury_v2, &blob_store).data,
             vec![0x00, 0xF1]
         );
     }
@@ -14637,9 +15250,10 @@ mod tests {
         let engine = WasmExecutionEngine;
         let composer = RecordingFeeComposer::new();
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+        let blob_store: MemoryBlobStore = MemoryBlobStore::default();
 
         let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
-&MemoryBlobStore::default(),
+&blob_store,
             &store,
             &context,
             &hash_resolver,
@@ -14675,7 +15289,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            payer_v2.payload().inline().unwrap().object().data,
+            committed_object(&payer_v2, &blob_store).data,
             vec![0x10, 0xF0]
         );
         let treasury_v2 = store
@@ -14688,7 +15302,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            treasury_v2.payload().inline().unwrap().object().data,
+            committed_object(&treasury_v2, &blob_store).data,
             vec![0x00, 0xF1]
         );
         let nonce_key: Vec<u8> =
@@ -14871,9 +15485,10 @@ mod tests {
         let engine = WasmExecutionEngine;
         let composer = RecordingFeeComposer::new();
         let fee_composition = PreinstalledFeeComposition::new(treasury_id, &composer);
+        let blob_store: MemoryBlobStore = MemoryBlobStore::default();
 
         let resolved = handle_authenticated_resolved_durable_submit_transaction_with_preinstalled_wasm_execution(
-&MemoryBlobStore::default(),
+&blob_store,
             &store,
             &context,
             &hash_resolver,
@@ -14904,7 +15519,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            payer_v2.payload().inline().unwrap().object().data,
+            committed_object(&payer_v2, &blob_store).data,
             vec![0xCA, 0xFE, 0xF0]
         );
         let treasury_v2 = store
@@ -14917,7 +15532,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            treasury_v2.payload().inline().unwrap().object().data,
+            committed_object(&treasury_v2, &blob_store).data,
             vec![0x00, 0xF1]
         );
     }
@@ -14951,7 +15566,7 @@ mod tests {
         let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
         let machine = OwnedObjectEffectMachine {
             expected_inputs: Vec::new(),
-            replacement_byte: 0,
+            replacement_data: vec![0],
             calls: AtomicUsize::new(0),
         };
 
@@ -14998,7 +15613,7 @@ mod tests {
         let store = ScriptedDurableStore::new(DurableCommitOutcome::Committed);
         let machine = OwnedObjectEffectMachine {
             expected_inputs: Vec::new(),
-            replacement_byte: 0,
+            replacement_data: vec![0],
             calls: AtomicUsize::new(0),
         };
 

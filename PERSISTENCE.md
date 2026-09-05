@@ -236,9 +236,25 @@ not the logical type hash retained in canonical Object bytes. Memory and
 PostgreSQL implement this section atomically with state, receipt, and outbox.
 Node-core now loads and authorizes authenticated read-only and owned
 mutating/consuming manifest entries, including a blob-backed input, and
-commits their complete head assertions through this section; blob
-upload/publication of a new version, a durable provider `BlobStore`, and
-GC/checkpoint manifest work remain deferred.
+commits their complete head assertions through this section. A new version an
+accepted authenticated Create/Update mutation commits is published to an explicit
+`BlobStore` (content-addressed insert-if-absent, keyed under the same object
+digest) and referenced rather than stored inline only when its canonical
+bytes exceed a fixed deterministic 64 KiB threshold
+(`node_core::MAX_INLINE_OBJECT_BODY_BYTES`, ARCHITECTURE.md DR-0096); a
+version at or under the threshold stays inline exactly as before, which
+every ordinary small object body (an asset-account update included) always
+does. The staging decision that picks inline vs. blob is a pure function of
+the canonical bytes with no I/O; the actual `put_blob` calls run only after
+the complete structured envelope has been built and validated, strictly
+before the structured commit, so a publish failure aborts with zero
+state/receipt/nonce/outbox/object changes and a later structured commit
+rejection can only leave an already-published blob as an unreachable
+content-addressed orphan. Only Update is currently reachable; Create effects
+remain fail-closed, though the persistence-layout staging covers both mutation
+variants so future Create support cannot bypass it. A durable provider
+`BlobStore` beyond the local file-backed SQLite implementation, and
+GC/checkpoint manifest work, remain deferred.
 Indexed repositories refine this structured store boundary. Node-core constructs the envelope after one
 manifest resolution and one pure transition, checks typed receipts before
 state reads, preserves read-only assertions, and withholds output for rejected

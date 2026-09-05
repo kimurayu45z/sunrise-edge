@@ -24,7 +24,9 @@ pub use asset_account::{
     asset_account_type_hash, decode_asset_account, decode_transfer_args, decode_transfer_event,
     encode_asset_account, encode_transfer_args, encode_transfer_event,
 };
-pub use boot::{DEVNET_DATABASE_FILE, DevnetBoot, DevnetBootError, boot_local_store};
+pub use boot::{
+    DEVNET_BLOB_DATABASE_FILE, DEVNET_DATABASE_FILE, DevnetBoot, DevnetBootError, boot_local_store,
+};
 pub use catalog::{DevnetAssetModule, DevnetCatalogError, build_asset_module};
 pub use composition::{DevnetCompositionError, compose_devnet_router};
 pub use config::{

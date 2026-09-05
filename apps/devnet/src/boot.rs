@@ -3,11 +3,20 @@
 use crate::{config::DevnetConfig, genesis::DEVNET_DOMAIN_BYTES};
 use protocol_types::{AtomicityDomainId, ValidatorId};
 use runtime::WriterFenceGeneration;
-use runtime_sqlite::{SqliteDurableStore, SqliteDurableStoreError, SqliteNamespace};
+use runtime_sqlite::{
+    SqliteBlobStore, SqliteBlobStoreError, SqliteDurableStore, SqliteDurableStoreError,
+    SqliteNamespace,
+};
 use std::{error::Error, fmt, fs, io, path::PathBuf};
 
 /// Structured SQLite file used by the local devnet.
 pub const DEVNET_DATABASE_FILE: &str = "structured.sqlite3";
+/// Content-addressed blob SQLite file used by the local devnet.
+///
+/// Deliberately a separate file from [`DEVNET_DATABASE_FILE`]:
+/// `application_id`/`user_version` are whole-file SQLite properties, so the
+/// structured store and the blob store cannot share one database file.
+pub const DEVNET_BLOB_DATABASE_FILE: &str = "blobs.sqlite3";
 const INITIAL_WRITER_FENCE_VALUE: u64 = 1;
 const DEVNET_VALIDATOR_BYTES: [u8; 32] = [0x56; 32];
 
@@ -15,8 +24,10 @@ const DEVNET_VALIDATOR_BYTES: [u8; 32] = [0x56; 32];
 #[derive(Debug)]
 pub struct DevnetBoot {
     store: SqliteDurableStore,
+    blob_store: SqliteBlobStore,
     boot_generation: WriterFenceGeneration,
     database_path: PathBuf,
+    blob_database_path: PathBuf,
 }
 
 impl DevnetBoot {
@@ -26,10 +37,16 @@ impl DevnetBoot {
         &self.store
     }
 
-    /// Consumes the boot and returns its structured store.
+    /// Returns the opened content-addressed blob store.
     #[must_use]
-    pub fn into_store(self) -> SqliteDurableStore {
-        self.store
+    pub const fn blob_store(&self) -> &SqliteBlobStore {
+        &self.blob_store
+    }
+
+    /// Consumes the boot and returns its structured store and blob store.
+    #[must_use]
+    pub fn into_parts(self) -> (SqliteDurableStore, SqliteBlobStore) {
+        (self.store, self.blob_store)
     }
 
     /// Returns this process boot's persisted writer generation.
@@ -38,18 +55,32 @@ impl DevnetBoot {
         self.boot_generation
     }
 
-    /// Returns the exact SQLite path opened for this boot.
+    /// Returns the exact structured SQLite path opened for this boot.
     #[must_use]
     pub fn database_path(&self) -> &std::path::Path {
         &self.database_path
     }
+
+    /// Returns the exact blob SQLite path opened for this boot.
+    #[must_use]
+    pub fn blob_database_path(&self) -> &std::path::Path {
+        &self.blob_database_path
+    }
 }
 
-/// Opens the local structured database and atomically claims a fresh writer
-/// generation for this process boot.
+/// Opens the local structured database and blob database, and atomically
+/// claims a fresh writer generation for this process boot.
+///
+/// The blob database has no writer-fence concept of its own: it is
+/// content-addressed and every write is insert-if-absent, so a stale writer
+/// cannot overwrite content or mutate a structured head/reference; a digest
+/// conflict fails closed. It can still leave unreachable content and consume
+/// storage, so multi-writer operation and GC/capacity controls remain outside
+/// this local profile rather than being claimed safe here.
 pub fn boot_local_store(config: &DevnetConfig) -> Result<DevnetBoot, DevnetBootError> {
     fs::create_dir_all(config.data_dir()).map_err(DevnetBootError::CreateDataDirectory)?;
     let database_path: PathBuf = config.data_dir().join(DEVNET_DATABASE_FILE);
+    let blob_database_path: PathBuf = config.data_dir().join(DEVNET_BLOB_DATABASE_FILE);
     let domain: AtomicityDomainId = AtomicityDomainId::new(DEVNET_DOMAIN_BYTES)
         .map_err(|_| DevnetBootError::InvalidStaticDomain)?;
     let namespace: SqliteNamespace = SqliteNamespace::new(
@@ -63,6 +94,11 @@ pub fn boot_local_store(config: &DevnetConfig) -> Result<DevnetBoot, DevnetBootE
     let store: SqliteDurableStore =
         SqliteDurableStore::open(&database_path, namespace, initial_writer_fence)
             .map_err(DevnetBootError::Store)?;
+    // Open and validate the independent blob database before promoting the
+    // structured writer fence. A blob-schema failure therefore aborts this
+    // boot without consuming a structured generation.
+    let blob_store: SqliteBlobStore =
+        SqliteBlobStore::open(&blob_database_path).map_err(DevnetBootError::BlobStore)?;
     let persisted: WriterFenceGeneration = store.writer_fence().map_err(DevnetBootError::Store)?;
     let boot_generation: WriterFenceGeneration = persisted
         .checked_next()
@@ -72,8 +108,10 @@ pub fn boot_local_store(config: &DevnetConfig) -> Result<DevnetBoot, DevnetBootE
         .map_err(DevnetBootError::Store)?;
     Ok(DevnetBoot {
         store,
+        blob_store,
         boot_generation,
         database_path,
+        blob_database_path,
     })
 }
 
@@ -90,6 +128,8 @@ pub enum DevnetBootError {
     WriterFenceExhausted(WriterFenceGeneration),
     /// The structured SQLite adapter rejected startup or fence advancement.
     Store(SqliteDurableStoreError),
+    /// The blob SQLite adapter rejected startup.
+    BlobStore(SqliteBlobStoreError),
 }
 
 impl fmt::Display for DevnetBootError {
@@ -108,6 +148,7 @@ impl fmt::Display for DevnetBootError {
                 generation.get()
             ),
             Self::Store(error) => write!(f, "devnet structured store startup failed: {error}"),
+            Self::BlobStore(error) => write!(f, "devnet blob store startup failed: {error}"),
         }
     }
 }
@@ -117,6 +158,7 @@ impl Error for DevnetBootError {
         match self {
             Self::CreateDataDirectory(error) => Some(error),
             Self::Store(error) => Some(error),
+            Self::BlobStore(error) => Some(error),
             _ => None,
         }
     }
@@ -198,6 +240,31 @@ mod tests {
     }
 
     #[test]
+    fn blob_open_failure_does_not_consume_a_structured_writer_generation() {
+        let directory = TestDirectory::new();
+        let config = config(&directory.0, "devnet-blob-boot-failure");
+        let first = boot_local_store(&config).unwrap();
+        assert_eq!(first.boot_generation().get(), 2);
+        drop(first);
+
+        let blob_path = directory.0.join(DEVNET_BLOB_DATABASE_FILE);
+        fs::remove_file(&blob_path).unwrap();
+        fs::create_dir(&blob_path).unwrap();
+        assert!(matches!(
+            boot_local_store(&config),
+            Err(DevnetBootError::BlobStore(_))
+        ));
+
+        fs::remove_dir(&blob_path).unwrap();
+        let recovered = boot_local_store(&config).unwrap();
+        assert_eq!(
+            recovered.boot_generation().get(),
+            3,
+            "the failed blob-store open must not have consumed generation 3"
+        );
+    }
+
+    #[test]
     fn reopening_same_file_under_another_chain_fails_closed() {
         let directory = TestDirectory::new();
         let first_config = config(&directory.0, "devnet-chain-a");
@@ -231,6 +298,7 @@ mod tests {
         let first_module = build_asset_module(first_protocol, ASSET_ACCOUNT_WASM.to_vec()).unwrap();
         let created = seed_asset_accounts(
             first.store(),
+            first.blob_store(),
             first_module.resolver(),
             config.epoch(),
             owner,
@@ -254,6 +322,7 @@ mod tests {
             build_asset_module(second_protocol, ASSET_ACCOUNT_WASM.to_vec()).unwrap();
         let existing = seed_asset_accounts(
             second.store(),
+            second.blob_store(),
             second_module.resolver(),
             config.epoch(),
             owner,
